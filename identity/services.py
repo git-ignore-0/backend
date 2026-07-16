@@ -10,11 +10,24 @@ EVENT_BY_STATUS = {
 }
 
 
+class InvalidAccountTransition(ValueError):
+    pass
+
+
 @transaction.atomic
 def transition_account(user: User, status: AccountStatus) -> User:
+    try:
+        status = AccountStatus(status)
+    except ValueError as error:
+        raise InvalidAccountTransition(f"Unknown account status: {status}") from error
+
     locked_user = User.objects.select_for_update().get(pk=user.pk)
     if locked_user.status == status:
         return locked_user
+    if locked_user.status == AccountStatus.ANONYMIZED:
+        raise InvalidAccountTransition("An anonymized identity cannot change status")
+    if status == AccountStatus.ACTIVE and not locked_user.email_verified:
+        raise InvalidAccountTransition("Email verification is required before activation")
 
     locked_user.status = status
     locked_user.is_active = status in {

@@ -2,6 +2,7 @@ import uuid
 
 from django.contrib.auth.models import AbstractBaseUser, PermissionsMixin
 from django.db import models
+from django.db.models import Q
 from django.utils import timezone
 
 from identity.managers import UserManager
@@ -38,6 +39,28 @@ class User(AbstractBaseUser, PermissionsMixin):
 
     class Meta:
         ordering = ["-date_joined"]
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    Q(
+                        status__in=[
+                            AccountStatus.PENDING_VERIFICATION,
+                            AccountStatus.ACTIVE,
+                        ],
+                        is_active=True,
+                    )
+                    | Q(
+                        status__in=[
+                            AccountStatus.SUSPENDED,
+                            AccountStatus.DELETION_REQUESTED,
+                            AccountStatus.ANONYMIZED,
+                        ],
+                        is_active=False,
+                    )
+                ),
+                name="identity_user_status_matches_is_active",
+            )
+        ]
 
     def __str__(self) -> str:
         return self.email
@@ -52,8 +75,12 @@ class User(AbstractBaseUser, PermissionsMixin):
             AccountStatus.ACTIVE,
         }
 
-    def can_access_core(self) -> bool:
-        return self.is_active and self.status == AccountStatus.ACTIVE and self.email_verified
+    def can_access_core(self, *, email_verified: bool | None = None) -> bool:
+        if not self.is_active or self.status != AccountStatus.ACTIVE:
+            return False
+        if email_verified is None:
+            email_verified = self.email_verified
+        return email_verified
 
 
 class EventStatus(models.TextChoices):

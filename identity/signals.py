@@ -7,6 +7,8 @@ from identity.services import transition_account
 
 
 def request_metadata(request) -> dict[str, str | None]:
+    if request is None:
+        return {"ip_address": None, "user_agent": ""}
     return {
         "ip_address": request.META.get("REMOTE_ADDR"),
         "user_agent": request.META.get("HTTP_USER_AGENT", "")[:1000],

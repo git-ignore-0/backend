@@ -14,6 +14,8 @@ def test_pkce_is_required():
     assert settings.OAUTH2_PROVIDER["OAUTH2_VALIDATOR_CLASS"] == (
         "identity.oauth.CoreOAuth2Validator"
     )
+    assert settings.OAUTH2_PROVIDER["REFRESH_TOKEN_REUSE_PROTECTION"] is True
+    assert settings.OAUTH2_PROVIDER["ALLOWED_REDIRECT_URI_SCHEMES"] == ["http", "https"]
 
 
 @pytest.mark.django_db

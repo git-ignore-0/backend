@@ -1,20 +1,34 @@
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+.venv/
+
+# Python caches and build artifacts
 __pycache__/
 *.py[cod]
-*.sqlite3
-.coverage
-.env
-.phpunit.result.cache
+*.egg-info/
+.mypy_cache/
 .pytest_cache/
 .ruff_cache/
-.venv/
-bootstrap/
-database/
+build/
+dist/
+
+# Test and coverage output
+.coverage
+.coverage.*
+coverage.xml
 htmlcov/
+
+# Runtime-generated data
+*.sqlite
+*.sqlite3
 media/
-nfv_core_auth.egg-info/
 staticfiles/
-storage/
-node_modules/
-vendor/
+
+# Editors and operating systems
+.DS_Store
 .idea/
 .vscode/

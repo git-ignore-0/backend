@@ -17,6 +17,7 @@ def test_profile_scope_returns_stable_core_identity(client, active_user, access_
     )
 
     assert response.status_code == 200
+    assert response["Cache-Control"] == "no-store"
     assert response.json() == {
         "data": {
             "sub": str(active_user.pk),
@@ -45,6 +46,7 @@ def test_suspended_identity_is_rejected_with_valid_existing_token(
 
     assert response.status_code == 403
     assert response.json() == {"code": "account_inactive"}
+    assert response["Cache-Control"] == "no-store"
 
 
 @pytest.mark.django_db
@@ -61,6 +63,7 @@ def test_profile_and_email_scopes_are_required(client, active_user, oauth_applic
 
     assert response.status_code == 403
     assert response.json() == {"code": "insufficient_scope"}
+    assert 'error="insufficient_scope"' in response["WWW-Authenticate"]
 
 
 @pytest.mark.django_db
@@ -68,3 +71,5 @@ def test_invalid_token_is_rejected(client):
     response = client.get("/api/v1/me", HTTP_AUTHORIZATION="Bearer unknown")
     assert response.status_code == 401
     assert response.json() == {"code": "invalid_token"}
+    assert response["WWW-Authenticate"] == 'Bearer error="invalid_token"'
+    assert response["Cache-Control"] == "no-store"

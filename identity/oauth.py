@@ -1,7 +1,10 @@
 import hashlib
+from datetime import timedelta
 
+from django.utils import timezone
 from oauth2_provider.models import AccessToken
 from oauth2_provider.oauth2_validators import OAuth2Validator
+from oauth2_provider.settings import oauth2_settings
 
 REQUIRED_ME_SCOPES = {"profile", "email"}
 
@@ -13,7 +16,15 @@ class CoreOAuth2Validator(OAuth2Validator):
 
     def validate_refresh_token(self, refresh_token, client, request, *args, **kwargs):
         valid = super().validate_refresh_token(refresh_token, client, request, *args, **kwargs)
-        return valid and request.user.can_access_core()
+        if not valid or not request.user.can_access_core():
+            return False
+
+        lifetime = oauth2_settings.REFRESH_TOKEN_EXPIRE_SECONDS
+        if lifetime is None:
+            return True
+        if not isinstance(lifetime, timedelta):
+            lifetime = timedelta(seconds=lifetime)
+        return request.refresh_token_instance.created + lifetime > timezone.now()
 
     def validate_bearer_token(self, token, scopes, request):
         valid = super().validate_bearer_token(token, scopes, request)

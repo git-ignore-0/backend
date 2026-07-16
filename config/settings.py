@@ -1,20 +1,50 @@
 import os
 from pathlib import Path
 
+from django.core.exceptions import ImproperlyConfigured
+from dotenv import load_dotenv
+
 BASE_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(BASE_DIR / ".env")
+
+TRUE_VALUES = {"1", "true", "yes", "on"}
+FALSE_VALUES = {"0", "false", "no", "off"}
 
 
 def env_bool(name: str, default: bool = False) -> bool:
-    return os.getenv(name, str(default)).lower() in {"1", "true", "yes", "on"}
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in TRUE_VALUES:
+        return True
+    if normalized in FALSE_VALUES:
+        return False
+    raise ImproperlyConfigured(f"{name} must be a boolean value")
 
 
-SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "unsafe-local-development-key")
+def required_env(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise ImproperlyConfigured(f"{name} is required")
+    return value
+
+
 DEBUG = env_bool("DJANGO_DEBUG", True)
-ALLOWED_HOSTS = [
-    item.strip()
-    for item in os.getenv("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1,testserver").split(",")
-    if item.strip()
-]
+SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "").strip()
+if not SECRET_KEY:
+    if DEBUG:
+        SECRET_KEY = "unsafe-local-development-key"
+    else:
+        raise ImproperlyConfigured("DJANGO_SECRET_KEY is required when DJANGO_DEBUG=false")
+
+allowed_hosts_value = os.getenv("DJANGO_ALLOWED_HOSTS", "").strip()
+if not allowed_hosts_value:
+    if DEBUG:
+        allowed_hosts_value = "localhost,127.0.0.1,testserver"
+    else:
+        raise ImproperlyConfigured("DJANGO_ALLOWED_HOSTS is required when DJANGO_DEBUG=false")
+ALLOWED_HOSTS = [item.strip() for item in allowed_hosts_value.split(",") if item.strip()]
 CSRF_TRUSTED_ORIGINS = [
     item.strip() for item in os.getenv("DJANGO_CSRF_TRUSTED_ORIGINS", "").split(",") if item.strip()
 ]
@@ -29,7 +59,6 @@ INSTALLED_APPS = [
     "allauth",
     "allauth.account",
     "oauth2_provider",
-    "rest_framework",
     "identity.apps.IdentityConfig",
 ]
 
@@ -70,13 +99,17 @@ if os.getenv("DB_ENGINE", "sqlite") == "mysql":
     DATABASES = {
         "default": {
             "ENGINE": "django.db.backends.mysql",
-            "NAME": os.environ["DB_NAME"],
-            "USER": os.environ["DB_USER"],
-            "PASSWORD": os.environ["DB_PASSWORD"],
+            "NAME": required_env("DB_NAME"),
+            "USER": required_env("DB_USER"),
+            "PASSWORD": required_env("DB_PASSWORD"),
             "HOST": os.getenv("DB_HOST", "127.0.0.1"),
             "PORT": os.getenv("DB_PORT", "3306"),
-            "OPTIONS": {"charset": "utf8mb4"},
+            "OPTIONS": {
+                "charset": "utf8mb4",
+                "init_command": "SET sql_mode='STRICT_TRANS_TABLES'",
+            },
             "CONN_MAX_AGE": 60,
+            "CONN_HEALTH_CHECKS": True,
         }
     }
 else:
@@ -132,8 +165,10 @@ ACCOUNT_SIGNUP_FIELDS = ["email*", "password1*", "password2*"]
 ACCOUNT_USER_MODEL_USERNAME_FIELD = None
 ACCOUNT_EMAIL_VERIFICATION = "mandatory"
 ACCOUNT_EMAIL_SUBJECT_PREFIX = "[Natural Farming Vietnam] "
+ACCOUNT_EMAIL_CONFIRMATION_EXPIRE_DAYS = 1
 ACCOUNT_CONFIRM_EMAIL_ON_GET = False
 ACCOUNT_LOGIN_ON_EMAIL_CONFIRMATION = True
+ACCOUNT_PREVENT_ENUMERATION = True
 ACCOUNT_FORMS = {"signup": "identity.forms.CoreSignupForm"}
 ACCOUNT_ADAPTER = "identity.adapters.CoreAccountAdapter"
 
@@ -144,15 +179,14 @@ OAUTH2_PROVIDER = {
         "email": "Read your email address and verification state",
     },
     "DEFAULT_SCOPES": ["profile", "email"],
+    "ALLOWED_REDIRECT_URI_SCHEMES": ["http", "https"] if DEBUG else ["https"],
     "PKCE_REQUIRED": True,
+    "AUTHORIZATION_CODE_EXPIRE_SECONDS": 60,
     "ACCESS_TOKEN_EXPIRE_SECONDS": 3600,
     "REFRESH_TOKEN_EXPIRE_SECONDS": 2592000,
     "ROTATE_REFRESH_TOKEN": True,
-}
-
-REST_FRAMEWORK = {
-    "DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.IsAuthenticated"],
-    "DEFAULT_RENDERER_CLASSES": ["rest_framework.renderers.JSONRenderer"],
+    "REFRESH_TOKEN_REUSE_PROTECTION": True,
+    "ERROR_RESPONSE_WITH_SCOPES": True,
 }
 
 EMAIL_BACKEND = os.getenv("EMAIL_BACKEND", "django.core.mail.backends.console.EmailBackend")
@@ -161,6 +195,7 @@ EMAIL_PORT = int(os.getenv("EMAIL_PORT", "587"))
 EMAIL_HOST_USER = os.getenv("EMAIL_HOST_USER", "")
 EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD", "")
 EMAIL_USE_TLS = env_bool("EMAIL_USE_TLS", True)
+EMAIL_TIMEOUT = int(os.getenv("EMAIL_TIMEOUT", "10"))
 DEFAULT_FROM_EMAIL = os.getenv(
     "DEFAULT_FROM_EMAIL",
     "Natural Farming Vietnam <no-reply@naturalfarmingvietnam.com>",
@@ -175,7 +210,11 @@ SECURE_HSTS_PRELOAD = env_bool("DJANGO_SECURE_HSTS_PRELOAD", False)
 if env_bool("DJANGO_BEHIND_PROXY", False):
     SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 SESSION_COOKIE_HTTPONLY = True
+CSRF_COOKIE_HTTPONLY = True
 SESSION_COOKIE_SAMESITE = "Lax"
 CSRF_COOKIE_SAMESITE = "Lax"
+SESSION_COOKIE_NAME = "nfv_core_sessionid"
+CSRF_COOKIE_NAME = "nfv_core_csrftoken"
+PASSWORD_RESET_TIMEOUT = 3600
 SECURE_CONTENT_TYPE_NOSNIFF = True
 X_FRAME_OPTIONS = "DENY"
