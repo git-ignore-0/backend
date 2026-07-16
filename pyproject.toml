@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nfv-core-auth"
+version = "0.1.0"
+description = "Natural Farming Vietnam central identity and OAuth2 service"
+requires-python = ">=3.11"
+dependencies = [
+    "Django>=5.2,<5.3",
+    "django-allauth>=65,<66",
+    "django-oauth-toolkit>=3.0,<4",
+    "djangorestframework>=3.15,<4",
+    "gunicorn>=23,<24",
+    "whitenoise>=6.8,<7",
+]
+
+[project.optional-dependencies]
+mysql = ["mysqlclient>=2.2,<3"]
+dev = [
+    "pytest>=8.3,<9",
+    "pytest-django>=4.10,<5",
+    "pytest-cov>=6,<7",
+    "ruff>=0.11,<1",
+]
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "config.settings"
+python_files = ["test_*.py", "tests.py"]
+addopts = "--strict-markers"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+exclude = ["*/migrations/*", "node_modules", "vendor"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "DJ"]
+ignore = ["DJ001"]
+
+[tool.setuptools]
+py-modules = []

@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}Xác minh email{% endblock %}
+{% block content %}
+<section class="card">
+    <h1>Xác minh email</h1>
+    {% if confirmation %}
+        <p>Xác nhận <strong>{{ confirmation.email_address.email }}</strong> là email của bạn.</p>
+        <form method="post">
+            {% csrf_token %}
+            <button type="submit">Xác minh và kích hoạt</button>
+        </form>
+    {% else %}
+        <p>Liên kết xác minh không hợp lệ hoặc đã hết hạn.</p>
+    {% endif %}
+</section>
+{% endblock %}

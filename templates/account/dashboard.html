@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}Tài khoản{% endblock %}
+{% block content %}
+<section class="card">
+    <p class="eyebrow">Tài khoản đang hoạt động</p>
+    <h1>Xin chào, {{ user.name }}</h1>
+    <dl>
+        <dt>Email</dt><dd>{{ user.email }}</dd>
+        <dt>Mã tài khoản</dt><dd><code>{{ user.id }}</code></dd>
+    </dl>
+    <form method="post" action="{% url 'account_logout' %}">{% csrf_token %}<button class="secondary" type="submit">Đăng xuất</button></form>
+</section>
+{% endblock %}

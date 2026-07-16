@@ -1,39 +1,66 @@
 # Identity architecture
 
-Tài liệu này là bản tóm tắt ở phạm vi backend. Trong workspace đầy đủ, mô tả toàn hệ thống, Flarum extension, security boundary, lifecycle và roadmap nằm tại `docs/shared-auth-architecture.md` ở thư mục gốc.
-
 ## Ownership
 
 | Concern | Source of truth |
 |---|---|
-| Email, password, verification, suspension, deletion lifecycle | Core Auth database |
-| Website profiles and future business data | Website/backend database, keyed by Core UUID |
-| Forum posts, groups, moderator/admin permissions | Flarum database |
-| Core-to-Flarum identity link | Flarum `login_providers`, provider `nfv`, identifier = Core UUID |
+| UUID, email, password, verification, identity status | Django Core Auth DB |
+| Core roles | Django groups/permissions |
+| Workshop và business data tương lai | Backend business models, liên kết bằng Core UUID |
+| Forum posts, sessions, groups, moderator/admin | Flarum DB |
+| Core-to-Flarum link | Flarum login provider `nfv`, identifier = Core UUID |
 
-Core roles are not copied into Flarum admin groups. An existing Flarum administrator keeps admin access when the verified Core email is linked to that same Flarum row.
+Core role và Flarum group độc lập. Django superuser không tự trở thành Flarum admin.
 
-## Login flow
+## Runtime boundaries
 
-1. Flarum redirects the browser to Core Auth `/oauth/authorize` with state and a PKCE challenge.
-2. Core Auth handles registration/login and requires verified, active identity state.
-3. Core Auth returns a short-lived authorization code to Flarum.
-4. Flarum exchanges the code server-to-server and calls `/api/v1/me` with `profile email` scopes.
-5. FoF OAuth resolves provider `nfv` + Core UUID. On first login it may safely link an existing Flarum row by verified email; otherwise it creates the forum row.
-6. Flarum creates its own session. Core credentials and tokens are never stored in the Flarum user table.
+- `django-allauth` quản lý signup, email verification, login và password reset.
+- `django-oauth-toolkit` quản lý OAuth client, authorization code, access token và refresh token.
+- `identity.User` là custom user ngay từ migration đầu, dùng UUID và email làm login identifier.
+- allauth `EmailAddress.verified` là nguồn sự thật về email verification.
+- `identity.IdentityEvent` là outbox; cron worker và Flarum lifecycle endpoint sẽ được bổ sung trước khi mở suspend/delete cho admin production.
+- `identity.AuditLog` ghi các sự kiện bảo mật, hiện gồm login/logout.
 
-## Lifecycle
+## Flarum login flow
 
-`users.status` supports `pending_verification`, `active`, `suspended`, `deletion_requested`, and `anonymized`. API access and OAuth authorization require `active` plus verified email.
+1. Extension tạo state và PKCE S256 rồi redirect tới `/oauth/authorize`.
+2. Core yêu cầu user đăng nhập, xác minh email và có status `active`.
+3. Flarum đổi authorization code tại `/oauth/token`.
+4. Flarum gọi `/api/v1/me` với Bearer token có scopes `profile email`.
+5. Response trả Core UUID trong `data.sub`; Flarum dùng UUID này làm stable provider identifier.
+6. Flarum tạo session riêng và giữ nguyên group/admin của forum row đã liên kết.
 
-`identity_events` is an outbox for later reliable propagation to consumers. The current phase emits activation events and blocks destructive Flarum-side account actions. Before exposing suspension/deletion in an admin UI, add an idempotent outbox worker and a signed Flarum lifecycle endpoint so active Flarum sessions are revoked promptly.
+## Account lifecycle
 
-Never hard-delete a Core UUID referenced by posts or business data. Use status transitions and anonymization.
+`transition_account()` khóa row trong transaction, cập nhật `status` cùng `is_active` và ghi outbox event. User chỉ được API/SSO chấp nhận khi:
 
-## Security decisions
+```text
+status = active
+AND is_active = true
+AND primary email is verified
+```
 
-- UUID is the stable cross-system subject (`sub`). Email is mutable and only a first-link hint.
-- Website and Flarum receive separate OAuth clients and secrets.
-- Access tokens default to 60 minutes; refresh tokens default to 30 days.
-- Cross-subdomain cookies are intentionally not shared.
-- Local Flarum password login, password registration, user deletion, and provider unlinking are blocked by the NFV extension.
+Không hard-delete Core UUID. Django Admin đã tắt delete permission cho user; quy trình tương lai dùng `deletion_requested` rồi `anonymized`.
+
+## API contract
+
+```http
+GET /api/v1/me
+Authorization: Bearer <access-token>
+```
+
+Token thiếu `profile email` trả `403 insufficient_scope`; token sai/hết hạn trả `401 invalid_token`; identity không active trả `403 account_inactive`.
+
+```json
+{
+  "data": {
+    "sub": "core-user-uuid",
+    "name": "Nguyen Van A",
+    "email": "user@example.com",
+    "email_verified": true,
+    "locale": "vi",
+    "status": "active",
+    "roles": ["member"]
+  }
+}
+```

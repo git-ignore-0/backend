@@ -1,51 +1,63 @@
-# Deployment runbook (for the later hosting session)
+# Django deployment runbook
 
-## Preflight
+Chưa chạy các bước này cho tới phiên deploy có thông tin hosting, SMTP và domain thật.
 
-1. Back up the Flarum files and database.
-2. Run `php flarum info` and record the exact Flarum/FoF OAuth versions. The extension accepts Flarum 1.8 stable and the 2.x beta line, but must be resolved against the forum's existing root `composer.lock` without forcing a Flarum upgrade.
-3. Choose the Core Auth subdomain and point DNS/TLS to Laravel's `public` directory.
-4. Create a dedicated MySQL database/user for Core Auth. Do not place Core tables in the Flarum database.
-5. Verify SMTP credentials for `no-reply@naturalfarmingvietnam.com` and DNS SPF/DKIM/DMARC.
+## Hosting preflight
 
-## Core Auth
+Xác nhận cPanel có Setup Python App/Passenger, Python 3.11+, virtualenv, pip, cron, MySQL client build dependency và cách restart application. Tạo database/user riêng cho Core Auth; không dùng database Flarum.
 
-Deploy with a production `.env`, then run:
+## Cài ứng dụng
+
+Ví dụ trong application root:
 
 ```bash
-composer install --no-dev --optimize-autoloader
-php artisan key:generate
-php artisan passport:keys
-php artisan migrate --force
-php artisan optimize
+python3 -m venv .venv
+.venv/bin/python -m pip install -e '.[mysql]'
+cp .env.example .env
+.venv/bin/python manage.py migrate
+.venv/bin/python manage.py collectstatic --noinput
+.venv/bin/python manage.py check --deploy
 ```
 
-Point the web root at `backend/public`. Ensure `storage` and `bootstrap/cache` are writable and schedule `php artisan schedule:run` every minute. Keep Passport private keys outside Git and readable only by the application user.
+Passenger entrypoint là `passenger_wsgi.py`. Nếu hosting dùng Gunicorn thì WSGI target là `config.wsgi:application`.
 
-Create a separate confidential Passport client for Flarum and record the exact ID, secret and redirect URI.
+Production `.env` tối thiểu:
 
-## Flarum
-
-Install the extension through a Composer path/VCS repository. Enable FoF OAuth first, then NFV Core SSO. Configure its Core URL/client credentials and clear cache:
-
-```bash
-php flarum migrate
-php flarum cache:clear
+```text
+DJANGO_DEBUG=false
+DJANGO_ALLOWED_HOSTS=auth.naturalfarmingvietnam.com
+DJANGO_CSRF_TRUSTED_ORIGINS=https://auth.naturalfarmingvietnam.com
+DB_ENGINE=mysql
+DJANGO_SECURE_SSL_REDIRECT=true
+DJANGO_SESSION_COOKIE_SECURE=true
+DJANGO_CSRF_COOKIE_SECURE=true
+DJANGO_SECURE_HSTS_SECONDS=31536000
+DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS=true
 ```
 
-Before enabling the extension, create and verify a Core account whose email exactly matches the current Flarum admin. In a private browser, prove that it returns to the same Flarum admin row and retains the admin group. Only then test a new normal member.
+Chỉ bật `DJANGO_BEHIND_PROXY=true` khi cPanel xác nhận HTTPS được terminate ở trusted reverse proxy và gửi `X-Forwarded-Proto` đúng cách. Chỉ bật HSTS preload sau khi mọi subdomain đều dùng HTTPS ổn định.
+
+Sinh `DJANGO_SECRET_KEY` riêng ngoài Git. Cấu hình SMTP cho `no-reply@naturalfarmingvietnam.com`, SPF/DKIM/DMARC và không log password/token.
+
+## OAuth/Flarum
+
+1. Tạo Django superuser bằng `manage.py createsuperuser`.
+2. Trong Django Admin, tạo confidential authorization-code application cho Flarum.
+3. Redirect URI phải khớp tuyệt đối callback FoF OAuth.
+4. Cấu hình Core URL, client ID và secret trong Flarum.
+5. Tạo/verify Core account có email trùng Flarum admin hiện tại.
+6. Bật `nfv-core-sso` rồi test trong cửa sổ ẩn danh trước khi chặn login local.
 
 ## Acceptance checks
 
-- register in Core, receive verification mail, verify, then enter Flarum without another password
-- an unverified or suspended Core user cannot authorize or use `/api/v1/me`
-- existing Flarum admin maps to the existing row and remains admin
-- new user receives a normal member row, never the admin group
-- local Flarum password login and password registration return 403
-- Flarum user deletion and NFV provider unlink return 403
-- logout/login, expired state, invalid callback, refresh, and mobile browser paths work
-- no client secret, app key, SMTP password, or Passport private key is present in Git/log output
+- đăng ký → nhận email → verify → status active → vào Flarum không cần password thứ hai;
+- pending/suspended user không dùng được OAuth identity API;
+- Flarum admin cũ map đúng row và giữ group admin;
+- member mới không nhận quyền admin;
+- `/oauth/authorize`, `/oauth/token`, `/api/v1/me` hoạt động trên HTTPS;
+- static files, reset password, callback lỗi, expired token và mobile browser hoạt động;
+- Git/log không chứa database password, SMTP password, Django secret hay OAuth client secret.
 
 ## Rollback
 
-Disable `nfv/core-sso`, clear Flarum cache, and restore the pre-change Flarum backup if schema/data changed. Core Auth is isolated in its own database, so rollback does not require deleting its data. Keep the old Flarum login path available only during the controlled deployment window; once SSO is verified, the extension enforces Core-only login.
+Tắt extension `nfv/core-sso`, clear Flarum cache và phục hồi Flarum backup nếu cần. Core Auth dùng database riêng nên rollback forum không yêu cầu xóa dữ liệu Core. Branch `laravel-prototype` chỉ là bản tham chiếu local, không dùng làm rollback production sau khi Django đã sinh dữ liệu thật.

@@ -1,0 +1,25 @@
+:root {
+    color-scheme: light;
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: #183229;
+    background: #f3f6ef;
+}
+* { box-sizing: border-box; }
+body { margin: 0; min-height: 100vh; background: radial-gradient(circle at top, #fff 0, #f3f6ef 58%); }
+.shell { width: min(100% - 2rem, 34rem); margin: 0 auto; padding: 3rem 0; }
+.brand { display: inline-block; margin-bottom: 1.5rem; color: #295b40; font-weight: 800; text-decoration: none; }
+.card { padding: clamp(1.5rem, 5vw, 2.5rem); border: 1px solid #d9e1d3; border-radius: 1.25rem; background: rgba(255,255,255,.94); box-shadow: 0 1rem 3rem rgba(31,65,47,.08); }
+h1 { margin: .25rem 0 1rem; font-size: clamp(1.8rem, 5vw, 2.4rem); line-height: 1.1; }
+.eyebrow { margin: 0; color: #3f7a54; font-size: .78rem; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
+label { display: block; margin-bottom: .35rem; font-weight: 700; }
+input, select { width: 100%; min-height: 2.9rem; padding: .65rem .8rem; border: 1px solid #b9c8ba; border-radius: .65rem; font: inherit; }
+input:focus, select:focus, button:focus, a:focus { outline: 3px solid rgba(58,128,78,.28); outline-offset: 2px; }
+button { min-height: 2.9rem; padding: .65rem 1rem; border: 0; border-radius: .65rem; color: #fff; background: #28633f; font: inherit; font-weight: 800; cursor: pointer; }
+button.secondary { color: #244b35; background: #e8eee6; }
+.links, .actions { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 1rem; margin-top: 1.25rem; }
+.messages { margin-bottom: 1rem; padding: .75rem 1rem; border-radius: .65rem; background: #e2f0df; }
+.errorlist { padding-left: 1.25rem; color: #a12b28; }
+.helptext { display: block; margin-top: .35rem; color: #5d6f65; font-size: .85rem; }
+dl { display: grid; grid-template-columns: max-content 1fr; gap: .6rem 1rem; }
+dt { font-weight: 800; } dd { margin: 0; overflow-wrap: anywhere; }
+code { font-size: .85em; }

@@ -1,51 +1,64 @@
 # Natural Farming Vietnam Core Auth
 
-Central account and OAuth2 service for `naturalfarmingvietnam.com` and `forum.naturalfarmingvietnam.com`.
+Django service sở hữu tài khoản chung và phát OAuth2 identity cho website chính và Flarum.
 
-Workspace-level architecture is documented in `docs/shared-auth-architecture.md` at the Natural Farming Vietnam workspace root.
+## Phạm vi hiện tại
 
-## Current scope
+- custom user UUID với vòng đời `pending_verification`, `active`, `suspended`, `deletion_requested`, `anonymized`;
+- đăng ký, xác minh email, đăng nhập và reset mật khẩu qua django-allauth;
+- OAuth2 Authorization Code + PKCE qua Django OAuth Toolkit;
+- contract tương thích Flarum tại `GET /api/v1/me` với scopes `profile email`;
+- audit log và transactional identity-event outbox;
+- Django Admin không cho hard-delete identity;
+- giao diện auth server-rendered, không cần Node build.
 
-- UUID user identities with lifecycle states
-- registration, email verification, password reset and optional 2FA through Laravel Fortify
-- OAuth2 Authorization Code flow with PKCE through Laravel Passport
-- scoped `GET /api/v1/me` identity endpoint
-- audit log and transactional identity-event outbox tables
-- server-rendered Vietnamese-first account screens (no frontend build required)
+Flarum vẫn sở hữu bài viết, session, group và quyền admin/moderator của forum trong database riêng.
 
-Core Auth owns credentials and identity state. Flarum keeps a separate application database and its own groups/admin permissions. Flarum links its user row to the immutable Core UUID through FoF OAuth's login-provider mapping.
+## Chạy local
 
-## Local setup
-
-Requirements: PHP 8.3+, Composer, and Laravel's required PHP extensions. Node is not required for the current server-rendered UI.
+Yêu cầu Python 3.11+.
 
 ```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -e '.[dev]'
 cp .env.example .env
-composer install
-php artisan key:generate
-touch database/database.sqlite
-php artisan migrate
-php artisan passport:keys
-php artisan serve
+.venv/bin/python manage.py migrate
+.venv/bin/python manage.py createsuperuser
+.venv/bin/python manage.py runserver
 ```
 
-Email is logged locally. Registration links can be inspected in `storage/logs/laravel.log` until SMTP is configured.
+Mặc định dùng SQLite và in email ra terminal. Link xác minh xuất hiện trong output của `runserver`.
 
-Run verification:
+Kiểm tra code:
 
 ```bash
-composer test
-./vendor/bin/pint --test
+.venv/bin/ruff check .
+.venv/bin/python manage.py check
+.venv/bin/python manage.py makemigrations --check
+.venv/bin/pytest
 ```
 
-## OAuth clients
+## Tạo OAuth client cho Flarum
 
-Create one confidential authorization-code client per application. Do not reuse a secret across the website and forum.
+Vào `/admin/oauth2_provider/application/add/` và tạo application:
 
-```bash
-php artisan passport:client
+- Client type: `Confidential`;
+- Authorization grant type: `Authorization code`;
+- Redirect URI: callback chính xác do FoF OAuth hiển thị;
+- Algorithm: `No OIDC support` nếu chỉ dùng OAuth2 hiện tại.
+
+Copy client ID và client secret ngay khi tạo, rồi lưu trong Flarum/hosting secrets. Không commit secret. Mỗi website, forum và admin frontend phải dùng client riêng.
+
+Các endpoint public tương thích extension:
+
+```text
+/oauth/authorize
+/oauth/token
+/api/v1/me
 ```
 
-For Flarum, register the exact callback URL displayed by FoF OAuth. The client requests `profile email` and uses PKCE. Store the client ID and secret only in Flarum settings/hosting secrets, never in this repository.
+Xem thêm [identity-architecture.md](docs/identity-architecture.md) và [deployment.md](docs/deployment.md).
 
-See [deployment.md](docs/deployment.md) and [identity-architecture.md](docs/identity-architecture.md). Do not deploy with `APP_DEBUG=true`, SQLite, log mail, or generated local Passport keys.
+## Lịch sử chuyển đổi
+
+Prototype Laravel được giữ ở branch `laravel-prototype`. Bản Django được phát triển trên branch `python-rewrite`; không xóa branch prototype cho tới khi local integration và deploy production hoàn tất.
