@@ -1,15 +1,25 @@
-{% load static %}
+{% load i18n static %}
+{% get_current_language as LANGUAGE_CODE %}
 <!doctype html>
-<html lang="vi">
+<html lang="{{ LANGUAGE_CODE }}">
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>{% block title %}Tài khoản NFV{% endblock %}</title>
+    <title>{% block title %}{% translate "NFV account" %}{% endblock %}</title>
     <link rel="stylesheet" href="{% static 'css/auth.css' %}">
 </head>
 <body>
     <main class="shell">
-        <a class="brand" href="/">Natural Farming Vietnam</a>
+        <header class="topbar">
+            <a class="brand" href="/">Natural Farming Vietnam</a>
+            <form class="language-switcher" method="post" action="{% url 'set-language' %}" aria-label="{% translate 'Language selection' %}">
+                {% csrf_token %}
+                <input type="hidden" name="next" value="{{ request.get_full_path }}">
+                <button class="language-option{% if LANGUAGE_CODE == 'vi' %} active{% endif %}" type="submit" name="language" value="vi"{% if LANGUAGE_CODE == 'vi' %} aria-current="true"{% endif %}>VI</button>
+                <span aria-hidden="true">/</span>
+                <button class="language-option{% if LANGUAGE_CODE == 'en' %} active{% endif %}" type="submit" name="language" value="en"{% if LANGUAGE_CODE == 'en' %} aria-current="true"{% endif %}>EN</button>
+            </form>
+        </header>
         {% if messages %}
             <div class="messages" role="status">
                 {% for message in messages %}<p>{{ message }}</p>{% endfor %}

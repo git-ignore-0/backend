@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 
 from django.core.exceptions import ImproperlyConfigured
+from django.utils.translation import gettext_lazy as _
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -71,6 +72,7 @@ MIDDLEWARE += [
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "identity.middleware.UserLocaleMiddleware",
     "allauth.account.middleware.AccountMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
@@ -133,6 +135,9 @@ AUTH_PASSWORD_VALIDATORS = [
 
 LANGUAGE_CODE = "vi"
 LANGUAGES = [("vi", "Tiếng Việt"), ("en", "English")]
+LOCALE_PATHS = [BASE_DIR / "locale"]
+LANGUAGE_COOKIE_NAME = "nfv_core_language"
+LANGUAGE_COOKIE_AGE = 365 * 24 * 60 * 60
 TIME_ZONE = os.getenv("DJANGO_TIME_ZONE", "Asia/Ho_Chi_Minh")
 USE_I18N = True
 USE_TZ = True
@@ -169,14 +174,17 @@ ACCOUNT_EMAIL_CONFIRMATION_EXPIRE_DAYS = 1
 ACCOUNT_CONFIRM_EMAIL_ON_GET = False
 ACCOUNT_LOGIN_ON_EMAIL_CONFIRMATION = True
 ACCOUNT_PREVENT_ENUMERATION = True
-ACCOUNT_FORMS = {"signup": "identity.forms.CoreSignupForm"}
+ACCOUNT_FORMS = {
+    "login": "identity.forms.CoreLoginForm",
+    "signup": "identity.forms.CoreSignupForm",
+}
 ACCOUNT_ADAPTER = "identity.adapters.CoreAccountAdapter"
 
 OAUTH2_PROVIDER = {
     "OAUTH2_VALIDATOR_CLASS": "identity.oauth.CoreOAuth2Validator",
     "SCOPES": {
-        "profile": "Read your stable identity and public profile",
-        "email": "Read your email address and verification state",
+        "profile": _("Read your stable identity and public profile"),
+        "email": _("Read your email address and verification state"),
     },
     "DEFAULT_SCOPES": ["profile", "email"],
     "ALLOWED_REDIRECT_URI_SCHEMES": ["http", "https"] if DEBUG else ["https"],
@@ -215,6 +223,9 @@ SESSION_COOKIE_SAMESITE = "Lax"
 CSRF_COOKIE_SAMESITE = "Lax"
 SESSION_COOKIE_NAME = "nfv_core_sessionid"
 CSRF_COOKIE_NAME = "nfv_core_csrftoken"
+LANGUAGE_COOKIE_SECURE = SESSION_COOKIE_SECURE
+LANGUAGE_COOKIE_HTTPONLY = True
+LANGUAGE_COOKIE_SAMESITE = "Lax"
 PASSWORD_RESET_TIMEOUT = 3600
 SECURE_CONTENT_TYPE_NOSNIFF = True
 X_FRAME_OPTIONS = "DENY"

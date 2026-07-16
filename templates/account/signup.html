@@ -1,15 +1,16 @@
 {% extends "base.html" %}
-{% block title %}Tạo tài khoản{% endblock %}
+{% load i18n %}
+{% block title %}{% translate "Create account" %}{% endblock %}
 {% block content %}
 <section class="card">
-    <p class="eyebrow">Tài khoản dùng chung</p>
-    <h1>Tạo tài khoản</h1>
-    <p>Sau khi đăng ký, hãy xác minh email trước khi sử dụng website và diễn đàn.</p>
+    <p class="eyebrow">{% translate "Shared account" %}</p>
+    <h1>{% translate "Create account" %}</h1>
+    <p>{% translate "After signing up, verify your email before using the website and forum." %}</p>
     <form method="post" action="{% url 'account_signup' %}">
         {% csrf_token %}
         {{ form.as_p }}
-        <button type="submit">Đăng ký</button>
+        <button type="submit">{% translate "Sign up" %}</button>
     </form>
-    <div class="links"><a href="/login">Đã có tài khoản?</a></div>
+    <div class="links"><a href="/login">{% translate "Already have an account?" %}</a></div>
 </section>
 {% endblock %}

@@ -14,7 +14,6 @@ def test_registration_creates_pending_uuid_identity_and_sends_verification(clien
         {
             "name": "  Nông Dân Xanh  ",
             "email": "HELLO@example.com",
-            "locale": "vi",
             "password1": "StrongPassword12",
             "password2": "StrongPassword12",
         },
@@ -24,10 +23,13 @@ def test_registration_creates_pending_uuid_identity_and_sends_verification(clien
     assert response.status_code == 302
     assert user.name == "Nông Dân Xanh"
     assert user.email == "hello@example.com"
+    assert user.locale == "vi"
     assert user.status == AccountStatus.PENDING_VERIFICATION
     assert re.fullmatch(r"[0-9a-f-]{36}", str(user.id))
     assert EmailAddress.objects.filter(user=user, email=user.email, verified=False).exists()
     assert len(mailoutbox) == 1
+    assert "Xác minh địa chỉ email của bạn" in mailoutbox[0].subject
+    assert "Mở liên kết bên dưới để xác minh email" in mailoutbox[0].body
 
 
 @pytest.mark.django_db

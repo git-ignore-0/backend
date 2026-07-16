@@ -1,23 +1,24 @@
 {% extends "base.html" %}
-{% block title %}Cho phép truy cập{% endblock %}
+{% load i18n %}
+{% block title %}{% translate "Authorize access" %}{% endblock %}
 {% block content %}
 <section class="card">
     {% if not error %}
-        <p class="eyebrow">Kết nối tài khoản</p>
-        <h1>Cho phép {{ application.name }}?</h1>
-        <p>Ứng dụng yêu cầu các quyền sau:</p>
+        <p class="eyebrow">{% translate "Connect account" %}</p>
+        <h1>{% blocktranslate with application_name=application.name %}Allow {{ application_name }}?{% endblocktranslate %}</h1>
+        <p>{% translate "This application is requesting the following permissions:" %}</p>
         <ul>{% for scope in scopes_descriptions %}<li>{{ scope }}</li>{% endfor %}</ul>
         <form method="post">
             {% csrf_token %}
             {% for field in form %}{% if field.is_hidden %}{{ field }}{% endif %}{% endfor %}
             {{ form.errors }}
             <div class="actions">
-                <button class="secondary" type="submit">Hủy</button>
-                <button type="submit" name="allow" value="Authorize">Cho phép</button>
+                <button class="secondary" type="submit">{% translate "Cancel" %}</button>
+                <button type="submit" name="allow" value="Authorize">{% translate "Allow" %}</button>
             </div>
         </form>
     {% else %}
-        <h1>Không thể cấp quyền</h1><p>{{ error.description }}</p>
+        <h1>{% translate "Unable to authorize" %}</h1><p>{{ error.description }}</p>
     {% endif %}
 </section>
 {% endblock %}

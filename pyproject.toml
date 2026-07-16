@@ -19,6 +19,7 @@ dependencies = [
 [project.optional-dependencies]
 mysql = ["mysqlclient>=2.2,<3"]
 dev = [
+    "polib>=1.2,<2",
     "pytest>=9.0.3,<10",
     "pytest-django>=4.10,<5",
     "pytest-cov>=6,<7",

@@ -1,0 +1,13 @@
+{% extends "account/email/base_message.txt" %}
+{% load i18n %}
+
+{% block content %}{% autoescape off %}{% translate "A security-related change was made to your Natural Farming Vietnam account:" %}
+
+{% block notification_message %}{% endblock notification_message %}
+
+{% translate "If you do not recognize this change, secure your account immediately." %}
+
+{% translate "Request details:" %}
+{% blocktranslate %}- IP address: {{ ip }}
+- Browser: {{ user_agent }}
+- Date: {{ timestamp }}{% endblocktranslate %}{% endautoescape %}{% endblock content %}

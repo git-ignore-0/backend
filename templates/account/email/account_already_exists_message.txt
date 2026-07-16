@@ -1,0 +1,10 @@
+{% extends "account/email/base_message.txt" %}
+{% load i18n %}
+
+{% block content %}{% autoescape off %}{% blocktranslate %}Someone tried to create a Natural Farming Vietnam account using this email address: {{ email }}{% endblocktranslate %}
+
+{% translate "An account with this email already exists. Use the link below if you need to reset its password:" %}
+
+{{ password_reset_url }}
+
+{% translate "If this was not you, you can safely ignore this email." %}{% endautoescape %}{% endblock content %}

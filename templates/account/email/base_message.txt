@@ -1,0 +1,7 @@
+{% load i18n %}{% autoescape off %}{% translate "Hello from Natural Farming Vietnam!" %}
+
+{% block content %}{% endblock content %}
+
+{% translate "Thank you for being part of the Natural Farming Vietnam community." %}
+{{ current_site.domain }}
+{% endautoescape %}

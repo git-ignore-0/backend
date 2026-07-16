@@ -1,4 +1,6 @@
 from allauth.account.adapter import DefaultAccountAdapter
+from django.conf import settings
+from django.utils import translation
 
 from identity.models import AccountStatus
 
@@ -21,3 +23,12 @@ class CoreAccountAdapter(DefaultAccountAdapter):
 
     def get_signup_redirect_url(self, request) -> str:
         return "/accounts/confirm-email/"
+
+    def send_mail(self, template_prefix, email, context):
+        user = context.get("user")
+        language = getattr(user, "locale", None)
+        supported_languages = {code for code, _name in settings.LANGUAGES}
+        if language not in supported_languages:
+            language = translation.get_language()
+        with translation.override(language):
+            return super().send_mail(template_prefix, email, context)

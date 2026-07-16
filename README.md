@@ -6,6 +6,7 @@ Django service sở hữu tài khoản chung và phát OAuth2 identity cho websi
 
 - custom user UUID với vòng đời `pending_verification`, `active`, `suspended`, `deletion_requested`, `anonymized`;
 - đăng ký, xác minh email, đăng nhập, đăng xuất và reset mật khẩu qua django-allauth;
+- toàn bộ giao diện auth, OAuth consent và email hệ thống hỗ trợ chuyển đổi Việt/Anh;
 - OAuth2 Authorization Code + PKCE qua Django OAuth Toolkit;
 - contract tương thích Flarum tại `GET /api/v1/me`, bắt buộc scopes `profile email`;
 - audit log và transactional identity-event outbox;
@@ -21,6 +22,8 @@ backend/
 │   └── migrations/         Database migrations
 ├── templates/              Login, signup, verification, consent
 ├── static/                 Source static assets
+├── locale/                 Bản dịch Việt và catalog `.mo` dùng khi chạy
+├── scripts/                Công cụ compile bản dịch
 ├── tests/                  Integration và domain tests
 ├── docs/                   Architecture và deployment runbook
 ├── manage.py
@@ -46,12 +49,22 @@ cp .env.example .env
 
 `python-dotenv` tự load file `.env`; environment variables do hosting/process cung cấp luôn được ưu tiên hơn file này. Mặc định local dùng SQLite và in email ra terminal, nên link xác minh xuất hiện trong output của `runserver`.
 
+Nút `VI / EN` xuất hiện trên mọi màn hình auth. Lựa chọn được giữ bằng cookie; với user đã đăng nhập, ngôn ngữ cũng được lưu vào `identity.User.locale`. Email xác minh và reset password ưu tiên ngôn ngữ đã lưu của người nhận.
+
+Khi sửa hoặc thêm chuỗi trong `locale/vi/LC_MESSAGES/django.po`, biên dịch lại catalog và commit cả file `.po` lẫn `.mo`:
+
+```bash
+.venv/bin/python scripts/compile_translations.py
+```
+
+Script dùng `polib` trong nhóm dependency `dev`; production không cần cài `polib` vì file `.mo` đã được build sẵn trong Git.
+
 Nếu workspace từng chạy Laravel, không tái sử dụng `.env` cũ. Hãy backup nó ngoài repo rồi tạo `.env` mới từ `.env.example`.
 
 ## Kiểm tra code
 
 ```bash
-.venv/bin/ruff format --check config identity tests manage.py passenger_wsgi.py
+.venv/bin/ruff format --check config identity scripts tests manage.py passenger_wsgi.py
 .venv/bin/ruff check .
 .venv/bin/python manage.py makemigrations --check
 .venv/bin/python manage.py check

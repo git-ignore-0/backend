@@ -1,0 +1,12 @@
+{% extends "account/email/base_message.txt" %}
+{% load i18n %}
+
+{% block content %}{% autoescape off %}{% translate "You created a shared account for the Natural Farming Vietnam website and forum." %}
+
+{% if code %}{% translate "Enter this verification code in the browser to activate your account:" %}
+
+{{ code }}{% else %}{% translate "Open the link below to verify your email and activate your account:" %}
+
+{{ activate_url }}{% endif %}
+
+{% translate "If you did not create this account, you can safely ignore this email." %}{% endautoescape %}{% endblock content %}

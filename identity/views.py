@@ -1,7 +1,9 @@
+from django.conf import settings
 from django.contrib.auth.decorators import login_required
 from django.http import JsonResponse
 from django.shortcuts import redirect, render
-from django.views.decorators.http import require_GET
+from django.views.decorators.http import require_GET, require_POST
+from django.views.i18n import set_language as django_set_language
 
 from identity.oauth import access_token_from_request, has_me_scopes
 
@@ -23,6 +25,16 @@ def oauth_error(code: str, status: int) -> JsonResponse:
 
 def home(request):
     return redirect("account" if request.user.is_authenticated else "account_login_alias")
+
+
+@require_POST
+def set_language(request):
+    language = request.POST.get("language")
+    if language in {code for code, _name in settings.LANGUAGES} and request.user.is_authenticated:
+        if request.user.locale != language:
+            request.user.locale = language
+            request.user.save(update_fields=["locale", "updated_at"])
+    return django_set_language(request)
 
 
 @login_required

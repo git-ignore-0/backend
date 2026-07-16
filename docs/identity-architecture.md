@@ -21,6 +21,15 @@ Core role và Flarum group độc lập. Django superuser không tự trở thà
 - allauth `EmailAddress.verified` là nguồn sự thật về email verification.
 - `identity.IdentityEvent` là outbox; cron worker và Flarum lifecycle endpoint sẽ được bổ sung trước khi mở suspend/delete cho admin production.
 - `identity.AuditLog` ghi các sự kiện bảo mật, hiện gồm login/logout.
+- `LocaleMiddleware` đọc lựa chọn ngôn ngữ từ cookie; `UserLocaleMiddleware` dùng `User.locale` khi trình duyệt chưa có cookie.
+
+## Ngôn ngữ và email
+
+Core Auth hỗ trợ `vi` và `en`; tiếng Việt là mặc định. Nút chuyển ngôn ngữ gửi POST có CSRF tới `/language/`, chỉ redirect về URL cùng host, lưu cookie một năm và cập nhật `User.locale` nếu user đã đăng nhập. Khi đăng nhập từ trình duyệt đã có lựa chọn ngôn ngữ, profile được đồng bộ theo lựa chọn đó. Trên trình duyệt mới chưa có cookie, ngôn ngữ đã lưu trong profile được khôi phục.
+
+Template dùng Django i18n thay vì chứa text Việt cố định. Chuỗi tiếng Anh là source message; bản dịch Việt nằm tại `locale/vi/LC_MESSAGES/django.po` và file runtime `django.mo`. Phiên bản django-allauth hiện tại không cung cấp catalog `vi`, nên project catalog cũng sở hữu bản dịch cho label, validation, flash message và security email của toàn bộ auth flow đang bật.
+
+`CoreAccountAdapter.send_mail()` render email trong language context của người nhận. Vì vậy email verification và password reset không phụ thuộc vào ngôn ngữ của worker hoặc request khác. Form đăng ký không hỏi lại ngôn ngữ; `User.locale` và email xác minh tự dùng ngôn ngữ đang được chọn bằng nút `VI / EN`.
 
 Database có check constraint buộc `is_active=true` chỉ đi cùng `pending_verification|active`; các trạng thái `suspended|deletion_requested|anonymized` bắt buộc `is_active=false`.
 

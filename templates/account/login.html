@@ -1,21 +1,22 @@
 {% extends "base.html" %}
-{% block title %}Đăng nhập{% endblock %}
+{% load i18n %}
+{% block title %}{% translate "Sign in" %}{% endblock %}
 {% block content %}
 <section class="card">
-    <p class="eyebrow">Tài khoản dùng chung</p>
-    <h1>Đăng nhập</h1>
-    <p>Dùng một tài khoản cho website và diễn đàn Natural Farming Vietnam.</p>
+    <p class="eyebrow">{% translate "Shared account" %}</p>
+    <h1>{% translate "Sign in" %}</h1>
+    <p>{% translate "Use one account for the Natural Farming Vietnam website and forum." %}</p>
     <form method="post" action="{% url 'account_login' %}">
         {% csrf_token %}
         {{ form.as_p }}
         {% if redirect_field_value %}
             <input type="hidden" name="{{ redirect_field_name }}" value="{{ redirect_field_value }}">
         {% endif %}
-        <button type="submit">Đăng nhập</button>
+        <button type="submit">{% translate "Sign in" %}</button>
     </form>
     <div class="links">
-        <a href="{% url 'account_reset_password' %}">Quên mật khẩu?</a>
-        <a href="/register">Tạo tài khoản</a>
+        <a href="{% url 'account_reset_password' %}">{% translate "Forgot password?" %}</a>
+        <a href="/register">{% translate "Create account" %}</a>
     </div>
 </section>
 {% endblock %}

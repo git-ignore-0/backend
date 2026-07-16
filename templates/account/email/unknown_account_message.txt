@@ -1,0 +1,10 @@
+{% extends "account/email/base_message.txt" %}
+{% load i18n %}
+
+{% block content %}{% autoescape off %}{% blocktranslate %}A password reset was requested for {{ email }}, but no Natural Farming Vietnam account uses this address.{% endblocktranslate %}
+
+{% translate "You can create an account using the link below:" %}
+
+{{ signup_url }}
+
+{% translate "If this was not you, you can safely ignore this email." %}{% endautoescape %}{% endblock content %}

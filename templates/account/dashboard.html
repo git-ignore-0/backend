@@ -1,13 +1,14 @@
 {% extends "base.html" %}
-{% block title %}Tài khoản{% endblock %}
+{% load i18n %}
+{% block title %}{% translate "Account" %}{% endblock %}
 {% block content %}
 <section class="card">
-    <p class="eyebrow">Tài khoản đang hoạt động</p>
-    <h1>Xin chào, {{ user.name }}</h1>
+    <p class="eyebrow">{% translate "Active account" %}</p>
+    <h1>{% blocktranslate with name=user.name %}Hello, {{ name }}{% endblocktranslate %}</h1>
     <dl>
         <dt>Email</dt><dd>{{ user.email }}</dd>
-        <dt>Mã tài khoản</dt><dd><code>{{ user.id }}</code></dd>
+        <dt>{% translate "Account ID" %}</dt><dd><code>{{ user.id }}</code></dd>
     </dl>
-    <form method="post" action="{% url 'account_logout' %}">{% csrf_token %}<button class="secondary" type="submit">Đăng xuất</button></form>
+    <form method="post" action="{% url 'account_logout' %}">{% csrf_token %}<button class="secondary" type="submit">{% translate "Sign out" %}</button></form>
 </section>
 {% endblock %}

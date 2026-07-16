@@ -11,6 +11,7 @@ urlpatterns = [
     re_path(r"^register/?$", SignupView.as_view(), name="account_signup_alias"),
     re_path(r"^login/?$", LoginView.as_view(), name="account_login_alias"),
     path("accounts/", include("allauth.urls")),
+    path("language/", views.set_language, name="set-language"),
     re_path(r"^oauth/authorize/?$", CoreAuthorizationView.as_view(), name="authorize"),
     re_path(r"^oauth/token/?$", TokenView.as_view(), name="token"),
     re_path(r"^api/v1/me/?$", views.me, name="api-me"),

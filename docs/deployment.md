@@ -20,6 +20,8 @@ cp .env.example .env
 .venv/bin/python manage.py check --deploy
 ```
 
+File `locale/vi/LC_MESSAGES/django.mo` phải có trong bản deploy. Production không cần GNU gettext hoặc `polib`; chỉ cần compile lại bằng `scripts/compile_translations.py` ở môi trường phát triển khi file `.po` thay đổi.
+
 Passenger entrypoint là `passenger_wsgi.py`. Nếu hosting dùng Gunicorn thì WSGI target là `config.wsgi:application`.
 
 Production `.env` tối thiểu:
@@ -67,6 +69,8 @@ Django Admin không cho tạo/xóa user hoặc sửa email/status ở phase hi�
 - member mới không nhận quyền admin;
 - `/oauth/authorize`, `/oauth/token`, `/api/v1/me` hoạt động trên HTTPS;
 - static files, reset password, callback lỗi, expired token và mobile browser hoạt động;
+- đổi `VI / EN` trên login, signup, verification, reset password và OAuth consent; refresh vẫn giữ đúng ngôn ngữ;
+- email verification/reset có subject và body đúng ngôn ngữ đã chọn của user;
 - Git/log không chứa database password, SMTP password, Django secret hay OAuth client secret.
 - `pip-audit` không báo dependency vulnerability đã biết;
 - `manage.py check --deploy`, migration check và toàn bộ pytest đều pass.

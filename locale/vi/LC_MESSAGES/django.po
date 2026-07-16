@@ -1,0 +1,371 @@
+msgid ""
+msgstr ""
+"Project-Id-Version: NFV Core Auth 0.1.0\n"
+"Language: vi\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+
+msgid "NFV account"
+msgstr "Tài khoản NFV"
+
+msgid "Language selection"
+msgstr "Chọn ngôn ngữ"
+
+msgid "Full name"
+msgstr "Họ và tên"
+
+msgid "Remember me"
+msgstr "Ghi nhớ đăng nhập"
+
+#, python-format
+msgid "Successfully signed in as %(name)s."
+msgstr "Đăng nhập thành công với tài khoản %(name)s."
+
+msgid "You have signed out."
+msgstr "Bạn đã đăng xuất."
+
+#, python-format
+msgid "Confirmation email sent to %(email)s."
+msgstr "Email xác minh đã được gửi tới %(email)s."
+
+#, python-format
+msgid "You have confirmed %(email)s."
+msgstr "Bạn đã xác minh %(email)s."
+
+#, python-format
+msgid "Unable to confirm %(email)s because it is already confirmed by a different account."
+msgstr "Không thể xác minh %(email)s vì địa chỉ này đã được xác minh bởi một tài khoản khác."
+
+msgid "Password successfully changed."
+msgstr "Đổi mật khẩu thành công."
+
+msgid "Password successfully set."
+msgstr "Đặt mật khẩu thành công."
+
+msgid "Your primary email address must be verified."
+msgstr "Địa chỉ email chính của bạn phải được xác minh."
+
+msgid "The email address and/or password you specified are not correct."
+msgstr "Địa chỉ email hoặc mật khẩu không chính xác."
+
+msgid "This account is currently inactive."
+msgstr "Tài khoản này hiện không hoạt động."
+
+msgid "You cannot remove your primary email address."
+msgstr "Bạn không thể xóa địa chỉ email chính."
+
+msgid "This email address is already associated with this account."
+msgstr "Địa chỉ email này đã được liên kết với tài khoản hiện tại."
+
+msgid "A user is already registered with this email address."
+msgstr "Địa chỉ email này đã được đăng ký."
+
+msgid "Please type your current password."
+msgstr "Vui lòng nhập mật khẩu hiện tại."
+
+msgid "Incorrect password."
+msgstr "Mật khẩu không chính xác."
+
+msgid "Incorrect code."
+msgstr "Mã xác minh không chính xác."
+
+msgid "Invalid or expired key."
+msgstr "Liên kết không hợp lệ hoặc đã hết hạn."
+
+msgid "The password reset token was invalid."
+msgstr "Mã đặt lại mật khẩu không hợp lệ."
+
+msgid "Invalid login."
+msgstr "Thông tin đăng nhập không hợp lệ."
+
+msgid "The new value must be different from the current one."
+msgstr "Giá trị mới phải khác giá trị hiện tại."
+
+msgid "Too many failed login attempts. Try again later."
+msgstr "Đăng nhập sai quá nhiều lần. Vui lòng thử lại sau."
+
+msgid "The email address is not assigned to any user account."
+msgstr "Địa chỉ email này không thuộc tài khoản nào."
+
+msgid "Be patient, you are sending too many requests."
+msgstr "Bạn đang gửi quá nhiều yêu cầu. Vui lòng thử lại sau."
+
+msgid "You must type the same password each time."
+msgstr "Hai mật khẩu phải giống nhau."
+
+msgid "New Password"
+msgstr "Mật khẩu mới"
+
+msgid "New Password (again)"
+msgstr "Nhập lại mật khẩu mới"
+
+#, python-format
+msgid "You cannot remove your primary email address (%(email)s)."
+msgstr "Bạn không thể xóa địa chỉ email chính (%(email)s)."
+
+#, python-format
+msgid "Removed email address %(email)s."
+msgstr "Đã xóa địa chỉ email %(email)s."
+
+#, python-format
+msgid "A sign-in code has been sent to %(recipient)s."
+msgstr "Mã đăng nhập đã được gửi tới %(recipient)s."
+
+#, python-format
+msgid "A verification code has been sent to %(phone)s."
+msgstr "Mã xác minh đã được gửi tới %(phone)s."
+
+#, python-format
+msgid "You have verified phone number %(phone)s."
+msgstr "Bạn đã xác minh số điện thoại %(phone)s."
+
+msgid "Primary email address set."
+msgstr "Đã đặt địa chỉ email chính."
+
+msgid "Email address"
+msgstr "Địa chỉ email"
+
+msgid "Password"
+msgstr "Mật khẩu"
+
+msgid "Password (again)"
+msgstr "Nhập lại mật khẩu"
+
+msgid "Remember Me"
+msgstr "Ghi nhớ đăng nhập"
+
+msgid "Account Already Exists"
+msgstr "Tài khoản đã tồn tại"
+
+msgid "Unknown Account"
+msgstr "Không tìm thấy tài khoản"
+
+msgid "Password Changed"
+msgstr "Mật khẩu đã được thay đổi"
+
+msgid "Password Reset"
+msgstr "Mật khẩu đã được đặt lại"
+
+msgid "Password Set"
+msgstr "Mật khẩu đã được thiết lập"
+
+msgid "Email Confirmation"
+msgstr "Xác minh email"
+
+msgid "Your password has been changed."
+msgstr "Mật khẩu của bạn đã được thay đổi."
+
+msgid "Your password has been reset."
+msgstr "Mật khẩu của bạn đã được đặt lại."
+
+msgid "Your password has been set."
+msgstr "Mật khẩu của bạn đã được thiết lập."
+
+msgid "Your email has been confirmed."
+msgstr "Email của bạn đã được xác minh."
+
+msgid "A security-related change was made to your Natural Farming Vietnam account:"
+msgstr "Một thay đổi liên quan đến bảo mật đã được thực hiện trên tài khoản Natural Farming Vietnam của bạn:"
+
+msgid "If you do not recognize this change, secure your account immediately."
+msgstr "Nếu bạn không nhận ra thay đổi này, hãy bảo vệ tài khoản ngay lập tức."
+
+msgid "Request details:"
+msgstr "Chi tiết yêu cầu:"
+
+#, python-format
+msgid "" 
+"- IP address: %(ip)s\n"
+"- Browser: %(user_agent)s\n"
+"- Date: %(timestamp)s"
+msgstr ""
+"- Địa chỉ IP: %(ip)s\n"
+"- Trình duyệt: %(user_agent)s\n"
+"- Thời gian: %(timestamp)s"
+
+#, python-format
+msgid "Someone tried to create a Natural Farming Vietnam account using this email address: %(email)s"
+msgstr "Có người đã thử tạo tài khoản Natural Farming Vietnam bằng địa chỉ email này: %(email)s"
+
+msgid "An account with this email already exists. Use the link below if you need to reset its password:"
+msgstr "Đã có tài khoản sử dụng email này. Hãy dùng liên kết bên dưới nếu bạn cần đặt lại mật khẩu:"
+
+msgid "If this was not you, you can safely ignore this email."
+msgstr "Nếu không phải bạn thực hiện, bạn có thể bỏ qua email này."
+
+#, python-format
+msgid "A password reset was requested for %(email)s, but no Natural Farming Vietnam account uses this address."
+msgstr "Có yêu cầu đặt lại mật khẩu cho %(email)s, nhưng không có tài khoản Natural Farming Vietnam nào sử dụng địa chỉ này."
+
+msgid "You can create an account using the link below:"
+msgstr "Bạn có thể tạo tài khoản bằng liên kết bên dưới:"
+
+msgid "Account unavailable"
+msgstr "Tài khoản không khả dụng"
+
+msgid "This account cannot sign in right now"
+msgstr "Tài khoản hiện không thể đăng nhập"
+
+msgid "Please contact a Natural Farming Vietnam administrator if you need help."
+msgstr "Vui lòng liên hệ quản trị viên Natural Farming Vietnam nếu bạn cần hỗ trợ."
+
+msgid "Account"
+msgstr "Tài khoản"
+
+msgid "Active account"
+msgstr "Tài khoản đang hoạt động"
+
+#, python-format
+msgid "Hello, %(name)s"
+msgstr "Xin chào, %(name)s"
+
+msgid "Account ID"
+msgstr "Mã tài khoản"
+
+msgid "Sign out"
+msgstr "Đăng xuất"
+
+msgid "Verify email"
+msgstr "Xác minh email"
+
+#, python-format
+msgid "Confirm that <strong>%(email)s</strong> is your email address."
+msgstr "Xác nhận <strong>%(email)s</strong> là địa chỉ email của bạn."
+
+msgid "Verify and activate"
+msgstr "Xác minh và kích hoạt"
+
+msgid "This verification link is invalid or has expired."
+msgstr "Liên kết xác minh không hợp lệ hoặc đã hết hạn."
+
+msgid "Check your email"
+msgstr "Kiểm tra email của bạn"
+
+msgid "One more step"
+msgstr "Còn một bước"
+
+msgid "We sent you a verification link. Open it to activate your account."
+msgstr "Chúng tôi đã gửi liên kết xác minh. Hãy mở liên kết đó để kích hoạt tài khoản."
+
+msgid "Sign in"
+msgstr "Đăng nhập"
+
+msgid "Shared account"
+msgstr "Tài khoản dùng chung"
+
+msgid "Use one account for the Natural Farming Vietnam website and forum."
+msgstr "Dùng một tài khoản cho website và diễn đàn Natural Farming Vietnam."
+
+msgid "Forgot password?"
+msgstr "Quên mật khẩu?"
+
+msgid "Create account"
+msgstr "Tạo tài khoản"
+
+msgid "Are you sure you want to end this session?"
+msgstr "Bạn có chắc muốn kết thúc phiên đăng nhập?"
+
+msgid "Forgot password"
+msgstr "Quên mật khẩu"
+
+msgid "Reset your password"
+msgstr "Đặt lại mật khẩu"
+
+msgid "Enter your email and we will send you a password reset link."
+msgstr "Nhập email và chúng tôi sẽ gửi cho bạn liên kết đặt lại mật khẩu."
+
+msgid "Send reset link"
+msgstr "Gửi liên kết"
+
+msgid "Email sent"
+msgstr "Đã gửi email"
+
+msgid "If that email exists in our system, you will receive password reset instructions."
+msgstr "Nếu email tồn tại trong hệ thống, bạn sẽ nhận được hướng dẫn đặt lại mật khẩu."
+
+msgid "New password"
+msgstr "Mật khẩu mới"
+
+msgid "Create a new password"
+msgstr "Tạo mật khẩu mới"
+
+msgid "This password reset link is invalid or has expired."
+msgstr "Liên kết đặt lại mật khẩu không hợp lệ hoặc đã hết hạn."
+
+msgid "Save password"
+msgstr "Lưu mật khẩu"
+
+msgid "Password changed"
+msgstr "Đã đổi mật khẩu"
+
+msgid "After signing up, verify your email before using the website and forum."
+msgstr "Sau khi đăng ký, hãy xác minh email trước khi sử dụng website và diễn đàn."
+
+msgid "Sign up"
+msgstr "Đăng ký"
+
+msgid "Already have an account?"
+msgstr "Đã có tài khoản?"
+
+msgid "Authorize access"
+msgstr "Cho phép truy cập"
+
+msgid "Connect account"
+msgstr "Kết nối tài khoản"
+
+#, python-format
+msgid "Allow %(application_name)s?"
+msgstr "Cho phép %(application_name)s?"
+
+msgid "This application is requesting the following permissions:"
+msgstr "Ứng dụng yêu cầu các quyền sau:"
+
+msgid "Cancel"
+msgstr "Hủy"
+
+msgid "Allow"
+msgstr "Cho phép"
+
+msgid "Unable to authorize"
+msgstr "Không thể cấp quyền"
+
+msgid "Read your stable identity and public profile"
+msgstr "Đọc mã định danh ổn định và hồ sơ công khai của bạn"
+
+msgid "Read your email address and verification state"
+msgstr "Đọc địa chỉ email và trạng thái xác minh của bạn"
+
+msgid "Hello from Natural Farming Vietnam!"
+msgstr "Xin chào từ Natural Farming Vietnam!"
+
+msgid "Thank you for being part of the Natural Farming Vietnam community."
+msgstr "Cảm ơn bạn đã là một phần của cộng đồng Natural Farming Vietnam."
+
+msgid "Verify your email address"
+msgstr "Xác minh địa chỉ email của bạn"
+
+msgid "You created a shared account for the Natural Farming Vietnam website and forum."
+msgstr "Bạn đã tạo tài khoản dùng chung cho website và diễn đàn Natural Farming Vietnam."
+
+msgid "Enter this verification code in the browser to activate your account:"
+msgstr "Nhập mã xác minh này vào trình duyệt để kích hoạt tài khoản:"
+
+msgid "Open the link below to verify your email and activate your account:"
+msgstr "Mở liên kết bên dưới để xác minh email và kích hoạt tài khoản:"
+
+msgid "If you did not create this account, you can safely ignore this email."
+msgstr "Nếu bạn không tạo tài khoản này, bạn có thể bỏ qua email này."
+
+msgid "Reset your Natural Farming Vietnam password"
+msgstr "Đặt lại mật khẩu Natural Farming Vietnam"
+
+msgid "We received a request to reset the password for your Natural Farming Vietnam account."
+msgstr "Chúng tôi nhận được yêu cầu đặt lại mật khẩu cho tài khoản Natural Farming Vietnam của bạn."
+
+msgid "Open the link below to create a new password:"
+msgstr "Mở liên kết bên dưới để tạo mật khẩu mới:"
+
+msgid "If you did not request a password reset, you can safely ignore this email. Your password will not change."
+msgstr "Nếu bạn không yêu cầu đặt lại mật khẩu, bạn có thể bỏ qua email này. Mật khẩu của bạn sẽ không thay đổi."

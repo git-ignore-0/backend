@@ -1,16 +1,17 @@
 {% extends "base.html" %}
-{% block title %}Xác minh email{% endblock %}
+{% load i18n %}
+{% block title %}{% translate "Verify email" %}{% endblock %}
 {% block content %}
 <section class="card">
-    <h1>Xác minh email</h1>
+    <h1>{% translate "Verify email" %}</h1>
     {% if confirmation %}
-        <p>Xác nhận <strong>{{ confirmation.email_address.email }}</strong> là email của bạn.</p>
+        <p>{% blocktranslate with email=confirmation.email_address.email %}Confirm that <strong>{{ email }}</strong> is your email address.{% endblocktranslate %}</p>
         <form method="post">
             {% csrf_token %}
-            <button type="submit">Xác minh và kích hoạt</button>
+            <button type="submit">{% translate "Verify and activate" %}</button>
         </form>
     {% else %}
-        <p>Liên kết xác minh không hợp lệ hoặc đã hết hạn.</p>
+        <p>{% translate "This verification link is invalid or has expired." %}</p>
     {% endif %}
 </section>
 {% endblock %}
