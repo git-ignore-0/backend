@@ -61,4 +61,4 @@ Xem thêm [identity-architecture.md](docs/identity-architecture.md) và [deploym
 
 ## Lịch sử chuyển đổi
 
-Prototype Laravel được giữ ở branch `laravel-prototype`. Bản Django được phát triển trên branch `python-rewrite`; không xóa branch prototype cho tới khi local integration và deploy production hoàn tất.
+Prototype Laravel được giữ ở branch `laravel-prototype`. Bản Django được phát triển trên branch `python-rewrite` rồi fast-forward vào `main`; không xóa branch prototype cho tới khi local integration và deploy production hoàn tất.
