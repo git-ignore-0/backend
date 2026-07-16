@@ -41,6 +41,7 @@ DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS=true
 Chỉ bật `DJANGO_BEHIND_PROXY=true` khi cPanel xác nhận HTTPS được terminate ở trusted reverse proxy và gửi `X-Forwarded-Proto` đúng cách. Chỉ bật HSTS preload sau khi mọi subdomain đều dùng HTTPS ổn định.
 
 Sinh `DJANGO_SECRET_KEY` riêng ngoài Git. Cấu hình SMTP cho `no-reply@naturalfarmingvietnam.com`, SPF/DKIM/DMARC và không log password/token.
+SMTP port 465 phải dùng `EMAIL_USE_SSL=true` và `EMAIL_USE_TLS=false`; port 587 STARTTLS dùng cấu hình ngược lại. Backend fail-fast nếu cả hai cùng được bật.
 
 Ứng dụng fail-fast khi production thiếu `DJANGO_SECRET_KEY`, `DJANGO_ALLOWED_HOSTS` hoặc thông tin MySQL bắt buộc. Không copy `.env` Laravel hay Passport keys sang deployment Django.
 
