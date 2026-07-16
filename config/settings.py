@@ -100,7 +100,7 @@ TEMPLATES = [
 if os.getenv("DB_ENGINE", "sqlite") == "mysql":
     DATABASES = {
         "default": {
-            "ENGINE": "django.db.backends.mysql",
+            "ENGINE": "mysql.connector.django",
             "NAME": required_env("DB_NAME"),
             "USER": required_env("DB_USER"),
             "PASSWORD": required_env("DB_PASSWORD"),

@@ -4,7 +4,7 @@ Chưa chạy các bước này cho tới phiên deploy có thông tin hosting, S
 
 ## Hosting preflight
 
-Xác nhận cPanel có Setup Python App/Passenger, Python 3.11+, virtualenv, pip, cron, MySQL client build dependency và cách restart application. Tạo database/user riêng cho Core Auth; không dùng database Flarum.
+Xác nhận cPanel có Setup Python App/Passenger, Python 3.11+, virtualenv, pip, cron và cách restart application. Tạo database/user riêng cho Core Auth; không dùng database Flarum. Production dùng MySQL Connector/Python dạng wheel để không phụ thuộc compiler hoặc Python development headers trên shared hosting.
 
 ## Cài ứng dụng
 

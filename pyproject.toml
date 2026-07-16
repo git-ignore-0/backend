@@ -17,7 +17,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-mysql = ["mysqlclient>=2.2,<3"]
+mysql = ["mysql-connector-python>=9.5,<10"]
 dev = [
     "polib>=1.2,<2",
     "pytest>=9.0.3,<10",
