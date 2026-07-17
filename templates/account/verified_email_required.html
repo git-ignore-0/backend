@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% load i18n %}
+{% block title %}{% translate "Email verification required" %}{% endblock %}
+{% block content %}
+<section class="card">
+    <p class="eyebrow">{% translate "Account security" %}</p>
+    <h1>{% translate "Verify your email to continue" %}</h1>
+    <p>{% translate "You must verify your email address before accessing this page." %}</p>
+    <p>{% translate "Open the verification link we sent you. If you do not see the email, check your spam folder." %}</p>
+</section>
+{% endblock %}

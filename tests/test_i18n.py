@@ -107,6 +107,84 @@ def test_language_switch_rejects_external_destination(client):
     assert response.url == "/"
 
 
+@pytest.mark.parametrize(
+    "path",
+    ["/login", "/register", "/accounts/password/reset/"],
+)
+def test_auth_form_validation_is_vietnamese(client, path):
+    client.post("/language/", {"language": "vi", "next": path})
+
+    response = client.post(path, {})
+    content = response.content.decode()
+
+    assert response.status_code == 200
+    assert "Trường này là bắt buộc." in content
+    assert "This field is required." not in content
+
+
+@pytest.mark.parametrize(
+    ("path", "vietnamese_text", "english_text"),
+    [
+        ("/login", "Đăng nhập", "Sign in"),
+        ("/register", "Tạo tài khoản", "Create account"),
+        ("/accounts/confirm-email/", "Kiểm tra email của bạn", "Check your email"),
+        ("/accounts/password/reset/", "Đặt lại mật khẩu", "Reset your password"),
+        ("/accounts/password/reset/done/", "Đã gửi email", "Email sent"),
+        ("/accounts/inactive/", "Tài khoản hiện không thể đăng nhập", "Account unavailable"),
+    ],
+)
+def test_public_auth_pages_use_project_layout_in_both_languages(
+    client, path, vietnamese_text, english_text
+):
+    client.post("/language/", {"language": "vi", "next": path})
+    vietnamese = client.get(path)
+    vietnamese_content = vietnamese.content.decode()
+
+    assert vietnamese.status_code == 200
+    assert '<html lang="vi">' in vietnamese_content
+    assert 'class="language-switcher"' in vietnamese_content
+    assert vietnamese_text in vietnamese_content
+    assert "Menu:" not in vietnamese_content
+
+    client.post("/language/", {"language": "en", "next": path})
+    english = client.get(path)
+    english_content = english.content.decode()
+
+    assert english.status_code == 200
+    assert '<html lang="en">' in english_content
+    assert 'class="language-switcher"' in english_content
+    assert english_text in english_content
+    assert "Menu:" not in english_content
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("/account", "Tài khoản đang hoạt động"),
+        ("/accounts/logout/", "Bạn có chắc muốn kết thúc phiên đăng nhập?"),
+        ("/accounts/reauthenticate/", "Xác nhận danh tính"),
+        ("/accounts/email/", "Các địa chỉ email"),
+        ("/accounts/password/change/", "Đổi mật khẩu"),
+    ],
+)
+def test_authenticated_auth_pages_use_vietnamese_project_layout(
+    client, active_user, path, expected
+):
+    active_user.locale = "vi"
+    active_user.save(update_fields=["locale", "updated_at"])
+    client.force_login(active_user, backend="identity.backends.CoreAuthenticationBackend")
+
+    response = client.get(path)
+    content = response.content.decode()
+
+    assert response.status_code == 200
+    assert '<html lang="vi">' in content
+    assert 'class="language-switcher"' in content
+    assert expected in content
+    assert "Menu:" not in content
+
+
 @pytest.mark.django_db
 def test_authenticated_language_switch_is_saved_to_profile(client, active_user):
     client.force_login(active_user, backend="identity.backends.CoreAuthenticationBackend")

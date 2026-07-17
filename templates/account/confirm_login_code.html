@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% load i18n %}
+{% block title %}{% translate "Enter sign-in code" %}{% endblock %}
+{% block content %}
+<section class="card">
+    <p class="eyebrow">{% translate "Account security" %}</p>
+    <h1>{% translate "Enter sign-in code" %}</h1>
+    <p>
+        {% if email %}
+            {% blocktranslate %}Enter the code sent to {{ email }}.{% endblocktranslate %}
+        {% else %}
+            {% blocktranslate %}Enter the code sent to {{ phone }}.{% endblocktranslate %}
+        {% endif %}
+    </p>
+    <form method="post" action="{% url 'account_confirm_login_code' %}">
+        {% csrf_token %}
+        {{ form.as_p }}
+        {{ redirect_field }}
+        <button type="submit">{% translate "Confirm" %}</button>
+    </form>
+</section>
+{% endblock %}

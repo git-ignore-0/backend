@@ -6,7 +6,7 @@
     <p class="eyebrow">{% translate "Active account" %}</p>
     <h1>{% blocktranslate with name=user.name %}Hello, {{ name }}{% endblocktranslate %}</h1>
     <dl>
-        <dt>Email</dt><dd>{{ user.email }}</dd>
+        <dt>{% translate "Email" %}</dt><dd>{{ user.email }}</dd>
         <dt>{% translate "Account ID" %}</dt><dd><code>{{ user.id }}</code></dd>
     </dl>
     <form method="post" action="{% url 'account_logout' %}">{% csrf_token %}<button class="secondary" type="submit">{% translate "Sign out" %}</button></form>

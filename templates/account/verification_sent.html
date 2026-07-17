@@ -6,5 +6,9 @@
     <p class="eyebrow">{% translate "One more step" %}</p>
     <h1>{% translate "Check your email" %}</h1>
     <p>{% translate "We sent you a verification link. Open it to activate your account." %}</p>
+    <p>{% translate "If you do not see the email, check your spam folder or request a new verification email." %}</p>
+    <div class="links">
+        <a href="{% url 'account_login' %}">{% translate "Back to sign in" %}</a>
+    </div>
 </section>
 {% endblock %}

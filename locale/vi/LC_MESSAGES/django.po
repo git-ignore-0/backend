@@ -127,6 +127,9 @@ msgstr "Đã đặt địa chỉ email chính."
 msgid "Email address"
 msgstr "Địa chỉ email"
 
+msgid "Email"
+msgstr "Email"
+
 msgid "Password"
 msgstr "Mật khẩu"
 
@@ -249,6 +252,86 @@ msgstr "Còn một bước"
 msgid "We sent you a verification link. Open it to activate your account."
 msgstr "Chúng tôi đã gửi liên kết xác minh. Hãy mở liên kết đó để kích hoạt tài khoản."
 
+msgid "If you do not see the email, check your spam folder or request a new verification email."
+msgstr "Nếu không thấy email, hãy kiểm tra thư mục Spam hoặc yêu cầu gửi lại email xác minh."
+
+msgid "Back to sign in"
+msgstr "Quay lại đăng nhập"
+
+msgid "Email verification required"
+msgstr "Cần xác minh email"
+
+msgid "Account security"
+msgstr "Bảo mật tài khoản"
+
+msgid "Confirm your identity"
+msgstr "Xác nhận danh tính"
+
+msgid "Enter your password to continue."
+msgstr "Nhập mật khẩu để tiếp tục."
+
+msgid "Confirm"
+msgstr "Xác nhận"
+
+msgid "Change password"
+msgstr "Đổi mật khẩu"
+
+msgid "Set password"
+msgstr "Thiết lập mật khẩu"
+
+msgid "Enter sign-in code"
+msgstr "Nhập mã đăng nhập"
+
+#, python-format
+msgid "Enter the code sent to %(email)s."
+msgstr "Nhập mã đã được gửi tới %(email)s."
+
+#, python-format
+msgid "Enter the code sent to %(phone)s."
+msgstr "Nhập mã đã được gửi tới %(phone)s."
+
+msgid "Email addresses"
+msgstr "Các địa chỉ email"
+
+msgid "The following email addresses are associated with your account:"
+msgstr "Các địa chỉ email sau đang được liên kết với tài khoản của bạn:"
+
+msgid "Verified"
+msgstr "Đã xác minh"
+
+msgid "Unverified"
+msgstr "Chưa xác minh"
+
+msgid "Primary"
+msgstr "Chính"
+
+msgid "Make primary"
+msgstr "Đặt làm email chính"
+
+msgid "Resend verification"
+msgstr "Gửi lại email xác minh"
+
+msgid "Remove"
+msgstr "Xóa"
+
+msgid "No email address is currently associated with this account."
+msgstr "Hiện chưa có địa chỉ email nào được liên kết với tài khoản này."
+
+msgid "Add email address"
+msgstr "Thêm địa chỉ email"
+
+msgid "Add email"
+msgstr "Thêm email"
+
+msgid "Verify your email to continue"
+msgstr "Xác minh email để tiếp tục"
+
+msgid "You must verify your email address before accessing this page."
+msgstr "Bạn phải xác minh địa chỉ email trước khi truy cập trang này."
+
+msgid "Open the verification link we sent you. If you do not see the email, check your spam folder."
+msgstr "Hãy mở liên kết xác minh chúng tôi đã gửi. Nếu không thấy email, hãy kiểm tra thư mục Spam."
+
 msgid "Sign in"
 msgstr "Đăng nhập"
 
@@ -330,6 +413,9 @@ msgstr "Cho phép"
 
 msgid "Unable to authorize"
 msgstr "Không thể cấp quyền"
+
+msgid "The authorization request is invalid or has expired. Please return to the application and try again."
+msgstr "Yêu cầu cấp quyền không hợp lệ hoặc đã hết hạn. Vui lòng quay lại ứng dụng và thử lại."
 
 msgid "Read your stable identity and public profile"
 msgstr "Đọc mã định danh ổn định và hồ sơ công khai của bạn"

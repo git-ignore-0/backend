@@ -18,7 +18,8 @@
             </div>
         </form>
     {% else %}
-        <h1>{% translate "Unable to authorize" %}</h1><p>{{ error.description }}</p>
+        <h1>{% translate "Unable to authorize" %}</h1>
+        <p>{% translate "The authorization request is invalid or has expired. Please return to the application and try again." %}</p>
     {% endif %}
 </section>
 {% endblock %}

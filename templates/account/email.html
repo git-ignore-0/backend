@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% load i18n %}
+{% block title %}{% translate "Email addresses" %}{% endblock %}
+{% block content %}
+<section class="card">
+    <p class="eyebrow">{% translate "Account security" %}</p>
+    <h1>{% translate "Email addresses" %}</h1>
+    {% if emailaddresses %}
+        <p>{% translate "The following email addresses are associated with your account:" %}</p>
+        <form method="post" action="{% url 'account_email' %}">
+            {% csrf_token %}
+            {% for radio in emailaddress_radios %}
+                {% with emailaddress=radio.emailaddress %}
+                    <p>
+                        <input type="radio" name="email" value="{{ emailaddress.email }}" id="{{ radio.id }}"{% if radio.checked %} checked{% endif %}>
+                        <label for="{{ radio.id }}">
+                            {{ emailaddress.email }} —
+                            {% if emailaddress.verified %}{% translate "Verified" %}{% else %}{% translate "Unverified" %}{% endif %}
+                            {% if emailaddress.primary %}· {% translate "Primary" %}{% endif %}
+                        </label>
+                    </p>
+                {% endwith %}
+            {% endfor %}
+            <div class="actions">
+                <button type="submit" name="action_primary">{% translate "Make primary" %}</button>
+                <button class="secondary" type="submit" name="action_send">{% translate "Resend verification" %}</button>
+                <button class="secondary" type="submit" name="action_remove">{% translate "Remove" %}</button>
+            </div>
+        </form>
+    {% else %}
+        <p>{% translate "No email address is currently associated with this account." %}</p>
+    {% endif %}
+    {% if can_add_email %}
+        <h2>{% translate "Add email address" %}</h2>
+        <form method="post" action="{% url 'account_email' %}">
+            {% csrf_token %}
+            {{ form.as_p }}
+            <button type="submit" name="action_add">{% translate "Add email" %}</button>
+        </form>
+    {% endif %}
+</section>
+{% endblock %}

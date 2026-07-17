@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% load i18n %}
+{% block title %}{% translate "Confirm your identity" %}{% endblock %}
+{% block content %}
+<section class="card">
+    <p class="eyebrow">{% translate "Account security" %}</p>
+    <h1>{% translate "Confirm your identity" %}</h1>
+    <p>{% translate "Enter your password to continue." %}</p>
+    <form method="post" action="{% url 'account_reauthenticate' %}">
+        {% csrf_token %}
+        {{ form.as_p }}
+        {{ redirect_field }}
+        <button type="submit">{% translate "Confirm" %}</button>
+    </form>
+</section>
+{% endblock %}
