@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
+from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from mysql.connector.conversion import MySQLConverter
 
@@ -31,3 +32,11 @@ def test_mysql_connector_schema_literals_are_quoted():
 
     assert editor.quote_value("pending_verification") == "'pending_verification'"
     assert editor.quote_value(True) == "1"
+
+
+def test_cross_origin_oauth_popup_keeps_window_opener(client):
+    assert settings.SECURE_CROSS_ORIGIN_OPENER_POLICY is None
+
+    response = client.get("/login")
+
+    assert "Cross-Origin-Opener-Policy" not in response

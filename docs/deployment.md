@@ -36,9 +36,12 @@ DJANGO_SESSION_COOKIE_SECURE=true
 DJANGO_CSRF_COOKIE_SECURE=true
 DJANGO_SECURE_HSTS_SECONDS=31536000
 DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS=true
+DJANGO_SECURE_CROSS_ORIGIN_OPENER_POLICY=
 ```
 
 Chỉ bật `DJANGO_BEHIND_PROXY=true` khi cPanel xác nhận HTTPS được terminate ở trusted reverse proxy và gửi `X-Forwarded-Proto` đúng cách. Chỉ bật HSTS preload sau khi mọi subdomain đều dùng HTTPS ổn định.
+
+Để `DJANGO_SECURE_CROSS_ORIGIN_OPENER_POLICY` trống. FoF OAuth chạy đăng nhập trong popup khác origin và callback Flarum cần gọi `window.opener.app.authenticationComplete(...)`; COOP `same-origin` sẽ tách browsing context và làm popup đóng mà cửa sổ forum không hoàn tất đăng ký/đăng nhập. Các bảo vệ cookie, CSRF, HTTPS và `X-Frame-Options: DENY` vẫn giữ nguyên.
 
 Sinh `DJANGO_SECRET_KEY` riêng ngoài Git. Cấu hình SMTP cho `no-reply@naturalfarmingvietnam.com`, SPF/DKIM/DMARC và không log password/token.
 SMTP port 465 phải dùng `EMAIL_USE_SSL=true` và `EMAIL_USE_TLS=false`; port 587 STARTTLS dùng cấu hình ngược lại. Backend fail-fast nếu cả hai cùng được bật.
