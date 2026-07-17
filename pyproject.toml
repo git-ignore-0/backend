@@ -13,6 +13,7 @@ dependencies = [
     "django-oauth-toolkit>=3.0,<4",
     "gunicorn>=23,<24",
     "python-dotenv>=1.1,<2",
+    "requests>=2.32,<3",
     "whitenoise>=6.8,<7",
 ]
 

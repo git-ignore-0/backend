@@ -37,6 +37,10 @@ DJANGO_CSRF_COOKIE_SECURE=true
 DJANGO_SECURE_HSTS_SECONDS=31536000
 DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS=true
 DJANGO_SECURE_CROSS_ORIGIN_OPENER_POLICY=
+FLARUM_LIFECYCLE_URL=https://forum.naturalfarmingvietnam.com/api/nfv/core-lifecycle
+FLARUM_LIFECYCLE_SECRET=<same-random-secret-as-flarum-config>
+FLARUM_LIFECYCLE_TIMEOUT=10
+FLARUM_LIFECYCLE_MAX_ATTEMPTS=8
 ```
 
 Chỉ bật `DJANGO_BEHIND_PROXY=true` khi cPanel xác nhận HTTPS được terminate ở trusted reverse proxy và gửi `X-Forwarded-Proto` đúng cách. Chỉ bật HSTS preload sau khi mọi subdomain đều dùng HTTPS ổn định.
@@ -54,6 +58,16 @@ Schedule dọn OAuth token hết hạn, ví dụ cron hằng ngày:
 .venv/bin/python manage.py cleartokens
 ```
 
+Schedule outbox worker mỗi phút. Command có lease 10 phút cho event bị kẹt, timeout HTTP,
+exponential backoff tối đa một giờ và dừng sau số lần thử cấu hình:
+
+```bash
+.venv/bin/python manage.py dispatch_identity_events --limit 25
+```
+
+Trên production nên chạy cron với `--verbosity 0`; event thất bại vẫn được giữ trong Django
+Admin tại `Identity events` để kiểm tra và chạy lại sau khi sửa cấu hình.
+
 ## OAuth/Flarum
 
 1. Tạo Django superuser bằng `manage.py createsuperuser`.
@@ -62,8 +76,15 @@ Schedule dọn OAuth token hết hạn, ví dụ cron hằng ngày:
 4. Cấu hình Core URL, client ID và secret trong Flarum.
 5. Tạo/verify Core account có email trùng Flarum admin hiện tại.
 6. Bật `nfv-core-sso` rồi test trong cửa sổ ẩn danh trước khi chặn login local.
+7. Thêm cùng một lifecycle secret dài tối thiểu 32 ký tự vào Django `.env` và Flarum
+   `config.php` dưới khóa `nfv_core_sso.lifecycle_secret`.
+8. Chạy `php flarum migrate`, clear cache, rồi gọi thử endpoint không chữ ký và xác nhận
+   nhận HTTP 401 trước khi bật cron worker.
 
-Django Admin không cho tạo/xóa user hoặc sửa email/status ở phase hiện tại. User đăng ký qua Core signup; superuser tạo bằng CLI. Đây là khóa an toàn cho tới khi outbox worker và Flarum lifecycle endpoint hoàn tất.
+Django Admin không cho tạo/xóa cứng user hoặc sửa email/status trực tiếp. User đăng ký qua
+Core signup; superuser tạo bằng CLI. Các action khóa, mở khóa và yêu cầu xóa luôn đi qua
+domain service để ghi outbox event. Action yêu cầu xóa có màn xác nhận, không tác động
+superuser và chỉ soft-hide nội dung Flarum sau khi worker xử lý thành công.
 
 ## Acceptance checks
 
@@ -71,6 +92,10 @@ Django Admin không cho tạo/xóa user hoặc sửa email/status ở phase hi�
 - pending/suspended user không dùng được OAuth identity API;
 - Flarum admin cũ map đúng row và giữ group admin;
 - member mới không nhận quyền admin;
+- suspend user → Core bị khóa, Flarum access token bị thu hồi và phiên hiện tại mất hiệu lực;
+- request deletion → discussion/post của user bị soft-hide nhưng không bị hard-delete;
+- gửi lặp cùng event ID → Flarum trả 2xx mà không xử lý nội dung lần hai;
+- chữ ký sai hoặc timestamp quá 5 phút → endpoint trả 401;
 - `/oauth/authorize`, `/oauth/token`, `/api/v1/me` hoạt động trên HTTPS;
 - static files, reset password, callback lỗi, expired token và mobile browser hoạt động;
 - đổi `VI / EN` trên login, signup, verification, reset password và OAuth consent; refresh vẫn giữ đúng ngôn ngữ;

@@ -214,6 +214,31 @@ msgstr "Tài khoản hiện không thể đăng nhập"
 msgid "Please contact a Natural Farming Vietnam administrator if you need help."
 msgstr "Vui lòng liên hệ quản trị viên Natural Farming Vietnam nếu bạn cần hỗ trợ."
 
+msgid "Suspend selected accounts"
+msgstr "Khóa các tài khoản đã chọn"
+
+msgid "Reactivate selected suspended accounts"
+msgstr "Mở khóa các tài khoản đã chọn"
+
+msgid "Request deletion and hide forum content"
+msgstr "Yêu cầu xóa và ẩn nội dung trên diễn đàn"
+
+#, python-format
+msgid "%(changed)d account(s) updated; %(skipped)d skipped."
+msgstr "Đã cập nhật %(changed)d tài khoản; bỏ qua %(skipped)d tài khoản."
+
+msgid "Confirm account deletion request"
+msgstr "Xác nhận yêu cầu xóa tài khoản"
+
+msgid "The selected Core accounts will be blocked immediately. The lifecycle worker will then revoke their Flarum sessions and hide their forum discussions and posts."
+msgstr "Các tài khoản Core đã chọn sẽ bị khóa ngay lập tức. Tiến trình đồng bộ sau đó sẽ thu hồi phiên Flarum và ẩn các thảo luận, bài viết của họ trên diễn đàn."
+
+msgid "This action does not hard-delete data and cannot be undone from this screen."
+msgstr "Thao tác này không xóa cứng dữ liệu và không thể hoàn tác tại màn hình này."
+
+msgid "Confirm deletion request"
+msgstr "Xác nhận yêu cầu xóa"
+
 msgid "Account"
 msgstr "Tài khoản"
 

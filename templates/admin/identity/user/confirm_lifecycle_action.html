@@ -1,0 +1,25 @@
+{% extends "admin/base_site.html" %}
+{% load i18n %}
+
+{% block content %}
+  <p>{% translate "The selected Core accounts will be blocked immediately. The lifecycle worker will then revoke their Flarum sessions and hide their forum discussions and posts." %}</p>
+  <p><strong>{% translate "This action does not hard-delete data and cannot be undone from this screen." %}</strong></p>
+
+  <ul>
+    {% for user in queryset %}
+      <li>{{ user.email }}</li>
+    {% endfor %}
+  </ul>
+
+  <form method="post">
+    {% csrf_token %}
+    {% for user in queryset %}
+      <input type="hidden" name="{{ action_checkbox_name }}" value="{{ user.pk }}">
+    {% endfor %}
+    <input type="hidden" name="action" value="{{ action_name }}">
+    <input type="hidden" name="select_across" value="0">
+    <input type="hidden" name="confirm_lifecycle_action" value="yes">
+    <input type="submit" value="{% translate 'Confirm deletion request' %}">
+    <a href="../" class="button cancel-link">{% translate "Cancel" %}</a>
+  </form>
+{% endblock %}

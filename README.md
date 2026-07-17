@@ -10,7 +10,9 @@ Django service sở hữu tài khoản chung và phát OAuth2 identity cho websi
 - OAuth2 Authorization Code + PKCE qua Django OAuth Toolkit;
 - contract tương thích Flarum tại `GET /api/v1/me`, bắt buộc scopes `profile email`;
 - audit log và transactional identity-event outbox;
-- Django Admin chỉ quản lý profile/role: không tạo, hard-delete, đổi email hoặc đổi lifecycle status ở phase hiện tại;
+- signed lifecycle dispatcher đồng bộ khóa/xóa tài khoản sang Flarum với retry hữu hạn;
+- Django Admin quản lý profile/role và có action khóa, mở khóa, yêu cầu xóa an toàn;
+  không cho tạo, hard-delete, đổi email hoặc sửa lifecycle status trực tiếp;
 - giao diện auth server-rendered, không cần Node build.
 
 ## Cấu trúc
@@ -73,6 +75,13 @@ Nếu workspace từng chạy Laravel, không tái sử dụng `.env` cũ. Hãy 
 ```
 
 Test hiện bao phủ đăng ký/xác minh, login theo trạng thái, DB lifecycle constraint, audit/outbox, OAuth endpoint compatibility và toàn bộ Authorization Code + PKCE → access token → `/api/v1/me`.
+
+Outbox lifecycle được gửi bằng management command sau; production phải schedule command này
+qua cron thay vì gửi HTTP ngay trong request Django Admin:
+
+```bash
+.venv/bin/python manage.py dispatch_identity_events --limit 25
+```
 
 ## Tạo OAuth client cho Flarum
 
