@@ -448,6 +448,9 @@ msgstr "Đọc mã định danh ổn định và hồ sơ công khai của bạn
 msgid "Read your email address and verification state"
 msgstr "Đọc địa chỉ email và trạng thái xác minh của bạn"
 
+msgid "Manage website settings and workshop content"
+msgstr "Quản lý thông tin website và nội dung workshop"
+
 msgid "Hello from Natural Farming Vietnam!"
 msgstr "Xin chào từ Natural Farming Vietnam!"
 

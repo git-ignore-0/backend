@@ -11,7 +11,9 @@ dependencies = [
     "Django>=5.2,<5.3",
     "django-allauth>=65,<66",
     "django-oauth-toolkit>=3.0,<4",
+    "djangorestframework>=3.16,<4",
     "gunicorn>=23,<24",
+    "Pillow>=12.3,<13",
     "python-dotenv>=1.1,<2",
     "requests>=2.32,<3",
     "whitenoise>=6.8,<7",
@@ -43,4 +45,4 @@ select = ["E", "F", "I", "UP", "B", "DJ"]
 ignore = ["DJ001"]
 
 [tool.setuptools.packages.find]
-include = ["config*", "identity*"]
+include = ["config*", "content*", "identity*"]

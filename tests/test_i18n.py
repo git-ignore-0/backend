@@ -356,7 +356,7 @@ def test_oauth_consent_and_scope_descriptions_are_translated(
             "client_id": oauth_application.client_id,
             "response_type": "code",
             "redirect_uri": "https://forum.example.com/auth/nfv",
-            "scope": "profile email",
+            "scope": "profile email content:manage",
             "state": "i18n-test",
             "code_challenge": challenge,
             "code_challenge_method": "S256",
@@ -367,3 +367,4 @@ def test_oauth_consent_and_scope_descriptions_are_translated(
     assert response.status_code == 200
     assert "Cho phép NFV Forum?" in content
     assert "Đọc địa chỉ email và trạng thái xác minh của bạn" in content
+    assert "Quản lý thông tin website và nội dung workshop" in content

@@ -41,6 +41,7 @@ FLARUM_LIFECYCLE_URL=https://forum.naturalfarmingvietnam.com/api/nfv/core-lifecy
 FLARUM_LIFECYCLE_SECRET=<same-random-secret-as-flarum-config>
 FLARUM_LIFECYCLE_TIMEOUT=10
 FLARUM_LIFECYCLE_MAX_ATTEMPTS=8
+CONTENT_SERVE_MEDIA=true
 ```
 
 Chỉ bật `DJANGO_BEHIND_PROXY=true` khi cPanel xác nhận HTTPS được terminate ở trusted reverse proxy và gửi `X-Forwarded-Proto` đúng cách. Chỉ bật HSTS preload sau khi mọi subdomain đều dùng HTTPS ổn định.
@@ -51,6 +52,12 @@ Sinh `DJANGO_SECRET_KEY` riêng ngoài Git. Cấu hình SMTP cho `no-reply@natur
 SMTP port 465 phải dùng `EMAIL_USE_SSL=true` và `EMAIL_USE_TLS=false`; port 587 STARTTLS dùng cấu hình ngược lại. Backend fail-fast nếu cả hai cùng được bật.
 
 Ứng dụng fail-fast khi production thiếu `DJANGO_SECRET_KEY`, `DJANGO_ALLOWED_HOSTS` hoặc thông tin MySQL bắt buộc. Không copy `.env` Laravel hay Passport keys sang deployment Django.
+
+`CONTENT_SERVE_MEDIA=true` là cấu hình dành cho Passenger hosting hiện tại: Django phục vụ
+ảnh chèn trong nội dung workshop tại `/media/`. Ảnh được hiển thị đúng vị trí trong nội dung;
+không có ảnh đại diện hay banner riêng. Chỉ chuyển thành `false` sau khi LiteSpeed/Apache đã
+được cấu hình alias URL `/media/` trực tiếp tới thư mục `MEDIA_ROOT` của ứng dụng. Sau deploy,
+upload một ảnh thử và xác nhận URL do API trả về phản hồi HTTP 200 trước khi publish workshop.
 
 Schedule dọn OAuth token hết hạn, ví dụ cron hằng ngày:
 

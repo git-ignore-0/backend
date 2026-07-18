@@ -1,6 +1,8 @@
 from allauth.account.views import LoginView, SignupView
+from django.conf import settings
 from django.contrib import admin
 from django.urls import include, path, re_path
+from django.views.static import serve
 from oauth2_provider.views.base import TokenView
 
 from identity import views
@@ -8,6 +10,7 @@ from identity.oauth_views import CoreAuthorizationView
 
 urlpatterns = [
     path("admin/", admin.site.urls),
+    path("api/v1/", include("content.urls")),
     re_path(r"^register/?$", SignupView.as_view(), name="account_signup_alias"),
     re_path(r"^login/?$", LoginView.as_view(), name="account_login_alias"),
     path("accounts/", include("allauth.urls")),
@@ -19,3 +22,6 @@ urlpatterns = [
     path("account", views.account, name="account"),
     path("", views.home, name="home"),
 ]
+
+if settings.DEBUG or settings.CONTENT_SERVE_MEDIA:
+    urlpatterns += [re_path(r"^media/(?P<path>.*)$", serve, {"document_root": settings.MEDIA_ROOT})]

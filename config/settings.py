@@ -60,6 +60,8 @@ INSTALLED_APPS = [
     "allauth",
     "allauth.account",
     "oauth2_provider",
+    "rest_framework",
+    "content.apps.ContentConfig",
     "identity.apps.IdentityConfig",
 ]
 
@@ -145,6 +147,13 @@ USE_TZ = True
 STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 STATICFILES_DIRS = [BASE_DIR / "static"]
+MEDIA_URL = "/media/"
+MEDIA_ROOT = BASE_DIR / "media"
+CONTENT_MAX_UPLOAD_BYTES = int(os.getenv("CONTENT_MAX_UPLOAD_BYTES", str(8 * 1024 * 1024)))
+CONTENT_MAX_IMAGE_PIXELS = int(os.getenv("CONTENT_MAX_IMAGE_PIXELS", "16000000"))
+CONTENT_SERVE_MEDIA = env_bool("CONTENT_SERVE_MEDIA", True)
+CONTENT_FRONTEND_REVALIDATE_URL = os.getenv("CONTENT_FRONTEND_REVALIDATE_URL", "").strip()
+CONTENT_FRONTEND_REVALIDATE_SECRET = os.getenv("CONTENT_FRONTEND_REVALIDATE_SECRET", "").strip()
 STORAGES = {
     "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
     "staticfiles": {
@@ -185,6 +194,7 @@ OAUTH2_PROVIDER = {
     "SCOPES": {
         "profile": _("Read your stable identity and public profile"),
         "email": _("Read your email address and verification state"),
+        "content:manage": _("Manage website settings and workshop content"),
     },
     "DEFAULT_SCOPES": ["profile", "email"],
     "ALLOWED_REDIRECT_URI_SCHEMES": ["http", "https"] if DEBUG else ["https"],
@@ -233,6 +243,13 @@ PASSWORD_RESET_TIMEOUT = 3600
 SECURE_CONTENT_TYPE_NOSNIFF = True
 cross_origin_opener_policy = os.getenv("DJANGO_SECURE_CROSS_ORIGIN_OPENER_POLICY", "").strip()
 SECURE_CROSS_ORIGIN_OPENER_POLICY = cross_origin_opener_policy or None
+
+REST_FRAMEWORK = {
+    "DEFAULT_AUTHENTICATION_CLASSES": ["content.authentication.CoreBearerAuthentication"],
+    "DEFAULT_RENDERER_CLASSES": ["rest_framework.renderers.JSONRenderer"],
+    "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
+    "PAGE_SIZE": 20,
+}
 X_FRAME_OPTIONS = "DENY"
 
 FLARUM_LIFECYCLE_URL = os.getenv("FLARUM_LIFECYCLE_URL", "").strip()
