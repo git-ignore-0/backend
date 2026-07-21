@@ -34,7 +34,7 @@ def choose_translation(revision, locale):
     return selected, sorted(by_locale)
 
 
-def public_workshop_payload(revision, locale, include_body=True):
+def public_workshop_payload(revision, locale, include_body=True, effective_at=None):
     translation, available_locales = choose_translation(revision, locale)
     if translation is None:
         return None
@@ -49,7 +49,11 @@ def public_workshop_payload(revision, locale, include_body=True):
         "start_at": revision.start_at.isoformat(),
         "end_at": revision.end_at.isoformat(),
         "event_timezone": revision.event_timezone,
-        "status": revision.effective_status,
+        "status": (
+            revision.effective_status
+            if effective_at is None
+            else revision.effective_status_at(effective_at)
+        ),
         "registration_url": revision.registration_url or None,
         "title": translation.title,
         "summary": translation.summary,

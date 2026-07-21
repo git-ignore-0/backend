@@ -446,8 +446,44 @@ def test_draft_update_rejects_stale_version(admin_api):
     assert response.json()["errors"][0]["code"] == "version_conflict"
 
 
+@pytest.mark.parametrize(
+    ("start_offset", "end_offset", "expected_status"),
+    [
+        (timedelta(hours=1), timedelta(hours=2), "upcoming"),
+        (timedelta(0), timedelta(hours=1), "ongoing"),
+        (timedelta(hours=-1), timedelta(hours=1), "ongoing"),
+        (timedelta(hours=-2), timedelta(0), "completed"),
+        (timedelta(hours=-2), timedelta(hours=-1), "completed"),
+    ],
+)
+def test_workshop_status_is_derived_from_schedule(start_offset, end_offset, expected_status):
+    now = timezone.now()
+    revision = WorkshopRevision(
+        start_at=now + start_offset,
+        end_at=now + end_offset,
+    )
+
+    assert revision.effective_status_at(now) == expected_status
+
+
 @pytest.mark.django_db
-def test_completed_status_is_derived(admin_api):
+def test_ongoing_status_is_exposed_by_public_api(admin_api):
+    payload = workshop_payload()
+    payload["translations"][0]["title"] = "Ongoing workshop"
+    payload["start_at"] = (timezone.now() - timedelta(hours=1)).isoformat()
+    payload["end_at"] = (timezone.now() + timedelta(hours=1)).isoformat()
+    created = admin_api.post("/api/v1/admin/workshops/", payload, format="json")
+    workshop = created.json()["data"]
+    assert publish_workshop(admin_api, workshop).status_code == 200
+    response = admin_api.get("/api/v1/public/workshops/ongoing-workshop?locale=vi")
+    upcoming = admin_api.get("/api/v1/public/workshops?locale=vi&period=upcoming")
+
+    assert response.json()["data"]["status"] == "ongoing"
+    assert [item["slug"] for item in upcoming.json()["data"]] == ["ongoing-workshop"]
+
+
+@pytest.mark.django_db
+def test_completed_status_is_exposed_by_public_api(admin_api):
     payload = workshop_payload()
     payload["translations"][0]["title"] = "Past workshop"
     payload["start_at"] = (timezone.now() - timedelta(days=2)).isoformat()
@@ -456,7 +492,10 @@ def test_completed_status_is_derived(admin_api):
     workshop = created.json()["data"]
     assert publish_workshop(admin_api, workshop).status_code == 200
     response = admin_api.get("/api/v1/public/workshops/past-workshop?locale=vi")
+    past = admin_api.get("/api/v1/public/workshops?locale=vi&period=past")
+
     assert response.json()["data"]["status"] == "completed"
+    assert [item["slug"] for item in past.json()["data"]] == ["past-workshop"]
 
 
 @pytest.mark.django_db

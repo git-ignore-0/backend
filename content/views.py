@@ -184,9 +184,9 @@ class PublicWorkshopListView(APIView):
         now = timezone.now()
         queryset = published_queryset()
         if period == "past":
-            queryset = queryset.filter(end_at__lt=now).order_by("-start_at")
+            queryset = queryset.filter(end_at__lte=now).order_by("-start_at")
         else:
-            queryset = queryset.filter(end_at__gte=now).order_by("start_at")
+            queryset = queryset.filter(end_at__gt=now).order_by("start_at")
         page_size = query.validated_data["page_size"]
         page = query.validated_data["page"]
         total = queryset.count()
@@ -194,7 +194,13 @@ class PublicWorkshopListView(APIView):
         response = Response(
             {
                 "data": [
-                    public_workshop_payload(item, locale, include_body=False) for item in items
+                    public_workshop_payload(
+                        item,
+                        locale,
+                        include_body=False,
+                        effective_at=now,
+                    )
+                    for item in items
                 ],
                 "meta": {"page": page, "page_size": page_size, "total": total},
             }
@@ -457,7 +463,7 @@ class AdminDashboardView(APIView):
         return Response(
             {
                 "data": {
-                    "upcoming": published_queryset().filter(end_at__gte=now).count(),
+                    "upcoming": published_queryset().filter(end_at__gt=now).count(),
                     "drafts": WorkshopRevision.objects.filter(is_draft=True).count(),
                     "incomplete_translations": WorkshopTranslation.objects.filter(
                         revision__is_draft=True, is_ready=False

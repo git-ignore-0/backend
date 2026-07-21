@@ -156,9 +156,14 @@ class WorkshopRevision(models.Model):
 
     @property
     def effective_status(self):
-        if self.end_at <= timezone.now():
+        return self.effective_status_at(timezone.now())
+
+    def effective_status_at(self, instant):
+        if self.start_at > instant:
+            return "upcoming"
+        if self.end_at <= instant:
             return "completed"
-        return "upcoming"
+        return "ongoing"
 
 
 def empty_tiptap_document():
