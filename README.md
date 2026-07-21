@@ -1,43 +1,20 @@
-# Natural Farming Vietnam Core Auth
+# Natural Farming Vietnam Backend
 
-Django service sở hữu tài khoản chung và phát OAuth2 identity cho website chính và Flarum. Flarum vẫn giữ database, session, bài viết, group và quyền admin/moderator riêng.
+Django backend dùng chung cho hai miền nghiệp vụ:
 
-## Phạm vi hiện tại
+1. **Core Identity/OAuth**: tài khoản UUID, đăng ký/đăng nhập/xác minh email, OAuth2 Authorization Code + PKCE, `/api/v1/me`, audit và lifecycle outbox.
+2. **Website Content/CMS**: public API cho site settings/workshop, admin API, revision/publish/preview, upload ảnh và cache revalidation.
 
-- custom user UUID với vòng đời `pending_verification`, `active`, `suspended`, `deletion_requested`, `anonymized`;
-- đăng ký, xác minh email, đăng nhập, đăng xuất và reset mật khẩu qua django-allauth;
-- toàn bộ giao diện auth, OAuth consent và email hệ thống hỗ trợ chuyển đổi Việt/Anh;
-- OAuth2 Authorization Code + PKCE qua Django OAuth Toolkit;
-- contract tương thích Flarum tại `GET /api/v1/me`, bắt buộc scopes `profile email`;
-- audit log và transactional identity-event outbox;
-- signed lifecycle dispatcher đồng bộ khóa/xóa tài khoản sang Flarum với retry hữu hạn;
-- Django Admin quản lý profile/role và có action khóa, mở khóa, yêu cầu xóa an toàn;
-  không cho tạo, hard-delete, đổi email hoặc sửa lifecycle status trực tiếp;
-- giao diện auth server-rendered, không cần Node build.
+## Công nghệ
 
-## Cấu trúc
-
-```text
-backend/
-├── config/                 Django settings, URL, WSGI/ASGI
-├── identity/               User, auth rules, OAuth guard, audit/outbox
-│   └── migrations/         Database migrations
-├── templates/              Login, signup, verification, consent
-├── static/                 Source static assets
-├── locale/                 Bản dịch Việt và catalog `.mo` dùng khi chạy
-├── scripts/                Công cụ compile bản dịch
-├── tests/                  Integration và domain tests
-├── docs/                   Architecture và deployment runbook
-├── manage.py
-├── passenger_wsgi.py
-└── pyproject.toml
-```
-
-`staticfiles/`, SQLite local, virtualenv, cache và `.env` là artifact local nên không được commit. Laravel `vendor/`, `bootstrap/`, `storage/`, Passport keys và Composer files không thuộc implementation Django.
+- Python `>=3.11`, Django `5.2`
+- django-allauth, Django OAuth Toolkit
+- Django REST Framework
+- Pillow cho image processing
+- SQLite local; MySQL production qua optional dependency `mysql`
+- Django templates cho auth UI; không cần Node build
 
 ## Chạy local
-
-Yêu cầu Python 3.11+.
 
 ```bash
 python3 -m venv .venv
@@ -49,24 +26,70 @@ cp .env.example .env
 .venv/bin/python manage.py runserver
 ```
 
-`python-dotenv` tự load file `.env`; environment variables do hosting/process cung cấp luôn được ưu tiên hơn file này. Mặc định local dùng SQLite và in email ra terminal, nên link xác minh xuất hiện trong output của `runserver`.
+Không tái sử dụng `.env` từ Laravel prototype cũ. Local mặc định dùng SQLite và console email backend; link xác minh/reset password xuất hiện trong terminal.
 
-Nút `VI / EN` xuất hiện trên mọi màn hình auth. Lựa chọn được giữ bằng cookie; với user đã đăng nhập, ngôn ngữ cũng được lưu vào `identity.User.locale`. Email xác minh và reset password ưu tiên ngôn ngữ đã lưu của người nhận.
+## Runtime chính
 
-Khi sửa hoặc thêm chuỗi trong `locale/vi/LC_MESSAGES/django.po`, biên dịch lại catalog và commit cả file `.po` lẫn `.mo`:
+- `config/settings.py`: env, database, middleware, auth, OAuth, DRF, media và security.
+- `config/urls.py`: route identity, OAuth, content API, health và Django Admin.
+- `identity/`: user lifecycle, allauth integration, OAuth guards, audit và webhook outbox.
+- `content/`: site settings, workshop revisions, public/admin APIs, upload và revalidation.
+- `templates/`, `static/`, `locale/`: auth UI song ngữ server-rendered.
+
+## Endpoint chính
+
+```text
+GET|POST /register, /login, /accounts/...
+GET|POST /oauth/authorize
+POST     /oauth/token
+GET      /api/v1/me
+
+GET      /api/v1/public/site-settings
+GET      /api/v1/public/workshops
+GET      /api/v1/public/workshops/<slug>
+GET      /api/v1/public/workshops/preview/<token>
+
+GET      /api/v1/admin/session
+GET      /api/v1/admin/dashboard
+GET|PATCH /api/v1/admin/site-settings
+POST     /api/v1/admin/media
+REST     /api/v1/admin/workshops/
+```
+
+Admin content API yêu cầu access token có scope `content:manage` và user thuộc Django group `website_admin`. `/api/v1/me` yêu cầu đồng thời scopes `profile email`.
+
+## Identity lifecycle
+
+`identity.User` dùng UUID và các trạng thái:
+
+```text
+pending_verification -> active -> suspended | deletion_requested -> anonymized
+```
+
+Eligibility cho OAuth/Core API là `status=active`, `is_active=true` và email hiện tại đã verified trong allauth. Lifecycle change phải đi qua `identity.services.transition_account()` để giữ constraint và tạo `IdentityEvent` cùng transaction.
+
+Gửi event sang Flarum bằng cron:
+
+```bash
+.venv/bin/python manage.py dispatch_identity_events --limit 25
+```
+
+## Workshop publishing
+
+Workshop có một draft revision và tối đa một published revision. Save/publish dùng optimistic version; publish validate bản dịch ready, chuyển draft thành published, clone draft mới, ghi audit và gửi signed revalidation sang frontend sau commit. Preview dùng signed token hết hạn 10 phút và không yêu cầu login ở public preview endpoint.
+
+## Dịch thuật
+
+Khi sửa `locale/vi/LC_MESSAGES/django.po`, compile và commit cả `.po` lẫn `.mo`:
 
 ```bash
 .venv/bin/python scripts/compile_translations.py
 ```
 
-Script dùng `polib` trong nhóm dependency `dev`; production không cần cài `polib` vì file `.mo` đã được build sẵn trong Git.
-
-Nếu workspace từng chạy Laravel, không tái sử dụng `.env` cũ. Hãy backup nó ngoài repo rồi tạo `.env` mới từ `.env.example`.
-
-## Kiểm tra code
+## Kiểm tra
 
 ```bash
-.venv/bin/ruff format --check config identity scripts tests manage.py passenger_wsgi.py
+.venv/bin/ruff format --check config content identity scripts tests manage.py passenger_wsgi.py
 .venv/bin/ruff check .
 .venv/bin/python manage.py makemigrations --check
 .venv/bin/python manage.py check
@@ -74,47 +97,16 @@ Nếu workspace từng chạy Laravel, không tái sử dụng `.env` cũ. Hãy 
 .venv/bin/pip-audit
 ```
 
-Test hiện bao phủ đăng ký/xác minh, login theo trạng thái, DB lifecycle constraint, audit/outbox, OAuth endpoint compatibility và toàn bộ Authorization Code + PKCE → access token → `/api/v1/me`.
+## Production
 
-Outbox lifecycle được gửi bằng management command sau; production phải schedule command này
-qua cron thay vì gửi HTTP ngay trong request Django Admin:
-
-```bash
-.venv/bin/python manage.py dispatch_identity_events --limit 25
-```
-
-## Tạo OAuth client cho Flarum
-
-Cách 1: vào `/admin/oauth2_provider/application/add/` và tạo application:
-
-- Client type: `Confidential`;
-- Authorization grant type: `Authorization code`;
-- Redirect URI: callback chính xác do FoF OAuth hiển thị;
-- không bật OIDC khi chưa có yêu cầu.
-
-Cách 2: dùng management command:
+Production thường dùng MySQL, WhiteNoise cho static và Passenger (`passenger_wsgi.py`) hoặc Gunicorn (`config.wsgi:application`). Trước deploy:
 
 ```bash
-.venv/bin/python manage.py createapplication \
-  confidential authorization-code \
-  --name "NFV Forum" \
-  --redirect-uris "https://forum.naturalfarmingvietnam.com/auth/nfv"
+.venv/bin/python manage.py migrate
+.venv/bin/python manage.py collectstatic --noinput
+.venv/bin/python manage.py check --deploy
 ```
 
-Lưu client ID/secret trong Flarum hoặc hosting secrets, không commit Git. Mỗi website, forum và admin frontend phải dùng client riêng. Production chỉ chấp nhận HTTPS redirect URI; HTTP chỉ được phép khi `DJANGO_DEBUG=true` để test local.
+Ngoài web process, cần cron dispatch identity events và dọn OAuth tokens (`manage.py cleartokens`). Secrets OAuth, lifecycle và revalidation không được commit.
 
-Các endpoint public tương thích extension:
-
-```text
-/oauth/authorize
-/oauth/token
-/api/v1/me
-```
-
-Xem [identity-architecture.md](docs/identity-architecture.md) và [deployment.md](docs/deployment.md).
-
-## Git history
-
-- `main`: implementation Django hiện tại;
-- `python-rewrite`: giữ mốc nhánh chuyển đổi;
-- `laravel-prototype`: prototype Laravel cũ, chỉ để tham chiếu và không dùng để deploy.
+Xem chi tiết tại [`../docs/backend.md`](../docs/backend.md) và [`../docs/development-deployment.md`](../docs/development-deployment.md).
