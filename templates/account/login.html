@@ -16,7 +16,7 @@
     </form>
     <div class="links">
         <a href="{% url 'account_reset_password' %}">{% translate "Forgot password?" %}</a>
-        <a href="/register">{% translate "Create account" %}</a>
+        <a href="{{ signup_url }}">{% translate "Create account" %}</a>
     </div>
 </section>
 {% endblock %}

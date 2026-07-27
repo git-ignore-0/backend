@@ -9,8 +9,11 @@
     <form method="post" action="{% url 'account_signup' %}">
         {% csrf_token %}
         {{ form.as_p }}
+        {% if redirect_field_value %}
+            <input type="hidden" name="{{ redirect_field_name }}" value="{{ redirect_field_value }}">
+        {% endif %}
         <button type="submit">{% translate "Sign up" %}</button>
     </form>
-    <div class="links"><a href="/login">{% translate "Already have an account?" %}</a></div>
+    <div class="links"><a href="{{ login_url }}">{% translate "Already have an account?" %}</a></div>
 </section>
 {% endblock %}

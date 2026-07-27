@@ -1,11 +1,16 @@
 from django.conf import settings
+from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.http import JsonResponse
 from django.shortcuts import redirect, render
-from django.views.decorators.http import require_GET, require_POST
+from django.utils.translation import gettext as _
+from django.views.decorators.http import require_GET, require_http_methods, require_POST
 from django.views.i18n import set_language as django_set_language
 
 from identity.oauth import access_token_from_request, has_me_scopes
+from members.forms import MemberProfileForm
+from members.models import MemberProfile
+from members.services import update_member_profile
 
 
 def no_store(response: JsonResponse) -> JsonResponse:
@@ -27,6 +32,12 @@ def home(request):
     return redirect("account" if request.user.is_authenticated else "account_login_alias")
 
 
+@login_required
+@require_http_methods(["GET", "POST"])
+def fixed_account_email(request):
+    return redirect("account")
+
+
 @require_POST
 def set_language(request):
     language = request.POST.get("language")
@@ -38,13 +49,32 @@ def set_language(request):
 
 
 @login_required
+@require_http_methods(["GET", "POST"])
 def account(request):
     email_verified = request.user.email_verified
     if not email_verified:
         return redirect("account_email_verification_sent")
     if not request.user.can_access_core(email_verified=email_verified):
         return render(request, "account/account_inactive.html", status=403)
-    return render(request, "account/dashboard.html")
+    profile = MemberProfile.objects.filter(user=request.user).first()
+    initial = {
+        "name": request.user.name,
+        "phone_number": profile.phone_number if profile else "",
+        "date_of_birth": profile.date_of_birth if profile else None,
+        "province_code": profile.province_code if profile else "",
+        "ward_code": profile.ward_code if profile else "",
+        "address": profile.address if profile else "",
+    }
+    form = MemberProfileForm(
+        request.POST or None,
+        initial=initial,
+        language_code=request.LANGUAGE_CODE,
+    )
+    if request.method == "POST" and form.is_valid():
+        update_member_profile(user=request.user, data=form.cleaned_data)
+        messages.success(request, _("Profile updated."))
+        return redirect("account")
+    return render(request, "account/dashboard.html", {"profile_form": form})
 
 
 @require_GET

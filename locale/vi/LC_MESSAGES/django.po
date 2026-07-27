@@ -16,6 +16,66 @@ msgstr "Chọn ngôn ngữ"
 msgid "Full name"
 msgstr "Họ và tên"
 
+msgid "Phone number"
+msgstr "Số điện thoại"
+
+msgid "Date of birth"
+msgstr "Ngày sinh"
+
+msgid "Province or city"
+msgstr "Tỉnh hoặc thành phố"
+
+msgid "Ward, commune or special zone"
+msgstr "Phường, xã hoặc đặc khu"
+
+msgid "Detailed address"
+msgstr "Địa chỉ cụ thể"
+
+msgid "House number, street or hamlet only."
+msgstr "Chỉ nhập số nhà, đường, ngõ, thôn hoặc ấp."
+
+msgid "For example: No. 12, Alley 5"
+msgstr "Ví dụ: Số 12, ngõ 5"
+
+msgid "Select a province or city"
+msgstr "Chọn tỉnh hoặc thành phố"
+
+msgid "Select a ward, commune or special zone"
+msgstr "Chọn phường, xã hoặc đặc khu"
+
+msgid "Select a province or city."
+msgstr "Hãy chọn tỉnh hoặc thành phố."
+
+msgid "Select a ward, commune or special zone."
+msgstr "Hãy chọn phường, xã hoặc đặc khu."
+
+msgid "Loading administrative units…"
+msgstr "Đang tải đơn vị hành chính…"
+
+msgid "Unable to load administrative units. Please try again."
+msgstr "Không thể tải đơn vị hành chính. Vui lòng thử lại."
+
+msgid "Enter a valid phone number."
+msgstr "Hãy nhập số điện thoại hợp lệ."
+
+msgid "Date of birth cannot be in the future."
+msgstr "Ngày sinh không thể ở trong tương lai."
+
+msgid "Personal information"
+msgstr "Thông tin cá nhân"
+
+msgid "This information is shared across Natural Farming Vietnam services."
+msgstr "Thông tin này được dùng chung trên các dịch vụ của Natural Farming Vietnam."
+
+msgid "Save changes"
+msgstr "Lưu thay đổi"
+
+msgid "Account security"
+msgstr "Bảo mật tài khoản"
+
+msgid "Profile updated."
+msgstr "Đã cập nhật thông tin."
+
 msgid "Remember me"
 msgstr "Ghi nhớ đăng nhập"
 

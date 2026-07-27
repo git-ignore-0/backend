@@ -5,6 +5,7 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 from allauth.account.models import EmailAddress
 from django.conf import settings
+from django.urls import reverse
 
 from identity.models import User
 
@@ -32,6 +33,40 @@ def test_authorize_endpoint_requires_login(client):
     response = client.get("/oauth/authorize?client_id=missing&response_type=code")
     assert response.status_code == 302
     assert response.url.startswith("/accounts/login/")
+
+
+@pytest.mark.django_db
+def test_authorize_screen_hint_opens_signup_and_preserves_oauth_request(client):
+    response = client.get(
+        "/oauth/authorize",
+        {
+            "client_id": "public-client",
+            "response_type": "code",
+            "redirect_uri": "http://localhost:3000/api/auth/callback",
+            "scope": "profile email",
+            "state": "public-state",
+            "code_challenge": "challenge",
+            "code_challenge_method": "S256",
+            "screen_hint": "signup",
+            "ui_locales": "en",
+        },
+    )
+
+    assert response.status_code == 302
+    assert response.url.startswith(f"{reverse('account_signup')}?next=")
+    assert "screen_hint%3Dsignup" in response.url
+    assert response.cookies[settings.LANGUAGE_COOKIE_NAME].value == "en"
+
+
+def test_login_and_signup_templates_preserve_next(client):
+    next_url = "/oauth/authorize?client_id=public-client&state=state"
+
+    login = client.get("/login", {"next": next_url})
+    assert parse_qs(urlparse(login.context["signup_url"]).query)["next"] == [next_url]
+
+    signup = client.get("/register", {"next": next_url})
+    assert signup.context["redirect_field_value"] == next_url
+    assert f'value="{next_url.replace("&", "&amp;")}"' in signup.content.decode()
 
 
 @pytest.mark.django_db

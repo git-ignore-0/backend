@@ -1,14 +1,57 @@
 {% extends "base.html" %}
-{% load i18n %}
+{% load i18n static %}
 {% block title %}{% translate "Account" %}{% endblock %}
 {% block content %}
-<section class="card">
-    <p class="eyebrow">{% translate "Active account" %}</p>
-    <h1>{% blocktranslate with name=user.name %}Hello, {{ name }}{% endblocktranslate %}</h1>
-    <dl>
-        <dt>{% translate "Email" %}</dt><dd>{{ user.email }}</dd>
-        <dt>{% translate "Account ID" %}</dt><dd><code>{{ user.id }}</code></dd>
-    </dl>
-    <form method="post" action="{% url 'account_logout' %}">{% csrf_token %}<button class="secondary" type="submit">{% translate "Sign out" %}</button></form>
+<section class="card account-card">
+    <p class="eyebrow">{% translate "Personal information" %}</p>
+    <h1 id="profile-title">{% translate "Account" %}</h1>
+    <p>{% translate "This information is shared across Natural Farming Vietnam services." %}</p>
+
+    <form
+        class="account-form"
+        method="post"
+        action="{% url 'account' %}"
+        data-wards-url="{% url 'administrative-wards' %}"
+        data-ward-placeholder="{% translate 'Select a ward, commune or special zone' %}"
+        data-ward-loading="{% translate 'Loading administrative units…' %}"
+        data-ward-error="{% translate 'Unable to load administrative units. Please try again.' %}"
+        novalidate
+    >
+        {% csrf_token %}
+        {% if profile_form.non_field_errors %}
+            <div class="form-alert" role="alert">{{ profile_form.non_field_errors }}</div>
+        {% endif %}
+
+        {% for field in profile_form %}
+            <div class="field-group{% if field.name == 'name' or field.name == 'address' %} field-group-wide{% endif %}">
+                <label for="{{ field.id_for_label }}">{{ field.label }}</label>
+                {{ field }}
+                {% if field.help_text %}<span class="helptext">{{ field.help_text }}</span>{% endif %}
+                {% if field.errors %}<div class="field-errors" role="alert">{{ field.errors }}</div>{% endif %}
+            </div>
+        {% endfor %}
+
+        <p class="address-status" data-address-status aria-live="polite"></p>
+
+        <div class="form-actions">
+            <button type="submit" data-profile-submit disabled>{% translate "Save changes" %}</button>
+        </div>
+    </form>
+
+    <div class="account-security" aria-labelledby="security-title">
+        <h2 id="security-title">{% translate "Account security" %}</h2>
+        <p class="account-email">{{ user.email }}</p>
+        <nav class="account-links" aria-label="{% translate 'Account security' %}">
+            <a href="{% url 'account_change_password' %}">
+                <span>{% translate "Change password" %}</span>
+                <span aria-hidden="true">→</span>
+            </a>
+        </nav>
+        <form class="sign-out" method="post" action="{% url 'account_logout' %}">
+            {% csrf_token %}
+            <button class="secondary" type="submit">{% translate "Sign out" %}</button>
+        </form>
+    </div>
 </section>
+<script src="{% static 'js/account.js' %}" defer></script>
 {% endblock %}

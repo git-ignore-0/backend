@@ -161,10 +161,9 @@ def test_public_auth_pages_use_project_layout_in_both_languages(
 @pytest.mark.parametrize(
     ("path", "expected"),
     [
-        ("/account", "Tài khoản đang hoạt động"),
+        ("/account", "Thông tin cá nhân"),
         ("/accounts/logout/", "Bạn có chắc muốn kết thúc phiên đăng nhập?"),
         ("/accounts/reauthenticate/", "Xác nhận danh tính"),
-        ("/accounts/email/", "Các địa chỉ email"),
         ("/accounts/password/change/", "Đổi mật khẩu"),
     ],
 )
@@ -204,7 +203,7 @@ def test_saved_profile_language_is_used_on_a_new_browser(client, active_user):
     response = client.get("/account")
 
     assert '<html lang="en">' in response.content.decode()
-    assert "Hello, Nông Dân Xanh" in response.content.decode()
+    assert "Personal information" in response.content.decode()
     assert response.cookies[settings.LANGUAGE_COOKIE_NAME].value == "en"
 
 

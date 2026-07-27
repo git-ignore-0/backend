@@ -63,6 +63,7 @@ INSTALLED_APPS = [
     "rest_framework",
     "content.apps.ContentConfig",
     "identity.apps.IdentityConfig",
+    "members.apps.MembersConfig",
 ]
 
 MIDDLEWARE = ["django.middleware.security.SecurityMiddleware"]
@@ -178,6 +179,7 @@ ACCOUNT_LOGIN_METHODS = {"email"}
 ACCOUNT_SIGNUP_FIELDS = ["email*", "password1*", "password2*"]
 ACCOUNT_USER_MODEL_USERNAME_FIELD = None
 ACCOUNT_EMAIL_VERIFICATION = "mandatory"
+ACCOUNT_MAX_EMAIL_ADDRESSES = 1
 ACCOUNT_EMAIL_SUBJECT_PREFIX = "[Natural Farming Vietnam] "
 ACCOUNT_EMAIL_CONFIRMATION_EXPIRE_DAYS = 1
 ACCOUNT_CONFIRM_EMAIL_ON_GET = False

@@ -10,9 +10,11 @@ from identity.oauth_views import CoreAuthorizationView
 
 urlpatterns = [
     path("admin/", admin.site.urls),
+    path("api/v1/administrative-units/", include("members.urls")),
     path("api/v1/", include("content.urls")),
     re_path(r"^register/?$", SignupView.as_view(), name="account_signup_alias"),
     re_path(r"^login/?$", LoginView.as_view(), name="account_login_alias"),
+    path("accounts/email/", views.fixed_account_email, name="fixed-account-email"),
     path("accounts/", include("allauth.urls")),
     path("language/", views.set_language, name="set-language"),
     re_path(r"^oauth/authorize/?$", CoreAuthorizationView.as_view(), name="authorize"),
