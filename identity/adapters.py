@@ -1,5 +1,6 @@
 from allauth.account.adapter import DefaultAccountAdapter
 from django.conf import settings
+from django.urls import reverse
 from django.utils import translation
 
 from identity.models import AccountStatus
@@ -23,6 +24,9 @@ class CoreAccountAdapter(DefaultAccountAdapter):
 
     def get_signup_redirect_url(self, request) -> str:
         return "/accounts/confirm-email/"
+
+    def get_password_change_redirect_url(self, request) -> str:
+        return reverse("account")
 
     def send_mail(self, template_prefix, email, context):
         user = context.get("user")

@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from django.core.exceptions import ImproperlyConfigured
 from django.utils.translation import gettext_lazy as _
@@ -31,6 +32,37 @@ def required_env(name: str) -> str:
     return value
 
 
+def parse_origins(name: str, value: str) -> tuple[str, ...]:
+    origins: list[str] = []
+    for item in value.split(","):
+        candidate = item.strip()
+        if not candidate:
+            continue
+        parsed = urlsplit(candidate)
+        try:
+            _port = parsed.port
+        except ValueError as error:
+            raise ImproperlyConfigured(
+                f"{name} must contain comma-separated HTTP(S) origins without paths"
+            ) from error
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.netloc
+            or parsed.username
+            or parsed.password
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ImproperlyConfigured(
+                f"{name} must contain comma-separated HTTP(S) origins without paths"
+            )
+        origin = f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+        if origin not in origins:
+            origins.append(origin)
+    return tuple(origins)
+
+
 DEBUG = env_bool("DJANGO_DEBUG", True)
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "").strip()
 if not SECRET_KEY:
@@ -49,6 +81,12 @@ ALLOWED_HOSTS = [item.strip() for item in allowed_hosts_value.split(",") if item
 CSRF_TRUSTED_ORIGINS = [
     item.strip() for item in os.getenv("DJANGO_CSRF_TRUSTED_ORIGINS", "").split(",") if item.strip()
 ]
+public_site_origins_value = os.getenv("PUBLIC_SITE_ORIGINS", "").strip()
+if not public_site_origins_value and DEBUG:
+    public_site_origins_value = "http://localhost:3000"
+PUBLIC_SITE_ORIGINS = parse_origins("PUBLIC_SITE_ORIGINS", public_site_origins_value)
+if not PUBLIC_SITE_ORIGINS:
+    raise ImproperlyConfigured("PUBLIC_SITE_ORIGINS is required when DJANGO_DEBUG=false")
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -71,6 +109,7 @@ if not DEBUG:
     MIDDLEWARE.append("whitenoise.middleware.WhiteNoiseMiddleware")
 MIDDLEWARE += [
     "django.contrib.sessions.middleware.SessionMiddleware",
+    "identity.middleware.AccountNavigationMiddleware",
     "django.middleware.locale.LocaleMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -95,6 +134,7 @@ TEMPLATES = [
                 "django.template.context_processors.request",
                 "django.contrib.auth.context_processors.auth",
                 "django.contrib.messages.context_processors.messages",
+                "identity.context_processors.account_navigation",
             ],
         },
     },

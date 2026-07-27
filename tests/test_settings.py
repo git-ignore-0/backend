@@ -7,7 +7,7 @@ from mysql.connector.conversion import MySQLConverter
 
 from config.db.backends.mysql_connector.base import DatabaseWrapper
 from config.db.backends.mysql_connector.schema import DatabaseSchemaEditor
-from config.settings import env_bool
+from config.settings import env_bool, parse_origins
 
 
 def test_env_bool_rejects_typo(monkeypatch):
@@ -15,6 +15,32 @@ def test_env_bool_rejects_typo(monkeypatch):
 
     with pytest.raises(ImproperlyConfigured, match="must be a boolean"):
         env_bool("TEST_BOOLEAN")
+
+
+def test_parse_origins_normalizes_and_deduplicates_origins():
+    assert parse_origins(
+        "TEST_ORIGINS",
+        "https://NaturalFarmingVietnam.com/, http://localhost:3000,"
+        "https://naturalfarmingvietnam.com",
+    ) == (
+        "https://naturalfarmingvietnam.com",
+        "http://localhost:3000",
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "ftp://example.com",
+        "https://example.com/path",
+        "https://user:password@example.com",
+        "https://example.com?next=/account",
+        "https://example.com:not-a-port",
+    ],
+)
+def test_parse_origins_rejects_non_origin_values(value):
+    with pytest.raises(ImproperlyConfigured, match="HTTP\\(S\\) origins"):
+        parse_origins("TEST_ORIGINS", value)
 
 
 def test_mysql_connector_display_name_is_django_compatible():

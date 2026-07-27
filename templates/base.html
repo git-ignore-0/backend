@@ -11,7 +11,7 @@
 <body>
     <main class="shell">
         <header class="topbar">
-            <a class="brand" href="/">Natural Farming Vietnam</a>
+            <a class="brand" href="{{ public_site_url }}">Natural Farming Vietnam</a>
             <form class="language-switcher" method="post" action="{% url 'set-language' %}" aria-label="{% translate 'Language selection' %}">
                 {% csrf_token %}
                 <input type="hidden" name="next" value="{{ request.get_full_path }}">

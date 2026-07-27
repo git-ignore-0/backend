@@ -58,6 +58,7 @@ def test_authorize_screen_hint_opens_signup_and_preserves_oauth_request(client):
     assert response.cookies[settings.LANGUAGE_COOKIE_NAME].value == "en"
 
 
+@pytest.mark.django_db
 def test_login_and_signup_templates_preserve_next(client):
     next_url = "/oauth/authorize?client_id=public-client&state=state"
 

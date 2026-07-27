@@ -183,6 +183,10 @@ def test_authenticated_auth_pages_use_vietnamese_project_layout(
     assert expected in content
     assert "Menu:" not in content
 
+    if path == "/accounts/password/change/":
+        assert "Mật khẩu hiện tại" in content
+        assert "Current Password" not in content
+
 
 @pytest.mark.django_db
 def test_authenticated_language_switch_is_saved_to_profile(client, active_user):

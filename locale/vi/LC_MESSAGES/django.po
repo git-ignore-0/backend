@@ -543,3 +543,18 @@ msgstr "Mở liên kết bên dưới để tạo mật khẩu mới:"
 
 msgid "If you did not request a password reset, you can safely ignore this email. Your password will not change."
 msgstr "Nếu bạn không yêu cầu đặt lại mật khẩu, bạn có thể bỏ qua email này. Mật khẩu của bạn sẽ không thay đổi."
+
+msgid "Back to website"
+msgstr "Quay lại website"
+
+msgid "Back to account"
+msgstr "Quay lại tài khoản"
+
+msgid "Request another reset link"
+msgstr "Yêu cầu liên kết đặt lại khác"
+
+msgid "Your new password is ready. Sign in again to continue."
+msgstr "Mật khẩu mới đã sẵn sàng. Hãy đăng nhập lại để tiếp tục."
+
+msgid "Current Password"
+msgstr "Mật khẩu hiện tại"

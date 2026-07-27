@@ -8,7 +8,8 @@
     <p>{% translate "We sent you a verification link. Open it to activate your account." %}</p>
     <p>{% translate "If you do not see the email, check your spam folder or request a new verification email." %}</p>
     <div class="links">
-        <a href="{% url 'account_login' %}">{% translate "Back to sign in" %}</a>
+        <a href="{{ core_login_url }}">{% translate "Back to sign in" %}</a>
+        <a href="{{ public_site_url }}">{% translate "Back to website" %}</a>
     </div>
 </section>
 {% endblock %}

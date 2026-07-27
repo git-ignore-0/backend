@@ -1,6 +1,35 @@
 from django.conf import settings
 from django.utils import translation
 
+from identity.navigation import (
+    LOGIN_NEXT_SESSION_KEY,
+    PUBLIC_RETURN_TO_SESSION_KEY,
+    public_return_from_oauth_next,
+    safe_local_next,
+    safe_public_return_to,
+)
+
+
+class AccountNavigationMiddleware:
+    """Keep validated navigation context while the user moves through Core account pages."""
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        return_to = safe_public_return_to(request.GET.get("return_to"))
+        if return_to:
+            request.session[PUBLIC_RETURN_TO_SESSION_KEY] = return_to
+
+        next_url = safe_local_next(request.GET.get("next"))
+        if next_url:
+            request.session[LOGIN_NEXT_SESSION_KEY] = next_url
+            oauth_return_to = public_return_from_oauth_next(next_url)
+            if not return_to and oauth_return_to:
+                request.session[PUBLIC_RETURN_TO_SESSION_KEY] = oauth_return_to
+
+        return self.get_response(request)
+
 
 class UserLocaleMiddleware:
     """Use the saved account locale when the current browser has no preference."""

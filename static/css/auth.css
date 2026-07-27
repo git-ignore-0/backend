@@ -17,6 +17,7 @@ a { color: #28633f; }
 h1 { margin: .25rem 0 1rem; font-size: clamp(1.8rem, 5vw, 2.4rem); line-height: 1.1; }
 h2 { margin: .25rem 0 1rem; font-size: 1.25rem; overflow-wrap: anywhere; }
 .eyebrow { margin: 0; color: #3f7a54; font-size: .78rem; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
+.card-back { min-height: 2.75rem; display: inline-flex; align-items: center; margin: -1rem 0 .5rem; font-size: .9rem; font-weight: 700; text-decoration: none; }
 label { display: block; margin-bottom: .35rem; font-weight: 700; }
 input:not([type="checkbox"]):not([type="radio"]):not([type="hidden"]), select { width: 100%; min-height: 2.9rem; padding: .65rem .8rem; border: 1px solid #b9c8ba; border-radius: .65rem; font: inherit; }
 select { appearance: none; padding-right: 2.75rem; background-color: #fff; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8' fill='none'%3E%3Cpath d='m1 1.5 5 5 5-5' stroke='%2353665b' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right .9rem center; background-size: .75rem .5rem; }
@@ -30,6 +31,7 @@ button { min-height: 2.9rem; padding: .65rem 1rem; border: 0; border-radius: .65
 button:disabled { cursor: not-allowed; opacity: .5; }
 button.secondary { color: #244b35; background: #e8eee6; }
 .links, .actions { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 1rem; margin-top: 1.25rem; }
+.links a, .actions a { min-height: 2.75rem; display: inline-flex; align-items: center; }
 .messages { margin-bottom: 1rem; padding: .65rem .85rem; border: 1px solid #cee1ca; border-radius: .65rem; background: #edf6ea; font-size: .9rem; line-height: 1.45; }
 .messages p { margin: 0; }
 .errorlist { padding-left: 1.25rem; color: #a12b28; }
