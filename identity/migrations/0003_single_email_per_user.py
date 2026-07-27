@@ -46,12 +46,22 @@ def drop_unique_email_index(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
+    atomic = False
+
     dependencies = [
         ("account", "0009_emailaddress_unique_primary_email"),
         ("identity", "0002_user_identity_user_status_matches_is_active"),
     ]
 
     operations = [
-        migrations.RunPython(keep_one_email_per_user, migrations.RunPython.noop),
-        migrations.RunPython(create_unique_email_index, drop_unique_email_index),
+        migrations.RunPython(
+            keep_one_email_per_user,
+            migrations.RunPython.noop,
+            atomic=True,
+        ),
+        migrations.RunPython(
+            create_unique_email_index,
+            drop_unique_email_index,
+            atomic=False,
+        ),
     ]
