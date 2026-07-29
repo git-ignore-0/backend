@@ -102,6 +102,7 @@ INSTALLED_APPS = [
     "content.apps.ContentConfig",
     "identity.apps.IdentityConfig",
     "members.apps.MembersConfig",
+    "referrals.apps.ReferralsConfig",
 ]
 
 MIDDLEWARE = ["django.middleware.security.SecurityMiddleware"]

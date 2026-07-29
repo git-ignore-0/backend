@@ -16,6 +16,12 @@ msgstr "Chọn ngôn ngữ"
 msgid "Full name"
 msgstr "Họ và tên"
 
+msgid "Referral code"
+msgstr "Mã giới thiệu"
+
+msgid "Enter a valid referral code."
+msgstr "Hãy nhập mã giới thiệu hợp lệ."
+
 msgid "Phone number"
 msgstr "Số điện thoại"
 
