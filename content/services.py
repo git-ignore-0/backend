@@ -191,7 +191,9 @@ def request_frontend_revalidation(tags):
     return True
 
 
-def store_workshop_image(upload, *, actor) -> MediaAsset:
+def store_media_image(upload, *, actor, storage_prefix: str) -> MediaAsset:
+    if storage_prefix not in {"rewards", "workshops"}:
+        raise ValueError("Unsupported media storage prefix.")
     if upload.size > settings.CONTENT_MAX_UPLOAD_BYTES:
         raise ValueError("Image exceeds the upload size limit.")
     try:
@@ -223,7 +225,7 @@ def store_workshop_image(upload, *, actor) -> MediaAsset:
         output = io.BytesIO()
         resized.save(output, "WEBP", quality=84, method=6)
         name = default_storage.save(
-            f"workshops/{timezone.now():%Y/%m}/{asset_id}-{width}.webp",
+            f"{storage_prefix}/{timezone.now():%Y/%m}/{asset_id}-{width}.webp",
             ContentFile(output.getvalue()),
         )
         variants.append({"file": name, "width": width, "height": height})
@@ -241,3 +243,11 @@ def store_workshop_image(upload, *, actor) -> MediaAsset:
         original_name=upload.name[:255],
         created_by=actor,
     )
+
+
+def store_workshop_image(upload, *, actor) -> MediaAsset:
+    return store_media_image(upload, actor=actor, storage_prefix="workshops")
+
+
+def store_reward_image(upload, *, actor) -> MediaAsset:
+    return store_media_image(upload, actor=actor, storage_prefix="rewards")

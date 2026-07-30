@@ -16,6 +16,7 @@ def test_pkce_is_required():
         "identity.oauth.CoreOAuth2Validator"
     )
     assert settings.OAUTH2_PROVIDER["REFRESH_TOKEN_REUSE_PROTECTION"] is True
+    assert "REFRESH_TOKEN_GRACE_PERIOD_SECONDS" not in settings.OAUTH2_PROVIDER
     assert settings.OAUTH2_PROVIDER["ALLOWED_REDIRECT_URI_SCHEMES"] == ["http", "https"]
 
 
