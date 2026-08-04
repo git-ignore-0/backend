@@ -15,6 +15,7 @@ from memberships.models import (
     MembershipCycle,
     MembershipCycleQuota,
     MembershipPackage,
+    MembershipPackageTranslation,
     MembershipPaymentInstruction,
     MembershipPaymentSettings,
     MembershipProductSnapshot,
@@ -28,6 +29,8 @@ from memberships.models import (
     MembershipUsageLine,
     MembershipUsageOrder,
     MembershipUsageReversal,
+    Product,
+    ProductTranslation,
     QuotaPolicy,
     UsageOrderStatus,
 )
@@ -160,20 +163,43 @@ def _record_request_event(*, request, action, actor, reason=""):
 
 
 def _snapshot_package(request: MembershipRequest, package: MembershipPackage) -> None:
-    items = list(package.items.select_related("product").order_by("id"))
+    items = list(package.items.select_for_update().order_by("id"))
     if not items:
         raise PackageUnavailable("Package has no quota items")
-    if any(not item.product.is_active for item in items):
+    product_ids = [item.product_id for item in items]
+    products = {
+        product.pk: product
+        for product in Product.objects.select_for_update()
+        .filter(pk__in=product_ids)
+        .order_by("id")
+    }
+    if any(not products[item.product_id].is_active for item in items):
         raise PackageUnavailable("Package contains an inactive product")
+    translations = {
+        (translation.product_id, translation.locale): translation
+        for translation in ProductTranslation.objects.select_for_update().filter(
+            product_id__in=product_ids
+        ).order_by("product_id", "locale", "id")
+    }
     MembershipRequestItemSnapshot.objects.bulk_create(
         [
             MembershipRequestItemSnapshot(
                 request=request,
-                product=item.product,
-                product_name=item.product.name,
-                unit_size=item.product.unit_size,
-                unit_label_vi=item.product.unit_label_vi,
-                unit_label_en=item.product.unit_label_en,
+                product=products[item.product_id],
+                product_name=products[item.product_id].name,
+                product_name_vi_snapshot=(
+                    translations[(item.product_id, "vi")].name
+                    if (item.product_id, "vi") in translations
+                    else products[item.product_id].name
+                ),
+                product_name_en_snapshot=(
+                    translations[(item.product_id, "en")].name
+                    if (item.product_id, "en") in translations
+                    else ""
+                ),
+                unit_size=products[item.product_id].unit_size,
+                unit_label_vi=products[item.product_id].unit_label_vi,
+                unit_label_en=products[item.product_id].unit_label_en,
                 quota_units_per_cycle=item.quota_units,
             )
             for item in items
@@ -223,6 +249,14 @@ def create_membership_request(*, user, package_id, flow: str, phone: str | None 
         package = MembershipPackage.objects.select_for_update().get(pk=package_id, is_active=True)
     except MembershipPackage.DoesNotExist as error:
         raise PackageUnavailable("Package does not exist or is inactive") from error
+    package_translations = {
+        translation.locale: translation
+        for translation in MembershipPackageTranslation.objects.select_for_update().filter(
+            package=package
+        )
+    }
+    package_vi = package_translations.get("vi")
+    package_en = package_translations.get("en")
     if flow not in {"consultation", "direct_transfer"}:
         raise RequestTransitionConflict("Invalid request flow")
     for _attempt in range(20):
@@ -234,6 +268,14 @@ def create_membership_request(*, user, package_id, flow: str, phone: str | None 
                     package=package,
                     package_name_snapshot=package.name,
                     package_description_snapshot=package.description,
+                    package_name_vi_snapshot=(package_vi.name if package_vi else package.name),
+                    package_name_en_snapshot=(package_en.name if package_en else ""),
+                    package_description_vi_snapshot=(
+                        package_vi.description if package_vi else package.description
+                    ),
+                    package_description_en_snapshot=(
+                        package_en.description if package_en else ""
+                    ),
                     upfront_price_snapshot=package.upfront_price,
                     duration_months_snapshot=package.duration_months,
                     quota_policy_snapshot=package.quota_policy,
@@ -509,6 +551,10 @@ def approve_request(*, request_id, actor, start_date: date):
         package=item.package,
         package_name_snapshot=item.package_name_snapshot,
         package_description_snapshot=item.package_description_snapshot,
+        package_name_vi_snapshot=item.package_name_vi_snapshot,
+        package_name_en_snapshot=item.package_name_en_snapshot,
+        package_description_vi_snapshot=item.package_description_vi_snapshot,
+        package_description_en_snapshot=item.package_description_en_snapshot,
         upfront_price_snapshot=item.upfront_price_snapshot,
         duration_months_snapshot=item.duration_months_snapshot,
         quota_policy_snapshot=item.quota_policy_snapshot,
@@ -523,6 +569,8 @@ def approve_request(*, request_id, actor, start_date: date):
             membership=membership,
             product=snapshot.product,
             product_name=snapshot.product_name,
+            product_name_vi_snapshot=snapshot.product_name_vi_snapshot,
+            product_name_en_snapshot=snapshot.product_name_en_snapshot,
             unit_size=snapshot.unit_size,
             unit_label_vi=snapshot.unit_label_vi,
             unit_label_en=snapshot.unit_label_en,

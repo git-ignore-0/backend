@@ -1,3 +1,4 @@
+import importlib
 import threading
 import uuid
 from datetime import date, timedelta
@@ -6,6 +7,7 @@ from decimal import Decimal
 import pytest
 import requests
 from allauth.account.models import EmailAddress
+from django.apps import apps
 from django.contrib.auth.models import Group
 from django.core.cache import cache
 from django.db import IntegrityError, close_old_connections, connection, transaction
@@ -29,6 +31,7 @@ from memberships.models import (
     MembershipCycleQuota,
     MembershipPackage,
     MembershipPackageItem,
+    MembershipPackageTranslation,
     MembershipPaymentSettings,
     MembershipRequest,
     MembershipRequestEventAction,
@@ -38,6 +41,7 @@ from memberships.models import (
     MembershipUsageOrder,
     MembershipUsageReversal,
     Product,
+    ProductTranslation,
     QuotaPolicy,
     UsageOrderStatus,
 )
@@ -110,6 +114,32 @@ def create_package(*, policy=QuotaPolicy.EXPIRE, quota=2, price=Decimal("6000000
     )
     MembershipPackageItem.objects.create(package=package, product=product, quota_units=quota)
     return package, product
+
+
+def product_translations(
+    *,
+    vi_name="Giỏ rau theo mùa",
+    en_name="Seasonal basket",
+    vi_description="Rau tươi",
+    en_description="Fresh vegetables",
+):
+    return [
+        {"locale": "vi", "name": vi_name, "short_description": vi_description},
+        {"locale": "en", "name": en_name, "short_description": en_description},
+    ]
+
+
+def package_translations(
+    *,
+    vi_name="Gói CSA sáu tháng",
+    en_name="Six month CSA",
+    vi_description="Giao mỗi chu kỳ",
+    en_description="One delivery per cycle",
+):
+    return [
+        {"locale": "vi", "name": vi_name, "description": vi_description},
+        {"locale": "en", "name": en_name, "description": en_description},
+    ]
 
 
 def cache_transfer_banks():
@@ -583,6 +613,9 @@ def test_self_usage_payload_uses_membership_product_unit_snapshot(active_user, a
     assert response.json()["data"][0]["lines"][0] == {
         "product_id": str(product.pk),
         "product_name": "Seasonal basket",
+        "requested_locale": "vi",
+        "content_locale": "vi",
+        "is_fallback": False,
         "unit_size": "0.500",
         "unit_label_vi": "kg",
         "unit_label_en": "kg",
@@ -674,9 +707,7 @@ def test_admin_membership_user_payload_and_phone_search(admin_api, active_user):
         user=active_user, package_id=package.pk, flow="direct_transfer"
     )
 
-    request_search = admin_api.get(
-        "/api/v1/admin/membership-requests", {"search": phone}
-    )
+    request_search = admin_api.get("/api/v1/admin/membership-requests", {"search": phone})
     assert request_search.status_code == 200
     assert request_search.json()["meta"] == {"page": 1, "page_size": 30, "total": 1}
     assert request_search.json()["data"][0]["id"] == str(request.pk)
@@ -687,9 +718,7 @@ def test_admin_membership_user_payload_and_phone_search(admin_api, active_user):
         actor=active_user,
         start_date=timezone.localdate(),
     )
-    membership_search = admin_api.get(
-        "/api/v1/admin/memberships", {"search": phone}
-    )
+    membership_search = admin_api.get("/api/v1/admin/memberships", {"search": phone})
     assert membership_search.status_code == 200
     assert membership_search.json()["meta"] == {
         "page": 1,
@@ -817,6 +846,131 @@ def test_public_package_list_is_paginated(client):
     assert response.status_code == 200
     assert response.json()["meta"] == {"page": 2, "page_size": 30, "total": 31}
     assert len(response.json()["data"]) == 1
+
+
+@pytest.mark.django_db
+def test_public_packages_localize_content_and_fallback_safely(client):
+    package, product = create_package()
+    ProductTranslation.objects.bulk_create(
+        [ProductTranslation(product=product, **item) for item in product_translations()]
+    )
+    MembershipPackageTranslation.objects.bulk_create(
+        [MembershipPackageTranslation(package=package, **item) for item in package_translations()]
+    )
+
+    vietnamese = client.get("/api/v1/public/membership-packages?locale=vi").json()["data"][0]
+    english = client.get("/api/v1/public/membership-packages?locale=en").json()["data"][0]
+    assert (vietnamese["name"], vietnamese["content_locale"], vietnamese["is_fallback"]) == (
+        "Gói CSA sáu tháng",
+        "vi",
+        False,
+    )
+    assert english["name"] == "Six month CSA"
+    assert english["items"][0]["product_name"] == "Seasonal basket"
+    assert english["items"][0]["short_description"] == "Fresh vegetables"
+    assert english["items"][0]["requested_locale"] == "en"
+
+    product.translations.filter(locale="en").delete()
+    fallback = client.get("/api/v1/public/membership-packages?locale=en").json()["data"][0]
+    assert fallback["items"][0]["product_name"] == "Giỏ rau theo mùa"
+    assert fallback["items"][0]["content_locale"] == "vi"
+    assert fallback["items"][0]["is_fallback"] is True
+    assert "translations" not in fallback
+    assert "is_active" not in fallback
+
+
+@pytest.mark.django_db
+def test_membership_self_apis_use_immutable_bilingual_snapshots(active_user, access_token):
+    ensure_phone(active_user)
+    package, product = create_package(quota=3)
+    ProductTranslation.objects.bulk_create(
+        [ProductTranslation(product=product, **item) for item in product_translations()]
+    )
+    MembershipPackageTranslation.objects.bulk_create(
+        [MembershipPackageTranslation(package=package, **item) for item in package_translations()]
+    )
+    configure_payment_settings()
+    membership_request, _instruction = create_membership_request(
+        user=active_user, package_id=package.pk, flow="direct_transfer"
+    )
+    request_snapshot = membership_request.item_snapshots.get()
+    assert request_snapshot.product_name == "Seasonal basket"
+    assert request_snapshot.product_name_vi_snapshot == "Giỏ rau theo mùa"
+    assert request_snapshot.product_name_en_snapshot == "Seasonal basket"
+    assert request_snapshot.unit_size == Decimal("0.500")
+    assert request_snapshot.unit_label_vi == "kg"
+    assert request_snapshot.unit_label_en == "kg"
+
+    package.translations.filter(locale="en").update(name="Changed live package")
+    product.translations.filter(locale="vi").update(name="Giỏ rau đã thay đổi")
+    product.translations.filter(locale="en").update(name="Changed live product")
+    Product.objects.filter(pk=product.pk).update(
+        name="Changed live legacy product",
+        unit_size=Decimal("1.000"),
+        unit_label_vi="túi",
+        unit_label_en="bag",
+        is_active=False,
+    )
+    own_client = bearer_client(access_token)
+    request_response = own_client.get("/api/v1/memberships/requests?locale=en")
+    assert request_response.status_code == 200
+    request_data = request_response.json()["data"]
+    assert request_data["package"]["name"] == "Six month CSA"
+    assert request_data["package"]["items"][0]["product_name"] == "Seasonal basket"
+    assert request_data["package"]["content_locale"] == "en"
+    assert "package_name_en_snapshot" not in request_data["package"]
+
+    submit_payment(request_id=membership_request.pk, user=active_user)
+    membership, _created = approve_request(
+        request_id=membership_request.pk,
+        actor=active_user,
+        start_date=timezone.localdate(),
+    )
+    membership_snapshot = membership.product_snapshots.get()
+    assert membership_snapshot.product_name == "Seasonal basket"
+    assert membership_snapshot.product_name_vi_snapshot == "Giỏ rau theo mùa"
+    assert membership_snapshot.product_name_en_snapshot == "Seasonal basket"
+    assert membership_snapshot.unit_size == Decimal("0.500")
+    assert membership_snapshot.unit_label_vi == "kg"
+    assert membership_snapshot.unit_label_en == "kg"
+    current = own_client.get("/api/v1/memberships/current?locale=en").json()["data"]
+    quota_data = own_client.get("/api/v1/memberships/quota?locale=en").json()["data"]
+    assert current["package_name"] == "Six month CSA"
+    assert current["content_locale"] == "en"
+    assert quota_data["products"][0]["product_name"] == "Seasonal basket"
+    create_usage_order(
+        membership_id=membership.pk,
+        actor=active_user,
+        idempotency_key=uuid.uuid4(),
+        lines=[{"product_id": product.pk, "units": 1}],
+    )
+    usage = own_client.get("/api/v1/memberships/usage?page=1&locale=en").json()["data"]
+    assert usage[0]["lines"][0]["product_name"] == "Seasonal basket"
+    assert usage[0]["lines"][0]["content_locale"] == "en"
+
+    membership.package_name_en_snapshot = ""
+    membership.package_description_en_snapshot = ""
+    membership.save(
+        update_fields=["package_name_en_snapshot", "package_description_en_snapshot"]
+    )
+    membership.product_snapshots.update(product_name_en_snapshot="")
+    fallback = own_client.get("/api/v1/memberships/current?locale=en").json()["data"]
+    fallback_quota = own_client.get("/api/v1/memberships/quota?locale=en").json()["data"]
+    fallback_usage = own_client.get("/api/v1/memberships/usage?page=1&locale=en").json()["data"]
+    assert fallback["package_name"] == "Gói CSA sáu tháng"
+    assert (fallback["content_locale"], fallback["is_fallback"]) == ("vi", True)
+    assert fallback_quota["products"][0]["product_name"] == "Giỏ rau theo mùa"
+    assert fallback_quota["products"][0]["is_fallback"] is True
+    assert fallback_usage[0]["lines"][0]["product_name"] == "Giỏ rau theo mùa"
+    assert fallback_usage[0]["lines"][0]["is_fallback"] is True
+
+
+@pytest.mark.django_db
+def test_membership_self_locale_query_is_strict(active_user, access_token):
+    own_client = bearer_client(access_token)
+    assert own_client.get("/api/v1/memberships/current?locale=fr").status_code == 400
+    assert own_client.get("/api/v1/memberships/quota?unexpected=1").status_code == 400
+    assert own_client.get("/api/v1/memberships/usage?page=1&locale=en&extra=1").status_code == 400
 
 
 @pytest.mark.django_db
@@ -1163,6 +1317,126 @@ def test_admin_product_lookup_is_paginated_searchable_and_can_filter_active(admi
     assert [item["name"] for item in search.json()["data"]] == ["Lookup product 30"]
 
 
+@pytest.mark.django_db
+def test_admin_catalog_requires_unique_vi_and_en_names_and_rejects_unknown_input(admin_api):
+    base_product = {
+        "unit_size": "0.500",
+        "unit_label_vi": "kg",
+        "unit_label_en": "kg",
+    }
+    missing_en = admin_api.post(
+        "/api/v1/admin/membership-products",
+        {**base_product, "translations": product_translations()[:1]},
+        format="json",
+    )
+    assert missing_en.status_code == 400
+    assert "translations" in missing_en.json()
+
+    duplicate = admin_api.post(
+        "/api/v1/admin/membership-products",
+        {
+            **base_product,
+            "translations": [product_translations()[0], product_translations()[0]],
+        },
+        format="json",
+    )
+    assert duplicate.status_code == 400
+    assert "translations" in duplicate.json()
+
+    unknown_nested = admin_api.post(
+        "/api/v1/admin/membership-products",
+        {
+            **base_product,
+            "translations": [
+                {**product_translations()[0], "unexpected": "value"},
+                product_translations()[1],
+            ],
+        },
+        format="json",
+    )
+    assert unknown_nested.status_code == 400
+    assert "unexpected" in unknown_nested.json()["translations"][0]
+
+    created = admin_api.post(
+        "/api/v1/admin/membership-products",
+        {**base_product, "translations": product_translations()},
+        format="json",
+    )
+    assert created.status_code == 201
+    product_id = created.json()["data"]["id"]
+
+    package_base = {
+        "upfront_price": "1500000",
+        "duration_months": 3,
+        "quota_policy": "expire",
+        "items": [{"product_id": product_id, "quota_units": 1}],
+    }
+    missing_package_en = admin_api.post(
+        "/api/v1/admin/membership-packages",
+        {**package_base, "translations": package_translations()[:1]},
+        format="json",
+    )
+    duplicate_package_locale = admin_api.post(
+        "/api/v1/admin/membership-packages",
+        {
+            **package_base,
+            "translations": [package_translations()[0], package_translations()[0]],
+        },
+        format="json",
+    )
+    assert missing_package_en.status_code == 400
+    assert duplicate_package_locale.status_code == 400
+
+    incomplete_update = admin_api.patch(
+        f"/api/v1/admin/membership-products/{product_id}",
+        {"translations": product_translations()[:1]},
+        format="json",
+    )
+    assert incomplete_update.status_code == 400
+
+
+@pytest.mark.django_db
+def test_admin_catalog_searches_both_translation_languages(admin_api):
+    product_response = admin_api.post(
+        "/api/v1/admin/membership-products",
+        {
+            "translations": product_translations(
+                vi_name="Rau củ bản địa",
+                en_name="Heritage produce",
+                en_description="Rare seasonal greens",
+            ),
+            "unit_size": "1.000",
+            "unit_label_vi": "kg",
+            "unit_label_en": "kg",
+        },
+        format="json",
+    )
+    product_id = product_response.json()["data"]["id"]
+    package_response = admin_api.post(
+        "/api/v1/admin/membership-packages",
+        {
+            "translations": package_translations(
+                vi_name="Gói gìn giữ hạt giống",
+                en_name="Seed keeper package",
+                en_description="Supports heritage crops",
+            ),
+            "upfront_price": "1500000",
+            "duration_months": 3,
+            "quota_policy": "expire",
+            "items": [{"product_id": product_id, "quota_units": 1}],
+        },
+        format="json",
+    )
+    assert package_response.status_code == 201
+
+    product_search = admin_api.get("/api/v1/admin/membership-products?search=seasonal%20greens")
+    package_search = admin_api.get("/api/v1/admin/membership-packages?search=heritage%20crops")
+    assert [item["id"] for item in product_search.json()["data"]] == [product_id]
+    assert [item["id"] for item in package_search.json()["data"]] == [
+        package_response.json()["data"]["id"]
+    ]
+
+
 @pytest.mark.django_db(transaction=True)
 def test_payment_settings_migration_disables_legacy_non_bin_configuration():
     migrate_from = ("memberships", "0002_membershippaymentsettings_direct_transfer_enabled")
@@ -1172,7 +1446,7 @@ def test_payment_settings_migration_disables_legacy_non_bin_configuration():
     )
     current_migration = (
         "memberships",
-        "0005_membership_request_phone_and_payment_version",
+        "0007_membership_package_description_en_snapshot_and_more",
     )
     executor = MigrationExecutor(connection)
     try:
@@ -1197,6 +1471,104 @@ def test_payment_settings_migration_disables_legacy_non_bin_configuration():
         assert migrated.bank_name == ""
     finally:
         MigrationExecutor(connection).migrate([current_migration])
+
+
+@pytest.mark.django_db(transaction=True)
+def test_catalog_translation_migration_backfills_vi_without_inventing_english():
+    migrate_from = ("memberships", "0005_membership_request_phone_and_payment_version")
+    migrate_to = (
+        "memberships",
+        "0006_membershippackagetranslation_producttranslation",
+    )
+    executor = MigrationExecutor(connection)
+    try:
+        executor.migrate([migrate_from])
+        old_apps = executor.loader.project_state([migrate_from]).apps
+        LegacyProduct = old_apps.get_model("memberships", "Product")
+        LegacyPackage = old_apps.get_model("memberships", "MembershipPackage")
+        product = LegacyProduct.objects.create(
+            name="Giỏ rau cũ",
+            short_description="Nội dung gốc",
+            unit_size=Decimal("0.500"),
+            unit_label_vi="kg",
+            unit_label_en="kg",
+        )
+        package = LegacyPackage.objects.create(
+            name="Gói CSA cũ",
+            description="Mô tả gốc",
+            upfront_price=Decimal("1500000"),
+            duration_months=3,
+            quota_policy="expire",
+        )
+
+        executor = MigrationExecutor(connection)
+        executor.migrate([migrate_to])
+        new_apps = executor.loader.project_state([migrate_to]).apps
+        ProductTranslation = new_apps.get_model("memberships", "ProductTranslation")
+        PackageTranslation = new_apps.get_model(
+            "memberships", "MembershipPackageTranslation"
+        )
+        assert list(
+            ProductTranslation.objects.filter(product_id=product.pk).values_list(
+                "locale", "name", "short_description"
+            )
+        ) == [("vi", "Giỏ rau cũ", "Nội dung gốc")]
+        assert list(
+            PackageTranslation.objects.filter(package_id=package.pk).values_list(
+                "locale", "name", "description"
+            )
+        ) == [("vi", "Gói CSA cũ", "Mô tả gốc")]
+    finally:
+        MigrationExecutor(connection).migrate(
+            [("memberships", "0007_membership_package_description_en_snapshot_and_more")]
+        )
+
+
+@pytest.mark.django_db
+def test_snapshot_migration_backfills_only_vietnamese_content(active_user):
+    membership, _product, membership_request = activate_membership(active_user, quota=3)
+    request_snapshot = membership_request.item_snapshots.get()
+    membership_snapshot = membership.product_snapshots.get()
+    MembershipRequest.objects.filter(pk=membership_request.pk).update(
+        package_name_vi_snapshot="",
+        package_name_en_snapshot="",
+        package_description_vi_snapshot="",
+        package_description_en_snapshot="",
+    )
+    type(request_snapshot).objects.filter(pk=request_snapshot.pk).update(
+        product_name_vi_snapshot="", product_name_en_snapshot=""
+    )
+    Membership.objects.filter(pk=membership.pk).update(
+        package_name_vi_snapshot="",
+        package_name_en_snapshot="",
+        package_description_vi_snapshot="",
+        package_description_en_snapshot="",
+    )
+    type(membership_snapshot).objects.filter(pk=membership_snapshot.pk).update(
+        product_name_vi_snapshot="", product_name_en_snapshot=""
+    )
+    original_price = membership.upfront_price_snapshot
+    original_status = membership.status
+
+    migration = importlib.import_module(
+        "memberships.migrations.0007_membership_package_description_en_snapshot_and_more"
+    )
+    migration.backfill_vietnamese_snapshots(apps, None)
+
+    membership_request.refresh_from_db()
+    request_snapshot.refresh_from_db()
+    membership.refresh_from_db()
+    membership_snapshot.refresh_from_db()
+    assert membership_request.package_name_vi_snapshot == membership_request.package_name_snapshot
+    assert membership_request.package_name_en_snapshot == ""
+    assert request_snapshot.product_name_vi_snapshot == request_snapshot.product_name
+    assert request_snapshot.product_name_en_snapshot == ""
+    assert membership.package_name_vi_snapshot == membership.package_name_snapshot
+    assert membership.package_name_en_snapshot == ""
+    assert membership_snapshot.product_name_vi_snapshot == membership_snapshot.product_name
+    assert membership_snapshot.product_name_en_snapshot == ""
+    assert membership.upfront_price_snapshot == original_price
+    assert membership.status == original_status
 
 
 @pytest.mark.django_db
@@ -1269,7 +1641,7 @@ def test_admin_api_full_membership_workflow(admin_api, active_user):
     product_response = admin_api.post(
         "/api/v1/admin/membership-products",
         {
-            "name": "Vegetable basket",
+            "translations": product_translations(),
             "unit_size": "0.500",
             "unit_label_vi": "kg",
             "unit_label_en": "kg",
@@ -1281,11 +1653,18 @@ def test_admin_api_full_membership_workflow(admin_api, active_user):
     assert "category" not in product
     product_patch = admin_api.patch(
         f"/api/v1/admin/membership-products/{product['id']}",
-        {"short_description": "Updated through the admin API"},
+        {
+            "translations": product_translations(
+                vi_description="Cập nhật qua API quản trị",
+                en_description="Updated through the admin API",
+            )
+        },
         format="json",
     )
     assert product_patch.status_code == 200
-    assert product_patch.json()["data"]["short_description"] == "Updated through the admin API"
+    assert product_patch.json()["data"]["translations"][0]["short_description"] == (
+        "Updated through the admin API"
+    )
     product_list = admin_api.get("/api/v1/admin/membership-products")
     product_detail = admin_api.get(f"/api/v1/admin/membership-products/{product['id']}")
     assert "category" not in product_list.json()["data"][0]
@@ -1293,7 +1672,7 @@ def test_admin_api_full_membership_workflow(admin_api, active_user):
     package_response = admin_api.post(
         "/api/v1/admin/membership-packages",
         {
-            "name": "Six month CSA",
+            "translations": package_translations(),
             "upfront_price": "6000000",
             "duration_months": 6,
             "quota_policy": "rollover",
@@ -1305,11 +1684,16 @@ def test_admin_api_full_membership_workflow(admin_api, active_user):
     package = package_response.json()["data"]
     package_patch = admin_api.patch(
         f"/api/v1/admin/membership-packages/{package['id']}",
-        {"description": "Updated package"},
+        {
+            "translations": package_translations(
+                vi_description="Gói đã cập nhật",
+                en_description="Updated package",
+            )
+        },
         format="json",
     )
     assert package_patch.status_code == 200
-    assert package_patch.json()["data"]["description"] == "Updated package"
+    assert package_patch.json()["data"]["translations"][0]["description"] == "Updated package"
 
     invalid_request = admin_api.post(
         "/api/v1/memberships/requests",
@@ -1420,9 +1804,7 @@ def test_self_api_authorization_ownership_and_repeated_submit(
 
 @pytest.mark.django_db
 def test_admin_permission_crud_actions_and_usage_pagination(admin_api, active_user, access_token):
-    assert (
-        admin_api.get("/api/v1/admin/membership-categories").status_code == 404
-    )
+    assert admin_api.get("/api/v1/admin/membership-categories").status_code == 404
 
     rejected_legacy_contract = admin_api.post(
         "/api/v1/admin/membership-products",
@@ -1437,7 +1819,8 @@ def test_admin_permission_crud_actions_and_usage_pagination(admin_api, active_us
     )
     assert rejected_legacy_contract.status_code == 400
     assert rejected_legacy_contract.json() == {
-        "category_id": "This field is not allowed."
+        "category_id": "This field is not allowed.",
+        "name": "This field is not allowed.",
     }
 
     membership, product, _request = activate_membership(active_user, quota=100)

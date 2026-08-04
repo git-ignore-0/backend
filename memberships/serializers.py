@@ -4,6 +4,7 @@ from django.utils import timezone
 from rest_framework import serializers
 
 from memberships.models import (
+    MembershipContentLocale,
     MembershipRequestStatus,
     Product,
     QuotaPolicy,
@@ -23,7 +24,18 @@ class StrictSerializer(serializers.Serializer):
         return super().to_internal_value(data)
 
 
-class PageQuerySerializer(serializers.Serializer):
+class PageQuerySerializer(StrictSerializer):
+    page = serializers.IntegerField(min_value=1, max_value=MAX_PAGE, default=1)
+
+
+class LocaleQuerySerializer(StrictSerializer):
+    locale = serializers.ChoiceField(
+        choices=MembershipContentLocale.choices,
+        default=MembershipContentLocale.VI,
+    )
+
+
+class LocalePageQuerySerializer(LocaleQuerySerializer):
     page = serializers.IntegerField(min_value=1, max_value=MAX_PAGE, default=1)
 
 
@@ -32,28 +44,75 @@ class AdminProductQuerySerializer(PageQuerySerializer):
     active = serializers.BooleanField(required=False)
 
 
-class AdminRequestQuerySerializer(PageQuerySerializer):
+class AdminPackageQuerySerializer(AdminProductQuerySerializer):
+    pass
+
+
+class PublicPackageQuerySerializer(LocalePageQuerySerializer):
+    pass
+
+
+class AdminRequestQuerySerializer(LocalePageQuerySerializer):
     status = serializers.ChoiceField(
         choices=MembershipRequestStatus.choices, allow_blank=True, default=""
     )
     search = serializers.CharField(max_length=254, allow_blank=True, default="")
 
 
-class AdminMembershipQuerySerializer(PageQuerySerializer):
+class AdminMembershipQuerySerializer(LocalePageQuerySerializer):
     search = serializers.CharField(max_length=254, allow_blank=True, default="")
 
 
-class ProductWriteSerializer(StrictSerializer):
+class ProductTranslationWriteSerializer(StrictSerializer):
+    locale = serializers.ChoiceField(choices=MembershipContentLocale.choices)
     name = serializers.CharField(max_length=200, trim_whitespace=True)
     short_description = serializers.CharField(
         max_length=800, allow_blank=True, required=False, default="", trim_whitespace=True
     )
+
+
+def validate_bilingual_translations(value):
+    locales = [item["locale"] for item in value]
+    if len(locales) != len(set(locales)):
+        raise serializers.ValidationError("Locale must be unique.")
+    if set(locales) != set(MembershipContentLocale.values):
+        raise serializers.ValidationError("Vietnamese and English translations are required.")
+    return value
+
+
+class ProductWriteSerializer(StrictSerializer):
+    translations = ProductTranslationWriteSerializer(many=True, required=False)
     unit_size = serializers.DecimalField(
         max_digits=10, decimal_places=3, min_value=Decimal("0.001")
     )
     unit_label_vi = serializers.CharField(max_length=40, trim_whitespace=True)
     unit_label_en = serializers.CharField(max_length=40, trim_whitespace=True)
     is_active = serializers.BooleanField(required=False, default=True)
+
+    def validate_translations(self, value):
+        return validate_bilingual_translations(value)
+
+    def validate(self, attrs):
+        translations = attrs.get("translations")
+        existing_locales = (
+            set(self.instance.translations.values_list("locale", flat=True))
+            if self.instance is not None
+            else set()
+        )
+        if translations is None and existing_locales != set(MembershipContentLocale.values):
+            raise serializers.ValidationError(
+                {"translations": "Vietnamese and English translations are required."}
+            )
+        return attrs
+
+
+class PackageTranslationWriteSerializer(StrictSerializer):
+    locale = serializers.ChoiceField(choices=MembershipContentLocale.choices)
+    name = serializers.CharField(max_length=200, trim_whitespace=True)
+    description = serializers.CharField(
+        allow_blank=True, required=False, default="", trim_whitespace=True
+    )
+
 
 class PackageItemWriteSerializer(StrictSerializer):
     product_id = serializers.UUIDField()
@@ -67,10 +126,7 @@ class PackageItemWriteSerializer(StrictSerializer):
 
 
 class PackageWriteSerializer(StrictSerializer):
-    name = serializers.CharField(max_length=200, trim_whitespace=True)
-    description = serializers.CharField(
-        allow_blank=True, required=False, default="", trim_whitespace=True
-    )
+    translations = PackageTranslationWriteSerializer(many=True, required=False)
     upfront_price = serializers.DecimalField(
         max_digits=14, decimal_places=0, min_value=Decimal("1")
     )
@@ -78,6 +134,9 @@ class PackageWriteSerializer(StrictSerializer):
     quota_policy = serializers.ChoiceField(choices=QuotaPolicy.choices)
     is_active = serializers.BooleanField(required=False, default=True)
     items = PackageItemWriteSerializer(many=True, allow_empty=False)
+
+    def validate_translations(self, value):
+        return validate_bilingual_translations(value)
 
     def validate_items(self, value):
         products = [item["product_id"] for item in value]
@@ -87,6 +146,19 @@ class PackageWriteSerializer(StrictSerializer):
         if any(not product.is_active for product in products):
             raise serializers.ValidationError("Package items must use active products.")
         return value
+
+    def validate(self, attrs):
+        translations = attrs.get("translations")
+        existing_locales = (
+            set(self.instance.translations.values_list("locale", flat=True))
+            if self.instance is not None
+            else set()
+        )
+        if translations is None and existing_locales != set(MembershipContentLocale.values):
+            raise serializers.ValidationError(
+                {"translations": "Vietnamese and English translations are required."}
+            )
+        return attrs
 
 
 class PaymentSettingsWriteSerializer(StrictSerializer):

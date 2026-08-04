@@ -53,6 +53,11 @@ class UsageOrderStatus(models.TextChoices):
     REVERSED = "reversed", "Reversed"
 
 
+class MembershipContentLocale(models.TextChoices):
+    VI = "vi", "Vietnamese"
+    EN = "en", "English"
+
+
 class Product(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=200)
@@ -70,6 +75,25 @@ class Product(models.Model):
             models.CheckConstraint(
                 condition=Q(unit_size__gt=0), name="memberships_product_unit_size_positive"
             )
+        ]
+
+
+class ProductTranslation(models.Model):
+    product = models.ForeignKey(Product, related_name="translations", on_delete=models.CASCADE)
+    locale = models.CharField(max_length=2, choices=MembershipContentLocale.choices)
+    name = models.CharField(max_length=200)
+    short_description = models.CharField(max_length=800, blank=True)
+
+    class Meta:
+        ordering = ["locale", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["product", "locale"], name="memberships_product_translation_unique"
+            ),
+            models.CheckConstraint(
+                condition=Q(locale__in=MembershipContentLocale.values),
+                name="memberships_product_translation_locale_valid",
+            ),
         ]
 
 
@@ -96,6 +120,27 @@ class MembershipPackage(models.Model):
             models.CheckConstraint(
                 condition=Q(quota_policy__in=QuotaPolicy.values),
                 name="memberships_package_policy_valid",
+            ),
+        ]
+
+
+class MembershipPackageTranslation(models.Model):
+    package = models.ForeignKey(
+        MembershipPackage, related_name="translations", on_delete=models.CASCADE
+    )
+    locale = models.CharField(max_length=2, choices=MembershipContentLocale.choices)
+    name = models.CharField(max_length=200)
+    description = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["locale", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["package", "locale"], name="memberships_package_translation_unique"
+            ),
+            models.CheckConstraint(
+                condition=Q(locale__in=MembershipContentLocale.values),
+                name="memberships_package_translation_locale_valid",
             ),
         ]
 
@@ -149,6 +194,10 @@ class MembershipRequest(models.Model):
     )
     package_name_snapshot = models.CharField(max_length=200)
     package_description_snapshot = models.TextField(blank=True)
+    package_name_vi_snapshot = models.CharField(max_length=200, blank=True, default="")
+    package_name_en_snapshot = models.CharField(max_length=200, blank=True, default="")
+    package_description_vi_snapshot = models.TextField(blank=True, default="")
+    package_description_en_snapshot = models.TextField(blank=True, default="")
     upfront_price_snapshot = models.DecimalField(max_digits=14, decimal_places=0)
     duration_months_snapshot = models.PositiveSmallIntegerField()
     quota_policy_snapshot = models.CharField(max_length=16, choices=QuotaPolicy.choices)
@@ -274,6 +323,8 @@ class MembershipRequestItemSnapshot(models.Model):
         Product, related_name="membership_request_snapshots", on_delete=models.PROTECT
     )
     product_name = models.CharField(max_length=200)
+    product_name_vi_snapshot = models.CharField(max_length=200, blank=True, default="")
+    product_name_en_snapshot = models.CharField(max_length=200, blank=True, default="")
     unit_size = models.DecimalField(max_digits=10, decimal_places=3)
     unit_label_vi = models.CharField(max_length=40)
     unit_label_en = models.CharField(max_length=40)
@@ -308,6 +359,10 @@ class Membership(models.Model):
     )
     package_name_snapshot = models.CharField(max_length=200)
     package_description_snapshot = models.TextField(blank=True)
+    package_name_vi_snapshot = models.CharField(max_length=200, blank=True, default="")
+    package_name_en_snapshot = models.CharField(max_length=200, blank=True, default="")
+    package_description_vi_snapshot = models.TextField(blank=True, default="")
+    package_description_en_snapshot = models.TextField(blank=True, default="")
     upfront_price_snapshot = models.DecimalField(max_digits=14, decimal_places=0)
     duration_months_snapshot = models.PositiveSmallIntegerField()
     quota_policy_snapshot = models.CharField(max_length=16, choices=QuotaPolicy.choices)
@@ -360,6 +415,8 @@ class MembershipProductSnapshot(models.Model):
         Product, related_name="membership_snapshots", on_delete=models.PROTECT
     )
     product_name = models.CharField(max_length=200)
+    product_name_vi_snapshot = models.CharField(max_length=200, blank=True, default="")
+    product_name_en_snapshot = models.CharField(max_length=200, blank=True, default="")
     unit_size = models.DecimalField(max_digits=10, decimal_places=3)
     unit_label_vi = models.CharField(max_length=40)
     unit_label_en = models.CharField(max_length=40)
