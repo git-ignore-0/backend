@@ -203,6 +203,7 @@ def membership_payload(item, *, include_quota=False, include_user=False):
         "id": str(item.pk),
         "user_id": str(item.user_id),
         "request_id": str(item.request_id),
+        "package_id": str(item.package_id),
         "status": item.status,
         "package_name": item.package_name_snapshot,
         "package_description": item.package_description_snapshot,
@@ -414,7 +415,12 @@ class SelfMembershipView(APIView):
 
     @transaction.atomic
     def get(self, request):
-        item = membership_queryset().filter(user=request.user, current_slot=True).first()
+        item = (
+            membership_queryset()
+            .select_for_update()
+            .filter(user=request.user, current_slot=True)
+            .first()
+        )
         if not item:
             return no_store(Response({"data": None}))
         ensure_due_cycles(item)
@@ -429,7 +435,12 @@ class SelfQuotaView(APIView):
 
     @transaction.atomic
     def get(self, request):
-        item = membership_queryset().filter(user=request.user, current_slot=True).first()
+        item = (
+            membership_queryset()
+            .select_for_update()
+            .filter(user=request.user, current_slot=True)
+            .first()
+        )
         if not item:
             return no_store(Response({"data": None}))
         ensure_due_cycles(item)

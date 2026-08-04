@@ -183,6 +183,29 @@ def admin_api(active_user, access_token):
 
 
 @pytest.mark.django_db
+def test_current_membership_is_null_without_a_membership(admin_api):
+    response = admin_api.get("/api/v1/memberships/current")
+
+    assert response.status_code == 200
+    assert response.json()["data"] is None
+
+
+@pytest.mark.django_db
+def test_current_active_membership_returns_database_package_id(admin_api, active_user):
+    membership, product, _request = activate_membership(active_user)
+
+    response = admin_api.get("/api/v1/memberships/current")
+    quota_response = admin_api.get("/api/v1/memberships/quota")
+
+    assert response.status_code == 200
+    assert response.json()["data"]["status"] == MembershipStatus.ACTIVE
+    assert response.json()["data"]["package_id"] == str(membership.package_id)
+    assert quota_response.status_code == 200
+    assert quota_response.json()["data"]["membership_id"] == str(membership.pk)
+    assert quota_response.json()["data"]["products"][0]["product_id"] == str(product.pk)
+
+
+@pytest.mark.django_db
 def test_consultation_and_direct_transfer_requests_snapshot_authoritative_data(active_user):
     ensure_phone(active_user)
     package, product = create_package()
@@ -476,6 +499,21 @@ def test_expire_and_rollover_cycles_follow_start_anniversary():
 
 
 @pytest.mark.django_db
+def test_ensure_due_cycles_is_idempotent(active_user):
+    membership, _product, _request = activate_membership(active_user)
+    MembershipCycleQuota.objects.filter(cycle__membership=membership).delete()
+    membership.cycles.all().delete()
+
+    first_created = ensure_due_cycles(membership)
+    second_created = ensure_due_cycles(membership)
+
+    assert [cycle.sequence for cycle in first_created] == [1]
+    assert second_created == []
+    assert list(membership.cycles.values_list("sequence", flat=True)) == [1]
+    assert MembershipCycleQuota.objects.filter(cycle__membership=membership).count() == 1
+
+
+@pytest.mark.django_db
 def test_usage_deducts_exact_product_never_negative_and_undo_restores_once(active_user):
     membership, product, _request = activate_membership(
         active_user, policy=QuotaPolicy.ROLLOVER, quota=3
@@ -596,6 +634,7 @@ def test_future_membership_is_visible_without_quota_then_becomes_active_and_ende
     current_response = admin_api.get("/api/v1/memberships/current")
     assert current_response.status_code == 200
     assert current_response.json()["data"]["status"] == MembershipStatus.SCHEDULED
+    assert current_response.json()["data"]["package_id"] == str(package.pk)
     assert current_response.json()["data"]["start_date"] == start_date.isoformat()
     assert current_response.json()["data"]["end_date"] == membership.end_date.isoformat()
     assert "user" not in current_response.json()["data"]
@@ -622,6 +661,7 @@ def test_future_membership_is_visible_without_quota_then_becomes_active_and_ende
     membership = sync_membership_status(membership, as_of=membership.end_date)
     assert membership.status == MembershipStatus.ENDED
     assert membership.current_slot is None
+    assert admin_api.get("/api/v1/memberships/current").json()["data"] is None
 
 
 @pytest.mark.django_db
@@ -1564,6 +1604,45 @@ def test_concurrent_usage_cannot_overdraw_quota():
     assert sorted(outcomes) == ["created", "insufficient"]
     quota = MembershipCycleQuota.objects.get(cycle__membership=membership)
     assert quota.remaining_units == 1
+
+
+@pytest.mark.skipif(
+    not connection.features.has_select_for_update,
+    reason="SQLite does not provide row-level SELECT FOR UPDATE semantics",
+)
+@pytest.mark.django_db(transaction=True)
+def test_concurrent_current_and_quota_views_initialize_cycles_once(active_user, access_token):
+    membership, _product, _request = activate_membership(active_user)
+    MembershipCycleQuota.objects.filter(cycle__membership=membership).delete()
+    membership.cycles.all().delete()
+    barrier = threading.Barrier(3)
+    outcomes = []
+
+    def load(path):
+        close_old_connections()
+        try:
+            barrier.wait()
+            response = bearer_client(access_token).get(path)
+            outcomes.append((path, response.status_code))
+        finally:
+            close_old_connections()
+
+    threads = [
+        threading.Thread(target=load, args=(path,))
+        for path in ("/api/v1/memberships/current", "/api/v1/memberships/quota")
+    ]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(outcomes) == [
+        ("/api/v1/memberships/current", 200),
+        ("/api/v1/memberships/quota", 200),
+    ]
+    assert list(membership.cycles.values_list("sequence", flat=True)) == [1]
+    assert MembershipCycleQuota.objects.filter(cycle__membership=membership).count() == 1
 
 
 def test_add_months_clamps_anniversary_day():
