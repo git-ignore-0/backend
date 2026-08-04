@@ -5,37 +5,23 @@ from datetime import date, timedelta
 from decimal import Decimal
 
 import pytest
-import requests
 from allauth.account.models import EmailAddress
-from django.apps import apps
 from django.contrib.auth.models import Group
-from django.core.cache import cache
 from django.db import IntegrityError, close_old_connections, connection, transaction
 from django.db.migrations.executor import MigrationExecutor
+from django.db.models.deletion import ProtectedError
 from django.utils import timezone
-from oauth2_provider.models import AccessToken
 from rest_framework.test import APIClient
 
 from identity.models import AccountStatus, User
 from members.models import MemberProfile
-from memberships.banks import (
-    FRESH_BANKS_CACHE_KEY,
-    STALE_BANKS_CACHE_KEY,
-    UNAVAILABLE_BANKS_CACHE_KEY,
-    BankDirectoryUnavailable,
-    get_transfer_banks,
-)
 from memberships.models import (
-    OPEN_REQUEST_STATUSES,
     Membership,
     MembershipCycleQuota,
     MembershipPackage,
     MembershipPackageItem,
+    MembershipPackagePriceOption,
     MembershipPackageTranslation,
-    MembershipPaymentSettings,
-    MembershipRequest,
-    MembershipRequestEventAction,
-    MembershipRequestStatus,
     MembershipStatus,
     MembershipUsageAllocation,
     MembershipUsageOrder,
@@ -45,37 +31,24 @@ from memberships.models import (
     QuotaPolicy,
     UsageOrderStatus,
 )
+from memberships.pricing import MAX_POSITIVE_BIG_INTEGER
 from memberships.services import (
     ActiveMembershipExists,
-    DirectTransferDisabled,
+    DuplicateFarmbriteOrderReference,
     InsufficientQuota,
-    OpenRequestExists,
-    PaymentSettingsInvalid,
+    PriceOptionTotalInvalid,
+    PriceOptionUnavailable,
     ProductNotInMembership,
-    RequestTransitionConflict,
     StartDateInPast,
     UsageIntegrityConflict,
     UsageUndoConflict,
     add_months,
-    approve_request,
-    create_membership_request,
+    assign_membership,
     create_usage_order,
     ensure_due_cycles,
-    issue_payment_instruction,
-    mark_contacted,
-    reject_request,
-    return_to_payment_pending,
-    submit_payment,
     sync_membership_status,
     undo_usage_order,
 )
-
-
-@pytest.fixture(autouse=True)
-def clear_membership_bank_cache():
-    cache.clear()
-    yield
-    cache.clear()
 
 
 def bearer_client(token):
@@ -97,25 +70,6 @@ def create_active_user(email, *, phone="0901234567"):
     return user
 
 
-def create_package(*, policy=QuotaPolicy.EXPIRE, quota=2, price=Decimal("6000000")):
-    product = Product.objects.create(
-        name="Seasonal basket",
-        short_description="Fresh vegetables",
-        unit_size=Decimal("0.500"),
-        unit_label_vi="kg",
-        unit_label_en="kg",
-    )
-    package = MembershipPackage.objects.create(
-        name="Six month membership",
-        description="One delivery per cycle",
-        upfront_price=price,
-        duration_months=6,
-        quota_policy=policy,
-    )
-    MembershipPackageItem.objects.create(package=package, product=product, quota_units=quota)
-    return package, product
-
-
 def product_translations(
     *,
     vi_name="Giỏ rau theo mùa",
@@ -131,8 +85,8 @@ def product_translations(
 
 def package_translations(
     *,
-    vi_name="Gói CSA sáu tháng",
-    en_name="Six month CSA",
+    vi_name="Gói CSA",
+    en_name="CSA package",
     vi_description="Giao mỗi chu kỳ",
     en_description="One delivery per cycle",
 ):
@@ -142,65 +96,75 @@ def package_translations(
     ]
 
 
-def cache_transfer_banks():
-    banks = [
-        {
-            "bin": "970436",
-            "name": "Ngân hàng TMCP Ngoại Thương Việt Nam",
-            "short_name": "Vietcombank",
-            "code": "VCB",
-        }
-    ]
-    cache.set(FRESH_BANKS_CACHE_KEY, banks, timeout=86400)
-    cache.set(STALE_BANKS_CACHE_KEY, banks, timeout=None)
-    return banks
-
-
-def configure_payment_settings(actor=None, *, enabled=True):
-    cache_transfer_banks()
-    item, _created = MembershipPaymentSettings.objects.update_or_create(
-        key="default",
-        defaults={
-            "direct_transfer_enabled": enabled,
-            "bank_bin": "970436",
-            "bank_name": "Ngân hàng TMCP Ngoại Thương Việt Nam",
-            "account_number": "0123456789",
-            "account_name": "NATURAL FARMING VIETNAM",
-            "updated_by": actor,
-        },
+def create_package(
+    *,
+    policy=QuotaPolicy.EXPIRE,
+    quota=2,
+    duration=6,
+    monthly_price=1_000_000,
+):
+    product = Product.objects.create(
+        name="Giỏ rau theo mùa",
+        short_description="Rau tươi",
+        unit_size=Decimal("0.500"),
+        unit_label_vi="kg",
+        unit_label_en="kg",
     )
-    return item
-
-
-def ensure_phone(user, phone="0901234567"):
-    MemberProfile.objects.update_or_create(user=user, defaults={"phone_number": phone})
-
-
-def activate_membership(user, *, policy=QuotaPolicy.EXPIRE, quota=2, start_date=None):
-    ensure_phone(user)
-    package, product = create_package(policy=policy, quota=quota)
-    configure_payment_settings()
-    request, instruction = create_membership_request(
-        user=user, package_id=package.pk, flow="direct_transfer"
+    ProductTranslation.objects.bulk_create(
+        [ProductTranslation(product=product, **item) for item in product_translations()]
     )
-    assert instruction is not None
-    submit_payment(request_id=request.pk, user=user)
-    requested_start = start_date or timezone.localdate()
-    approval_start = max(requested_start, timezone.localdate())
-    membership, created = approve_request(
-        request_id=request.pk,
-        actor=user,
-        start_date=approval_start,
+    package = MembershipPackage.objects.create(
+        name="Gói CSA",
+        description="Giao mỗi chu kỳ",
+        quota_policy=policy,
     )
-    assert created
-    if requested_start < approval_start:
-        MembershipCycleQuota.objects.filter(cycle__membership=membership).delete()
-        membership.cycles.all().delete()
-        membership.start_date = requested_start
-        membership.end_date = add_months(requested_start, package.duration_months)
-        membership.status = MembershipStatus.ACTIVE
-        membership.save(update_fields=["start_date", "end_date", "status", "updated_at"])
-    return membership, product, request
+    MembershipPackageTranslation.objects.bulk_create(
+        [MembershipPackageTranslation(package=package, **item) for item in package_translations()]
+    )
+    MembershipPackageItem.objects.create(package=package, product=product, quota_units=quota)
+    option = MembershipPackagePriceOption.objects.create(
+        package=package,
+        duration_months=duration,
+        monthly_price_vnd=monthly_price,
+        is_active=True,
+        sort_order=0,
+    )
+    return package, product, option
+
+
+def assign(
+    user,
+    *,
+    package=None,
+    option=None,
+    actor=None,
+    start_date=None,
+    reference=None,
+):
+    if package is None:
+        package, product, option = create_package()
+    else:
+        product = package.items.get().product
+    membership = assign_membership(
+        user_id=user.pk,
+        package_id=package.pk,
+        price_option_id=option.pk,
+        start_date=start_date or timezone.localdate(),
+        farmbrite_order_reference=reference or f"FB-{uuid.uuid4()}",
+        actor=actor or user,
+    )
+    return membership, product, option
+
+
+def assign_with_past_start(user, *, policy=QuotaPolicy.EXPIRE, quota=2, months_ago=1):
+    package, product, option = create_package(policy=policy, quota=quota)
+    membership, _product, _option = assign(user, package=package, option=option)
+    MembershipCycleQuota.objects.filter(cycle__membership=membership).delete()
+    membership.cycles.all().delete()
+    membership.start_date = add_months(timezone.localdate(), -months_ago)
+    membership.end_date = add_months(membership.start_date, option.duration_months)
+    membership.save(update_fields=["start_date", "end_date", "updated_at"])
+    return membership, product, option
 
 
 @pytest.fixture
@@ -212,342 +176,555 @@ def admin_api(active_user, access_token):
     return bearer_client(access_token)
 
 
+def product_api_payload():
+    return {
+        "translations": product_translations(),
+        "unit_size": "0.500",
+        "unit_label_vi": "kg",
+        "unit_label_en": "kg",
+    }
+
+
+def package_api_payload(product_id, *, options=None):
+    return {
+        "translations": package_translations(),
+        "quota_policy": "expire",
+        "items": [{"product_id": str(product_id), "quota_units": 2}],
+        "price_options": options
+        or [
+            {
+                "duration_months": 6,
+                "monthly_price_vnd": 1_000_000,
+                "is_active": True,
+                "sort_order": 0,
+            }
+        ],
+    }
+
+
 @pytest.mark.django_db
-def test_current_membership_is_null_without_a_membership(admin_api):
-    response = admin_api.get("/api/v1/memberships/current")
-
-    assert response.status_code == 200
-    assert response.json()["data"] is None
-
-
-@pytest.mark.django_db
-def test_current_active_membership_returns_database_package_id(admin_api, active_user):
-    membership, product, _request = activate_membership(active_user)
-
-    response = admin_api.get("/api/v1/memberships/current")
-    quota_response = admin_api.get("/api/v1/memberships/quota")
-
-    assert response.status_code == 200
-    assert response.json()["data"]["status"] == MembershipStatus.ACTIVE
-    assert response.json()["data"]["package_id"] == str(membership.package_id)
-    assert quota_response.status_code == 200
-    assert quota_response.json()["data"]["membership_id"] == str(membership.pk)
-    assert quota_response.json()["data"]["products"][0]["product_id"] == str(product.pk)
-
-
-@pytest.mark.django_db
-def test_consultation_and_direct_transfer_requests_snapshot_authoritative_data(active_user):
-    ensure_phone(active_user)
-    package, product = create_package()
-    consultation, instruction = create_membership_request(
-        user=active_user, package_id=package.pk, flow="consultation"
+def test_admin_package_requires_an_active_price_option_and_rejects_unknown_total(admin_api):
+    product = admin_api.post(
+        "/api/v1/admin/membership-products", product_api_payload(), format="json"
+    ).json()["data"]
+    missing = package_api_payload(product["id"])
+    missing.pop("price_options")
+    response = admin_api.post(
+        "/api/v1/admin/membership-packages", missing, format="json"
     )
-    assert consultation.status == MembershipRequestStatus.CONSULTATION_REQUESTED
-    assert instruction is None
-    assert consultation.item_snapshots.get().product_id == product.pk
+    assert response.status_code == 400
+    assert "price_options" in response.json()
 
-    mark_contacted(request_id=consultation.pk, actor=active_user)
-    with pytest.raises(PaymentSettingsInvalid):
-        issue_payment_instruction(request_id=consultation.pk, actor=active_user)
-    configure_payment_settings(active_user)
-    consultation, instruction = issue_payment_instruction(
-        request_id=consultation.pk, actor=active_user
+    inactive = package_api_payload(
+        product["id"],
+        options=[
+            {
+                "duration_months": 6,
+                "monthly_price_vnd": 1_000_000,
+                "is_active": False,
+            }
+        ],
     )
-    assert consultation.status == MembershipRequestStatus.PAYMENT_PENDING
-    assert instruction.phone_snapshot == "0901234567"
-    assert instruction.transfer_content == f"0901234567-{consultation.short_code}"
-    assert instruction.amount == Decimal("6000000")
+    response = admin_api.post(
+        "/api/v1/admin/membership-packages", inactive, format="json"
+    )
+    assert response.status_code == 400
+
+    forged_total = package_api_payload(product["id"])
+    forged_total["price_options"][0]["total_price_vnd"] = 1
+    response = admin_api.post(
+        "/api/v1/admin/membership-packages", forged_total, format="json"
+    )
+    assert response.status_code == 400
+    assert response.json()["price_options"][0]["total_price_vnd"] == (
+        "This field is not allowed."
+    )
 
 
 @pytest.mark.django_db
-def test_direct_transfer_is_fail_closed_while_consultation_remains_available(active_user):
-    ensure_phone(active_user)
-    package, _product = create_package()
-    consultation, instruction = create_membership_request(
-        user=active_user,
-        package_id=package.pk,
-        flow="consultation",
+def test_active_package_duration_is_unique_and_total_is_computed_by_backend(admin_api):
+    product_id = admin_api.post(
+        "/api/v1/admin/membership-products", product_api_payload(), format="json"
+    ).json()["data"]["id"]
+    duplicate = package_api_payload(
+        product_id,
+        options=[
+            {"duration_months": 3, "monthly_price_vnd": 400_000},
+            {"duration_months": 3, "monthly_price_vnd": 500_000},
+        ],
     )
-    assert consultation.status == MembershipRequestStatus.CONSULTATION_REQUESTED
-    assert instruction is None
+    response = admin_api.post(
+        "/api/v1/admin/membership-packages", duplicate, format="json"
+    )
+    assert response.status_code == 400
+    assert "price_options" in response.json()
 
-    other_user = create_active_user("direct-disabled@example.com")
-    with pytest.raises(DirectTransferDisabled):
-        create_membership_request(
-            user=other_user,
-            package_id=package.pk,
-            flow="direct_transfer",
+    valid = package_api_payload(
+        product_id,
+        options=[
+            {
+                "duration_months": 3,
+                "monthly_price_vnd": 400_001,
+                "is_active": True,
+                "sort_order": 2,
+            }
+        ],
+    )
+    response = admin_api.post(
+        "/api/v1/admin/membership-packages", valid, format="json"
+    )
+    assert response.status_code == 201
+    option = response.json()["data"]["price_options"][0]
+    assert option["monthly_price_vnd"] == "400001"
+    assert option["total_price_vnd"] == "1200003"
+
+    package = MembershipPackage.objects.get(pk=response.json()["data"]["id"])
+    with pytest.raises(IntegrityError), transaction.atomic():
+        MembershipPackagePriceOption.objects.create(
+            package=package, duration_months=3, monthly_price_vnd=1
         )
-    assert not MembershipRequest.objects.filter(user=other_user).exists()
 
-    configure_payment_settings(enabled=False)
-    third_user = create_active_user("direct-still-disabled@example.com")
-    with pytest.raises(DirectTransferDisabled):
-        create_membership_request(
-            user=third_user,
-            package_id=package.pk,
-            flow="direct_transfer",
-        )
-    assert not MembershipRequest.objects.filter(user=third_user).exists()
+    historical = MembershipPackagePriceOption.objects.create(
+        package=package,
+        duration_months=3,
+        monthly_price_vnd=300_000,
+        is_active=False,
+    )
+    assert historical.active_duration_key is None
 
 
 @pytest.mark.django_db
-def test_direct_transfer_requires_valid_enabled_payment_settings(active_user):
-    ensure_phone(active_user)
-    package, _product = create_package()
-    MembershipPaymentSettings.objects.create(
-        direct_transfer_enabled=True,
-        bank_bin="",
-        bank_name="",
-        account_number="",
-        account_name="",
+def test_last_active_option_cannot_be_deactivated_or_removed(admin_api):
+    package, _product, option = create_package()
+    response = admin_api.patch(
+        f"/api/v1/admin/membership-packages/{package.pk}",
+        {
+            "price_options": [
+                {
+                    "id": str(option.pk),
+                    "duration_months": option.duration_months,
+                    "monthly_price_vnd": option.monthly_price_vnd,
+                    "is_active": False,
+                    "sort_order": 0,
+                }
+            ]
+        },
+        format="json",
     )
-    with pytest.raises(PaymentSettingsInvalid):
-        create_membership_request(user=active_user, package_id=package.pk, flow="direct_transfer")
-    assert not MembershipRequest.objects.filter(user=active_user).exists()
+    assert response.status_code == 400
+    option.refresh_from_db()
+    assert option.is_active is True
 
-    configure_payment_settings(enabled=True)
-    settings = MembershipPaymentSettings.objects.get()
-    settings.bank_bin = "999999"
-    settings.bank_name = "Fake bank"
-    settings.account_number = "0123456789"
-    settings.account_name = "NATURAL FARMING VIETNAM"
-    settings.save()
-    with pytest.raises(PaymentSettingsInvalid):
-        create_membership_request(user=active_user, package_id=package.pk, flow="direct_transfer")
-    assert not MembershipRequest.objects.filter(user=active_user).exists()
-
-    configure_payment_settings(enabled=True)
-    request, instruction = create_membership_request(
-        user=active_user,
-        package_id=package.pk,
-        flow="direct_transfer",
+    response = admin_api.patch(
+        f"/api/v1/admin/membership-packages/{package.pk}",
+        {"price_options": []},
+        format="json",
     )
-    assert request.status == MembershipRequestStatus.PAYMENT_PENDING
-    assert instruction is not None
-    assert instruction.bank_bin == "970436"
-    assert instruction.bank_name == "Ngân hàng TMCP Ngoại Thương Việt Nam"
+    assert response.status_code == 400
+    assert package.price_options.filter(is_active=True).count() == 1
 
 
 @pytest.mark.django_db
-def test_self_request_requires_valid_phone_and_snapshots_form_phone(
-    access_token, active_user, admin_api
-):
-    package, _product = create_package()
-    client = bearer_client(access_token)
-    base_payload = {"package_id": str(package.pk), "flow": "consultation"}
+def test_used_price_option_price_and_duration_are_immutable(active_user, admin_api):
+    package, _product, option = create_package()
+    assign(
+        active_user, package=package, option=option, reference="FB-USED-OPTION"
+    )
+    original = (option.duration_months, option.monthly_price_vnd)
 
-    missing = client.post("/api/v1/memberships/requests", base_payload, format="json")
-    assert missing.status_code == 400
-    for phone in ("abc", "1234567", "+84 912 abc"):
-        response = client.post(
-            "/api/v1/memberships/requests",
-            {**base_payload, "phone": phone},
+    for changes in (
+        {"duration_months": 12},
+        {"monthly_price_vnd": 900_000},
+    ):
+        response = admin_api.patch(
+            f"/api/v1/admin/membership-packages/{package.pk}",
+            {
+                "price_options": [
+                    {
+                        "id": str(option.pk),
+                        "duration_months": changes.get(
+                            "duration_months", option.duration_months
+                        ),
+                        "monthly_price_vnd": changes.get(
+                            "monthly_price_vnd", option.monthly_price_vnd
+                        ),
+                        "is_active": True,
+                        "sort_order": 0,
+                    }
+                ]
+            },
             format="json",
         )
         assert response.status_code == 400
-        assert "phone" in response.json()
-
-    response = client.post(
-        "/api/v1/memberships/requests",
-        {**base_payload, "phone": "+84 912 345 678"},
-        format="json",
-    )
-    assert response.status_code == 201
-    request_id = response.json()["data"]["id"]
-    item = MembershipRequest.objects.get(pk=request_id)
-    assert item.phone_snapshot == "+84 912 345 678"
-    assert not MemberProfile.objects.filter(user=active_user).exists()
-    detail = admin_api.get(f"/api/v1/admin/membership-requests/{request_id}")
-    assert detail.status_code == 200
-    assert detail.json()["data"]["user"]["phone"] == "+84 912 345 678"
+        option.refresh_from_db()
+        assert (option.duration_months, option.monthly_price_vnd) == original
 
 
 @pytest.mark.django_db
-def test_package_changes_cannot_change_request_or_membership_snapshot(active_user):
-    membership, product, request = activate_membership(active_user)
-    package = request.package
-    package.name = "Changed package"
-    package.upfront_price = 1
-    package.save()
-    product.name = "Changed product"
-    product.unit_size = Decimal("9.000")
-    product.save()
+def test_used_option_can_deactivate_then_new_price_can_reuse_duration(
+    active_user, admin_api
+):
+    package, _product, option = create_package()
+    membership, _product, _option = assign(
+        active_user, package=package, option=option, reference="FB-HISTORICAL-OPTION"
+    )
+    second = MembershipPackagePriceOption.objects.create(
+        package=package,
+        duration_months=12,
+        monthly_price_vnd=800_000,
+        is_active=True,
+        sort_order=1,
+    )
+    deactivate = admin_api.patch(
+        f"/api/v1/admin/membership-packages/{package.pk}",
+        {
+            "price_options": [
+                {
+                    "id": str(option.pk),
+                    "duration_months": 6,
+                    "monthly_price_vnd": 1_000_000,
+                    "is_active": False,
+                    "sort_order": 5,
+                },
+                {
+                    "id": str(second.pk),
+                    "duration_months": 12,
+                    "monthly_price_vnd": 800_000,
+                    "is_active": True,
+                    "sort_order": 1,
+                },
+            ]
+        },
+        format="json",
+    )
+    assert deactivate.status_code == 200
+    option.refresh_from_db()
+    assert option.is_active is False
+    assert option.active_duration_key is None
+    assert option.sort_order == 5
+
+    replace = admin_api.patch(
+        f"/api/v1/admin/membership-packages/{package.pk}",
+        {
+            "price_options": [
+                {
+                    "duration_months": 6,
+                    "monthly_price_vnd": 1_100_000,
+                    "is_active": True,
+                    "sort_order": 0,
+                },
+                {
+                    "id": str(option.pk),
+                    "duration_months": 6,
+                    "monthly_price_vnd": 1_000_000,
+                    "is_active": False,
+                    "sort_order": 5,
+                },
+                {
+                    "id": str(second.pk),
+                    "duration_months": 12,
+                    "monthly_price_vnd": 800_000,
+                    "is_active": True,
+                    "sort_order": 1,
+                },
+            ]
+        },
+        format="json",
+    )
+    assert replace.status_code == 200
+    replacement = package.price_options.get(
+        is_active=True, duration_months=6
+    )
+    assert replacement.monthly_price_vnd == 1_100_000
+    assert membership.price_option_id == option.pk
+    with pytest.raises(ProtectedError):
+        option.delete()
+
+
+@pytest.mark.django_db
+def test_public_catalog_localizes_and_only_exposes_active_safe_price_options(client):
+    package, product, option = create_package()
+    MembershipPackagePriceOption.objects.create(
+        package=package,
+        duration_months=6,
+        monthly_price_vnd=800_000,
+        is_active=False,
+        sort_order=1,
+    )
+    response = client.get("/api/v1/public/membership-packages?locale=en")
+    assert response.status_code == 200
+    data = response.json()["data"][0]
+    assert data["name"] == "CSA package"
+    assert data["items"][0]["product_id"] == str(product.pk)
+    assert data["price_options"] == [
+        {
+            "id": str(option.pk),
+            "duration_months": 6,
+            "monthly_price_vnd": "1000000",
+            "total_price_vnd": "6000000",
+        }
+    ]
+    assert "created_at" not in data
+    assert "is_active" not in data["price_options"][0]
+
+
+@pytest.mark.django_db
+def test_manual_assignment_snapshots_bilingual_catalog_price_and_products(active_user):
+    package, product, option = create_package(quota=3, duration=3, monthly_price=400_001)
+    membership, _product, _option = assign(
+        active_user,
+        package=package,
+        option=option,
+        reference="  FARM-ORDER-001  ",
+    )
     snapshot = membership.product_snapshots.get()
-    assert membership.package_name_snapshot == "Six month membership"
-    assert membership.upfront_price_snapshot == Decimal("6000000")
-    assert snapshot.product_name == "Seasonal basket"
+    assert membership.package_name_vi_snapshot == "Gói CSA"
+    assert membership.package_name_en_snapshot == "CSA package"
+    assert membership.package_description_vi_snapshot == "Giao mỗi chu kỳ"
+    assert membership.package_description_en_snapshot == "One delivery per cycle"
+    assert membership.duration_months_snapshot == 3
+    assert membership.monthly_price_vnd_snapshot == 400_001
+    assert membership.total_price_vnd_snapshot == 1_200_003
+    assert membership.farmbrite_order_reference == "FARM-ORDER-001"
+    assert membership.end_date == add_months(membership.start_date, 3)
+    assert snapshot.product_id == product.pk
+    assert snapshot.product_name_vi_snapshot == "Giỏ rau theo mùa"
+    assert snapshot.product_name_en_snapshot == "Seasonal basket"
+    assert snapshot.unit_size == Decimal("0.500")
+    assert snapshot.unit_label_vi == snapshot.unit_label_en == "kg"
+    assert snapshot.quota_units_per_cycle == 3
+
+
+@pytest.mark.django_db
+def test_assignment_rejects_wrong_or_inactive_option(active_user):
+    package, _product, _option = create_package()
+    other_package, _other_product, other_option = create_package()
+    with pytest.raises(PriceOptionUnavailable):
+        assign_membership(
+            user_id=active_user.pk,
+            package_id=package.pk,
+            price_option_id=other_option.pk,
+            start_date=timezone.localdate(),
+            farmbrite_order_reference="FB-WRONG-PACKAGE",
+            actor=active_user,
+        )
+    other_option.is_active = False
+    other_option.save(update_fields=["is_active", "updated_at"])
+    with pytest.raises(PriceOptionUnavailable):
+        assign_membership(
+            user_id=active_user.pk,
+            package_id=other_package.pk,
+            price_option_id=other_option.pk,
+            start_date=timezone.localdate(),
+            farmbrite_order_reference="FB-INACTIVE",
+            actor=active_user,
+        )
+
+
+@pytest.mark.django_db
+def test_price_total_overflow_returns_400_for_package_and_assignment(
+    admin_api, active_user
+):
+    product_id = admin_api.post(
+        "/api/v1/admin/membership-products", product_api_payload(), format="json"
+    ).json()["data"]["id"]
+    overflow_monthly = MAX_POSITIVE_BIG_INTEGER // 120 + 1
+    package_response = admin_api.post(
+        "/api/v1/admin/membership-packages",
+        package_api_payload(
+            product_id,
+            options=[
+                {
+                    "duration_months": 120,
+                    "monthly_price_vnd": overflow_monthly,
+                    "is_active": True,
+                }
+            ],
+        ),
+        format="json",
+    )
+    assert package_response.status_code == 400
+    assert "monthly_price_vnd" in package_response.json()["price_options"][0]
+
+    package, _product, option = create_package()
+    patch_response = admin_api.patch(
+        f"/api/v1/admin/membership-packages/{package.pk}",
+        {
+            "price_options": [
+                {
+                    "id": str(option.pk),
+                    "duration_months": 120,
+                    "monthly_price_vnd": overflow_monthly,
+                    "is_active": True,
+                    "sort_order": 0,
+                }
+            ]
+        },
+        format="json",
+    )
+    assert patch_response.status_code == 400
+    option.refresh_from_db()
+    assert (option.duration_months, option.monthly_price_vnd) == (6, 1_000_000)
+
+    overflow_option = MembershipPackagePriceOption.objects.create(
+        package=package,
+        duration_months=120,
+        monthly_price_vnd=overflow_monthly,
+        is_active=True,
+    )
+    response = admin_api.post(
+        "/api/v1/admin/memberships",
+        {
+            "user_id": str(active_user.pk),
+            "package_id": str(package.pk),
+            "price_option_id": str(overflow_option.pk),
+            "start_date": timezone.localdate().isoformat(),
+            "farmbrite_order_reference": "FB-OVERFLOW",
+        },
+        format="json",
+    )
+    assert response.status_code == 400
+    assert "price_option_id" in response.json()
+    assert not Membership.objects.filter(user=active_user).exists()
+
+    with pytest.raises(PriceOptionTotalInvalid):
+        assign_membership(
+            user_id=active_user.pk,
+            package_id=package.pk,
+            price_option_id=overflow_option.pk,
+            start_date=timezone.localdate(),
+            farmbrite_order_reference="FB-OVERFLOW-SERVICE",
+            actor=active_user,
+        )
+
+
+@pytest.mark.django_db
+def test_assignment_rejects_duplicate_reference_case_insensitively(active_user):
+    package, _product, option = create_package()
+    assign(active_user, package=package, option=option, reference="Farmbrite-ABC")
+    other = create_active_user("farmbrite-duplicate@example.com")
+    with pytest.raises(DuplicateFarmbriteOrderReference):
+        assign(other, package=package, option=option, reference=" farmbrite-abc ")
+
+
+@pytest.mark.django_db
+def test_assignment_dates_allow_today_and_future_but_reject_past(active_user):
+    package, _product, option = create_package(duration=3)
+    past = timezone.localdate() - timedelta(days=1)
+    with pytest.raises(StartDateInPast):
+        assign_membership(
+            user_id=active_user.pk,
+            package_id=package.pk,
+            price_option_id=option.pk,
+            start_date=past,
+            farmbrite_order_reference="FB-PAST",
+            actor=active_user,
+        )
+    today_membership, _product, _option = assign(
+        active_user, package=package, option=option, reference="FB-TODAY"
+    )
+    assert today_membership.status == MembershipStatus.ACTIVE
+
+    future_user = create_active_user("future-membership@example.com")
+    future = timezone.localdate() + timedelta(days=10)
+    future_membership, _product, _option = assign(
+        future_user,
+        package=package,
+        option=option,
+        reference="FB-FUTURE",
+        start_date=future,
+    )
+    assert future_membership.status == MembershipStatus.SCHEDULED
+    assert not future_membership.cycles.exists()
+
+
+@pytest.mark.django_db
+def test_user_cannot_have_multiple_current_memberships(active_user):
+    package, _product, option = create_package()
+    assign(active_user, package=package, option=option, reference="FB-FIRST")
+    with pytest.raises(ActiveMembershipExists):
+        assign(active_user, package=package, option=option, reference="FB-SECOND")
+    assert Membership.objects.filter(user=active_user).count() == 1
+
+
+@pytest.mark.django_db
+def test_live_catalog_and_price_changes_do_not_change_membership_snapshot(active_user):
+    package, product, option = create_package(quota=3)
+    membership, _product, _option = assign(
+        active_user, package=package, option=option, reference="FB-IMMUTABLE"
+    )
+    package.translations.update(name="Changed package", description="Changed")
+    product.translations.update(name="Changed product")
+    Product.objects.filter(pk=product.pk).update(
+        unit_size=Decimal("9.000"), unit_label_vi="túi", unit_label_en="bags"
+    )
+    option.is_active = False
+    option.save(update_fields=["is_active", "updated_at"])
+    membership.refresh_from_db()
+    snapshot = membership.product_snapshots.get()
+    assert membership.package_name_vi_snapshot == "Gói CSA"
+    assert membership.package_name_en_snapshot == "CSA package"
+    assert membership.duration_months_snapshot == 6
+    assert membership.monthly_price_vnd_snapshot == 1_000_000
+    assert membership.total_price_vnd_snapshot == 6_000_000
+    assert snapshot.product_name_vi_snapshot == "Giỏ rau theo mùa"
+    assert snapshot.product_name_en_snapshot == "Seasonal basket"
     assert snapshot.unit_size == Decimal("0.500")
 
 
 @pytest.mark.django_db
-def test_payment_submission_and_approval_are_idempotent(active_user):
-    ensure_phone(active_user)
-    package, _product = create_package()
-    configure_payment_settings()
-    request, _instruction = create_membership_request(
-        user=active_user, package_id=package.pk, flow="direct_transfer"
+def test_admin_assignment_api_rejects_unknown_fields_and_returns_snapshot(admin_api, active_user):
+    package, _product, option = create_package()
+    payload = {
+        "user_id": str(active_user.pk),
+        "package_id": str(package.pk),
+        "price_option_id": str(option.pk),
+        "start_date": timezone.localdate().isoformat(),
+        "farmbrite_order_reference": "FB-API-001",
+    }
+    forged = admin_api.post(
+        "/api/v1/admin/memberships", {**payload, "total_price_vnd": 1}, format="json"
     )
-    first, changed = submit_payment(request_id=request.pk, user=active_user)
-    second, changed_again = submit_payment(request_id=request.pk, user=active_user)
-    assert first.pk == second.pk
-    assert changed is True
-    assert changed_again is False
+    assert forged.status_code == 400
+    assert forged.json()["total_price_vnd"] == "This field is not allowed."
 
-    start = timezone.localdate()
-    membership, created = approve_request(
-        request_id=request.pk, actor=active_user, start_date=start
-    )
-    replay, replay_created = approve_request(
-        request_id=request.pk, actor=active_user, start_date=start + timedelta(days=1)
-    )
-    assert created is True
-    assert replay_created is False
-    assert replay.pk == membership.pk
-    assert replay.start_date == start
-    assert Membership.objects.filter(user=active_user).count() == 1
-    assert membership.end_date == add_months(start, 6)
+    response = admin_api.post("/api/v1/admin/memberships", payload, format="json")
+    assert response.status_code == 201
+    data = response.json()["data"]
+    assert data["user"]["id"] == str(active_user.pk)
+    assert data["price_option_id"] == str(option.pk)
+    assert data["price_option"] == {
+        "duration_months": 6,
+        "monthly_price_vnd": "1000000",
+        "total_price_vnd": "6000000",
+    }
+    assert data["farmbrite_order_reference"] == "FB-API-001"
 
 
 @pytest.mark.django_db
-def test_approval_rejects_past_start_date_in_api_and_service(admin_api, active_user):
-    package, _product = create_package()
-    configure_payment_settings()
-    request, _instruction = create_membership_request(
-        user=active_user, package_id=package.pk, flow="direct_transfer", phone="0901234567"
+def test_self_current_quota_and_usage_use_immutable_snapshot(active_user, access_token):
+    membership, product, _option = assign(active_user, reference="FB-SELF")
+    create_usage_order(
+        membership_id=membership.pk,
+        actor=active_user,
+        idempotency_key=uuid.uuid4(),
+        lines=[{"product_id": product.pk, "units": 1}],
     )
-    submit_payment(request_id=request.pk, user=active_user)
-    past = timezone.localdate() - timedelta(days=1)
-
-    response = admin_api.post(
-        f"/api/v1/admin/membership-requests/{request.pk}/approve",
-        {"start_date": past.isoformat()},
-        format="json",
-    )
-    assert response.status_code == 400
-    assert "start_date" in response.json()
-    with pytest.raises(StartDateInPast):
-        approve_request(request_id=request.pk, actor=active_user, start_date=past)
-    assert not Membership.objects.filter(request=request).exists()
+    client = bearer_client(access_token)
+    current = client.get("/api/v1/memberships/current?locale=en")
+    quota = client.get("/api/v1/memberships/quota?locale=en")
+    usage = client.get("/api/v1/memberships/usage?locale=en&page=1")
+    assert current.status_code == quota.status_code == usage.status_code == 200
+    assert current.json()["data"]["package_name"] == "CSA package"
+    assert current.json()["data"]["price_option"]["total_price_vnd"] == "6000000"
+    assert quota.json()["data"]["products"][0]["remaining_units"] == 1
+    assert usage.json()["data"][0]["lines"][0]["product_name"] == "Seasonal basket"
+    assert current["Cache-Control"] == "private, no-store"
 
 
 @pytest.mark.django_db
-def test_database_and_services_enforce_one_open_request_and_active_membership(active_user):
-    ensure_phone(active_user)
-    package, _product = create_package()
-    first, _instruction = create_membership_request(
-        user=active_user, package_id=package.pk, flow="consultation"
-    )
-    with pytest.raises(OpenRequestExists):
-        create_membership_request(user=active_user, package_id=package.pk, flow="consultation")
-    duplicate = MembershipRequest(
-        short_code="DUPLICATE",
-        user=active_user,
-        package=package,
-        package_name_snapshot=package.name,
-        package_description_snapshot="",
-        upfront_price_snapshot=package.upfront_price,
-        duration_months_snapshot=6,
-        quota_policy_snapshot=QuotaPolicy.EXPIRE,
-        status=MembershipRequestStatus.CONTACTED,
-    )
-    with pytest.raises(IntegrityError), transaction.atomic():
-        duplicate.save()
-    assert (
-        MembershipRequest.objects.filter(user=active_user, status__in=OPEN_REQUEST_STATUSES).get()
-        == first
-    )
-
-    reject_request(request_id=first.pk, actor=active_user, reason="Closed")
-    membership, _product, _request = activate_membership(active_user)
-    with pytest.raises(ActiveMembershipExists):
-        create_membership_request(user=active_user, package_id=package.pk, flow="consultation")
-    assert membership.status == MembershipStatus.ACTIVE
-
-    terminal_request = MembershipRequest.objects.create(
-        short_code="TERMINAL",
-        user=active_user,
-        package=package,
-        package_name_snapshot=package.name,
-        package_description_snapshot=package.description,
-        upfront_price_snapshot=package.upfront_price,
-        duration_months_snapshot=package.duration_months,
-        quota_policy_snapshot=package.quota_policy,
-        status=MembershipRequestStatus.REJECTED,
-        open_slot=None,
-        rejection_reason="Constraint fixture",
-        rejected_at=timezone.now(),
-    )
-    duplicate_membership = Membership(
-        user=active_user,
-        request=terminal_request,
-        package=package,
-        package_name_snapshot=package.name,
-        package_description_snapshot=package.description,
-        upfront_price_snapshot=package.upfront_price,
-        duration_months_snapshot=package.duration_months,
-        quota_policy_snapshot=package.quota_policy,
-        start_date=timezone.localdate(),
-        end_date=add_months(timezone.localdate(), package.duration_months),
-        activated_by=active_user,
-    )
-    with pytest.raises(IntegrityError), transaction.atomic():
-        duplicate_membership.save()
-
-
-@pytest.mark.django_db
-def test_expire_and_rollover_cycles_follow_start_anniversary():
-    expire_user = create_active_user("expire@example.com")
-    expire_membership, _product, _request = activate_membership(
-        expire_user, policy=QuotaPolicy.EXPIRE, start_date=date(2026, 7, 31)
-    )
-    ensure_due_cycles(expire_membership, as_of=date(2026, 9, 1))
-    expire_quotas = list(
-        MembershipCycleQuota.objects.filter(cycle__membership=expire_membership).order_by(
-            "cycle__sequence"
-        )
-    )
-    assert [item.cycle.start_date for item in expire_quotas] == [
-        date(2026, 7, 31),
-        date(2026, 8, 31),
-    ]
-    assert [(item.remaining_units, item.expired_units) for item in expire_quotas] == [
-        (0, 2),
-        (2, 0),
-    ]
-
-    rollover_user = create_active_user("rollover@example.com")
-    rollover_membership, _product, _request = activate_membership(
-        rollover_user, policy=QuotaPolicy.ROLLOVER, start_date=date(2026, 7, 31)
-    )
-    ensure_due_cycles(rollover_membership, as_of=date(2026, 9, 1))
-    assert list(
-        MembershipCycleQuota.objects.filter(cycle__membership=rollover_membership)
-        .order_by("cycle__sequence")
-        .values_list("remaining_units", flat=True)
-    ) == [2, 2]
-
-
-@pytest.mark.django_db
-def test_ensure_due_cycles_is_idempotent(active_user):
-    membership, _product, _request = activate_membership(active_user)
-    MembershipCycleQuota.objects.filter(cycle__membership=membership).delete()
-    membership.cycles.all().delete()
-
-    first_created = ensure_due_cycles(membership)
-    second_created = ensure_due_cycles(membership)
-
-    assert [cycle.sequence for cycle in first_created] == [1]
-    assert second_created == []
-    assert list(membership.cycles.values_list("sequence", flat=True)) == [1]
-    assert MembershipCycleQuota.objects.filter(cycle__membership=membership).count() == 1
-
-
-@pytest.mark.django_db
-def test_usage_deducts_exact_product_never_negative_and_undo_restores_once(active_user):
-    membership, product, _request = activate_membership(
-        active_user, policy=QuotaPolicy.ROLLOVER, quota=3
-    )
+def test_usage_and_undo_deduct_and_restore_exact_units(active_user):
+    membership, product, _option = assign(active_user)
     key = uuid.uuid4()
     order, created = create_usage_order(
         membership_id=membership.pk,
@@ -562,225 +739,31 @@ def test_usage_deducts_exact_product_never_negative_and_undo_restores_once(activ
         lines=[{"product_id": product.pk, "units": 2}],
     )
     assert created is True and replay_created is False and replay.pk == order.pk
-    allocation = MembershipUsageAllocation.objects.get(line__order=order)
-    allocation.cycle_quota.refresh_from_db()
-    assert allocation.units == 2
-    assert allocation.cycle_quota.remaining_units == 1
-
+    quota = MembershipCycleQuota.objects.get(cycle__membership=membership)
+    assert quota.remaining_units == 0
     with pytest.raises(InsufficientQuota):
         create_usage_order(
             membership_id=membership.pk,
             actor=active_user,
             idempotency_key=uuid.uuid4(),
-            lines=[{"product_id": product.pk, "units": 2}],
+            lines=[{"product_id": product.pk, "units": 1}],
         )
-    other_package, other_product = create_package()
-    assert other_package.pk
-    with pytest.raises(ProductNotInMembership):
-        create_usage_order(
-            membership_id=membership.pk,
-            actor=active_user,
-            idempotency_key=uuid.uuid4(),
-            lines=[{"product_id": other_product.pk, "units": 1}],
-        )
-    undo_usage_order(order_id=order.pk, actor=active_user, reason="Entered by mistake")
-    allocation.cycle_quota.refresh_from_db()
+    undo_usage_order(order_id=order.pk, actor=active_user, reason="Wrong delivery")
+    quota.refresh_from_db()
     order.refresh_from_db()
-    assert allocation.cycle_quota.remaining_units == 3
+    assert quota.remaining_units == 2
     assert order.status == UsageOrderStatus.REVERSED
-    assert MembershipUsageReversal.objects.get(order=order).reason == "Entered by mistake"
+    assert MembershipUsageReversal.objects.get(order=order).reason == "Wrong delivery"
     with pytest.raises(UsageUndoConflict):
-        undo_usage_order(order_id=order.pk, actor=active_user, reason="Double undo")
+        undo_usage_order(order_id=order.pk, actor=active_user, reason="Again")
 
 
 @pytest.mark.django_db
-def test_self_usage_payload_uses_membership_product_unit_snapshot(active_user, access_token):
-    membership, product, _request = activate_membership(active_user, quota=3)
-    create_usage_order(
-        membership_id=membership.pk,
-        actor=active_user,
-        idempotency_key=uuid.uuid4(),
-        lines=[{"product_id": product.pk, "units": 2}],
+def test_rollover_allocates_fifo_and_undo_restores_each_cycle(active_user):
+    membership, product, _option = assign_with_past_start(
+        active_user, policy=QuotaPolicy.ROLLOVER, quota=2
     )
-    product.unit_size = Decimal("9.000")
-    product.unit_label_vi = "túi"
-    product.unit_label_en = "bags"
-    product.save(update_fields=["unit_size", "unit_label_vi", "unit_label_en", "updated_at"])
-
-    response = bearer_client(access_token).get("/api/v1/memberships/usage?page=1")
-
-    assert response.status_code == 200
-    assert response.json()["data"][0]["lines"][0] == {
-        "product_id": str(product.pk),
-        "product_name": "Seasonal basket",
-        "requested_locale": "vi",
-        "content_locale": "vi",
-        "is_fallback": False,
-        "unit_size": "0.500",
-        "unit_label_vi": "kg",
-        "unit_label_en": "kg",
-        "units": 2,
-    }
-
-
-@pytest.mark.django_db
-def test_return_payment_pending_requires_reason_and_keeps_instruction(active_user):
-    ensure_phone(active_user)
-    package, _product = create_package()
-    configure_payment_settings()
-    request, instruction = create_membership_request(
-        user=active_user, package_id=package.pk, flow="direct_transfer"
-    )
-    submit_payment(request_id=request.pk, user=active_user)
-    returned = return_to_payment_pending(
-        request_id=request.pk, actor=active_user, reason="Amount is short"
-    )
-    assert returned.status == MembershipRequestStatus.PAYMENT_PENDING
-    assert returned.payment_instruction.pk == instruction.pk
-    assert returned.return_reason == "Amount is short"
-
-
-@pytest.mark.django_db
-def test_future_membership_is_visible_without_quota_then_becomes_active_and_ended(
-    admin_api, active_user
-):
-    start_date = timezone.localdate() + timedelta(days=2)
-    ensure_phone(active_user)
-    package, product = create_package()
-    configure_payment_settings()
-    request, _instruction = create_membership_request(
-        user=active_user, package_id=package.pk, flow="direct_transfer"
-    )
-    submit_payment(request_id=request.pk, user=active_user)
-    approve_response = admin_api.post(
-        f"/api/v1/admin/membership-requests/{request.pk}/approve",
-        {"start_date": start_date.isoformat()},
-        format="json",
-    )
-    assert approve_response.status_code == 201
-    membership = Membership.objects.get(pk=approve_response.json()["data"]["id"])
-    membership.refresh_from_db()
-    assert membership.status == MembershipStatus.SCHEDULED
-    assert membership.current_slot is True
-    assert not membership.cycles.exists()
-
-    current_response = admin_api.get("/api/v1/memberships/current")
-    assert current_response.status_code == 200
-    assert current_response.json()["data"]["status"] == MembershipStatus.SCHEDULED
-    assert current_response.json()["data"]["package_id"] == str(package.pk)
-    assert current_response.json()["data"]["start_date"] == start_date.isoformat()
-    assert current_response.json()["data"]["end_date"] == membership.end_date.isoformat()
-    assert "user" not in current_response.json()["data"]
-    assert admin_api.get("/api/v1/memberships/quota").json()["data"] is None
-    usage_response = admin_api.post(
-        "/api/v1/admin/membership-usage",
-        {
-            "membership_id": str(membership.pk),
-            "idempotency_key": str(uuid.uuid4()),
-            "lines": [{"product_id": str(product.pk), "units": 1}],
-        },
-        format="json",
-    )
-    assert usage_response.status_code == 409
-    assert usage_response.json()["errors"] == [{"code": "invalid_quota_usage"}]
-    assert not membership.cycles.exists()
-
-    membership = sync_membership_status(membership, as_of=start_date)
-    ensure_due_cycles(membership, as_of=start_date)
-    membership.refresh_from_db()
-    assert membership.status == MembershipStatus.ACTIVE
-    assert membership.cycles.count() == 1
-
-    membership = sync_membership_status(membership, as_of=membership.end_date)
-    assert membership.status == MembershipStatus.ENDED
-    assert membership.current_slot is None
-    assert admin_api.get("/api/v1/memberships/current").json()["data"] is None
-
-
-@pytest.mark.django_db
-def test_admin_membership_user_payload_and_phone_search(admin_api, active_user):
-    phone = "0918765432"
-    ensure_phone(active_user, phone)
-    package, _product = create_package()
-    configure_payment_settings()
-    request, _instruction = create_membership_request(
-        user=active_user, package_id=package.pk, flow="direct_transfer"
-    )
-
-    request_search = admin_api.get("/api/v1/admin/membership-requests", {"search": phone})
-    assert request_search.status_code == 200
-    assert request_search.json()["meta"] == {"page": 1, "page_size": 30, "total": 1}
-    assert request_search.json()["data"][0]["id"] == str(request.pk)
-
-    submit_payment(request_id=request.pk, user=active_user)
-    membership, _created = approve_request(
-        request_id=request.pk,
-        actor=active_user,
-        start_date=timezone.localdate(),
-    )
-    membership_search = admin_api.get("/api/v1/admin/memberships", {"search": phone})
-    assert membership_search.status_code == 200
-    assert membership_search.json()["meta"] == {
-        "page": 1,
-        "page_size": 30,
-        "total": 1,
-    }
-    expected_user = {
-        "id": str(active_user.pk),
-        "name": active_user.name,
-        "email": active_user.email,
-        "phone": phone,
-    }
-    assert membership_search.json()["data"][0]["id"] == str(membership.pk)
-    assert membership_search.json()["data"][0]["user"] == expected_user
-
-    detail_response = admin_api.get(f"/api/v1/admin/memberships/{membership.pk}")
-    assert detail_response.status_code == 200
-    assert detail_response.json()["data"]["user"] == expected_user
-    assert "user" not in admin_api.get("/api/v1/memberships/current").json()["data"]
-
-
-@pytest.mark.django_db
-def test_request_audit_events_preserve_multiple_payment_returns(active_user):
-    ensure_phone(active_user)
-    package, _product = create_package()
-    configure_payment_settings()
-    request, _instruction = create_membership_request(
-        user=active_user, package_id=package.pk, flow="direct_transfer"
-    )
-    submit_payment(request_id=request.pk, user=active_user)
-    return_to_payment_pending(
-        request_id=request.pk,
-        actor=active_user,
-        reason="First bank check failed",
-    )
-    submit_payment(request_id=request.pk, user=active_user)
-    return_to_payment_pending(
-        request_id=request.pk,
-        actor=active_user,
-        reason="Second bank check failed",
-    )
-
-    returned_events = list(
-        request.events.filter(action=MembershipRequestEventAction.PAYMENT_RETURNED).order_by(
-            "created_at"
-        )
-    )
-    assert [event.reason for event in returned_events] == [
-        "First bank check failed",
-        "Second bank check failed",
-    ]
-    assert all(event.actor_id == active_user.pk for event in returned_events)
-
-
-@pytest.mark.django_db
-def test_rollover_usage_allocates_oldest_cycles_and_undo_restores_each_cycle(active_user):
-    membership, product, _request = activate_membership(
-        active_user,
-        policy=QuotaPolicy.ROLLOVER,
-        quota=2,
-        start_date=add_months(timezone.localdate(), -1),
-    )
+    ensure_due_cycles(membership)
     order, _created = create_usage_order(
         membership_id=membership.pk,
         actor=active_user,
@@ -796,9 +779,7 @@ def test_rollover_usage_allocates_oldest_cycles_and_undo_restores_each_cycle(act
         (1, 2),
         (2, 1),
     ]
-    assert [item.cycle_quota.remaining_units for item in allocations] == [0, 1]
-
-    undo_usage_order(order_id=order.pk, actor=active_user, reason="Wrong delivery")
+    undo_usage_order(order_id=order.pk, actor=active_user, reason="Wrong order")
     assert list(
         MembershipCycleQuota.objects.filter(cycle__membership=membership)
         .order_by("cycle__sequence")
@@ -807,1057 +788,263 @@ def test_rollover_usage_allocates_oldest_cycles_and_undo_restores_each_cycle(act
 
 
 @pytest.mark.django_db
-def test_undo_rejects_corrupted_usage_relationships(active_user):
-    membership, product, _request = activate_membership(active_user, quota=2)
+def test_usage_rejects_other_product_and_corrupted_membership_user(active_user):
+    membership, _product, _option = assign(active_user)
+    _package, other_product, _option = create_package()
+    with pytest.raises(ProductNotInMembership):
+        create_usage_order(
+            membership_id=membership.pk,
+            actor=active_user,
+            idempotency_key=uuid.uuid4(),
+            lines=[{"product_id": other_product.pk, "units": 1}],
+        )
+    product = membership.product_snapshots.get().product
     order, _created = create_usage_order(
         membership_id=membership.pk,
         actor=active_user,
         idempotency_key=uuid.uuid4(),
         lines=[{"product_id": product.pk, "units": 1}],
     )
-    other_user = create_active_user("corrupt-usage-user@example.com")
+    other_user = create_active_user("corrupt-membership@example.com")
     MembershipUsageOrder.objects.filter(pk=order.pk).update(user=other_user)
-
     with pytest.raises(UsageIntegrityConflict):
-        undo_usage_order(order_id=order.pk, actor=active_user, reason="Should fail")
-    assert not MembershipUsageReversal.objects.filter(order=order).exists()
+        undo_usage_order(order_id=order.pk, actor=active_user, reason="Must fail")
 
 
 @pytest.mark.django_db
-def test_public_package_list_is_paginated(client):
-    package, product = create_package()
-    MembershipPackage.objects.bulk_create(
-        [
-            MembershipPackage(
-                name=f"Package {index:02d}",
-                upfront_price=Decimal("6000000"),
-                duration_months=6,
-                quota_policy=QuotaPolicy.EXPIRE,
-            )
-            for index in range(30)
-        ]
+def test_cycle_anniversary_and_future_status(active_user):
+    future = timezone.localdate() + timedelta(days=2)
+    membership, _product, _option = assign(
+        active_user, start_date=future, reference="FB-SCHEDULED"
     )
-    additional = MembershipPackage.objects.exclude(pk=package.pk)
-    MembershipPackageItem.objects.bulk_create(
-        [MembershipPackageItem(package=item, product=product, quota_units=2) for item in additional]
-    )
-
-    response = client.get("/api/v1/public/membership-packages?page=2")
-    assert response.status_code == 200
-    assert response.json()["meta"] == {"page": 2, "page_size": 30, "total": 31}
-    assert len(response.json()["data"]) == 1
+    assert membership.status == MembershipStatus.SCHEDULED
+    assert ensure_due_cycles(membership, as_of=future - timedelta(days=1)) == []
+    membership = sync_membership_status(membership, as_of=future)
+    ensure_due_cycles(membership, as_of=future)
+    assert membership.cycles.count() == 1
+    membership = sync_membership_status(membership, as_of=membership.end_date)
+    assert membership.status == MembershipStatus.ENDED
+    assert membership.current_slot is None
+    assert add_months(date(2024, 1, 31), 1) == date(2024, 2, 29)
 
 
 @pytest.mark.django_db
-def test_public_packages_localize_content_and_fallback_safely(client):
-    package, product = create_package()
-    ProductTranslation.objects.bulk_create(
-        [ProductTranslation(product=product, **item) for item in product_translations()]
-    )
-    MembershipPackageTranslation.objects.bulk_create(
-        [MembershipPackageTranslation(package=package, **item) for item in package_translations()]
-    )
-
-    vietnamese = client.get("/api/v1/public/membership-packages?locale=vi").json()["data"][0]
-    english = client.get("/api/v1/public/membership-packages?locale=en").json()["data"][0]
-    assert (vietnamese["name"], vietnamese["content_locale"], vietnamese["is_fallback"]) == (
-        "Gói CSA sáu tháng",
-        "vi",
-        False,
-    )
-    assert english["name"] == "Six month CSA"
-    assert english["items"][0]["product_name"] == "Seasonal basket"
-    assert english["items"][0]["short_description"] == "Fresh vegetables"
-    assert english["items"][0]["requested_locale"] == "en"
-
-    product.translations.filter(locale="en").delete()
-    fallback = client.get("/api/v1/public/membership-packages?locale=en").json()["data"][0]
-    assert fallback["items"][0]["product_name"] == "Giỏ rau theo mùa"
-    assert fallback["items"][0]["content_locale"] == "vi"
-    assert fallback["items"][0]["is_fallback"] is True
-    assert "translations" not in fallback
-    assert "is_active" not in fallback
-
-
-@pytest.mark.django_db
-def test_membership_self_apis_use_immutable_bilingual_snapshots(active_user, access_token):
-    ensure_phone(active_user)
-    package, product = create_package(quota=3)
-    ProductTranslation.objects.bulk_create(
-        [ProductTranslation(product=product, **item) for item in product_translations()]
-    )
-    MembershipPackageTranslation.objects.bulk_create(
-        [MembershipPackageTranslation(package=package, **item) for item in package_translations()]
-    )
-    configure_payment_settings()
-    membership_request, _instruction = create_membership_request(
-        user=active_user, package_id=package.pk, flow="direct_transfer"
-    )
-    request_snapshot = membership_request.item_snapshots.get()
-    assert request_snapshot.product_name == "Seasonal basket"
-    assert request_snapshot.product_name_vi_snapshot == "Giỏ rau theo mùa"
-    assert request_snapshot.product_name_en_snapshot == "Seasonal basket"
-    assert request_snapshot.unit_size == Decimal("0.500")
-    assert request_snapshot.unit_label_vi == "kg"
-    assert request_snapshot.unit_label_en == "kg"
-
-    package.translations.filter(locale="en").update(name="Changed live package")
-    product.translations.filter(locale="vi").update(name="Giỏ rau đã thay đổi")
-    product.translations.filter(locale="en").update(name="Changed live product")
-    Product.objects.filter(pk=product.pk).update(
-        name="Changed live legacy product",
-        unit_size=Decimal("1.000"),
-        unit_label_vi="túi",
-        unit_label_en="bag",
-        is_active=False,
-    )
-    own_client = bearer_client(access_token)
-    request_response = own_client.get("/api/v1/memberships/requests?locale=en")
-    assert request_response.status_code == 200
-    request_data = request_response.json()["data"]
-    assert request_data["package"]["name"] == "Six month CSA"
-    assert request_data["package"]["items"][0]["product_name"] == "Seasonal basket"
-    assert request_data["package"]["content_locale"] == "en"
-    assert "package_name_en_snapshot" not in request_data["package"]
-
-    submit_payment(request_id=membership_request.pk, user=active_user)
-    membership, _created = approve_request(
-        request_id=membership_request.pk,
-        actor=active_user,
-        start_date=timezone.localdate(),
-    )
-    membership_snapshot = membership.product_snapshots.get()
-    assert membership_snapshot.product_name == "Seasonal basket"
-    assert membership_snapshot.product_name_vi_snapshot == "Giỏ rau theo mùa"
-    assert membership_snapshot.product_name_en_snapshot == "Seasonal basket"
-    assert membership_snapshot.unit_size == Decimal("0.500")
-    assert membership_snapshot.unit_label_vi == "kg"
-    assert membership_snapshot.unit_label_en == "kg"
-    current = own_client.get("/api/v1/memberships/current?locale=en").json()["data"]
-    quota_data = own_client.get("/api/v1/memberships/quota?locale=en").json()["data"]
-    assert current["package_name"] == "Six month CSA"
-    assert current["content_locale"] == "en"
-    assert quota_data["products"][0]["product_name"] == "Seasonal basket"
-    create_usage_order(
-        membership_id=membership.pk,
-        actor=active_user,
-        idempotency_key=uuid.uuid4(),
-        lines=[{"product_id": product.pk, "units": 1}],
-    )
-    usage = own_client.get("/api/v1/memberships/usage?page=1&locale=en").json()["data"]
-    assert usage[0]["lines"][0]["product_name"] == "Seasonal basket"
-    assert usage[0]["lines"][0]["content_locale"] == "en"
-
-    membership.package_name_en_snapshot = ""
-    membership.package_description_en_snapshot = ""
-    membership.save(
-        update_fields=["package_name_en_snapshot", "package_description_en_snapshot"]
-    )
-    membership.product_snapshots.update(product_name_en_snapshot="")
-    fallback = own_client.get("/api/v1/memberships/current?locale=en").json()["data"]
-    fallback_quota = own_client.get("/api/v1/memberships/quota?locale=en").json()["data"]
-    fallback_usage = own_client.get("/api/v1/memberships/usage?page=1&locale=en").json()["data"]
-    assert fallback["package_name"] == "Gói CSA sáu tháng"
-    assert (fallback["content_locale"], fallback["is_fallback"]) == ("vi", True)
-    assert fallback_quota["products"][0]["product_name"] == "Giỏ rau theo mùa"
-    assert fallback_quota["products"][0]["is_fallback"] is True
-    assert fallback_usage[0]["lines"][0]["product_name"] == "Giỏ rau theo mùa"
-    assert fallback_usage[0]["lines"][0]["is_fallback"] is True
-
-
-@pytest.mark.django_db
-def test_membership_self_locale_query_is_strict(active_user, access_token):
-    own_client = bearer_client(access_token)
-    assert own_client.get("/api/v1/memberships/current?locale=fr").status_code == 400
-    assert own_client.get("/api/v1/memberships/quota?unexpected=1").status_code == 400
-    assert own_client.get("/api/v1/memberships/usage?page=1&locale=en&extra=1").status_code == 400
-
-
-@pytest.mark.django_db
-def test_membership_pagination_rejects_page_above_safe_limit(client):
-    response = client.get("/api/v1/public/membership-packages?page=10001")
-    assert response.status_code == 400
-    assert set(response.json()) == {"page"}
-    assert "10000" in response.json()["page"][0]
-
-
-@pytest.mark.django_db
-def test_public_payment_availability_exposes_only_the_switch(client):
-    disabled = client.get("/api/v1/public/membership-payment-availability")
-    assert disabled.status_code == 200
-    assert disabled.json() == {"data": {"direct_transfer_enabled": False}}
-
-    configure_payment_settings(enabled=True)
-    enabled = client.get("/api/v1/public/membership-payment-availability")
-    assert enabled.status_code == 200
-    assert enabled.json() == {"data": {"direct_transfer_enabled": True}}
-    assert "account_number" not in enabled.json()["data"]
-
-
-@pytest.mark.django_db
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("bank_bin", "999999"),
-        ("bank_name", "Wrong bank name"),
-        ("account_number", "ABC123"),
-        ("account_number", "12345"),
-        ("account_number", "1" * 20),
-        ("account_name", ""),
-    ],
-)
-def test_public_payment_availability_fails_closed_for_invalid_settings(client, field, value):
-    settings = configure_payment_settings(enabled=True)
-    setattr(settings, field, value)
-    settings.save(update_fields=[field, "updated_at"])
-
-    response = client.get("/api/v1/public/membership-payment-availability")
-    assert response.status_code == 200
-    assert response.json() == {"data": {"direct_transfer_enabled": False}}
-    assert "account_number" not in response.json()["data"]
-
-
-@pytest.mark.django_db
-def test_public_payment_availability_fails_closed_when_bank_directory_is_unavailable(
-    client, monkeypatch
-):
-    configure_payment_settings(enabled=True)
-    cache.clear()
-    http_calls = 0
-
-    def unavailable(*args, **kwargs):
-        nonlocal http_calls
-        http_calls += 1
-        raise requests.Timeout("vietqr timeout")
-
-    monkeypatch.setattr("memberships.banks.requests.get", unavailable)
-    response = client.get("/api/v1/public/membership-payment-availability")
-    assert response.status_code == 200
-    assert response.json() == {"data": {"direct_transfer_enabled": False}}
-    repeated = client.get("/api/v1/public/membership-payment-availability")
-    assert repeated.status_code == 200
-    assert repeated.json() == {"data": {"direct_transfer_enabled": False}}
-    assert http_calls == 1
-    assert cache.get(UNAVAILABLE_BANKS_CACHE_KEY) is True
-
-
-def test_negative_bank_cache_does_not_override_fresh_cache(monkeypatch):
-    fresh = [{"bin": "970436", "name": "Fresh bank"}]
-    stale = [{"bin": "970415", "name": "Stale bank"}]
-    cache.set(FRESH_BANKS_CACHE_KEY, fresh, timeout=60)
-    cache.set(STALE_BANKS_CACHE_KEY, stale, timeout=None)
-    cache.set(UNAVAILABLE_BANKS_CACHE_KEY, True, timeout=60)
-    http_calls = 0
-
-    def unexpected_http_call(*args, **kwargs):
-        nonlocal http_calls
-        http_calls += 1
-        raise AssertionError("VietQR must not be called when fresh cache exists")
-
-    monkeypatch.setattr("memberships.banks.requests.get", unexpected_http_call)
-
-    assert get_transfer_banks() == fresh
-    assert http_calls == 0
-
-
-def test_negative_bank_cache_uses_stale_cache_without_fetching(monkeypatch):
-    stale = [{"bin": "970415", "name": "Stale bank"}]
-    cache.set(STALE_BANKS_CACHE_KEY, stale, timeout=None)
-    cache.set(UNAVAILABLE_BANKS_CACHE_KEY, True, timeout=60)
-    http_calls = 0
-
-    def unexpected_http_call(*args, **kwargs):
-        nonlocal http_calls
-        http_calls += 1
-        raise AssertionError("VietQR must not be called while negative cache is active")
-
-    monkeypatch.setattr("memberships.banks.requests.get", unexpected_http_call)
-
-    assert get_transfer_banks() == stale
-    assert http_calls == 0
-
-
-def test_negative_bank_cache_without_available_cache_fails_fast(monkeypatch):
-    cache.set(UNAVAILABLE_BANKS_CACHE_KEY, True, timeout=60)
-    http_calls = 0
-
-    def unexpected_http_call(*args, **kwargs):
-        nonlocal http_calls
-        http_calls += 1
-        raise AssertionError("VietQR must not be called while negative cache is active")
-
-    monkeypatch.setattr("memberships.banks.requests.get", unexpected_http_call)
-
-    with pytest.raises(BankDirectoryUnavailable):
-        get_transfer_banks()
-    assert http_calls == 0
-
-
-def test_successful_vietqr_fetch_clears_negative_cache_set_during_request(monkeypatch):
-    cache.clear()
-
-    class BankResponse:
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            return {
-                "data": [
-                    {
-                        "bin": "970436",
-                        "name": "Ngân hàng TMCP Ngoại Thương Việt Nam",
-                        "shortName": "Vietcombank",
-                        "code": "VCB",
-                        "transferSupported": 1,
-                    }
-                ]
-            }
-
-    def successful_fetch(*args, **kwargs):
-        cache.set(UNAVAILABLE_BANKS_CACHE_KEY, True, timeout=60)
-        return BankResponse()
-
-    monkeypatch.setattr("memberships.banks.requests.get", successful_fetch)
-    assert get_transfer_banks()[0]["bin"] == "970436"
-    assert cache.get(UNAVAILABLE_BANKS_CACHE_KEY) is None
-
-
-@pytest.mark.django_db
-def test_vietqr_bank_directory_filters_and_falls_back_to_stale_cache(monkeypatch):
-    cache.clear()
-
-    class BankResponse:
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            return {
-                "data": [
-                    {
-                        "bin": "970436",
-                        "name": "Ngân hàng TMCP Ngoại Thương Việt Nam",
-                        "shortName": "Vietcombank",
-                        "code": "VCB",
-                        "transferSupported": 1,
-                    },
-                    {
-                        "bin": "970999",
-                        "name": "Unsupported bank",
-                        "shortName": "Unsupported",
-                        "code": "NOPE",
-                        "transferSupported": 0,
-                    },
-                ]
-            }
-
-    monkeypatch.setattr("memberships.banks.requests.get", lambda *args, **kwargs: BankResponse())
-    expected = [
-        {
-            "bin": "970436",
-            "name": "Ngân hàng TMCP Ngoại Thương Việt Nam",
-            "short_name": "Vietcombank",
-            "code": "VCB",
-        }
+def test_old_request_and_payment_routes_are_removed(admin_api):
+    paths = [
+        "/api/v1/memberships/requests",
+        f"/api/v1/memberships/requests/{uuid.uuid4()}/payment-submitted",
+        "/api/v1/public/membership-payment-availability",
+        "/api/v1/admin/membership-payment-settings",
+        "/api/v1/admin/membership-banks",
+        "/api/v1/admin/membership-requests",
+        f"/api/v1/admin/membership-requests/{uuid.uuid4()}/approve",
     ]
-    assert get_transfer_banks() == expected
-
-    cache.delete(FRESH_BANKS_CACHE_KEY)
-
-    def unavailable(*args, **kwargs):
-        raise requests.ConnectionError("vietqr unavailable")
-
-    monkeypatch.setattr("memberships.banks.requests.get", unavailable)
-    assert get_transfer_banks() == expected
-
-    cache.clear()
-    with pytest.raises(BankDirectoryUnavailable):
-        get_transfer_banks()
+    for path in paths:
+        assert admin_api.get(path).status_code == 404
+        assert admin_api.post(path, {}, format="json").status_code == 404
 
 
-@pytest.mark.django_db
-def test_admin_bank_options_error_is_retryable_without_any_cache(admin_api, monkeypatch):
-    cache.clear()
-
-    def unavailable(*args, **kwargs):
-        raise requests.Timeout("vietqr timeout")
-
-    monkeypatch.setattr("memberships.banks.requests.get", unavailable)
-    response = admin_api.get("/api/v1/admin/membership-banks")
-    assert response.status_code == 503
-    assert response.json() == {"errors": [{"code": "bank_directory_unavailable"}]}
-
-
-@pytest.mark.django_db
-def test_admin_payment_settings_validate_only_when_enabling(admin_api):
-    disabled = admin_api.put(
-        "/api/v1/admin/membership-payment-settings",
-        {
-            "direct_transfer_enabled": False,
-            "bank_bin": "",
-            "account_number": "",
-            "account_name": "",
-            "version": 0,
-        },
-        format="json",
+def test_legacy_price_migration_refuses_non_divisible_money():
+    migration = importlib.import_module(
+        "memberships.migrations.0008_farmbrite_memberships_and_price_options"
     )
-    assert disabled.status_code == 200
-    assert disabled.json()["data"]["direct_transfer_enabled"] is False
-    version = disabled.json()["data"]["version"]
-
-    missing = admin_api.put(
-        "/api/v1/admin/membership-payment-settings",
-        {
-            "direct_transfer_enabled": True,
-            "bank_bin": "",
-            "account_number": "",
-            "account_name": "",
-            "version": version,
-        },
-        format="json",
-    )
-    assert missing.status_code == 400
-    assert set(missing.json()) == {"bank_bin", "account_number", "account_name"}
-
-    configure_payment_settings(enabled=False)
-    invalid_bank = admin_api.put(
-        "/api/v1/admin/membership-payment-settings",
-        {
-            "direct_transfer_enabled": True,
-            "bank_bin": "999999",
-            "account_number": "0123456789",
-            "account_name": "NATURAL FARMING VIETNAM",
-            "version": version,
-        },
-        format="json",
-    )
-    assert invalid_bank.status_code == 400
-    assert set(invalid_bank.json()) == {"bank_bin"}
-
-    for invalid_account in ("ABC123", "12345", "1" * 20):
-        invalid = admin_api.put(
-            "/api/v1/admin/membership-payment-settings",
-            {
-                "direct_transfer_enabled": True,
-                "bank_bin": "970436",
-                "account_number": invalid_account,
-                "account_name": "NATURAL FARMING VIETNAM",
-                "version": version,
-            },
-            format="json",
-        )
-        assert invalid.status_code == 400
-        assert set(invalid.json()) == {"account_number"}
-
-    enabled = admin_api.put(
-        "/api/v1/admin/membership-payment-settings",
-        {
-            "direct_transfer_enabled": True,
-            "bank_bin": "970436",
-            "account_number": "0123456789",
-            "account_name": "NATURAL FARMING VIETNAM",
-            "version": version,
-        },
-        format="json",
-    )
-    assert enabled.status_code == 200
-    assert enabled.json()["data"]["direct_transfer_enabled"] is True
-
-
-@pytest.mark.django_db
-def test_payment_settings_reject_stale_version_without_overwrite(admin_api):
-    first = admin_api.put(
-        "/api/v1/admin/membership-payment-settings",
-        {
-            "direct_transfer_enabled": False,
-            "bank_bin": "",
-            "account_number": "0123456789",
-            "account_name": "FIRST ADMIN",
-            "version": 0,
-        },
-        format="json",
-    )
-    assert first.status_code == 200
-    version = first.json()["data"]["version"]
-    saved = admin_api.patch(
-        "/api/v1/admin/membership-payment-settings",
-        {"account_name": "SAVED CHANGE", "version": version},
-        format="json",
-    )
-    assert saved.status_code == 200
-
-    stale = admin_api.patch(
-        "/api/v1/admin/membership-payment-settings",
-        {"account_name": "STALE OVERWRITE", "version": version},
-        format="json",
-    )
-    assert stale.status_code == 409
-    assert stale.json() == {"errors": [{"code": "payment_settings_conflict"}]}
-    current = MembershipPaymentSettings.objects.get(pk="default")
-    assert current.account_name == "SAVED CHANGE"
-
-
-@pytest.mark.django_db
-def test_admin_product_lookup_is_paginated_searchable_and_can_filter_active(admin_api):
-    for index in range(31):
-        Product.objects.create(
-            name=f"Lookup product {index:02d}",
-            unit_size=Decimal("1.000"),
-            unit_label_vi="kg",
-            unit_label_en="kg",
-            is_active=index != 30,
-        )
-    page_two = admin_api.get("/api/v1/admin/membership-products?page=2&active=true")
-    assert page_two.status_code == 200
-    assert page_two.json()["meta"] == {"page": 2, "page_size": 30, "total": 30}
-    assert page_two.json()["data"] == []
-    search = admin_api.get(
-        "/api/v1/admin/membership-products?page=1&active=false&search=product%2030"
-    )
-    assert search.status_code == 200
-    assert [item["name"] for item in search.json()["data"]] == ["Lookup product 30"]
-
-
-@pytest.mark.django_db
-def test_admin_catalog_requires_unique_vi_and_en_names_and_rejects_unknown_input(admin_api):
-    base_product = {
-        "unit_size": "0.500",
-        "unit_label_vi": "kg",
-        "unit_label_en": "kg",
-    }
-    missing_en = admin_api.post(
-        "/api/v1/admin/membership-products",
-        {**base_product, "translations": product_translations()[:1]},
-        format="json",
-    )
-    assert missing_en.status_code == 400
-    assert "translations" in missing_en.json()
-
-    duplicate = admin_api.post(
-        "/api/v1/admin/membership-products",
-        {
-            **base_product,
-            "translations": [product_translations()[0], product_translations()[0]],
-        },
-        format="json",
-    )
-    assert duplicate.status_code == 400
-    assert "translations" in duplicate.json()
-
-    unknown_nested = admin_api.post(
-        "/api/v1/admin/membership-products",
-        {
-            **base_product,
-            "translations": [
-                {**product_translations()[0], "unexpected": "value"},
-                product_translations()[1],
-            ],
-        },
-        format="json",
-    )
-    assert unknown_nested.status_code == 400
-    assert "unexpected" in unknown_nested.json()["translations"][0]
-
-    created = admin_api.post(
-        "/api/v1/admin/membership-products",
-        {**base_product, "translations": product_translations()},
-        format="json",
-    )
-    assert created.status_code == 201
-    product_id = created.json()["data"]["id"]
-
-    package_base = {
-        "upfront_price": "1500000",
-        "duration_months": 3,
-        "quota_policy": "expire",
-        "items": [{"product_id": product_id, "quota_units": 1}],
-    }
-    missing_package_en = admin_api.post(
-        "/api/v1/admin/membership-packages",
-        {**package_base, "translations": package_translations()[:1]},
-        format="json",
-    )
-    duplicate_package_locale = admin_api.post(
-        "/api/v1/admin/membership-packages",
-        {
-            **package_base,
-            "translations": [package_translations()[0], package_translations()[0]],
-        },
-        format="json",
-    )
-    assert missing_package_en.status_code == 400
-    assert duplicate_package_locale.status_code == 400
-
-    incomplete_update = admin_api.patch(
-        f"/api/v1/admin/membership-products/{product_id}",
-        {"translations": product_translations()[:1]},
-        format="json",
-    )
-    assert incomplete_update.status_code == 400
-
-
-@pytest.mark.django_db
-def test_admin_catalog_searches_both_translation_languages(admin_api):
-    product_response = admin_api.post(
-        "/api/v1/admin/membership-products",
-        {
-            "translations": product_translations(
-                vi_name="Rau củ bản địa",
-                en_name="Heritage produce",
-                en_description="Rare seasonal greens",
-            ),
-            "unit_size": "1.000",
-            "unit_label_vi": "kg",
-            "unit_label_en": "kg",
-        },
-        format="json",
-    )
-    product_id = product_response.json()["data"]["id"]
-    package_response = admin_api.post(
-        "/api/v1/admin/membership-packages",
-        {
-            "translations": package_translations(
-                vi_name="Gói gìn giữ hạt giống",
-                en_name="Seed keeper package",
-                en_description="Supports heritage crops",
-            ),
-            "upfront_price": "1500000",
-            "duration_months": 3,
-            "quota_policy": "expire",
-            "items": [{"product_id": product_id, "quota_units": 1}],
-        },
-        format="json",
-    )
-    assert package_response.status_code == 201
-
-    product_search = admin_api.get("/api/v1/admin/membership-products?search=seasonal%20greens")
-    package_search = admin_api.get("/api/v1/admin/membership-packages?search=heritage%20crops")
-    assert [item["id"] for item in product_search.json()["data"]] == [product_id]
-    assert [item["id"] for item in package_search.json()["data"]] == [
-        package_response.json()["data"]["id"]
-    ]
+    assert migration.exact_monthly_price(
+        total=1_200_000, duration=3, identity="test package"
+    ) == 400_000
+    with pytest.raises(RuntimeError, match="not exactly divisible"):
+        migration.exact_monthly_price(total=1_000_001, duration=3, identity="test package")
 
 
 @pytest.mark.django_db(transaction=True)
-def test_payment_settings_migration_disables_legacy_non_bin_configuration():
-    migrate_from = ("memberships", "0002_membershippaymentsettings_direct_transfer_enabled")
-    migrate_to = (
-        "memberships",
-        "0003_remove_membershippaymentsettings_bank_code_and_more",
-    )
-    current_migration = (
+def test_price_option_migration_preserves_historical_membership_price_and_usage():
+    migrate_from = (
         "memberships",
         "0007_membership_package_description_en_snapshot_and_more",
     )
-    executor = MigrationExecutor(connection)
-    try:
-        executor.migrate([migrate_from])
-        old_apps = executor.loader.project_state([migrate_from]).apps
-        LegacySettings = old_apps.get_model("memberships", "MembershipPaymentSettings")
-        LegacySettings.objects.create(
-            key="default",
-            direct_transfer_enabled=True,
-            bank_code="VCB",
-            account_number="0123456789",
-            account_name="NATURAL FARMING VIETNAM",
-        )
-
-        executor = MigrationExecutor(connection)
-        executor.migrate([migrate_to])
-        new_apps = executor.loader.project_state([migrate_to]).apps
-        MigratedSettings = new_apps.get_model("memberships", "MembershipPaymentSettings")
-        migrated = MigratedSettings.objects.get(pk="default")
-        assert migrated.direct_transfer_enabled is False
-        assert migrated.bank_bin == ""
-        assert migrated.bank_name == ""
-    finally:
-        MigrationExecutor(connection).migrate([current_migration])
-
-
-@pytest.mark.django_db(transaction=True)
-def test_catalog_translation_migration_backfills_vi_without_inventing_english():
-    migrate_from = ("memberships", "0005_membership_request_phone_and_payment_version")
     migrate_to = (
         "memberships",
-        "0006_membershippackagetranslation_producttranslation",
+        "0008_farmbrite_memberships_and_price_options",
     )
     executor = MigrationExecutor(connection)
     try:
         executor.migrate([migrate_from])
         old_apps = executor.loader.project_state([migrate_from]).apps
+        LegacyUser = old_apps.get_model("identity", "User")
         LegacyProduct = old_apps.get_model("memberships", "Product")
         LegacyPackage = old_apps.get_model("memberships", "MembershipPackage")
+        LegacyPackageItem = old_apps.get_model(
+            "memberships", "MembershipPackageItem"
+        )
+        LegacyRequest = old_apps.get_model("memberships", "MembershipRequest")
+        LegacyMembership = old_apps.get_model("memberships", "Membership")
+        LegacySnapshot = old_apps.get_model(
+            "memberships", "MembershipProductSnapshot"
+        )
+        LegacyCycle = old_apps.get_model("memberships", "MembershipCycle")
+        LegacyQuota = old_apps.get_model("memberships", "MembershipCycleQuota")
+        LegacyUsage = old_apps.get_model("memberships", "MembershipUsageOrder")
+        LegacyUsageLine = old_apps.get_model("memberships", "MembershipUsageLine")
+        LegacyAllocation = old_apps.get_model(
+            "memberships", "MembershipUsageAllocation"
+        )
+
+        user = LegacyUser.objects.create(
+            email="legacy-price@example.com",
+            name="Legacy member",
+            password="!",
+            status="active",
+            is_active=True,
+        )
         product = LegacyProduct.objects.create(
-            name="Giỏ rau cũ",
-            short_description="Nội dung gốc",
+            name="Legacy basket",
+            short_description="Historical product",
             unit_size=Decimal("0.500"),
             unit_label_vi="kg",
             unit_label_en="kg",
         )
         package = LegacyPackage.objects.create(
-            name="Gói CSA cũ",
-            description="Mô tả gốc",
-            upfront_price=Decimal("1500000"),
-            duration_months=3,
-            quota_policy="expire",
+            name="Legacy package",
+            description="Live package price",
+            upfront_price=Decimal("4500000"),
+            duration_months=6,
+            quota_policy="rollover",
         )
+        LegacyPackageItem.objects.create(
+            package=package, product=product, quota_units=2
+        )
+        request = LegacyRequest.objects.create(
+            short_code="LEGACY01",
+            user=user,
+            package=package,
+            package_name_snapshot="Legacy package snapshot",
+            package_description_snapshot="Historical description",
+            package_name_vi_snapshot="Gói lịch sử",
+            package_name_en_snapshot="Historical package",
+            package_description_vi_snapshot="Mô tả lịch sử",
+            package_description_en_snapshot="Historical description",
+            upfront_price_snapshot=Decimal("4614000"),
+            duration_months_snapshot=6,
+            quota_policy_snapshot="rollover",
+            phone_snapshot="0901234567",
+            status="approved",
+            open_slot=None,
+            approved_at=timezone.now(),
+        )
+        membership = LegacyMembership.objects.create(
+            user=user,
+            request=request,
+            package=package,
+            package_name_snapshot="Legacy package snapshot",
+            package_description_snapshot="Historical description",
+            package_name_vi_snapshot="Gói lịch sử",
+            package_name_en_snapshot="Historical package",
+            package_description_vi_snapshot="Mô tả lịch sử",
+            package_description_en_snapshot="Historical description",
+            upfront_price_snapshot=Decimal("4614000"),
+            duration_months_snapshot=6,
+            quota_policy_snapshot="rollover",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 7, 1),
+            status="active",
+            current_slot=True,
+            activated_by=user,
+        )
+        snapshot = LegacySnapshot.objects.create(
+            membership=membership,
+            product=product,
+            product_name="Legacy basket snapshot",
+            product_name_vi_snapshot="Giỏ lịch sử",
+            product_name_en_snapshot="Historical basket",
+            unit_size=Decimal("0.500"),
+            unit_label_vi="kg",
+            unit_label_en="kg",
+            quota_units_per_cycle=2,
+        )
+        cycle = LegacyCycle.objects.create(
+            membership=membership,
+            sequence=1,
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 2, 1),
+        )
+        quota = LegacyQuota.objects.create(
+            cycle=cycle,
+            product_snapshot=snapshot,
+            granted_units=2,
+            remaining_units=1,
+            expired_units=0,
+        )
+        usage = LegacyUsage.objects.create(
+            membership=membership,
+            user=user,
+            idempotency_key=uuid.uuid4(),
+            status="applied",
+            note="Historical delivery",
+            created_by=user,
+        )
+        line = LegacyUsageLine.objects.create(
+            order=usage, product_snapshot=snapshot, units=1
+        )
+        LegacyAllocation.objects.create(line=line, cycle_quota=quota, units=1)
 
         executor = MigrationExecutor(connection)
         executor.migrate([migrate_to])
         new_apps = executor.loader.project_state([migrate_to]).apps
-        ProductTranslation = new_apps.get_model("memberships", "ProductTranslation")
-        PackageTranslation = new_apps.get_model(
-            "memberships", "MembershipPackageTranslation"
+        PriceOption = new_apps.get_model(
+            "memberships", "MembershipPackagePriceOption"
         )
-        assert list(
-            ProductTranslation.objects.filter(product_id=product.pk).values_list(
-                "locale", "name", "short_description"
+        MigratedMembership = new_apps.get_model("memberships", "Membership")
+        MigratedQuota = new_apps.get_model("memberships", "MembershipCycleQuota")
+        MigratedUsage = new_apps.get_model("memberships", "MembershipUsageOrder")
+        MigratedAllocation = new_apps.get_model(
+            "memberships", "MembershipUsageAllocation"
+        )
+
+        options = list(
+            PriceOption.objects.filter(package_id=package.pk).order_by(
+                "-is_active", "monthly_price_vnd"
             )
-        ) == [("vi", "Giỏ rau cũ", "Nội dung gốc")]
-        assert list(
-            PackageTranslation.objects.filter(package_id=package.pk).values_list(
-                "locale", "name", "description"
+        )
+        assert [
+            (
+                item.duration_months,
+                item.monthly_price_vnd,
+                item.is_active,
+                item.active_duration_key,
             )
-        ) == [("vi", "Gói CSA cũ", "Mô tả gốc")]
+            for item in options
+        ] == [
+            (6, 750_000, True, 6),
+            (6, 769_000, False, None),
+        ]
+        migrated = MigratedMembership.objects.get(pk=membership.pk)
+        historical_option = PriceOption.objects.get(
+            package_id=package.pk,
+            duration_months=6,
+            monthly_price_vnd=769_000,
+        )
+        assert migrated.price_option_id == historical_option.pk
+        assert migrated.monthly_price_vnd_snapshot == 769_000
+        assert migrated.total_price_vnd_snapshot == 4_614_000
+        assert migrated.package_name_vi_snapshot == "Gói lịch sử"
+        assert migrated.product_snapshots.get().product_name_en_snapshot == (
+            "Historical basket"
+        )
+        assert MigratedQuota.objects.get(pk=quota.pk).remaining_units == 1
+        assert MigratedUsage.objects.get(pk=usage.pk).note == "Historical delivery"
+        assert MigratedAllocation.objects.get(line__order_id=usage.pk).units == 1
     finally:
-        MigrationExecutor(connection).migrate(
-            [("memberships", "0007_membership_package_description_en_snapshot_and_more")]
-        )
+        MigrationExecutor(connection).migrate([migrate_to])
 
 
 @pytest.mark.django_db
-def test_snapshot_migration_backfills_only_vietnamese_content(active_user):
-    membership, _product, membership_request = activate_membership(active_user, quota=3)
-    request_snapshot = membership_request.item_snapshots.get()
-    membership_snapshot = membership.product_snapshots.get()
-    MembershipRequest.objects.filter(pk=membership_request.pk).update(
-        package_name_vi_snapshot="",
-        package_name_en_snapshot="",
-        package_description_vi_snapshot="",
-        package_description_en_snapshot="",
-    )
-    type(request_snapshot).objects.filter(pk=request_snapshot.pk).update(
-        product_name_vi_snapshot="", product_name_en_snapshot=""
-    )
-    Membership.objects.filter(pk=membership.pk).update(
-        package_name_vi_snapshot="",
-        package_name_en_snapshot="",
-        package_description_vi_snapshot="",
-        package_description_en_snapshot="",
-    )
-    type(membership_snapshot).objects.filter(pk=membership_snapshot.pk).update(
-        product_name_vi_snapshot="", product_name_en_snapshot=""
-    )
-    original_price = membership.upfront_price_snapshot
-    original_status = membership.status
-
-    migration = importlib.import_module(
-        "memberships.migrations.0007_membership_package_description_en_snapshot_and_more"
-    )
-    migration.backfill_vietnamese_snapshots(apps, None)
-
-    membership_request.refresh_from_db()
-    request_snapshot.refresh_from_db()
-    membership.refresh_from_db()
-    membership_snapshot.refresh_from_db()
-    assert membership_request.package_name_vi_snapshot == membership_request.package_name_snapshot
-    assert membership_request.package_name_en_snapshot == ""
-    assert request_snapshot.product_name_vi_snapshot == request_snapshot.product_name
-    assert request_snapshot.product_name_en_snapshot == ""
-    assert membership.package_name_vi_snapshot == membership.package_name_snapshot
-    assert membership.package_name_en_snapshot == ""
-    assert membership_snapshot.product_name_vi_snapshot == membership_snapshot.product_name
-    assert membership_snapshot.product_name_en_snapshot == ""
-    assert membership.upfront_price_snapshot == original_price
-    assert membership.status == original_status
-
-
-@pytest.mark.django_db
-def test_forged_direct_transfer_is_blocked_and_old_payment_request_still_works(
-    access_token, active_user
-):
-    ensure_phone(active_user)
-    package, _product = create_package()
-    own_client = bearer_client(access_token)
-
-    forged = own_client.post(
-        "/api/v1/memberships/requests",
-        {
-            "package_id": str(package.pk),
-            "flow": "direct_transfer",
-            "phone": "0901234567",
-        },
-        format="json",
-    )
-    assert forged.status_code == 409
-    assert forged.json() == {"errors": [{"code": "direct_transfer_disabled"}]}
-    assert not MembershipRequest.objects.filter(user=active_user).exists()
-
-    settings = configure_payment_settings(enabled=True)
-    request, instruction = create_membership_request(
-        user=active_user,
-        package_id=package.pk,
-        flow="direct_transfer",
-    )
-    instruction.bank_code = "VCB"
-    instruction.bank_bin = ""
-    instruction.bank_name = ""
-    instruction.save(update_fields=["bank_code", "bank_bin", "bank_name"])
-    settings.direct_transfer_enabled = False
-    settings.save(update_fields=["direct_transfer_enabled", "updated_at"])
-
-    pending = own_client.get("/api/v1/memberships/requests")
-    assert pending.status_code == 200
-    assert pending.json()["data"]["payment_instruction"]["bank_code"] == "VCB"
-    assert pending.json()["data"]["payment_instruction"]["bank_bin"] == ""
-    assert pending.json()["data"]["payment_instruction"]["account_number"] == (
-        instruction.account_number
-    )
-    submitted = own_client.post(
-        f"/api/v1/memberships/requests/{request.pk}/payment-submitted",
-        {},
-        format="json",
-    )
-    assert submitted.status_code == 200
-    assert submitted.json()["data"]["status"] == MembershipRequestStatus.PAYMENT_SUBMITTED
-    assert submitted.json()["data"]["payment_instruction"] is not None
-
-
-@pytest.mark.django_db
-def test_admin_api_full_membership_workflow(admin_api, active_user):
-    ensure_phone(active_user)
-    cache_transfer_banks()
-    settings_response = admin_api.put(
-        "/api/v1/admin/membership-payment-settings",
-        {
-            "direct_transfer_enabled": True,
-            "bank_bin": "970436",
-            "account_number": "0123456789",
-            "account_name": "NATURAL FARMING VIETNAM",
-            "version": 0,
-        },
-        format="json",
-    )
-    assert settings_response.status_code == 200
-    product_response = admin_api.post(
-        "/api/v1/admin/membership-products",
-        {
-            "translations": product_translations(),
-            "unit_size": "0.500",
-            "unit_label_vi": "kg",
-            "unit_label_en": "kg",
-        },
-        format="json",
-    )
-    assert product_response.status_code == 201
-    product = product_response.json()["data"]
-    assert "category" not in product
-    product_patch = admin_api.patch(
-        f"/api/v1/admin/membership-products/{product['id']}",
-        {
-            "translations": product_translations(
-                vi_description="Cập nhật qua API quản trị",
-                en_description="Updated through the admin API",
-            )
-        },
-        format="json",
-    )
-    assert product_patch.status_code == 200
-    assert product_patch.json()["data"]["translations"][0]["short_description"] == (
-        "Updated through the admin API"
-    )
-    product_list = admin_api.get("/api/v1/admin/membership-products")
-    product_detail = admin_api.get(f"/api/v1/admin/membership-products/{product['id']}")
-    assert "category" not in product_list.json()["data"][0]
-    assert "category" not in product_detail.json()["data"]
-    package_response = admin_api.post(
-        "/api/v1/admin/membership-packages",
-        {
-            "translations": package_translations(),
-            "upfront_price": "6000000",
-            "duration_months": 6,
-            "quota_policy": "rollover",
-            "items": [{"product_id": product["id"], "quota_units": 3}],
-        },
-        format="json",
-    )
-    assert package_response.status_code == 201
-    package = package_response.json()["data"]
-    package_patch = admin_api.patch(
-        f"/api/v1/admin/membership-packages/{package['id']}",
-        {
-            "translations": package_translations(
-                vi_description="Gói đã cập nhật",
-                en_description="Updated package",
-            )
-        },
-        format="json",
-    )
-    assert package_patch.status_code == 200
-    assert package_patch.json()["data"]["translations"][0]["description"] == "Updated package"
-
-    invalid_request = admin_api.post(
-        "/api/v1/memberships/requests",
-        {
-            "package_id": package["id"],
-            "flow": "direct_transfer",
-            "amount": "1",
-        },
-        format="json",
-    )
-    assert invalid_request.status_code == 400
-
-    request_response = admin_api.post(
-        "/api/v1/memberships/requests",
-        {
-            "package_id": package["id"],
-            "flow": "direct_transfer",
-            "phone": "0901234567",
-        },
-        format="json",
-    )
-    assert request_response.status_code == 201
-    request_id = request_response.json()["data"]["id"]
-    assert (
-        admin_api.post(
-            f"/api/v1/memberships/requests/{request_id}/payment-submitted",
-            {},
-            format="json",
-        ).status_code
-        == 200
-    )
-    approve_response = admin_api.post(
-        f"/api/v1/admin/membership-requests/{request_id}/approve",
-        {"start_date": timezone.localdate().isoformat()},
-        format="json",
-    )
-    assert approve_response.status_code == 201
-    membership_id = approve_response.json()["data"]["id"]
-    request_detail = admin_api.get(f"/api/v1/admin/membership-requests/{request_id}")
-    assert [event["action"] for event in request_detail.json()["data"]["events"]] == [
-        MembershipRequestEventAction.REQUEST_CREATED,
-        MembershipRequestEventAction.PAYMENT_INSTRUCTION_ISSUED,
-        MembershipRequestEventAction.PAYMENT_SUBMITTED,
-        MembershipRequestEventAction.APPROVED,
-    ]
-
-    usage_response = admin_api.post(
-        "/api/v1/admin/membership-usage",
-        {
-            "membership_id": membership_id,
-            "idempotency_key": str(uuid.uuid4()),
-            "lines": [{"product_id": product["id"], "units": 1}],
-        },
-        format="json",
-    )
-    assert usage_response.status_code == 201
-    usage_id = usage_response.json()["data"]["id"]
-    undo_response = admin_api.post(
-        f"/api/v1/admin/membership-usage/{usage_id}/undo",
-        {"reason": "API integration test"},
-        format="json",
-    )
-    assert undo_response.status_code == 200
-    assert undo_response.json()["data"]["status"] == UsageOrderStatus.REVERSED
-
-
-@pytest.mark.django_db
-def test_self_api_authorization_ownership_and_repeated_submit(
-    access_token, active_user, oauth_application
-):
-    ensure_phone(active_user)
-    package, _product = create_package()
-    configure_payment_settings()
-    request, _instruction = create_membership_request(
-        user=active_user, package_id=package.pk, flow="direct_transfer"
-    )
-    own_client = bearer_client(access_token)
-    first = own_client.post(
-        f"/api/v1/memberships/requests/{request.pk}/payment-submitted", {}, format="json"
-    )
-    second = own_client.post(
-        f"/api/v1/memberships/requests/{request.pk}/payment-submitted", {}, format="json"
-    )
-    assert first.status_code == second.status_code == 200
-    assert second.json()["meta"]["idempotent_replay"] is True
-    assert first["Cache-Control"] == "private, no-store"
-
-    other = create_active_user("membership-other@example.com")
-    other_token = AccessToken.objects.create(
-        user=other,
-        application=oauth_application,
-        token="membership-other-token",
-        expires=timezone.now() + timezone.timedelta(hours=1),
-        scope="profile email",
-    )
-    assert (
-        bearer_client(other_token)
-        .post(
-            f"/api/v1/memberships/requests/{request.pk}/payment-submitted",
-            {},
-            format="json",
-        )
-        .status_code
-        == 404
-    )
-    assert APIClient().get("/api/v1/memberships/quota").status_code == 401
-
-
-@pytest.mark.django_db
-def test_admin_permission_crud_actions_and_usage_pagination(admin_api, active_user, access_token):
-    assert admin_api.get("/api/v1/admin/membership-categories").status_code == 404
-
-    rejected_legacy_contract = admin_api.post(
-        "/api/v1/admin/membership-products",
-        {
-            "category_id": str(uuid.uuid4()),
-            "name": "Legacy product",
-            "unit_size": "0.500",
-            "unit_label_vi": "kg",
-            "unit_label_en": "kg",
-        },
-        format="json",
-    )
-    assert rejected_legacy_contract.status_code == 400
-    assert rejected_legacy_contract.json() == {
-        "category_id": "This field is not allowed.",
-        "name": "This field is not allowed.",
-    }
-
-    membership, product, _request = activate_membership(active_user, quota=100)
-    for _index in range(31):
-        create_usage_order(
-            membership_id=membership.pk,
-            actor=active_user,
-            idempotency_key=uuid.uuid4(),
-            lines=[{"product_id": product.pk, "units": 1}],
-        )
-    response = admin_api.get(f"/api/v1/admin/memberships/{membership.pk}/history?page=2")
-    assert response.status_code == 200
-    assert response.json()["meta"] == {"page": 2, "page_size": 30, "total": 31}
-    assert len(response.json()["data"]) == 1
-
-
-@pytest.mark.django_db
-def test_non_admin_cannot_access_admin_membership_api(access_token):
-    response = bearer_client(access_token).get("/api/v1/admin/membership-requests")
-    assert response.status_code == 403
-
-
-def test_mysql_safe_slot_constraints_do_not_use_partial_indexes():
-    request_constraint = next(
-        item
-        for item in MembershipRequest._meta.constraints
-        if item.name == "memberships_one_open_request_per_user"
-    )
-    membership_constraint = next(
+def test_mysql_safe_current_slot_constraint_has_no_partial_index():
+    constraint = next(
         item
         for item in Membership._meta.constraints
         if item.name == "memberships_one_current_per_user"
     )
-    assert request_constraint.condition is None
-    assert request_constraint.fields == ("user", "open_slot")
-    assert membership_constraint.condition is None
-    assert membership_constraint.fields == ("user", "current_slot")
+    assert constraint.condition is None
+    assert constraint.fields == ("user", "current_slot")
 
 
 @pytest.mark.skipif(
@@ -1865,89 +1052,41 @@ def test_mysql_safe_slot_constraints_do_not_use_partial_indexes():
     reason="SQLite does not provide row-level SELECT FOR UPDATE semantics",
 )
 @pytest.mark.django_db(transaction=True)
-def test_concurrent_approval_creates_exactly_one_membership():
-    user = create_active_user("concurrent-membership@example.com")
-    package, _product = create_package()
-    configure_payment_settings()
-    request, _instruction = create_membership_request(
-        user=user, package_id=package.pk, flow="direct_transfer"
-    )
-    submit_payment(request_id=request.pk, user=user)
+def test_concurrent_manual_assignment_creates_only_one_current_membership():
+    user = create_active_user("concurrent-assignment@example.com")
+    package, _product, option = create_package()
     barrier = threading.Barrier(3)
     outcomes = []
 
-    def approve():
+    def assign_once(reference):
         close_old_connections()
         try:
             barrier.wait()
-            _membership, created = approve_request(
-                request_id=request.pk,
-                actor=User.objects.get(pk=user.pk),
+            assign_membership(
+                user_id=user.pk,
+                package_id=package.pk,
+                price_option_id=option.pk,
                 start_date=timezone.localdate(),
+                farmbrite_order_reference=reference,
+                actor=User.objects.get(pk=user.pk),
             )
-            outcomes.append("created" if created else "replay")
-        except RequestTransitionConflict:
-            outcomes.append("conflict")
-        finally:
-            close_old_connections()
-
-    threads = [threading.Thread(target=approve) for _index in range(2)]
-    for thread in threads:
-        thread.start()
-    barrier.wait()
-    for thread in threads:
-        thread.join()
-
-    assert sorted(outcomes) == ["created", "replay"]
-    assert Membership.objects.filter(user=user).count() == 1
-
-
-@pytest.mark.skipif(
-    not connection.features.has_select_for_update,
-    reason="SQLite does not provide row-level SELECT FOR UPDATE semantics",
-)
-@pytest.mark.django_db(transaction=True)
-def test_concurrent_payment_settings_update_rejects_one_stale_writer(active_user, access_token):
-    group, _created = Group.objects.get_or_create(name="website_admin")
-    active_user.groups.add(group)
-    access_token.scope = "profile email content:manage"
-    access_token.save(update_fields=["scope"])
-    settings = MembershipPaymentSettings.objects.create(
-        key="default",
-        direct_transfer_enabled=False,
-        account_number="0123456789",
-        account_name="ORIGINAL",
-    )
-    barrier = threading.Barrier(3)
-    outcomes = []
-
-    def update_settings(name):
-        close_old_connections()
-        try:
-            barrier.wait()
-            response = bearer_client(access_token).patch(
-                "/api/v1/admin/membership-payment-settings",
-                {"account_name": name, "version": settings.version},
-                format="json",
-            )
-            outcomes.append(response.status_code)
+            outcomes.append("created")
+        except ActiveMembershipExists:
+            outcomes.append("active_exists")
         finally:
             close_old_connections()
 
     threads = [
-        threading.Thread(target=update_settings, args=(name,))
-        for name in ("ADMIN ONE", "ADMIN TWO")
+        threading.Thread(target=assign_once, args=(reference,))
+        for reference in ("FB-CONCURRENT-1", "FB-CONCURRENT-2")
     ]
     for thread in threads:
         thread.start()
     barrier.wait()
     for thread in threads:
         thread.join()
-
-    assert sorted(outcomes) == [200, 409]
-    settings.refresh_from_db()
-    assert settings.account_name in {"ADMIN ONE", "ADMIN TWO"}
-    assert settings.version == 2
+    assert sorted(outcomes) == ["active_exists", "created"]
+    assert Membership.objects.filter(user=user, current_slot=True).count() == 1
 
 
 @pytest.mark.skipif(
@@ -1957,7 +1096,7 @@ def test_concurrent_payment_settings_update_rejects_one_stale_writer(active_user
 @pytest.mark.django_db(transaction=True)
 def test_concurrent_usage_cannot_overdraw_quota():
     user = create_active_user("concurrent-usage@example.com")
-    membership, product, _request = activate_membership(user, quota=3)
+    membership, product, _option = assign(user)
     barrier = threading.Barrier(3)
     outcomes = []
 
@@ -1983,10 +1122,8 @@ def test_concurrent_usage_cannot_overdraw_quota():
     barrier.wait()
     for thread in threads:
         thread.join()
-
     assert sorted(outcomes) == ["created", "insufficient"]
-    quota = MembershipCycleQuota.objects.get(cycle__membership=membership)
-    assert quota.remaining_units == 1
+    assert MembershipCycleQuota.objects.get(cycle__membership=membership).remaining_units == 0
 
 
 @pytest.mark.skipif(
@@ -1995,7 +1132,7 @@ def test_concurrent_usage_cannot_overdraw_quota():
 )
 @pytest.mark.django_db(transaction=True)
 def test_concurrent_current_and_quota_views_initialize_cycles_once(active_user, access_token):
-    membership, _product, _request = activate_membership(active_user)
+    membership, _product, _option = assign(active_user)
     MembershipCycleQuota.objects.filter(cycle__membership=membership).delete()
     membership.cycles.all().delete()
     barrier = threading.Barrier(3)
@@ -2005,8 +1142,7 @@ def test_concurrent_current_and_quota_views_initialize_cycles_once(active_user, 
         close_old_connections()
         try:
             barrier.wait()
-            response = bearer_client(access_token).get(path)
-            outcomes.append((path, response.status_code))
+            outcomes.append((path, bearer_client(access_token).get(path).status_code))
         finally:
             close_old_connections()
 
@@ -2019,15 +1155,9 @@ def test_concurrent_current_and_quota_views_initialize_cycles_once(active_user, 
     barrier.wait()
     for thread in threads:
         thread.join()
-
     assert sorted(outcomes) == [
         ("/api/v1/memberships/current", 200),
         ("/api/v1/memberships/quota", 200),
     ]
     assert list(membership.cycles.values_list("sequence", flat=True)) == [1]
     assert MembershipCycleQuota.objects.filter(cycle__membership=membership).count() == 1
-
-
-def test_add_months_clamps_anniversary_day():
-    assert add_months(date(2026, 1, 31), 1) == date(2026, 2, 28)
-    assert add_months(date(2024, 1, 31), 1) == date(2024, 2, 29)

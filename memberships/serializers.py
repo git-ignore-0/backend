@@ -5,10 +5,10 @@ from rest_framework import serializers
 
 from memberships.models import (
     MembershipContentLocale,
-    MembershipRequestStatus,
     Product,
     QuotaPolicy,
 )
+from memberships.pricing import MAX_POSITIVE_BIG_INTEGER, calculate_total_price_vnd
 
 MAX_PAGE = 10_000
 
@@ -50,13 +50,6 @@ class AdminPackageQuerySerializer(AdminProductQuerySerializer):
 
 class PublicPackageQuerySerializer(LocalePageQuerySerializer):
     pass
-
-
-class AdminRequestQuerySerializer(LocalePageQuerySerializer):
-    status = serializers.ChoiceField(
-        choices=MembershipRequestStatus.choices, allow_blank=True, default=""
-    )
-    search = serializers.CharField(max_length=254, allow_blank=True, default="")
 
 
 class AdminMembershipQuerySerializer(LocalePageQuerySerializer):
@@ -125,15 +118,34 @@ class PackageItemWriteSerializer(StrictSerializer):
             raise serializers.ValidationError("Product does not exist.") from error
 
 
+class PackagePriceOptionWriteSerializer(StrictSerializer):
+    id = serializers.UUIDField(required=False)
+    duration_months = serializers.IntegerField(min_value=1, max_value=120)
+    monthly_price_vnd = serializers.IntegerField(
+        min_value=1, max_value=MAX_POSITIVE_BIG_INTEGER
+    )
+    is_active = serializers.BooleanField(required=False, default=True)
+    sort_order = serializers.IntegerField(min_value=0, required=False, default=0)
+
+    def validate(self, attrs):
+        try:
+            calculate_total_price_vnd(
+                duration_months=attrs["duration_months"],
+                monthly_price_vnd=attrs["monthly_price_vnd"],
+            )
+        except ValueError as error:
+            raise serializers.ValidationError(
+                {"monthly_price_vnd": str(error)}
+            ) from error
+        return attrs
+
+
 class PackageWriteSerializer(StrictSerializer):
     translations = PackageTranslationWriteSerializer(many=True, required=False)
-    upfront_price = serializers.DecimalField(
-        max_digits=14, decimal_places=0, min_value=Decimal("1")
-    )
-    duration_months = serializers.IntegerField(min_value=1, max_value=120)
     quota_policy = serializers.ChoiceField(choices=QuotaPolicy.choices)
     is_active = serializers.BooleanField(required=False, default=True)
     items = PackageItemWriteSerializer(many=True, allow_empty=False)
+    price_options = PackagePriceOptionWriteSerializer(many=True, allow_empty=False, required=False)
 
     def validate_translations(self, value):
         return validate_bilingual_translations(value)
@@ -147,6 +159,23 @@ class PackageWriteSerializer(StrictSerializer):
             raise serializers.ValidationError("Package items must use active products.")
         return value
 
+    def validate_price_options(self, value):
+        active_durations = [
+            item["duration_months"] for item in value if item["is_active"]
+        ]
+        if len(active_durations) != len(set(active_durations)):
+            raise serializers.ValidationError(
+                "Active duration months must be unique within a package."
+            )
+        option_ids = [item["id"] for item in value if item.get("id")]
+        if len(option_ids) != len(set(option_ids)):
+            raise serializers.ValidationError("Price option IDs must be unique.")
+        if not any(item["is_active"] for item in value):
+            raise serializers.ValidationError(
+                "At least one active price option is required."
+            )
+        return value
+
     def validate(self, attrs):
         translations = attrs.get("translations")
         existing_locales = (
@@ -158,62 +187,25 @@ class PackageWriteSerializer(StrictSerializer):
             raise serializers.ValidationError(
                 {"translations": "Vietnamese and English translations are required."}
             )
+        if self.instance is None and "price_options" not in attrs:
+            raise serializers.ValidationError(
+                {"price_options": "At least one active price option is required."}
+            )
         return attrs
-
-
-class PaymentSettingsWriteSerializer(StrictSerializer):
-    version = serializers.IntegerField(min_value=0, write_only=True)
-    direct_transfer_enabled = serializers.BooleanField()
-    bank_bin = serializers.RegexField(r"^\d{6}$", max_length=6, allow_blank=True)
-    account_number = serializers.RegexField(r"^\d{6,19}$", max_length=19, allow_blank=True)
-    account_name = serializers.CharField(max_length=160, allow_blank=True, trim_whitespace=True)
-
-    def validate(self, attrs):
-        current = self.instance
-        enabled = attrs.get(
-            "direct_transfer_enabled",
-            current.direct_transfer_enabled if current else False,
-        )
-        if not enabled:
-            return attrs
-
-        values = {
-            field: attrs.get(field, getattr(current, field, "")).strip()
-            for field in ("bank_bin", "account_number", "account_name")
-        }
-        errors = {}
-        for field, value in values.items():
-            if not value:
-                errors[field] = "This field is required when direct transfer is enabled."
-        if errors:
-            raise serializers.ValidationError(errors)
-        return attrs
-
-
-class MembershipRequestCreateSerializer(StrictSerializer):
-    package_id = serializers.UUIDField()
-    flow = serializers.ChoiceField(choices=["consultation", "direct_transfer"])
-    phone = serializers.CharField(max_length=32, trim_whitespace=True)
-
-    def validate_phone(self, value):
-        from memberships.validation import normalize_membership_phone
-
-        try:
-            return normalize_membership_phone(value)
-        except ValueError as error:
-            raise serializers.ValidationError(str(error)) from error
-
-
-class RequestActionSerializer(StrictSerializer):
-    pass
 
 
 class ReasonSerializer(StrictSerializer):
     reason = serializers.CharField(max_length=1000, trim_whitespace=True)
 
 
-class ApproveSerializer(StrictSerializer):
+class MembershipAssignSerializer(StrictSerializer):
+    user_id = serializers.UUIDField()
+    package_id = serializers.UUIDField()
+    price_option_id = serializers.UUIDField()
     start_date = serializers.DateField()
+    farmbrite_order_reference = serializers.CharField(
+        max_length=120, trim_whitespace=True
+    )
 
     def validate_start_date(self, value):
         if value < timezone.localdate():

@@ -1,6 +1,4 @@
 import calendar
-import re
-import secrets
 from datetime import date
 
 from django.db import IntegrityError, transaction
@@ -8,22 +6,15 @@ from django.db.models import F
 from django.utils import timezone
 
 from identity.models import User
-from memberships.banks import BankDirectoryUnavailable, find_transfer_bank
 from memberships.models import (
-    OPEN_REQUEST_STATUSES,
     Membership,
     MembershipCycle,
     MembershipCycleQuota,
     MembershipPackage,
+    MembershipPackageItem,
+    MembershipPackagePriceOption,
     MembershipPackageTranslation,
-    MembershipPaymentInstruction,
-    MembershipPaymentSettings,
     MembershipProductSnapshot,
-    MembershipRequest,
-    MembershipRequestEvent,
-    MembershipRequestEventAction,
-    MembershipRequestItemSnapshot,
-    MembershipRequestStatus,
     MembershipStatus,
     MembershipUsageAllocation,
     MembershipUsageLine,
@@ -34,8 +25,7 @@ from memberships.models import (
     QuotaPolicy,
     UsageOrderStatus,
 )
-
-SHORT_CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+from memberships.pricing import calculate_total_price_vnd
 
 
 class MembershipError(ValueError):
@@ -46,32 +36,32 @@ class PackageUnavailable(MembershipError):
     code = "package_unavailable"
 
 
-class OpenRequestExists(MembershipError):
-    code = "open_request_exists"
+class PriceOptionUnavailable(MembershipError):
+    code = "price_option_unavailable"
 
 
 class ActiveMembershipExists(MembershipError):
     code = "active_membership_exists"
 
 
-class PaymentSettingsInvalid(MembershipError):
-    code = "payment_settings_invalid"
+class DuplicateFarmbriteOrderReference(MembershipError):
+    code = "duplicate_farmbrite_order_reference"
 
 
-class DirectTransferDisabled(MembershipError):
-    code = "direct_transfer_disabled"
-
-
-class PhoneRequired(MembershipError):
-    code = "phone_required"
+class FarmbriteOrderReferenceRequired(MembershipError):
+    code = "farmbrite_order_reference_required"
 
 
 class StartDateInPast(MembershipError):
     code = "start_date_in_past"
 
 
-class RequestTransitionConflict(MembershipError):
-    code = "request_transition_conflict"
+class PriceOptionConflict(MembershipError):
+    code = "price_option_conflict"
+
+
+class PriceOptionTotalInvalid(MembershipError):
+    code = "price_option_total_invalid"
 
 
 class QuotaError(MembershipError):
@@ -106,64 +96,161 @@ def add_months(value: date, months: int) -> date:
     return date(year, month, day)
 
 
-def _short_code() -> str:
-    return "".join(secrets.choice(SHORT_CODE_ALPHABET) for _ in range(8))
+def normalize_farmbrite_order_reference(value: str) -> tuple[str, str]:
+    reference = value.strip()
+    if not reference:
+        raise FarmbriteOrderReferenceRequired("Farmbrite order reference is required")
+    if len(reference) > 120:
+        raise FarmbriteOrderReferenceRequired("Farmbrite order reference is too long")
+    return reference, reference.casefold()
 
 
-def _validated_payment_settings(*, require_direct_transfer=False) -> MembershipPaymentSettings:
-    settings = MembershipPaymentSettings.objects.filter(pk="default").first()
-    if require_direct_transfer and (not settings or not settings.direct_transfer_enabled):
-        raise DirectTransferDisabled("Direct transfer is disabled")
-    if not settings:
-        raise PaymentSettingsInvalid("Membership payment settings are missing")
-    values = (settings.bank_bin, settings.bank_name, settings.account_number, settings.account_name)
-    if any(not value.strip() for value in values):
-        raise PaymentSettingsInvalid("Membership payment settings are incomplete")
-    if not re.fullmatch(r"\d{6,19}", settings.account_number):
-        raise PaymentSettingsInvalid("Account number is invalid")
-    try:
-        bank = find_transfer_bank(settings.bank_bin)
-    except BankDirectoryUnavailable as error:
-        raise PaymentSettingsInvalid("Bank directory is unavailable") from error
-    if not bank:
-        raise PaymentSettingsInvalid("Bank BIN is invalid")
-    if settings.bank_name.strip() != bank["name"].strip():
-        raise PaymentSettingsInvalid("Bank name does not match the bank directory")
-    return settings
+@transaction.atomic
+def sync_package_price_options(*, package: MembershipPackage, options: list[dict]) -> None:
+    """Replace a package's option set while retaining any option used by history."""
+    package = MembershipPackage.objects.select_for_update().get(pk=package.pk)
+    normalized_options = [dict(item) for item in options]
+    existing = {
+        str(option.pk): option
+        for option in MembershipPackagePriceOption.objects.select_for_update()
+        .filter(package=package)
+        .order_by("id")
+    }
+    supplied_ids = {
+        str(item["id"]) for item in normalized_options if item.get("id")
+    }
+    if unknown := supplied_ids - set(existing):
+        raise PriceOptionConflict(f"Price options do not belong to package: {sorted(unknown)}")
+    if not any(item["is_active"] for item in normalized_options):
+        raise PriceOptionConflict("A package requires at least one active price option")
+    active_durations = [
+        item["duration_months"] for item in normalized_options if item["is_active"]
+    ]
+    if len(active_durations) != len(set(active_durations)):
+        raise PriceOptionConflict(
+            "A package cannot have two active price options with the same duration"
+        )
+
+    for item in normalized_options:
+        try:
+            calculate_total_price_vnd(
+                duration_months=item["duration_months"],
+                monthly_price_vnd=item["monthly_price_vnd"],
+            )
+        except ValueError as error:
+            raise PriceOptionTotalInvalid(str(error)) from error
+        if not item.get("id"):
+            continue
+        option = existing[str(item["id"])]
+        if option.memberships.exists():
+            if (
+                option.duration_months != item["duration_months"]
+                or option.monthly_price_vnd != item["monthly_price_vnd"]
+            ):
+                raise PriceOptionConflict(
+                    "A used price option's duration and monthly price are immutable"
+                )
+            if not option.is_active and item["is_active"]:
+                raise PriceOptionConflict(
+                    "A historical used price option cannot be reactivated"
+                )
+
+    for option_id, option in existing.items():
+        if option_id in supplied_ids:
+            continue
+        if option.memberships.exists():
+            option.is_active = False
+            option.active_duration_key = None
+            option.save(
+                update_fields=["is_active", "active_duration_key", "updated_at"]
+            )
+        else:
+            option.delete()
+
+    desired_by_id = {
+        str(item["id"]): item for item in normalized_options if item.get("id")
+    }
+    for option_id, desired in desired_by_id.items():
+        option = existing[option_id]
+        desired_key = desired["duration_months"] if desired["is_active"] else None
+        if option.active_duration_key is not None and (
+            option.active_duration_key != desired_key
+        ):
+            option.is_active = False
+            option.active_duration_key = None
+            option.save(
+                update_fields=["is_active", "active_duration_key", "updated_at"]
+            )
+
+    for item in normalized_options:
+        option_id = str(item.pop("id")) if item.get("id") else None
+        item["active_duration_key"] = (
+            item["duration_months"] if item["is_active"] else None
+        )
+        if option_id:
+            option = existing[option_id]
+            for field, value in item.items():
+                setattr(option, field, value)
+            option.save()
+        else:
+            MembershipPackagePriceOption.objects.create(package=package, **item)
+
+    if not package.price_options.filter(is_active=True).exists():
+        raise PriceOptionConflict("The last active price option cannot be deactivated or removed")
 
 
-def direct_transfer_is_available() -> bool:
-    try:
-        _validated_payment_settings(require_direct_transfer=True)
-    except (DirectTransferDisabled, PaymentSettingsInvalid):
-        return False
-    return True
-
-
-def _request_phone(user, supplied_phone: str | None) -> str:
-    from memberships.validation import normalize_membership_phone
-
-    profile = getattr(user, "member_profile", None)
-    phone = supplied_phone if supplied_phone is not None else (
-        profile.phone_number if profile else ""
+@transaction.atomic
+def assign_membership(
+    *,
+    user_id,
+    package_id,
+    price_option_id,
+    start_date: date,
+    farmbrite_order_reference: str,
+    actor,
+):
+    reference, reference_key = normalize_farmbrite_order_reference(
+        farmbrite_order_reference
     )
+    today = timezone.localdate()
+    if start_date < today:
+        raise StartDateInPast("Membership start date cannot be in the past")
+
+    user = User.objects.select_for_update().get(pk=user_id)
+    Membership.objects.filter(
+        user=user, current_slot=True, end_date__lte=today
+    ).update(status=MembershipStatus.ENDED, current_slot=None)
+    if Membership.objects.filter(user=user, current_slot=True).exists():
+        raise ActiveMembershipExists("User already has a scheduled or active membership")
+
     try:
-        return normalize_membership_phone(phone)
+        package = MembershipPackage.objects.select_for_update().get(
+            pk=package_id, is_active=True
+        )
+    except MembershipPackage.DoesNotExist as error:
+        raise PackageUnavailable("Package does not exist or is inactive") from error
+    try:
+        price_option = MembershipPackagePriceOption.objects.select_for_update().get(
+            pk=price_option_id, package=package, is_active=True
+        )
+    except MembershipPackagePriceOption.DoesNotExist as error:
+        raise PriceOptionUnavailable(
+            "Price option must be active and belong to the selected package"
+        ) from error
+
+    try:
+        total_price_vnd = calculate_total_price_vnd(
+            duration_months=price_option.duration_months,
+            monthly_price_vnd=price_option.monthly_price_vnd,
+        )
     except ValueError as error:
-        raise PhoneRequired("A valid phone number is required for CSA requests") from error
+        raise PriceOptionTotalInvalid(str(error)) from error
 
-
-def _record_request_event(*, request, action, actor, reason=""):
-    return MembershipRequestEvent.objects.create(
-        request=request,
-        action=action,
-        actor=actor,
-        reason=reason.strip(),
+    items = list(
+        MembershipPackageItem.objects.select_for_update()
+        .filter(package=package)
+        .order_by("id")
     )
-
-
-def _snapshot_package(request: MembershipRequest, package: MembershipPackage) -> None:
-    items = list(package.items.select_for_update().order_by("id"))
     if not items:
         raise PackageUnavailable("Package has no quota items")
     product_ids = [item.product_id for item in items]
@@ -173,28 +260,80 @@ def _snapshot_package(request: MembershipRequest, package: MembershipPackage) ->
         .filter(pk__in=product_ids)
         .order_by("id")
     }
-    if any(not products[item.product_id].is_active for item in items):
-        raise PackageUnavailable("Package contains an inactive product")
-    translations = {
-        (translation.product_id, translation.locale): translation
-        for translation in ProductTranslation.objects.select_for_update().filter(
-            product_id__in=product_ids
-        ).order_by("product_id", "locale", "id")
+    if len(products) != len(product_ids) or any(
+        not products[item.product_id].is_active for item in items
+    ):
+        raise PackageUnavailable("Package contains an unavailable product")
+    package_translations = {
+        item.locale: item
+        for item in MembershipPackageTranslation.objects.select_for_update()
+        .filter(package=package)
+        .order_by("locale", "id")
     }
-    MembershipRequestItemSnapshot.objects.bulk_create(
+    package_vi = package_translations.get("vi")
+    package_en = package_translations.get("en")
+    product_translations = {
+        (item.product_id, item.locale): item
+        for item in ProductTranslation.objects.select_for_update()
+        .filter(product_id__in=product_ids)
+        .order_by("product_id", "locale", "id")
+    }
+
+    try:
+        with transaction.atomic():
+            membership = Membership.objects.create(
+                user=user,
+                package=package,
+                price_option=price_option,
+                package_name_snapshot=package.name,
+                package_description_snapshot=package.description,
+                package_name_vi_snapshot=(package_vi.name if package_vi else package.name),
+                package_name_en_snapshot=(package_en.name if package_en else ""),
+                package_description_vi_snapshot=(
+                    package_vi.description if package_vi else package.description
+                ),
+                package_description_en_snapshot=(
+                    package_en.description if package_en else ""
+                ),
+                monthly_price_vnd_snapshot=price_option.monthly_price_vnd,
+                total_price_vnd_snapshot=total_price_vnd,
+                duration_months_snapshot=price_option.duration_months,
+                quota_policy_snapshot=package.quota_policy,
+                farmbrite_order_reference=reference,
+                farmbrite_order_reference_key=reference_key,
+                start_date=start_date,
+                end_date=add_months(start_date, price_option.duration_months),
+                status=(
+                    MembershipStatus.SCHEDULED
+                    if start_date > today
+                    else MembershipStatus.ACTIVE
+                ),
+                current_slot=True,
+                activated_by=actor,
+            )
+    except IntegrityError as error:
+        if Membership.objects.filter(
+            farmbrite_order_reference_key=reference_key
+        ).exists():
+            raise DuplicateFarmbriteOrderReference(
+                "Farmbrite order reference has already been assigned"
+            ) from error
+        raise
+
+    MembershipProductSnapshot.objects.bulk_create(
         [
-            MembershipRequestItemSnapshot(
-                request=request,
+            MembershipProductSnapshot(
+                membership=membership,
                 product=products[item.product_id],
                 product_name=products[item.product_id].name,
                 product_name_vi_snapshot=(
-                    translations[(item.product_id, "vi")].name
-                    if (item.product_id, "vi") in translations
+                    product_translations[(item.product_id, "vi")].name
+                    if (item.product_id, "vi") in product_translations
                     else products[item.product_id].name
                 ),
                 product_name_en_snapshot=(
-                    translations[(item.product_id, "en")].name
-                    if (item.product_id, "en") in translations
+                    product_translations[(item.product_id, "en")].name
+                    if (item.product_id, "en") in product_translations
                     else ""
                 ),
                 unit_size=products[item.product_id].unit_size,
@@ -205,239 +344,9 @@ def _snapshot_package(request: MembershipRequest, package: MembershipPackage) ->
             for item in items
         ]
     )
-
-
-def _create_instruction(
-    *, request: MembershipRequest, actor=None, require_direct_transfer=False
-):
-    if hasattr(request, "payment_instruction"):
-        return request.payment_instruction, False
-    settings = _validated_payment_settings(require_direct_transfer=require_direct_transfer)
-    phone = request.phone_snapshot
-    if not phone:
-        phone = _request_phone(request.user, None)
-    instruction = MembershipPaymentInstruction.objects.create(
-        request=request,
-        bank_code="",
-        bank_bin=settings.bank_bin,
-        bank_name=settings.bank_name,
-        account_number=settings.account_number.strip(),
-        account_name=settings.account_name.strip(),
-        amount=request.upfront_price_snapshot,
-        phone_snapshot=phone,
-        transfer_content=f"{phone}-{request.short_code}",
-        issued_by=actor,
-    )
-    return instruction, True
-
-
-@transaction.atomic
-def create_membership_request(*, user, package_id, flow: str, phone: str | None = None):
-    User.objects.select_for_update().get(pk=user.pk)
-    phone_snapshot = _request_phone(user, phone)
-    today = timezone.localdate()
-    Membership.objects.filter(
-        user=user,
-        current_slot=True,
-        end_date__lte=today,
-    ).update(status=MembershipStatus.ENDED, current_slot=None)
-    if Membership.objects.filter(user=user, current_slot=True).exists():
-        raise ActiveMembershipExists("User already has a scheduled or active membership")
-    if MembershipRequest.objects.filter(user=user, open_slot=True).exists():
-        raise OpenRequestExists("User already has an open membership request")
-    try:
-        package = MembershipPackage.objects.select_for_update().get(pk=package_id, is_active=True)
-    except MembershipPackage.DoesNotExist as error:
-        raise PackageUnavailable("Package does not exist or is inactive") from error
-    package_translations = {
-        translation.locale: translation
-        for translation in MembershipPackageTranslation.objects.select_for_update().filter(
-            package=package
-        )
-    }
-    package_vi = package_translations.get("vi")
-    package_en = package_translations.get("en")
-    if flow not in {"consultation", "direct_transfer"}:
-        raise RequestTransitionConflict("Invalid request flow")
-    for _attempt in range(20):
-        try:
-            with transaction.atomic():
-                request = MembershipRequest.objects.create(
-                    short_code=_short_code(),
-                    user=user,
-                    package=package,
-                    package_name_snapshot=package.name,
-                    package_description_snapshot=package.description,
-                    package_name_vi_snapshot=(package_vi.name if package_vi else package.name),
-                    package_name_en_snapshot=(package_en.name if package_en else ""),
-                    package_description_vi_snapshot=(
-                        package_vi.description if package_vi else package.description
-                    ),
-                    package_description_en_snapshot=(
-                        package_en.description if package_en else ""
-                    ),
-                    upfront_price_snapshot=package.upfront_price,
-                    duration_months_snapshot=package.duration_months,
-                    quota_policy_snapshot=package.quota_policy,
-                    phone_snapshot=phone_snapshot,
-                    status=(
-                        MembershipRequestStatus.CONSULTATION_REQUESTED
-                        if flow == "consultation"
-                        else MembershipRequestStatus.PAYMENT_PENDING
-                    ),
-                )
-            break
-        except IntegrityError:
-            if MembershipRequest.objects.filter(user=user, open_slot=True).exists():
-                raise OpenRequestExists("User already has an open membership request") from None
-    else:
-        raise RuntimeError("Could not allocate a membership request short code")
-    _snapshot_package(request, package)
-    _record_request_event(
-        request=request,
-        action=MembershipRequestEventAction.REQUEST_CREATED,
-        actor=user,
-    )
-    instruction = None
-    if flow == "direct_transfer":
-        instruction, _created = _create_instruction(
-            request=request,
-            require_direct_transfer=True,
-        )
-        _record_request_event(
-            request=request,
-            action=MembershipRequestEventAction.PAYMENT_INSTRUCTION_ISSUED,
-            actor=user,
-        )
-    return request, instruction
-
-
-def _locked_request(request_id) -> MembershipRequest:
-    return (
-        MembershipRequest.objects.select_for_update()
-        .select_related("user", "user__member_profile", "package")
-        .get(pk=request_id)
-    )
-
-
-@transaction.atomic
-def mark_contacted(*, request_id, actor):
-    item = _locked_request(request_id)
-    if item.status != MembershipRequestStatus.CONSULTATION_REQUESTED:
-        raise RequestTransitionConflict("Only consultation requests can be marked contacted")
-    item.status = MembershipRequestStatus.CONTACTED
-    item.contacted_by = actor
-    item.contacted_at = timezone.now()
-    item.save(update_fields=["status", "contacted_by", "contacted_at", "updated_at"])
-    _record_request_event(
-        request=item,
-        action=MembershipRequestEventAction.CONTACTED,
-        actor=actor,
-    )
-    return item
-
-
-@transaction.atomic
-def issue_payment_instruction(*, request_id, actor):
-    item = _locked_request(request_id)
-    if item.status not in {
-        MembershipRequestStatus.CONSULTATION_REQUESTED,
-        MembershipRequestStatus.CONTACTED,
-    }:
-        raise RequestTransitionConflict("Payment instructions cannot be issued in this state")
-    instruction, _created = _create_instruction(request=item, actor=actor)
-    item.status = MembershipRequestStatus.PAYMENT_PENDING
-    item.save(update_fields=["status", "updated_at"])
-    _record_request_event(
-        request=item,
-        action=MembershipRequestEventAction.PAYMENT_INSTRUCTION_ISSUED,
-        actor=actor,
-    )
-    return item, instruction
-
-
-@transaction.atomic
-def submit_payment(*, request_id, user):
-    item = MembershipRequest.objects.select_for_update().filter(pk=request_id, user=user).first()
-    if not item:
-        raise MembershipRequest.DoesNotExist
-    if item.status == MembershipRequestStatus.PAYMENT_SUBMITTED:
-        return item, False
-    if item.status != MembershipRequestStatus.PAYMENT_PENDING:
-        raise RequestTransitionConflict("Only payment-pending requests can be submitted")
-    if not MembershipPaymentInstruction.objects.filter(request=item).exists():
-        raise RequestTransitionConflict("Payment instruction has not been issued")
-    item.status = MembershipRequestStatus.PAYMENT_SUBMITTED
-    item.payment_submitted_at = timezone.now()
-    item.save(update_fields=["status", "payment_submitted_at", "updated_at"])
-    _record_request_event(
-        request=item,
-        action=MembershipRequestEventAction.PAYMENT_SUBMITTED,
-        actor=user,
-    )
-    return item, True
-
-
-@transaction.atomic
-def return_to_payment_pending(*, request_id, actor, reason: str):
-    if not reason.strip():
-        raise RequestTransitionConflict("A return reason is required")
-    item = _locked_request(request_id)
-    if item.status != MembershipRequestStatus.PAYMENT_SUBMITTED:
-        raise RequestTransitionConflict("Only submitted payments can be returned")
-    item.status = MembershipRequestStatus.PAYMENT_PENDING
-    item.return_reason = reason.strip()
-    item.processed_by = actor
-    item.payment_submitted_at = None
-    item.returned_at = timezone.now()
-    item.save(
-        update_fields=[
-            "status",
-            "return_reason",
-            "processed_by",
-            "payment_submitted_at",
-            "returned_at",
-            "updated_at",
-        ]
-    )
-    _record_request_event(
-        request=item,
-        action=MembershipRequestEventAction.PAYMENT_RETURNED,
-        actor=actor,
-        reason=reason,
-    )
-    return item
-
-
-@transaction.atomic
-def reject_request(*, request_id, actor, reason: str):
-    if not reason.strip():
-        raise RequestTransitionConflict("A rejection reason is required")
-    item = _locked_request(request_id)
-    if item.status not in OPEN_REQUEST_STATUSES:
-        raise RequestTransitionConflict("Only open requests can be rejected")
-    item.status = MembershipRequestStatus.REJECTED
-    item.open_slot = None
-    item.rejection_reason = reason.strip()
-    item.processed_by = actor
-    item.rejected_at = timezone.now()
-    item.save(
-        update_fields=[
-            "status",
-            "open_slot",
-            "rejection_reason",
-            "processed_by",
-            "rejected_at",
-            "updated_at",
-        ]
-    )
-    _record_request_event(
-        request=item,
-        action=MembershipRequestEventAction.REJECTED,
-        actor=actor,
-        reason=reason,
-    )
-    return item
+    if start_date <= today:
+        ensure_due_cycles(membership, as_of=today)
+    return membership
 
 
 def _create_cycle(membership: Membership, sequence: int) -> MembershipCycle:
@@ -485,9 +394,7 @@ def refresh_membership_statuses(*, as_of: date | None = None) -> None:
     as_of = as_of or timezone.localdate()
     updated_at = timezone.now()
     Membership.objects.filter(current_slot=True, end_date__lte=as_of).update(
-        status=MembershipStatus.ENDED,
-        current_slot=None,
-        updated_at=updated_at,
+        status=MembershipStatus.ENDED, current_slot=None, updated_at=updated_at
     )
     Membership.objects.filter(
         current_slot=True,
@@ -516,84 +423,15 @@ def ensure_due_cycles(
         if sequence not in existing:
             created.append(_create_cycle(membership, sequence))
     if membership.quota_policy_snapshot == QuotaPolicy.EXPIRE:
-        expired = MembershipCycleQuota.objects.filter(
+        MembershipCycleQuota.objects.filter(
             cycle__membership=membership,
             cycle__end_date__lte=as_of,
             remaining_units__gt=0,
+        ).update(
+            expired_units=F("expired_units") + F("remaining_units"),
+            remaining_units=0,
         )
-        expired.update(expired_units=F("expired_units") + F("remaining_units"), remaining_units=0)
     return created
-
-
-@transaction.atomic
-def approve_request(*, request_id, actor, start_date: date):
-    item = _locked_request(request_id)
-    User.objects.select_for_update().get(pk=item.user_id)
-    if hasattr(item, "membership"):
-        return item.membership, False
-    if item.status != MembershipRequestStatus.PAYMENT_SUBMITTED:
-        raise RequestTransitionConflict("Only submitted payments can be approved")
-    today = timezone.localdate()
-    if start_date < today:
-        raise StartDateInPast("Membership start date cannot be in the past")
-    Membership.objects.filter(
-        user=item.user,
-        current_slot=True,
-        end_date__lte=today,
-    ).update(status=MembershipStatus.ENDED, current_slot=None)
-    if Membership.objects.filter(user=item.user, current_slot=True).exists():
-        raise ActiveMembershipExists("User already has a scheduled or active membership")
-    if not MembershipPaymentInstruction.objects.filter(request=item).exists():
-        raise RequestTransitionConflict("Payment instruction is missing")
-    membership = Membership.objects.create(
-        user=item.user,
-        request=item,
-        package=item.package,
-        package_name_snapshot=item.package_name_snapshot,
-        package_description_snapshot=item.package_description_snapshot,
-        package_name_vi_snapshot=item.package_name_vi_snapshot,
-        package_name_en_snapshot=item.package_name_en_snapshot,
-        package_description_vi_snapshot=item.package_description_vi_snapshot,
-        package_description_en_snapshot=item.package_description_en_snapshot,
-        upfront_price_snapshot=item.upfront_price_snapshot,
-        duration_months_snapshot=item.duration_months_snapshot,
-        quota_policy_snapshot=item.quota_policy_snapshot,
-        start_date=start_date,
-        end_date=add_months(start_date, item.duration_months_snapshot),
-        status=(MembershipStatus.SCHEDULED if start_date > today else MembershipStatus.ACTIVE),
-        current_slot=True,
-        activated_by=actor,
-    )
-    snapshots = [
-        MembershipProductSnapshot(
-            membership=membership,
-            product=snapshot.product,
-            product_name=snapshot.product_name,
-            product_name_vi_snapshot=snapshot.product_name_vi_snapshot,
-            product_name_en_snapshot=snapshot.product_name_en_snapshot,
-            unit_size=snapshot.unit_size,
-            unit_label_vi=snapshot.unit_label_vi,
-            unit_label_en=snapshot.unit_label_en,
-            quota_units_per_cycle=snapshot.quota_units_per_cycle,
-        )
-        for snapshot in item.item_snapshots.select_related("product")
-    ]
-    if not snapshots:
-        raise RequestTransitionConflict("Request package snapshot is empty")
-    MembershipProductSnapshot.objects.bulk_create(snapshots)
-    if start_date <= today:
-        ensure_due_cycles(membership, as_of=today)
-    item.status = MembershipRequestStatus.APPROVED
-    item.open_slot = None
-    item.processed_by = actor
-    item.approved_at = timezone.now()
-    item.save(update_fields=["status", "open_slot", "processed_by", "approved_at", "updated_at"])
-    _record_request_event(
-        request=item,
-        action=MembershipRequestEventAction.APPROVED,
-        actor=actor,
-    )
-    return membership, True
 
 
 def _normalized_usage_lines(lines: list[dict]) -> list[tuple[str, int]]:
@@ -682,7 +520,8 @@ def create_usage_order(*, membership_id, actor, idempotency_key, lines: list[dic
     for quota in quotas:
         by_product.setdefault(str(quota.product_snapshot.product_id), []).append(quota)
     if any(
-        sum(q.remaining_units for q in by_product.get(pid, [])) < units for pid, units in requested
+        sum(q.remaining_units for q in by_product.get(pid, [])) < units
+        for pid, units in requested
     ):
         raise InsufficientQuota("Requested units exceed available quota")
     order = MembershipUsageOrder.objects.create(
@@ -703,7 +542,9 @@ def create_usage_order(*, membership_id, actor, idempotency_key, lines: list[dic
                 continue
             quota.remaining_units -= allocated
             quota.save(update_fields=["remaining_units"])
-            MembershipUsageAllocation.objects.create(line=line, cycle_quota=quota, units=allocated)
+            MembershipUsageAllocation.objects.create(
+                line=line, cycle_quota=quota, units=allocated
+            )
             needed -= allocated
             if not needed:
                 break

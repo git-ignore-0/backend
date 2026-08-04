@@ -10,7 +10,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from content.permissions import IsWebsiteAdmin
-from memberships.banks import BankDirectoryUnavailable, find_transfer_bank, get_transfer_banks
+from identity.models import User
 from memberships.models import (
     Membership,
     MembershipContentLocale,
@@ -18,8 +18,6 @@ from memberships.models import (
     MembershipPackage,
     MembershipPackageItem,
     MembershipPackageTranslation,
-    MembershipPaymentSettings,
-    MembershipRequest,
     MembershipStatus,
     MembershipUsageOrder,
     Product,
@@ -30,33 +28,24 @@ from memberships.serializers import (
     AdminMembershipQuerySerializer,
     AdminPackageQuerySerializer,
     AdminProductQuerySerializer,
-    AdminRequestQuerySerializer,
-    ApproveSerializer,
     LocalePageQuerySerializer,
     LocaleQuerySerializer,
-    MembershipRequestCreateSerializer,
+    MembershipAssignSerializer,
     PackageWriteSerializer,
-    PaymentSettingsWriteSerializer,
     ProductWriteSerializer,
     PublicPackageQuerySerializer,
-    ReasonSerializer,
-    RequestActionSerializer,
     UsageCreateSerializer,
     UsageUndoSerializer,
 )
 from memberships.services import (
     MembershipError,
-    approve_request,
-    create_membership_request,
+    PriceOptionConflict,
+    PriceOptionTotalInvalid,
+    assign_membership,
     create_usage_order,
-    direct_transfer_is_available,
     ensure_due_cycles,
-    issue_payment_instruction,
-    mark_contacted,
     refresh_membership_statuses,
-    reject_request,
-    return_to_payment_pending,
-    submit_payment,
+    sync_package_price_options,
     undo_usage_order,
 )
 
@@ -80,7 +69,9 @@ def paginate(queryset, page):
 
 
 def membership_error(error):
-    return no_store(Response({"errors": [{"code": error.code}]}, status=status.HTTP_409_CONFLICT))
+    return no_store(
+        Response({"errors": [{"code": error.code}]}, status=status.HTTP_409_CONFLICT)
+    )
 
 
 def requested_locale(request):
@@ -138,15 +129,37 @@ def product_payload(item):
     }
 
 
+def price_option_payload(option, *, public=False):
+    data = {
+        "id": str(option.pk),
+        "duration_months": option.duration_months,
+        "monthly_price_vnd": str(option.monthly_price_vnd),
+        "total_price_vnd": str(option.total_price_vnd),
+    }
+    if not public:
+        data.update(
+            {
+                "is_active": option.is_active,
+                "sort_order": option.sort_order,
+                "created_at": option.created_at.isoformat(),
+                "updated_at": option.updated_at.isoformat(),
+            }
+        )
+    return data
+
+
 def package_payload(item, *, public=False, locale=MembershipContentLocale.VI):
     content = _localized_content(item, locale, "description")
     data = {
         "id": str(item.pk),
         "name": content["name"],
         "description": content["description"],
-        "upfront_price": str(item.upfront_price),
-        "duration_months": item.duration_months,
         "quota_policy": item.quota_policy,
+        "price_options": [
+            price_option_payload(option, public=public)
+            for option in item.price_options.all()
+            if not public or option.is_active
+        ],
         "items": [
             {
                 "product_id": str(package_item.product_id),
@@ -196,43 +209,27 @@ def package_payload(item, *, public=False, locale=MembershipContentLocale.VI):
     return data
 
 
-def instruction_payload(item):
-    return {
-        "bank_bin": item.bank_bin,
-        "bank_name": item.bank_name,
-        "bank_code": item.bank_code,
-        "account_number": item.account_number,
-        "account_name": item.account_name,
-        "amount": str(item.amount),
-        "phone_snapshot": item.phone_snapshot,
-        "transfer_content": item.transfer_content,
-        "issued_at": item.issued_at.isoformat(),
-    }
-
-
 def _localized_snapshot(
-    *, locale, name_vi, name_en, legacy_name, description_vi=None,
-    description_en=None, legacy_description=None
+    *,
+    locale,
+    name_vi,
+    name_en,
+    legacy_name,
+    description_vi=None,
+    description_en=None,
+    legacy_description=None,
 ):
-    names = {
-        MembershipContentLocale.VI: name_vi,
-        MembershipContentLocale.EN: name_en,
-    }
+    names = {MembershipContentLocale.VI: name_vi, MembershipContentLocale.EN: name_en}
     selected_locale = next(
         (
             candidate
-            for candidate in (
-                locale,
-                MembershipContentLocale.VI,
-                MembershipContentLocale.EN,
-            )
+            for candidate in (locale, MembershipContentLocale.VI, MembershipContentLocale.EN)
             if names[candidate]
         ),
         MembershipContentLocale.VI,
     )
-    selected_name = names.get(selected_locale) or legacy_name
     result = {
-        "name": selected_name,
+        "name": names.get(selected_locale) or legacy_name,
         "requested_locale": locale,
         "content_locale": selected_locale,
         "is_fallback": selected_locale != locale,
@@ -244,107 +241,9 @@ def _localized_snapshot(
             MembershipContentLocale.EN: description_en or "",
         }
         result["description"] = (
-            descriptions[selected_locale]
-            if names.get(selected_locale)
-            else legacy_description
+            descriptions[selected_locale] if names.get(selected_locale) else legacy_description
         )
     return result
-
-
-def request_payload(
-    item, *, locale=MembershipContentLocale.VI, admin=False, include_events=False
-):
-    instruction = getattr(item, "payment_instruction", None)
-    package_content = _localized_snapshot(
-        locale=locale,
-        name_vi=item.package_name_vi_snapshot,
-        name_en=item.package_name_en_snapshot,
-        legacy_name=item.package_name_snapshot,
-        description_vi=item.package_description_vi_snapshot,
-        description_en=item.package_description_en_snapshot,
-        legacy_description=item.package_description_snapshot,
-    )
-    data = {
-        "id": str(item.pk),
-        "short_code": item.short_code,
-        "status": item.status,
-        "package": {
-            "id": str(item.package_id),
-            "name": package_content["name"],
-            "description": package_content["description"],
-            "requested_locale": locale,
-            "content_locale": package_content["content_locale"],
-            "is_fallback": package_content["is_fallback"],
-            **(
-                {"snapshot_complete": package_content["snapshot_complete"]}
-                if admin
-                else {}
-            ),
-            "upfront_price": str(item.upfront_price_snapshot),
-            "duration_months": item.duration_months_snapshot,
-            "quota_policy": item.quota_policy_snapshot,
-            "items": [
-                {
-                    "product_id": str(snapshot.product_id),
-                    "product_name": product_content["name"],
-                    "requested_locale": locale,
-                    "content_locale": product_content["content_locale"],
-                    "is_fallback": product_content["is_fallback"],
-                    **(
-                        {"snapshot_complete": product_content["snapshot_complete"]}
-                        if admin
-                        else {}
-                    ),
-                    "unit_size": str(snapshot.unit_size),
-                    "unit_label_vi": snapshot.unit_label_vi,
-                    "unit_label_en": snapshot.unit_label_en,
-                    "quota_units": snapshot.quota_units_per_cycle,
-                }
-                for snapshot in item.item_snapshots.all()
-                for product_content in [
-                    _localized_snapshot(
-                        locale=locale,
-                        name_vi=snapshot.product_name_vi_snapshot,
-                        name_en=snapshot.product_name_en_snapshot,
-                        legacy_name=snapshot.product_name,
-                    )
-                ]
-            ],
-        },
-        "payment_instruction": instruction_payload(instruction) if instruction else None,
-        "return_reason": item.return_reason,
-        "rejection_reason": item.rejection_reason,
-        "contacted_at": item.contacted_at.isoformat() if item.contacted_at else None,
-        "payment_submitted_at": (
-            item.payment_submitted_at.isoformat() if item.payment_submitted_at else None
-        ),
-        "returned_at": item.returned_at.isoformat() if item.returned_at else None,
-        "approved_at": item.approved_at.isoformat() if item.approved_at else None,
-        "rejected_at": item.rejected_at.isoformat() if item.rejected_at else None,
-        "created_at": item.created_at.isoformat(),
-        "updated_at": item.updated_at.isoformat(),
-    }
-    if admin:
-        data["user"] = {
-            "id": str(item.user_id),
-            "name": item.user.name,
-            "email": item.user.email,
-            "phone": item.phone_snapshot,
-        }
-    if include_events:
-        data["events"] = [
-            {
-                "id": str(event.pk),
-                "action": event.action,
-                "actor": (
-                    {"id": str(event.actor_id), "name": event.actor.name} if event.actor else None
-                ),
-                "reason": event.reason,
-                "created_at": event.created_at.isoformat(),
-            }
-            for event in item.events.all()
-        ]
-    return data
 
 
 def membership_payload(
@@ -367,8 +266,8 @@ def membership_payload(
     data = {
         "id": str(item.pk),
         "user_id": str(item.user_id),
-        "request_id": str(item.request_id),
         "package_id": str(item.package_id),
+        "price_option_id": str(item.price_option_id),
         "status": item.status,
         "package_name": content["name"],
         "package_description": content["description"],
@@ -376,8 +275,15 @@ def membership_payload(
         "content_locale": content["content_locale"],
         "is_fallback": content["is_fallback"],
         **({"snapshot_complete": content["snapshot_complete"]} if admin else {}),
-        "upfront_price": str(item.upfront_price_snapshot),
+        "price_option": {
+            "duration_months": item.duration_months_snapshot,
+            "monthly_price_vnd": str(item.monthly_price_vnd_snapshot),
+            "total_price_vnd": str(item.total_price_vnd_snapshot),
+        },
         "duration_months": item.duration_months_snapshot,
+        "monthly_price_vnd": str(item.monthly_price_vnd_snapshot),
+        "total_price_vnd": str(item.total_price_vnd_snapshot),
+        "farmbrite_order_reference": item.farmbrite_order_reference,
         "quota_policy": item.quota_policy_snapshot,
         "start_date": item.start_date.isoformat(),
         "end_date": item.end_date.isoformat(),
@@ -396,7 +302,6 @@ def membership_payload(
 
 
 def quota_payload(membership, *, locale=MembershipContentLocale.VI, admin=False):
-    snapshots = membership.product_snapshots.all()
     balances = {
         str(row["product_snapshot_id"]): row["remaining"] or 0
         for row in MembershipCycleQuota.objects.filter(cycle__membership=membership)
@@ -406,23 +311,19 @@ def quota_payload(membership, *, locale=MembershipContentLocale.VI, admin=False)
     return [
         {
             "product_id": str(snapshot.product_id),
-            "product_name": product_content["name"],
+            "product_name": content["name"],
             "requested_locale": locale,
-            "content_locale": product_content["content_locale"],
-            "is_fallback": product_content["is_fallback"],
-            **(
-                {"snapshot_complete": product_content["snapshot_complete"]}
-                if admin
-                else {}
-            ),
+            "content_locale": content["content_locale"],
+            "is_fallback": content["is_fallback"],
+            **({"snapshot_complete": content["snapshot_complete"]} if admin else {}),
             "unit_size": str(snapshot.unit_size),
             "unit_label_vi": snapshot.unit_label_vi,
             "unit_label_en": snapshot.unit_label_en,
             "quota_units_per_cycle": snapshot.quota_units_per_cycle,
             "remaining_units": balances.get(str(snapshot.pk), 0),
         }
-        for snapshot in snapshots
-        for product_content in [
+        for snapshot in membership.product_snapshots.all()
+        for content in [
             _localized_snapshot(
                 locale=locale,
                 name_vi=snapshot.product_name_vi_snapshot,
@@ -443,17 +344,17 @@ def cycle_payload(membership, *, locale=MembershipContentLocale.VI):
             "quotas": [
                 {
                     "product_id": str(quota.product_snapshot.product_id),
-                    "product_name": product_content["name"],
+                    "product_name": content["name"],
                     "requested_locale": locale,
-                    "content_locale": product_content["content_locale"],
-                    "is_fallback": product_content["is_fallback"],
-                    "snapshot_complete": product_content["snapshot_complete"],
+                    "content_locale": content["content_locale"],
+                    "is_fallback": content["is_fallback"],
+                    "snapshot_complete": content["snapshot_complete"],
                     "granted_units": quota.granted_units,
                     "remaining_units": quota.remaining_units,
                     "expired_units": quota.expired_units,
                 }
                 for quota in cycle.quotas.all()
-                for product_content in [
+                for content in [
                     _localized_snapshot(
                         locale=locale,
                         name_vi=quota.product_snapshot.product_name_vi_snapshot,
@@ -468,7 +369,11 @@ def cycle_payload(membership, *, locale=MembershipContentLocale.VI):
 
 
 def usage_payload(
-    item, *, locale=MembershipContentLocale.VI, include_allocations=False, admin=False
+    item,
+    *,
+    locale=MembershipContentLocale.VI,
+    include_allocations=False,
+    admin=False,
 ):
     data = {
         "id": str(item.pk),
@@ -480,15 +385,11 @@ def usage_payload(
         "lines": [
             {
                 "product_id": str(line.product_snapshot.product_id),
-                "product_name": product_content["name"],
+                "product_name": content["name"],
                 "requested_locale": locale,
-                "content_locale": product_content["content_locale"],
-                "is_fallback": product_content["is_fallback"],
-                **(
-                    {"snapshot_complete": product_content["snapshot_complete"]}
-                    if admin
-                    else {}
-                ),
+                "content_locale": content["content_locale"],
+                "is_fallback": content["is_fallback"],
+                **({"snapshot_complete": content["snapshot_complete"]} if admin else {}),
                 "unit_size": str(line.product_snapshot.unit_size),
                 "unit_label_vi": line.product_snapshot.unit_label_vi,
                 "unit_label_en": line.product_snapshot.unit_label_en,
@@ -508,7 +409,7 @@ def usage_payload(
                 ),
             }
             for line in item.lines.all()
-            for product_content in [
+            for content in [
                 _localized_snapshot(
                     locale=locale,
                     name_vi=line.product_snapshot.product_name_vi_snapshot,
@@ -518,8 +419,7 @@ def usage_payload(
             ]
         ],
     }
-    reversal = getattr(item, "reversal", None)
-    if reversal:
+    if reversal := getattr(item, "reversal", None):
         data["reversal"] = {
             "reason": reversal.reason,
             "created_at": reversal.created_at.isoformat(),
@@ -529,19 +429,13 @@ def usage_payload(
 
 def package_queryset():
     return MembershipPackage.objects.prefetch_related(
-        "translations", "items__product__translations"
+        "translations", "price_options", "items__product__translations"
     )
-
-
-def request_queryset():
-    return MembershipRequest.objects.select_related(
-        "user", "user__member_profile", "package", "payment_instruction"
-    ).prefetch_related("item_snapshots", "events__actor")
 
 
 def membership_queryset():
     return Membership.objects.select_related(
-        "user", "user__member_profile", "request", "package"
+        "user", "user__member_profile", "package", "price_option"
     ).prefetch_related("product_snapshots")
 
 
@@ -560,7 +454,7 @@ class PublicPackageListView(APIView):
         query.is_valid(raise_exception=True)
         queryset = (
             package_queryset()
-            .filter(is_active=True, items__isnull=False)
+            .filter(is_active=True, items__isnull=False, price_options__is_active=True)
             .exclude(items__product__is_active=False)
             .distinct()
         )
@@ -568,11 +462,7 @@ class PublicPackageListView(APIView):
         response = Response(
             {
                 "data": [
-                    package_payload(
-                        item,
-                        public=True,
-                        locale=query.validated_data["locale"],
-                    )
+                    package_payload(item, public=True, locale=query.validated_data["locale"])
                     for item in items
                 ],
                 "meta": meta,
@@ -580,74 +470,6 @@ class PublicPackageListView(APIView):
         )
         response["Cache-Control"] = "public, max-age=60, stale-while-revalidate=300"
         return response
-
-
-class PublicPaymentAvailabilityView(APIView):
-    permission_classes = [AllowAny]
-    authentication_classes = []
-
-    def get(self, request):
-        response = Response({"data": {"direct_transfer_enabled": direct_transfer_is_available()}})
-        response["Cache-Control"] = "public, no-store"
-        return response
-
-
-class SelfMembershipRequestView(APIView):
-    permission_classes = [HasMembershipSelfScopes]
-
-    def get(self, request):
-        locale = requested_locale(request)
-        item = (
-            request_queryset()
-            .filter(user=request.user)
-            .exclude(status__in=["approved", "rejected"])
-            .first()
-        )
-        return no_store(
-            Response({"data": request_payload(item, locale=locale) if item else None})
-        )
-
-    def post(self, request):
-        locale = requested_locale(request)
-        serializer = MembershipRequestCreateSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        try:
-            item, _instruction = create_membership_request(
-                user=request.user, **serializer.validated_data
-            )
-        except MembershipError as error:
-            return membership_error(error)
-        item = request_queryset().get(pk=item.pk)
-        return no_store(
-            Response(
-                {"data": request_payload(item, locale=locale)},
-                status=status.HTTP_201_CREATED,
-            )
-        )
-
-
-class SelfPaymentSubmittedView(APIView):
-    permission_classes = [HasMembershipSelfScopes]
-
-    def post(self, request, request_id):
-        locale = requested_locale(request)
-        serializer = RequestActionSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        try:
-            item, changed = submit_payment(request_id=request_id, user=request.user)
-        except MembershipRequest.DoesNotExist:
-            return no_store(Response(status=status.HTTP_404_NOT_FOUND))
-        except MembershipError as error:
-            return membership_error(error)
-        item = request_queryset().get(pk=item.pk)
-        return no_store(
-            Response(
-                {
-                    "data": request_payload(item, locale=locale),
-                    "meta": {"idempotent_replay": not changed},
-                }
-            )
-        )
 
 
 class SelfMembershipView(APIView):
@@ -731,8 +553,7 @@ class AdminProductViewSet(viewsets.ViewSet):
         query = AdminProductQuerySerializer(data=request.query_params)
         query.is_valid(raise_exception=True)
         queryset = Product.objects.prefetch_related("translations")
-        search = query.validated_data["search"]
-        if search:
+        if search := query.validated_data["search"]:
             queryset = queryset.filter(
                 Q(translations__name__icontains=search)
                 | Q(translations__short_description__icontains=search)
@@ -742,7 +563,9 @@ class AdminProductViewSet(viewsets.ViewSet):
         if "active" in request.query_params:
             queryset = queryset.filter(is_active=query.validated_data["active"])
         items, meta = paginate(queryset, query.validated_data["page"])
-        return no_store(Response({"data": [product_payload(item) for item in items], "meta": meta}))
+        return no_store(
+            Response({"data": [product_payload(item) for item in items], "meta": meta})
+        )
 
     @transaction.atomic
     def create(self, request):
@@ -758,7 +581,9 @@ class AdminProductViewSet(viewsets.ViewSet):
             [ProductTranslation(product=item, **translation) for translation in translations]
         )
         item = Product.objects.prefetch_related("translations").get(pk=item.pk)
-        return no_store(Response({"data": product_payload(item)}, status=status.HTTP_201_CREATED))
+        return no_store(
+            Response({"data": product_payload(item)}, status=status.HTTP_201_CREATED)
+        )
 
     def retrieve(self, request, pk=None):
         item = get_object_or_404(Product.objects.prefetch_related("translations"), pk=pk)
@@ -774,11 +599,7 @@ class AdminProductViewSet(viewsets.ViewSet):
         for field, value in data.items():
             setattr(item, field, value)
         if translations is not None:
-            vi = next(
-                translation
-                for translation in translations
-                if translation["locale"] == MembershipContentLocale.VI
-            )
+            vi = next(item for item in translations if item["locale"] == MembershipContentLocale.VI)
             item.name = vi["name"]
             item.short_description = vi["short_description"]
         item.save()
@@ -792,8 +613,15 @@ class AdminProductViewSet(viewsets.ViewSet):
                         "short_description": translation["short_description"],
                     },
                 )
-        item = Product.objects.prefetch_related("translations").get(pk=item.pk)
-        return no_store(Response({"data": product_payload(item)}))
+        return no_store(
+            Response(
+                {
+                    "data": product_payload(
+                        Product.objects.prefetch_related("translations").get(pk=item.pk)
+                    )
+                }
+            )
+        )
 
     def destroy(self, request, pk=None):
         item = get_object_or_404(Product, pk=pk)
@@ -811,8 +639,7 @@ class AdminPackageViewSet(viewsets.ViewSet):
         query = AdminPackageQuerySerializer(data=request.query_params)
         query.is_valid(raise_exception=True)
         queryset = package_queryset()
-        search = query.validated_data["search"]
-        if search:
+        if search := query.validated_data["search"]:
             queryset = queryset.filter(
                 Q(translations__name__icontains=search)
                 | Q(translations__description__icontains=search)
@@ -822,7 +649,9 @@ class AdminPackageViewSet(viewsets.ViewSet):
         if "active" in request.query_params:
             queryset = queryset.filter(is_active=query.validated_data["active"])
         items, meta = paginate(queryset, query.validated_data["page"])
-        return no_store(Response({"data": [package_payload(item) for item in items], "meta": meta}))
+        return no_store(
+            Response({"data": [package_payload(item) for item in items], "meta": meta})
+        )
 
     @transaction.atomic
     def create(self, request):
@@ -831,15 +660,13 @@ class AdminPackageViewSet(viewsets.ViewSet):
         data = serializer.validated_data
         items = data.pop("items")
         translations = data.pop("translations")
+        options = data.pop("price_options")
         vi = next(item for item in translations if item["locale"] == MembershipContentLocale.VI)
         package = MembershipPackage.objects.create(
             name=vi["name"], description=vi["description"], **data
         )
         MembershipPackageTranslation.objects.bulk_create(
-            [
-                MembershipPackageTranslation(package=package, **translation)
-                for translation in translations
-            ]
+            [MembershipPackageTranslation(package=package, **item) for item in translations]
         )
         MembershipPackageItem.objects.bulk_create(
             [
@@ -849,9 +676,15 @@ class AdminPackageViewSet(viewsets.ViewSet):
                 for item in items
             ]
         )
-        package = package_queryset().get(pk=package.pk)
+        try:
+            sync_package_price_options(package=package, options=options)
+        except (PriceOptionConflict, PriceOptionTotalInvalid) as error:
+            raise ValidationError({"price_options": str(error)}) from error
         return no_store(
-            Response({"data": package_payload(package)}, status=status.HTTP_201_CREATED)
+            Response(
+                {"data": package_payload(package_queryset().get(pk=package.pk))},
+                status=status.HTTP_201_CREATED,
+            )
         )
 
     def retrieve(self, request, pk=None):
@@ -867,39 +700,45 @@ class AdminPackageViewSet(viewsets.ViewSet):
         data = serializer.validated_data
         items = data.pop("items", None)
         translations = data.pop("translations", None)
+        options = data.pop("price_options", None)
         for field, value in data.items():
             setattr(package, field, value)
         if translations is not None:
-            vi = next(
-                translation
-                for translation in translations
-                if translation["locale"] == MembershipContentLocale.VI
-            )
+            vi = next(item for item in translations if item["locale"] == MembershipContentLocale.VI)
             package.name = vi["name"]
             package.description = vi["description"]
         package.save()
         if translations is not None:
-            for translation in translations:
+            for item in translations:
                 MembershipPackageTranslation.objects.update_or_create(
                     package=package,
-                    locale=translation["locale"],
-                    defaults={
-                        "name": translation["name"],
-                        "description": translation["description"],
-                    },
+                    locale=item["locale"],
+                    defaults={"name": item["name"], "description": item["description"]},
                 )
         if items is not None:
             package.items.all().delete()
             MembershipPackageItem.objects.bulk_create(
                 [
                     MembershipPackageItem(
-                        package=package, product=item["product_id"], quota_units=item["quota_units"]
+                        package=package,
+                        product=item["product_id"],
+                        quota_units=item["quota_units"],
                     )
                     for item in items
                 ]
             )
-        package = package_queryset().get(pk=package.pk)
-        return no_store(Response({"data": package_payload(package)}))
+        if options is not None:
+            try:
+                sync_package_price_options(package=package, options=options)
+            except (PriceOptionConflict, PriceOptionTotalInvalid) as error:
+                raise ValidationError({"price_options": str(error)}) from error
+            except IntegrityError as error:
+                raise ValidationError(
+                    {"price_options": "Duration months must be unique within a package."}
+                ) from error
+        return no_store(
+            Response({"data": package_payload(package_queryset().get(pk=package.pk))})
+        )
 
     def destroy(self, request, pk=None):
         package = get_object_or_404(MembershipPackage, pk=pk)
@@ -910,257 +749,6 @@ class AdminPackageViewSet(viewsets.ViewSet):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
-class AdminPaymentSettingsView(APIView):
-    permission_classes = [IsWebsiteAdmin]
-
-    def get(self, request):
-        item = MembershipPaymentSettings.objects.filter(pk="default").first()
-        return no_store(
-            Response(
-                {
-                    "data": (
-                        {
-                            "direct_transfer_enabled": item.direct_transfer_enabled,
-                            "bank_bin": item.bank_bin,
-                            "bank_name": item.bank_name,
-                            "account_number": item.account_number,
-                            "account_name": item.account_name,
-                            "version": item.version,
-                            "updated_at": item.updated_at.isoformat(),
-                        }
-                        if item
-                        else None
-                    )
-                }
-            )
-        )
-
-    def _update(self, request, *, partial):
-        with transaction.atomic():
-            try:
-                current = MembershipPaymentSettings.objects.select_for_update().get(pk="default")
-            except MembershipPaymentSettings.DoesNotExist:
-                try:
-                    with transaction.atomic():
-                        current = MembershipPaymentSettings.objects.create(
-                            key="default", account_number="", account_name="", version=0
-                        )
-                except IntegrityError:
-                    current = MembershipPaymentSettings.objects.select_for_update().get(
-                        pk="default"
-                    )
-            serializer = PaymentSettingsWriteSerializer(
-                data=request.data,
-                partial=partial,
-                instance=current,
-            )
-            serializer.is_valid(raise_exception=True)
-            if "version" not in serializer.validated_data:
-                raise ValidationError({"version": "This field is required."})
-            submitted_version = serializer.validated_data.pop("version")
-            if submitted_version != current.version:
-                return payment_settings_conflict_response()
-            bank_bin = serializer.validated_data.get("bank_bin", current.bank_bin).strip()
-            bank_name = ""
-            if bank_bin:
-                try:
-                    bank = find_transfer_bank(bank_bin)
-                except BankDirectoryUnavailable:
-                    return bank_directory_unavailable_response()
-                if not bank:
-                    raise ValidationError({"bank_bin": "Select a supported VietQR bank."})
-                bank_name = bank["name"]
-            for field, value in serializer.validated_data.items():
-                setattr(current, field, value)
-            current.bank_bin = bank_bin
-            current.bank_name = bank_name
-            current.updated_by = request.user
-            current.version += 1
-            current.save()
-            item = current
-        return no_store(
-            Response(
-                {
-                    "data": {
-                        "direct_transfer_enabled": item.direct_transfer_enabled,
-                        "bank_bin": item.bank_bin,
-                        "bank_name": item.bank_name,
-                        "account_number": item.account_number,
-                        "account_name": item.account_name,
-                        "version": item.version,
-                        "updated_at": item.updated_at.isoformat(),
-                    }
-                }
-            )
-        )
-
-    def put(self, request):
-        return self._update(request, partial=False)
-
-    def patch(self, request):
-        return self._update(request, partial=True)
-
-
-def bank_directory_unavailable_response():
-    return no_store(
-        Response(
-            {"errors": [{"code": "bank_directory_unavailable"}]},
-            status=status.HTTP_503_SERVICE_UNAVAILABLE,
-        )
-    )
-
-
-def payment_settings_conflict_response():
-    return no_store(
-        Response(
-            {"errors": [{"code": "payment_settings_conflict"}]},
-            status=status.HTTP_409_CONFLICT,
-        )
-    )
-
-
-class AdminBankOptionsView(APIView):
-    permission_classes = [IsWebsiteAdmin]
-
-    def get(self, request):
-        try:
-            banks = get_transfer_banks()
-        except BankDirectoryUnavailable:
-            return bank_directory_unavailable_response()
-        return no_store(Response({"data": banks}))
-
-
-class AdminRequestViewSet(viewsets.ViewSet):
-    permission_classes = [IsWebsiteAdmin]
-
-    def list(self, request):
-        query = AdminRequestQuerySerializer(data=request.query_params)
-        query.is_valid(raise_exception=True)
-        queryset = request_queryset()
-        if query.validated_data["status"]:
-            queryset = queryset.filter(status=query.validated_data["status"])
-        search = query.validated_data["search"].strip()
-        if search:
-            queryset = queryset.filter(
-                Q(user__email__icontains=search)
-                | Q(short_code__icontains=search)
-                | Q(phone_snapshot__icontains=search)
-                | Q(user__member_profile__phone_number__icontains=search)
-            )
-        items, meta = paginate(queryset, query.validated_data["page"])
-        return no_store(
-            Response(
-                {
-                    "data": [
-                        request_payload(
-                            item, locale=query.validated_data["locale"], admin=True
-                        )
-                        for item in items
-                    ],
-                    "meta": meta,
-                }
-            )
-        )
-
-    def retrieve(self, request, pk=None):
-        locale = requested_locale(request)
-        return no_store(
-            Response(
-                {
-                    "data": request_payload(
-                        get_object_or_404(request_queryset(), pk=pk),
-                        locale=locale,
-                        admin=True,
-                        include_events=True,
-                    )
-                }
-            )
-        )
-
-    def _empty_action(self, request):
-        requested_locale(request)
-        serializer = RequestActionSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-
-    @action(detail=True, methods=["post"])
-    def contact(self, request, pk=None):
-        self._empty_action(request)
-        return self._run(request, lambda: mark_contacted(request_id=pk, actor=request.user))
-
-    @action(detail=True, methods=["post"], url_path="issue-payment-instruction")
-    def issue_instruction(self, request, pk=None):
-        self._empty_action(request)
-        return self._run(
-            request, lambda: issue_payment_instruction(request_id=pk, actor=request.user)[0]
-        )
-
-    @action(detail=True, methods=["post"], url_path="return-payment-pending")
-    def return_payment(self, request, pk=None):
-        serializer = ReasonSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        return self._run(
-            request,
-            lambda: return_to_payment_pending(
-                request_id=pk, actor=request.user, **serializer.validated_data
-            )
-        )
-
-    @action(detail=True, methods=["post"])
-    def reject(self, request, pk=None):
-        serializer = ReasonSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        return self._run(
-            request,
-            lambda: reject_request(request_id=pk, actor=request.user, **serializer.validated_data)
-        )
-
-    @action(detail=True, methods=["post"])
-    def approve(self, request, pk=None):
-        locale = requested_locale(request)
-        serializer = ApproveSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        try:
-            membership, created = approve_request(
-                request_id=pk, actor=request.user, **serializer.validated_data
-            )
-        except MembershipRequest.DoesNotExist:
-            return Response(status=status.HTTP_404_NOT_FOUND)
-        except MembershipError as error:
-            return membership_error(error)
-        return no_store(
-            Response(
-                {
-                    "data": membership_payload(
-                        membership, locale=locale, include_user=True, admin=True
-                    ),
-                    "meta": {"idempotent_replay": not created},
-                },
-                status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
-            )
-        )
-
-    def _run(self, request, operation):
-        locale = requested_locale(request)
-        try:
-            item = operation()
-        except MembershipRequest.DoesNotExist:
-            return Response(status=status.HTTP_404_NOT_FOUND)
-        except MembershipError as error:
-            return membership_error(error)
-        return no_store(
-            Response(
-                {
-                    "data": request_payload(
-                        request_queryset().get(pk=item.pk),
-                        locale=locale,
-                        admin=True,
-                        include_events=True,
-                    )
-                }
-            )
-        )
-
-
 class AdminMembershipViewSet(viewsets.ViewSet):
     permission_classes = [IsWebsiteAdmin]
 
@@ -1169,12 +757,12 @@ class AdminMembershipViewSet(viewsets.ViewSet):
         query.is_valid(raise_exception=True)
         refresh_membership_statuses()
         queryset = membership_queryset()
-        search = query.validated_data["search"].strip()
-        if search:
+        if search := query.validated_data["search"].strip():
             queryset = queryset.filter(
                 Q(user__email__icontains=search)
                 | Q(user__name__icontains=search)
                 | Q(user__member_profile__phone_number__icontains=search)
+                | Q(farmbrite_order_reference__icontains=search)
             )
         items, meta = paginate(queryset, query.validated_data["page"])
         return no_store(
@@ -1194,6 +782,32 @@ class AdminMembershipViewSet(viewsets.ViewSet):
             )
         )
 
+    def create(self, request):
+        locale = requested_locale(request)
+        serializer = MembershipAssignSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            item = assign_membership(actor=request.user, **serializer.validated_data)
+        except User.DoesNotExist:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        except PriceOptionTotalInvalid as error:
+            raise ValidationError({"price_option_id": str(error)}) from error
+        except MembershipError as error:
+            return membership_error(error)
+        return no_store(
+            Response(
+                {
+                    "data": membership_payload(
+                        membership_queryset().get(pk=item.pk),
+                        locale=locale,
+                        include_user=True,
+                        admin=True,
+                    )
+                },
+                status=status.HTTP_201_CREATED,
+            )
+        )
+
     @transaction.atomic
     def retrieve(self, request, pk=None):
         locale = requested_locale(request)
@@ -1205,11 +819,7 @@ class AdminMembershipViewSet(viewsets.ViewSet):
             .get(pk=item.pk)
         )
         data = membership_payload(
-            item,
-            locale=locale,
-            include_quota=True,
-            include_user=True,
-            admin=True,
+            item, locale=locale, include_quota=True, include_user=True, admin=True
         )
         data["cycles"] = cycle_payload(item, locale=locale)
         return no_store(Response({"data": data}))
@@ -1253,12 +863,14 @@ class AdminUsageViewSet(viewsets.ViewSet):
             return Response(status=status.HTTP_404_NOT_FOUND)
         except MembershipError as error:
             return membership_error(error)
-        item = usage_queryset().get(pk=item.pk)
         return no_store(
             Response(
                 {
                     "data": usage_payload(
-                        item, locale=locale, include_allocations=True, admin=True
+                        usage_queryset().get(pk=item.pk),
+                        locale=locale,
+                        include_allocations=True,
+                        admin=True,
                     ),
                     "meta": {"idempotent_replay": not created},
                 },
