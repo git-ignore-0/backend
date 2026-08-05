@@ -1177,12 +1177,8 @@ def test_revoke_ended_membership_is_rejected(active_user, admin_api):
 
 
 @pytest.mark.django_db
-def test_revoke_stale_active_membership_past_end_transitions_to_ended(
-    active_user, admin_api
-):
-    membership, _product, _option = assign(
-        active_user, reference="REVOKE-STALE-ENDED"
-    )
+def test_revoke_stale_active_membership_past_end_transitions_to_ended(active_user, admin_api):
+    membership, _product, _option = assign(active_user, reference="REVOKE-STALE-ENDED")
     today = timezone.localdate()
     Membership.objects.filter(pk=membership.pk).update(
         start_date=add_months(today, -1),
@@ -1298,9 +1294,7 @@ def test_revoke_does_not_alter_usage_history(active_user, admin_api):
         format="json",
     )
     assert replay.status_code == fresh.status_code == 409
-    assert replay.json()["errors"] == fresh.json()["errors"] == [
-        {"code": "invalid_quota_usage"}
-    ]
+    assert replay.json()["errors"] == fresh.json()["errors"] == [{"code": "invalid_quota_usage"}]
 
     membership.refresh_from_db()
     order.refresh_from_db()
@@ -1327,11 +1321,14 @@ def test_revoked_membership_is_terminal_when_cycles_are_ensured(active_user, adm
     membership, _product, _option = assign(active_user, reference="REVOKE-TERMINAL")
     quota = MembershipCycleQuota.objects.get(cycle__membership=membership)
     original_quota = (quota.granted_units, quota.remaining_units, quota.expired_units)
-    assert admin_api.post(
-        f"/api/v1/admin/memberships/{membership.pk}/revoke",
-        {"reason": "terminal"},
-        format="json",
-    ).status_code == 200
+    assert (
+        admin_api.post(
+            f"/api/v1/admin/memberships/{membership.pk}/revoke",
+            {"reason": "terminal"},
+            format="json",
+        ).status_code
+        == 200
+    )
 
     assert ensure_due_cycles(membership, as_of=membership.end_date) == []
     membership.refresh_from_db()
@@ -1345,11 +1342,14 @@ def test_revoked_membership_is_terminal_when_cycles_are_ensured(active_user, adm
 @pytest.mark.django_db
 def test_admin_membership_detail_does_not_revive_revoked_membership(active_user, admin_api):
     membership, _product, _option = assign(active_user, reference="REVOKE-DETAIL")
-    assert admin_api.post(
-        f"/api/v1/admin/memberships/{membership.pk}/revoke",
-        {"reason": "Keep the audit trail"},
-        format="json",
-    ).status_code == 200
+    assert (
+        admin_api.post(
+            f"/api/v1/admin/memberships/{membership.pk}/revoke",
+            {"reason": "Keep the audit trail"},
+            format="json",
+        ).status_code
+        == 200
+    )
     membership.refresh_from_db()
     revoked_at = membership.revoked_at.isoformat()
 
@@ -1395,11 +1395,14 @@ def test_admin_usage_undo_rejects_revoked_membership_without_mutating_history(
         "allocation": (allocation.cycle_quota_id, allocation.units),
         "quota": (quota.granted_units, quota.remaining_units, quota.expired_units),
     }
-    assert admin_api.post(
-        f"/api/v1/admin/memberships/{membership.pk}/revoke",
-        {"reason": "Close audit record"},
-        format="json",
-    ).status_code == 200
+    assert (
+        admin_api.post(
+            f"/api/v1/admin/memberships/{membership.pk}/revoke",
+            {"reason": "Close audit record"},
+            format="json",
+        ).status_code
+        == 200
+    )
 
     response = admin_api.post(
         f"/api/v1/admin/membership-usage/{order.pk}/undo",
@@ -1460,8 +1463,7 @@ def test_concurrent_revoke_only_commits_once():
             close_old_connections()
 
     threads = [
-        threading.Thread(target=revoke_once, args=(reason,))
-        for reason in ("first", "second")
+        threading.Thread(target=revoke_once, args=(reason,)) for reason in ("first", "second")
     ]
     for thread in threads:
         thread.start()
@@ -1530,8 +1532,6 @@ def test_reassign_creates_fresh_quota(active_user, admin_api):
         MembershipCycle.objects.filter(membership_id=old_id).values_list("pk", flat=True)
     )
     new_cycles = set(
-        MembershipCycle.objects.filter(
-            membership_id=new_membership.pk
-        ).values_list("pk", flat=True)
+        MembershipCycle.objects.filter(membership_id=new_membership.pk).values_list("pk", flat=True)
     )
     assert old_cycles.isdisjoint(new_cycles)
