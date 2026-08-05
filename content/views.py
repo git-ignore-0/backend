@@ -1,6 +1,7 @@
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.signing import BadSignature, SignatureExpired
 from django.db import transaction
+from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import status, viewsets
@@ -15,31 +16,48 @@ from content.models import (
     ContentAuditLog,
     ExternalLink,
     SiteSettings,
+    Testimonial,
+    TestimonialStatus,
     Workshop,
     WorkshopRevision,
     WorkshopTranslation,
 )
 from content.permissions import IsWebsiteAdmin
 from content.serializers import (
+    AdminTestimonialQuerySerializer,
+    PublicTestimonialQuerySerializer,
     PublicWorkshopQuerySerializer,
     SiteSettingsWriteSerializer,
+    TestimonialActionSerializer,
+    TestimonialUpdateSerializer,
+    TestimonialWriteSerializer,
     WorkshopDraftWriteSerializer,
     WorkshopPublishSerializer,
     admin_revision_payload,
+    admin_testimonial_payload,
     media_payload,
+    public_testimonial_payload,
     public_workshop_payload,
 )
 from content.services import (
     RevisionConflict,
+    TestimonialTransitionConflict,
     audit,
     create_preview_token,
+    create_testimonial,
+    hide_testimonial,
     publish_revision,
+    publish_testimonial,
     read_preview_token,
     request_frontend_revalidation,
+    store_testimonial_image,
     store_workshop_image,
+    testimonial_queryset,
     translation_is_ready,
     unique_workshop_slug,
+    unpublish_testimonial,
     unpublish_workshop,
+    update_testimonial,
 )
 
 
@@ -243,6 +261,93 @@ class PublicWorkshopPreviewView(APIView):
         return response
 
 
+def published_testimonial_queryset():
+    return testimonial_queryset().filter(status=TestimonialStatus.PUBLISHED)
+
+
+def testimonial_page(queryset, page, page_size):
+    total = queryset.count()
+    start = (page - 1) * page_size
+    return queryset[start : start + page_size], {
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+    }
+
+
+def public_testimonial_response(data):
+    response = Response(data)
+    response["Cache-Control"] = "public, max-age=60, stale-while-revalidate=300"
+    return response
+
+
+def admin_no_store(response):
+    response["Cache-Control"] = "private, no-store"
+    response["Pragma"] = "no-cache"
+    return response
+
+
+class PublicTestimonialListView(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def get(self, request):
+        query = PublicTestimonialQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+        data = query.validated_data
+        queryset = published_testimonial_queryset().order_by(
+            "sort_order", "-published_at", "created_at", "id"
+        )
+        if data["type"] != "all":
+            queryset = queryset.filter(type=data["type"])
+        items, meta = testimonial_page(queryset, data["page"], data["page_size"])
+        payloads = [public_testimonial_payload(item, request, data["locale"]) for item in items]
+        return public_testimonial_response(
+            {"data": [item for item in payloads if item is not None], "meta": meta}
+        )
+
+
+class PublicFeaturedTestimonialView(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def get(self, request):
+        locale = validated_public_locale(request)
+        base = published_testimonial_queryset().order_by(
+            "sort_order", "-published_at", "created_at", "id"
+        )
+        first_featured = base.filter(featured=True).first()
+        if first_featured is None:
+            items = list(base[:3])
+        else:
+            items = [first_featured, *list(base.exclude(pk=first_featured.pk)[:2])]
+        payloads = [public_testimonial_payload(item, request, locale) for item in items]
+        return public_testimonial_response(
+            {"data": [item for item in payloads if item is not None]}
+        )
+
+
+class PublicTestimonialDetailView(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def get(self, request, testimonial_id):
+        locale = validated_public_locale(request)
+        testimonial = get_object_or_404(
+            published_testimonial_queryset(),
+            pk=testimonial_id,
+        )
+        data = public_testimonial_payload(
+            testimonial,
+            request,
+            locale,
+            include_full_story=True,
+        )
+        if data is None:
+            raise NotFound()
+        return public_testimonial_response({"data": data})
+
+
 def apply_translation_data(revision, translations):
     for translation_data in translations:
         data = dict(translation_data)
@@ -436,6 +541,139 @@ class AdminWorkshopViewSet(viewsets.ViewSet):
                     "expires_in": 600,
                 }
             }
+        )
+
+
+class AdminTestimonialViewSet(viewsets.ViewSet):
+    permission_classes = [IsWebsiteAdmin]
+    http_method_names = ["get", "post", "patch", "head", "options"]
+
+    def list(self, request):
+        query = AdminTestimonialQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+        data = query.validated_data
+        queryset = testimonial_queryset().order_by("sort_order", "-updated_at", "id")
+        search = data["search"].strip()
+        if search:
+            queryset = queryset.filter(
+                Q(display_name__icontains=search)
+                | Q(translations__role__icontains=search)
+                | Q(translations__location__icontains=search)
+                | Q(translations__quote__icontains=search)
+                | Q(translations__full_story__icontains=search)
+            ).distinct()
+        if data["status"]:
+            queryset = queryset.filter(status=data["status"])
+        if data["type"]:
+            queryset = queryset.filter(type=data["type"])
+        items, meta = testimonial_page(queryset, data["page"], data["page_size"])
+        return admin_no_store(
+            Response(
+                {
+                    "data": [admin_testimonial_payload(item, request) for item in items],
+                    "meta": meta,
+                }
+            )
+        )
+
+    def create(self, request):
+        serializer = TestimonialWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            testimonial = create_testimonial(
+                actor=request.user,
+                data=serializer.validated_data,
+            )
+        except DjangoValidationError as error:
+            raise ValidationError(error.message_dict) from error
+        return admin_no_store(
+            Response(
+                {"data": admin_testimonial_payload(testimonial, request)},
+                status=status.HTTP_201_CREATED,
+            )
+        )
+
+    def retrieve(self, request, pk=None):
+        testimonial = get_object_or_404(testimonial_queryset(), pk=pk)
+        return admin_no_store(Response({"data": admin_testimonial_payload(testimonial, request)}))
+
+    def partial_update(self, request, pk=None):
+        get_object_or_404(Testimonial, pk=pk)
+        serializer = TestimonialUpdateSerializer(data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        data = dict(serializer.validated_data)
+        expected_version = data.pop("version")
+        try:
+            testimonial = update_testimonial(
+                testimonial_id=pk,
+                actor=request.user,
+                expected_version=expected_version,
+                data=data,
+            )
+        except TestimonialTransitionConflict as error:
+            return admin_no_store(
+                Response(
+                    {"errors": [{"code": error.code}]},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            )
+        except DjangoValidationError as error:
+            raise ValidationError(error.message_dict) from error
+        return admin_no_store(Response({"data": admin_testimonial_payload(testimonial, request)}))
+
+    def _transition(self, request, pk, operation):
+        get_object_or_404(Testimonial, pk=pk)
+        serializer = TestimonialActionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            testimonial = operation(
+                testimonial_id=pk,
+                actor=request.user,
+                expected_version=serializer.validated_data["version"],
+            )
+        except TestimonialTransitionConflict as error:
+            return admin_no_store(
+                Response(
+                    {"errors": [{"code": error.code}]},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            )
+        except DjangoValidationError as error:
+            raise ValidationError(error.message_dict) from error
+        return admin_no_store(Response({"data": admin_testimonial_payload(testimonial, request)}))
+
+    @action(detail=True, methods=["post"])
+    def publish(self, request, pk=None):
+        return self._transition(request, pk, publish_testimonial)
+
+    @action(detail=True, methods=["post"])
+    def hide(self, request, pk=None):
+        return self._transition(request, pk, hide_testimonial)
+
+    @action(detail=True, methods=["post"])
+    def unpublish(self, request, pk=None):
+        return self._transition(request, pk, unpublish_testimonial)
+
+    @action(
+        detail=False,
+        methods=["post"],
+        url_path="media",
+        parser_classes=[MultiPartParser, FormParser],
+    )
+    def media(self, request):
+        upload = request.FILES.get("image")
+        if upload is None:
+            raise ValidationError({"image": "An image is required."})
+        try:
+            asset = store_testimonial_image(upload, actor=request.user)
+        except ValueError as error:
+            raise ValidationError({"image": str(error)}) from error
+        audit(actor=request.user, action="testimonial.media.upload", entity=asset)
+        return admin_no_store(
+            Response(
+                {"data": media_payload(asset, request)},
+                status=status.HTTP_201_CREATED,
+            )
         )
 
 

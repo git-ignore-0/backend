@@ -8,6 +8,7 @@ import uuid
 
 import requests
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.core.files.base import ContentFile
 from django.core.files.storage import default_storage
 from django.core.signing import TimestampSigner
@@ -17,8 +18,13 @@ from django.utils.text import slugify
 from PIL import Image, UnidentifiedImageError
 
 from content.models import (
+    SUPPORTED_LOCALES,
     ContentAuditLog,
     MediaAsset,
+    Testimonial,
+    TestimonialStatus,
+    TestimonialTranslation,
+    TestimonialType,
     Workshop,
     WorkshopRevision,
     WorkshopTranslation,
@@ -31,6 +37,12 @@ preview_signer = TimestampSigner(salt="nfv-workshop-preview")
 
 class RevisionConflict(Exception):
     """The requested draft revision is no longer current."""
+
+
+class TestimonialTransitionConflict(ValueError):
+    def __init__(self, code, message):
+        self.code = code
+        super().__init__(message)
 
 
 def translation_is_ready(translation: WorkshopTranslation) -> bool:
@@ -192,7 +204,7 @@ def request_frontend_revalidation(tags):
 
 
 def store_media_image(upload, *, actor, storage_prefix: str) -> MediaAsset:
-    if storage_prefix not in {"rewards", "workshops"}:
+    if storage_prefix not in {"rewards", "testimonials", "workshops"}:
         raise ValueError("Unsupported media storage prefix.")
     if upload.size > settings.CONTENT_MAX_UPLOAD_BYTES:
         raise ValueError("Image exceeds the upload size limit.")
@@ -251,3 +263,210 @@ def store_workshop_image(upload, *, actor) -> MediaAsset:
 
 def store_reward_image(upload, *, actor) -> MediaAsset:
     return store_media_image(upload, actor=actor, storage_prefix="rewards")
+
+
+def store_testimonial_image(upload, *, actor) -> MediaAsset:
+    return store_media_image(upload, actor=actor, storage_prefix="testimonials")
+
+
+def validate_testimonial_data(data, *, partial=False):
+    errors = {}
+    allowed_fields = {
+        "type",
+        "display_name",
+        "image_id",
+        "featured",
+        "sort_order",
+        "consent_confirmed",
+        "translations",
+    }
+    unknown_fields = sorted(set(data) - allowed_fields)
+    if unknown_fields:
+        errors.update({field: "This field is not allowed." for field in unknown_fields})
+    testimonial_type = data.get("type")
+    if not partial and testimonial_type not in TestimonialType.values:
+        errors["type"] = "A supported testimonial type is required."
+    if testimonial_type is not None and testimonial_type not in TestimonialType.values:
+        errors["type"] = "Unsupported testimonial type."
+    display_name = data.get("display_name")
+    if not partial and not (display_name or "").strip():
+        errors["display_name"] = "Display name is required."
+    if display_name is not None and not display_name.strip():
+        errors["display_name"] = "Display name is required."
+    if data.get("sort_order", 0) < 0:
+        errors["sort_order"] = "Sort order must be zero or greater."
+    image = data.get("image_id")
+    if "image_id" in data and image is not None and not isinstance(image, MediaAsset):
+        errors["image_id"] = "A valid media asset is required."
+
+    translations = data.get("translations")
+    if translations is not None:
+        locales = [item.get("locale") for item in translations]
+        if len(locales) != len(set(locales)):
+            errors["translations"] = "Locale must be unique."
+        elif any(locale not in SUPPORTED_LOCALES for locale in locales):
+            errors["translations"] = "Unsupported locale."
+        translation_fields = {"locale", "role", "location", "quote", "full_story"}
+        if any(set(item) - translation_fields for item in translations):
+            errors["translations"] = "Translation contains unsupported fields."
+    if errors:
+        raise ValidationError(errors)
+
+
+def _save_testimonial_translations(testimonial, translations):
+    for translation_data in translations:
+        data = dict(translation_data)
+        locale = data.pop("locale")
+        translation, _created = TestimonialTranslation.objects.update_or_create(
+            testimonial=testimonial,
+            locale=locale,
+            defaults=data,
+        )
+        translation.full_clean()
+
+
+def validate_testimonial_for_publish(testimonial):
+    testimonial.full_clean()
+    if not testimonial.consent_confirmed:
+        raise ValidationError({"consent_confirmed": "Consent is required before publishing."})
+    translations = {item.locale: item for item in testimonial.translations.all()}
+    errors = {}
+    for locale in ("vi", "en"):
+        translation = translations.get(locale)
+        if translation is None:
+            errors[locale] = "Translation is required."
+            continue
+        translation.full_clean()
+        missing = [
+            field
+            for field in ("role", "location", "quote", "full_story")
+            if not getattr(translation, field).strip()
+        ]
+        if missing:
+            errors[locale] = f"Translation is missing: {', '.join(missing)}."
+    if errors:
+        raise ValidationError(
+            {"translations": [f"{locale}: {message}" for locale, message in errors.items()]}
+        )
+
+
+def testimonial_queryset():
+    return Testimonial.objects.select_related("image", "created_by", "updated_by").prefetch_related(
+        "translations"
+    )
+
+
+@transaction.atomic
+def create_testimonial(*, actor, data):
+    data = dict(data)
+    validate_testimonial_data(data)
+    translations = data.pop("translations", [])
+    image = data.pop("image_id", None)
+    testimonial = Testimonial(
+        image=image,
+        created_by=actor,
+        updated_by=actor,
+        **data,
+    )
+    testimonial.full_clean()
+    testimonial.save()
+    _save_testimonial_translations(testimonial, translations)
+    audit(actor=actor, action="testimonial.create", entity=testimonial)
+    return testimonial_queryset().get(pk=testimonial.pk)
+
+
+def _assert_testimonial_version(testimonial, expected_version):
+    if testimonial.version != expected_version:
+        raise TestimonialTransitionConflict(
+            "version_conflict", "Testimonial was changed by another administrator."
+        )
+
+
+@transaction.atomic
+def update_testimonial(*, testimonial_id, actor, expected_version, data):
+    data = dict(data)
+    validate_testimonial_data(data, partial=True)
+    testimonial = Testimonial.objects.select_for_update().get(pk=testimonial_id)
+    _assert_testimonial_version(testimonial, expected_version)
+    translations = data.pop("translations", None)
+    if "image_id" in data:
+        testimonial.image = data.pop("image_id")
+    for field, value in data.items():
+        setattr(testimonial, field, value)
+    testimonial.updated_by = actor
+    testimonial.version += 1
+    testimonial.full_clean()
+    testimonial.save()
+    if translations is not None:
+        _save_testimonial_translations(testimonial, translations)
+    if testimonial.status == TestimonialStatus.PUBLISHED:
+        testimonial = testimonial_queryset().get(pk=testimonial.pk)
+        validate_testimonial_for_publish(testimonial)
+        transaction.on_commit(
+            lambda: request_frontend_revalidation(["testimonials", f"testimonial:{testimonial.pk}"])
+        )
+    audit(actor=actor, action="testimonial.update", entity=testimonial)
+    return testimonial_queryset().get(pk=testimonial.pk)
+
+
+@transaction.atomic
+def publish_testimonial(*, testimonial_id, actor, expected_version):
+    testimonial = Testimonial.objects.select_for_update().get(pk=testimonial_id)
+    _assert_testimonial_version(testimonial, expected_version)
+    if testimonial.status == TestimonialStatus.PUBLISHED:
+        raise TestimonialTransitionConflict(
+            "testimonial_already_published", "Testimonial is already published."
+        )
+    testimonial.status = TestimonialStatus.PUBLISHED
+    testimonial.published_at = timezone.now()
+    testimonial.updated_by = actor
+    testimonial.version += 1
+    validate_testimonial_for_publish(testimonial)
+    testimonial.save(
+        update_fields=["status", "published_at", "updated_by", "version", "updated_at"]
+    )
+    audit(actor=actor, action="testimonial.publish", entity=testimonial)
+    transaction.on_commit(
+        lambda: request_frontend_revalidation(["testimonials", f"testimonial:{testimonial.pk}"])
+    )
+    return testimonial_queryset().get(pk=testimonial.pk)
+
+
+@transaction.atomic
+def hide_testimonial(*, testimonial_id, actor, expected_version):
+    testimonial = Testimonial.objects.select_for_update().get(pk=testimonial_id)
+    _assert_testimonial_version(testimonial, expected_version)
+    if testimonial.status == TestimonialStatus.HIDDEN:
+        raise TestimonialTransitionConflict(
+            "testimonial_already_hidden", "Testimonial is already hidden."
+        )
+    testimonial.status = TestimonialStatus.HIDDEN
+    testimonial.updated_by = actor
+    testimonial.version += 1
+    testimonial.full_clean()
+    testimonial.save(update_fields=["status", "updated_by", "version", "updated_at"])
+    audit(actor=actor, action="testimonial.hide", entity=testimonial)
+    transaction.on_commit(
+        lambda: request_frontend_revalidation(["testimonials", f"testimonial:{testimonial.pk}"])
+    )
+    return testimonial_queryset().get(pk=testimonial.pk)
+
+
+@transaction.atomic
+def unpublish_testimonial(*, testimonial_id, actor, expected_version):
+    testimonial = Testimonial.objects.select_for_update().get(pk=testimonial_id)
+    _assert_testimonial_version(testimonial, expected_version)
+    if testimonial.status == TestimonialStatus.DRAFT:
+        raise TestimonialTransitionConflict(
+            "testimonial_already_draft", "Testimonial is already a draft."
+        )
+    testimonial.status = TestimonialStatus.DRAFT
+    testimonial.updated_by = actor
+    testimonial.version += 1
+    testimonial.full_clean()
+    testimonial.save(update_fields=["status", "updated_by", "version", "updated_at"])
+    audit(actor=actor, action="testimonial.unpublish", entity=testimonial)
+    transaction.on_commit(
+        lambda: request_frontend_revalidation(["testimonials", f"testimonial:{testimonial.pk}"])
+    )
+    return testimonial_queryset().get(pk=testimonial.pk)

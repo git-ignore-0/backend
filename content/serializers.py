@@ -7,6 +7,8 @@ from rest_framework import serializers
 from content.models import (
     ExternalLink,
     MediaAsset,
+    TestimonialStatus,
+    TestimonialType,
 )
 from content.validators import validate_tiptap_document
 
@@ -149,6 +151,118 @@ class PublicWorkshopQuerySerializer(serializers.Serializer):
     page = serializers.IntegerField(min_value=1, default=1)
 
 
+class TestimonialStrictSerializer(serializers.Serializer):
+    def to_internal_value(self, data):
+        if hasattr(data, "keys"):
+            unknown = sorted(set(data.keys()) - set(self.fields))
+            if unknown:
+                raise serializers.ValidationError(
+                    {field: "This field is not allowed." for field in unknown}
+                )
+        return super().to_internal_value(data)
+
+
+class TestimonialTranslationWriteSerializer(TestimonialStrictSerializer):
+    locale = serializers.ChoiceField(choices=["vi", "en"])
+    role = serializers.CharField(
+        max_length=240,
+        allow_blank=True,
+        required=False,
+        default="",
+        trim_whitespace=True,
+    )
+    location = serializers.CharField(
+        max_length=240,
+        allow_blank=True,
+        required=False,
+        default="",
+        trim_whitespace=True,
+    )
+    quote = serializers.CharField(
+        max_length=800,
+        allow_blank=True,
+        required=False,
+        default="",
+        trim_whitespace=True,
+    )
+    full_story = serializers.CharField(
+        max_length=20_000,
+        allow_blank=True,
+        required=False,
+        default="",
+        trim_whitespace=True,
+    )
+
+
+class TestimonialWriteSerializer(TestimonialStrictSerializer):
+    type = serializers.ChoiceField(choices=TestimonialType.choices)
+    display_name = serializers.CharField(max_length=240, trim_whitespace=True)
+    image_id = serializers.UUIDField(required=False, allow_null=True)
+    featured = serializers.BooleanField(required=False, default=False)
+    sort_order = serializers.IntegerField(min_value=0, required=False, default=0)
+    consent_confirmed = serializers.BooleanField(required=False, default=False)
+    translations = TestimonialTranslationWriteSerializer(many=True, required=False, default=list)
+
+    def validate_display_name(self, value):
+        if not value:
+            raise serializers.ValidationError("Display name is required.")
+        return value
+
+    def validate_image_id(self, value):
+        if value is None:
+            return None
+        try:
+            return MediaAsset.objects.get(pk=value)
+        except MediaAsset.DoesNotExist as error:
+            raise serializers.ValidationError("Media asset does not exist.") from error
+
+    def validate_translations(self, value):
+        locales = [item["locale"] for item in value]
+        if len(locales) != len(set(locales)):
+            raise serializers.ValidationError("Locale must be unique.")
+        return value
+
+
+class TestimonialUpdateSerializer(TestimonialWriteSerializer):
+    version = serializers.IntegerField(min_value=1, required=False)
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        if "version" not in attrs:
+            raise serializers.ValidationError({"version": "This field is required."})
+        return attrs
+
+
+class TestimonialActionSerializer(TestimonialStrictSerializer):
+    version = serializers.IntegerField(min_value=1)
+
+
+class AdminTestimonialQuerySerializer(serializers.Serializer):
+    search = serializers.CharField(max_length=240, allow_blank=True, default="")
+    status = serializers.ChoiceField(
+        choices=TestimonialStatus.choices,
+        allow_blank=True,
+        default="",
+    )
+    type = serializers.ChoiceField(
+        choices=TestimonialType.choices,
+        allow_blank=True,
+        default="",
+    )
+    page_size = serializers.IntegerField(min_value=1, max_value=50, default=20)
+    page = serializers.IntegerField(min_value=1, max_value=10_000, default=1)
+
+
+class PublicTestimonialQuerySerializer(serializers.Serializer):
+    locale = serializers.ChoiceField(choices=["vi", "en"], default="vi")
+    type = serializers.ChoiceField(
+        choices=["all", *TestimonialType.values],
+        default="all",
+    )
+    page_size = serializers.IntegerField(min_value=1, max_value=50, default=20)
+    page = serializers.IntegerField(min_value=1, max_value=10_000, default=1)
+
+
 def admin_translation_payload(item):
     return {
         "locale": item.locale,
@@ -175,4 +289,79 @@ def admin_revision_payload(revision):
         "has_published_revision": revision.workshop.revisions.filter(is_published=True).exists(),
         "translations": [admin_translation_payload(item) for item in revision.translations.all()],
         "updated_at": revision.updated_at.isoformat(),
+    }
+
+
+def testimonial_translation_is_complete(translation) -> bool:
+    return all(
+        getattr(translation, field).strip() for field in ("role", "location", "quote", "full_story")
+    )
+
+
+def choose_testimonial_translation(testimonial, locale):
+    translations = [
+        item for item in testimonial.translations.all() if testimonial_translation_is_complete(item)
+    ]
+    by_locale = {item.locale: item for item in translations}
+    selected = by_locale.get(locale) or by_locale.get("vi") or by_locale.get("en")
+    return selected, sorted(by_locale)
+
+
+def public_testimonial_payload(testimonial, request, locale, *, include_full_story=False):
+    translation, available_locales = choose_testimonial_translation(testimonial, locale)
+    if translation is None:
+        return None
+    data = {
+        "id": str(testimonial.pk),
+        "type": testimonial.type,
+        "display_name": testimonial.display_name,
+        "image": media_payload(testimonial.image, request) if testimonial.image else None,
+        "requested_locale": locale,
+        "content_locale": translation.locale,
+        "available_locales": available_locales,
+        "is_fallback": translation.locale != locale,
+        "role": translation.role,
+        "location": translation.location,
+        "quote": translation.quote,
+        "published_at": testimonial.published_at.isoformat(),
+    }
+    if include_full_story:
+        data["full_story"] = translation.full_story
+    return data
+
+
+def admin_testimonial_payload(testimonial, request):
+    def actor_payload(actor):
+        if actor is None:
+            return None
+        return {"id": str(actor.pk), "name": actor.name, "email": actor.email}
+
+    return {
+        "id": str(testimonial.pk),
+        "type": testimonial.type,
+        "status": testimonial.status,
+        "display_name": testimonial.display_name,
+        "image": media_payload(testimonial.image, request) if testimonial.image else None,
+        "featured": testimonial.featured,
+        "sort_order": testimonial.sort_order,
+        "published_at": (
+            testimonial.published_at.isoformat() if testimonial.published_at else None
+        ),
+        "consent_confirmed": testimonial.consent_confirmed,
+        "version": testimonial.version,
+        "translations": [
+            {
+                "locale": item.locale,
+                "role": item.role,
+                "location": item.location,
+                "quote": item.quote,
+                "full_story": item.full_story,
+                "is_complete": testimonial_translation_is_complete(item),
+            }
+            for item in testimonial.translations.all()
+        ],
+        "created_by": actor_payload(testimonial.created_by),
+        "updated_by": actor_payload(testimonial.updated_by),
+        "created_at": testimonial.created_at.isoformat(),
+        "updated_at": testimonial.updated_at.isoformat(),
     }

@@ -196,6 +196,132 @@ class WorkshopTranslation(models.Model):
             raise ValidationError({"locale": "Unsupported locale."})
 
 
+class TestimonialType(models.TextChoices):
+    CUSTOMER = "customer", "Customer"
+    FARMER = "farmer", "Farmer"
+
+
+class TestimonialStatus(models.TextChoices):
+    DRAFT = "draft", "Draft"
+    PUBLISHED = "published", "Published"
+    HIDDEN = "hidden", "Hidden"
+
+
+class Testimonial(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    type = models.CharField(max_length=16, choices=TestimonialType.choices)
+    status = models.CharField(
+        max_length=16,
+        choices=TestimonialStatus.choices,
+        default=TestimonialStatus.DRAFT,
+    )
+    display_name = models.CharField(max_length=240)
+    image = models.ForeignKey(
+        MediaAsset,
+        related_name="testimonials",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+    )
+    featured = models.BooleanField(default=False)
+    sort_order = models.PositiveIntegerField(default=0)
+    published_at = models.DateTimeField(null=True, blank=True)
+    consent_confirmed = models.BooleanField(default=False)
+    version = models.PositiveIntegerField(default=1)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        related_name="testimonials_created",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+    )
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        related_name="testimonials_updated",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["sort_order", "-published_at", "created_at", "id"]
+        indexes = [
+            models.Index(
+                fields=["status", "type", "sort_order"],
+                name="content_test_status_type_idx",
+            ),
+            models.Index(
+                fields=["status", "sort_order"],
+                name="content_test_status_order_idx",
+            ),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(type__in=TestimonialType.values),
+                name="content_testimonial_type_valid",
+            ),
+            models.CheckConstraint(
+                condition=Q(status__in=TestimonialStatus.values),
+                name="content_testimonial_status_valid",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~Q(status=TestimonialStatus.PUBLISHED)
+                    | Q(consent_confirmed=True, published_at__isnull=False)
+                ),
+                name="content_published_testimonial_has_consent_and_time",
+            ),
+        ]
+
+    def __str__(self):
+        return self.display_name
+
+    def clean(self):
+        if self.status == TestimonialStatus.PUBLISHED:
+            errors = {}
+            if not self.consent_confirmed:
+                errors["consent_confirmed"] = "Consent is required before publishing."
+            if self.published_at is None:
+                errors["published_at"] = "Published time is required for published testimonials."
+            if errors:
+                raise ValidationError(errors)
+
+
+class TestimonialTranslation(models.Model):
+    testimonial = models.ForeignKey(
+        Testimonial,
+        related_name="translations",
+        on_delete=models.CASCADE,
+    )
+    locale = models.CharField(max_length=2, choices=[("vi", "Vietnamese"), ("en", "English")])
+    role = models.CharField(max_length=240, blank=True)
+    location = models.CharField(max_length=240, blank=True)
+    quote = models.CharField(max_length=800, blank=True)
+    full_story = models.TextField(max_length=20_000, blank=True)
+
+    class Meta:
+        ordering = ["locale", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["testimonial", "locale"],
+                name="content_testimonial_translation_locale_unique",
+            ),
+            models.CheckConstraint(
+                condition=Q(locale__in=sorted(SUPPORTED_LOCALES)),
+                name="content_testimonial_translation_locale_supported",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.testimonial_id}:{self.locale}"
+
+    def clean(self):
+        if self.locale not in SUPPORTED_LOCALES:
+            raise ValidationError({"locale": "Unsupported locale."})
+
+
 class ContentAuditLog(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     actor = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL)
