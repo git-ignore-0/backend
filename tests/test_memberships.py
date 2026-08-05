@@ -209,9 +209,7 @@ def test_admin_package_requires_an_active_price_option_and_rejects_unknown_total
     ).json()["data"]
     missing = package_api_payload(product["id"])
     missing.pop("price_options")
-    response = admin_api.post(
-        "/api/v1/admin/membership-packages", missing, format="json"
-    )
+    response = admin_api.post("/api/v1/admin/membership-packages", missing, format="json")
     assert response.status_code == 400
     assert "price_options" in response.json()
 
@@ -225,20 +223,14 @@ def test_admin_package_requires_an_active_price_option_and_rejects_unknown_total
             }
         ],
     )
-    response = admin_api.post(
-        "/api/v1/admin/membership-packages", inactive, format="json"
-    )
+    response = admin_api.post("/api/v1/admin/membership-packages", inactive, format="json")
     assert response.status_code == 400
 
     forged_total = package_api_payload(product["id"])
     forged_total["price_options"][0]["total_price_vnd"] = 1
-    response = admin_api.post(
-        "/api/v1/admin/membership-packages", forged_total, format="json"
-    )
+    response = admin_api.post("/api/v1/admin/membership-packages", forged_total, format="json")
     assert response.status_code == 400
-    assert response.json()["price_options"][0]["total_price_vnd"] == (
-        "This field is not allowed."
-    )
+    assert response.json()["price_options"][0]["total_price_vnd"] == ("This field is not allowed.")
 
 
 @pytest.mark.django_db
@@ -253,9 +245,7 @@ def test_active_package_duration_is_unique_and_total_is_computed_by_backend(admi
             {"duration_months": 3, "monthly_price_vnd": 500_000},
         ],
     )
-    response = admin_api.post(
-        "/api/v1/admin/membership-packages", duplicate, format="json"
-    )
+    response = admin_api.post("/api/v1/admin/membership-packages", duplicate, format="json")
     assert response.status_code == 400
     assert "price_options" in response.json()
 
@@ -270,9 +260,7 @@ def test_active_package_duration_is_unique_and_total_is_computed_by_backend(admi
             }
         ],
     )
-    response = admin_api.post(
-        "/api/v1/admin/membership-packages", valid, format="json"
-    )
+    response = admin_api.post("/api/v1/admin/membership-packages", valid, format="json")
     assert response.status_code == 201
     option = response.json()["data"]["price_options"][0]
     assert option["monthly_price_vnd"] == "400001"
@@ -327,9 +315,7 @@ def test_last_active_option_cannot_be_deactivated_or_removed(admin_api):
 @pytest.mark.django_db
 def test_used_price_option_price_and_duration_are_immutable(active_user, admin_api):
     package, _product, option = create_package()
-    assign(
-        active_user, package=package, option=option, reference="FB-USED-OPTION"
-    )
+    assign(active_user, package=package, option=option, reference="FB-USED-OPTION")
     original = (option.duration_months, option.monthly_price_vnd)
 
     for changes in (
@@ -342,9 +328,7 @@ def test_used_price_option_price_and_duration_are_immutable(active_user, admin_a
                 "price_options": [
                     {
                         "id": str(option.pk),
-                        "duration_months": changes.get(
-                            "duration_months", option.duration_months
-                        ),
+                        "duration_months": changes.get("duration_months", option.duration_months),
                         "monthly_price_vnd": changes.get(
                             "monthly_price_vnd", option.monthly_price_vnd
                         ),
@@ -361,9 +345,7 @@ def test_used_price_option_price_and_duration_are_immutable(active_user, admin_a
 
 
 @pytest.mark.django_db
-def test_used_option_can_deactivate_then_new_price_can_reuse_duration(
-    active_user, admin_api
-):
+def test_used_option_can_deactivate_then_new_price_can_reuse_duration(active_user, admin_api):
     package, _product, option = create_package()
     membership, _product, _option = assign(
         active_user, package=package, option=option, reference="FB-HISTORICAL-OPTION"
@@ -432,9 +414,7 @@ def test_used_option_can_deactivate_then_new_price_can_reuse_duration(
         format="json",
     )
     assert replace.status_code == 200
-    replacement = package.price_options.get(
-        is_active=True, duration_months=6
-    )
+    replacement = package.price_options.get(is_active=True, duration_months=6)
     assert replacement.monthly_price_vnd == 1_100_000
     assert membership.price_option_id == option.pk
     with pytest.raises(ProtectedError):
@@ -522,9 +502,7 @@ def test_assignment_rejects_wrong_or_inactive_option(active_user):
 
 
 @pytest.mark.django_db
-def test_price_total_overflow_returns_400_for_package_and_assignment(
-    admin_api, active_user
-):
+def test_price_total_overflow_returns_400_for_package_and_assignment(admin_api, active_user):
     product_id = admin_api.post(
         "/api/v1/admin/membership-products", product_api_payload(), format="json"
     ).json()["data"]["id"]
@@ -814,9 +792,7 @@ def test_usage_rejects_other_product_and_corrupted_membership_user(active_user):
 @pytest.mark.django_db
 def test_cycle_anniversary_and_future_status(active_user):
     future = timezone.localdate() + timedelta(days=2)
-    membership, _product, _option = assign(
-        active_user, start_date=future, reference="FB-SCHEDULED"
-    )
+    membership, _product, _option = assign(active_user, start_date=future, reference="FB-SCHEDULED")
     assert membership.status == MembershipStatus.SCHEDULED
     assert ensure_due_cycles(membership, as_of=future - timedelta(days=1)) == []
     membership = sync_membership_status(membership, as_of=future)
@@ -848,9 +824,10 @@ def test_legacy_price_migration_refuses_non_divisible_money():
     migration = importlib.import_module(
         "memberships.migrations.0008_farmbrite_memberships_and_price_options"
     )
-    assert migration.exact_monthly_price(
-        total=1_200_000, duration=3, identity="test package"
-    ) == 400_000
+    assert (
+        migration.exact_monthly_price(total=1_200_000, duration=3, identity="test package")
+        == 400_000
+    )
     with pytest.raises(RuntimeError, match="not exactly divisible"):
         migration.exact_monthly_price(total=1_000_001, duration=3, identity="test package")
 
@@ -872,21 +849,15 @@ def test_price_option_migration_preserves_historical_membership_price_and_usage(
         LegacyUser = old_apps.get_model("identity", "User")
         LegacyProduct = old_apps.get_model("memberships", "Product")
         LegacyPackage = old_apps.get_model("memberships", "MembershipPackage")
-        LegacyPackageItem = old_apps.get_model(
-            "memberships", "MembershipPackageItem"
-        )
+        LegacyPackageItem = old_apps.get_model("memberships", "MembershipPackageItem")
         LegacyRequest = old_apps.get_model("memberships", "MembershipRequest")
         LegacyMembership = old_apps.get_model("memberships", "Membership")
-        LegacySnapshot = old_apps.get_model(
-            "memberships", "MembershipProductSnapshot"
-        )
+        LegacySnapshot = old_apps.get_model("memberships", "MembershipProductSnapshot")
         LegacyCycle = old_apps.get_model("memberships", "MembershipCycle")
         LegacyQuota = old_apps.get_model("memberships", "MembershipCycleQuota")
         LegacyUsage = old_apps.get_model("memberships", "MembershipUsageOrder")
         LegacyUsageLine = old_apps.get_model("memberships", "MembershipUsageLine")
-        LegacyAllocation = old_apps.get_model(
-            "memberships", "MembershipUsageAllocation"
-        )
+        LegacyAllocation = old_apps.get_model("memberships", "MembershipUsageAllocation")
 
         user = LegacyUser.objects.create(
             email="legacy-price@example.com",
@@ -909,9 +880,7 @@ def test_price_option_migration_preserves_historical_membership_price_and_usage(
             duration_months=6,
             quota_policy="rollover",
         )
-        LegacyPackageItem.objects.create(
-            package=package, product=product, quota_units=2
-        )
+        LegacyPackageItem.objects.create(package=package, product=product, quota_units=2)
         request = LegacyRequest.objects.create(
             short_code="LEGACY01",
             user=user,
@@ -981,23 +950,17 @@ def test_price_option_migration_preserves_historical_membership_price_and_usage(
             note="Historical delivery",
             created_by=user,
         )
-        line = LegacyUsageLine.objects.create(
-            order=usage, product_snapshot=snapshot, units=1
-        )
+        line = LegacyUsageLine.objects.create(order=usage, product_snapshot=snapshot, units=1)
         LegacyAllocation.objects.create(line=line, cycle_quota=quota, units=1)
 
         executor = MigrationExecutor(connection)
         executor.migrate([migrate_to])
         new_apps = executor.loader.project_state([migrate_to]).apps
-        PriceOption = new_apps.get_model(
-            "memberships", "MembershipPackagePriceOption"
-        )
+        PriceOption = new_apps.get_model("memberships", "MembershipPackagePriceOption")
         MigratedMembership = new_apps.get_model("memberships", "Membership")
         MigratedQuota = new_apps.get_model("memberships", "MembershipCycleQuota")
         MigratedUsage = new_apps.get_model("memberships", "MembershipUsageOrder")
-        MigratedAllocation = new_apps.get_model(
-            "memberships", "MembershipUsageAllocation"
-        )
+        MigratedAllocation = new_apps.get_model("memberships", "MembershipUsageAllocation")
 
         options = list(
             PriceOption.objects.filter(package_id=package.pk).order_by(
@@ -1026,9 +989,7 @@ def test_price_option_migration_preserves_historical_membership_price_and_usage(
         assert migrated.monthly_price_vnd_snapshot == 769_000
         assert migrated.total_price_vnd_snapshot == 4_614_000
         assert migrated.package_name_vi_snapshot == "Gói lịch sử"
-        assert migrated.product_snapshots.get().product_name_en_snapshot == (
-            "Historical basket"
-        )
+        assert migrated.product_snapshots.get().product_name_en_snapshot == ("Historical basket")
         assert MigratedQuota.objects.get(pk=quota.pk).remaining_units == 1
         assert MigratedUsage.objects.get(pk=usage.pk).note == "Historical delivery"
         assert MigratedAllocation.objects.get(line__order_id=usage.pk).units == 1

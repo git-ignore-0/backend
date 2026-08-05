@@ -469,9 +469,7 @@ def test_admin_api_returns_safe_conflict_for_invalid_redemption_debit(
     )
 
     assert response.status_code == 409
-    assert response.json() == {
-        "errors": [{"code": "redemption_transition_conflict"}]
-    }
+    assert response.json() == {"errors": [{"code": "redemption_transition_conflict"}]}
 
 
 @pytest.mark.django_db
