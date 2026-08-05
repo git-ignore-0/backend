@@ -84,6 +84,10 @@ class UsageUndoConflict(QuotaError):
     code = "usage_undo_conflict"
 
 
+class MembershipNotRevocable(MembershipError):
+    code = "membership_not_revocable"
+
+
 class UsageIntegrityConflict(QuotaError):
     code = "usage_integrity_conflict"
 
@@ -373,6 +377,8 @@ def _create_cycle(membership: Membership, sequence: int) -> MembershipCycle:
 def sync_membership_status(membership: Membership, *, as_of: date | None = None) -> Membership:
     as_of = as_of or timezone.localdate()
     membership = Membership.objects.select_for_update().get(pk=membership.pk)
+    if membership.status == MembershipStatus.REVOKED:
+        return membership
     if membership.status == MembershipStatus.ENDED or membership.end_date <= as_of:
         expected_status = MembershipStatus.ENDED
         expected_slot = None
@@ -393,9 +399,9 @@ def sync_membership_status(membership: Membership, *, as_of: date | None = None)
 def refresh_membership_statuses(*, as_of: date | None = None) -> None:
     as_of = as_of or timezone.localdate()
     updated_at = timezone.now()
-    Membership.objects.filter(current_slot=True, end_date__lte=as_of).update(
-        status=MembershipStatus.ENDED, current_slot=None, updated_at=updated_at
-    )
+    Membership.objects.filter(current_slot=True, end_date__lte=as_of).exclude(
+        status=MembershipStatus.REVOKED
+    ).update(status=MembershipStatus.ENDED, current_slot=None, updated_at=updated_at)
     Membership.objects.filter(
         current_slot=True,
         status=MembershipStatus.SCHEDULED,
@@ -410,6 +416,8 @@ def ensure_due_cycles(
 ) -> list[MembershipCycle]:
     as_of = as_of or timezone.localdate()
     membership = sync_membership_status(membership, as_of=as_of)
+    if membership.status == MembershipStatus.REVOKED:
+        return []
     due = 0
     for sequence in range(1, membership.duration_months_snapshot + 1):
         if add_months(membership.start_date, sequence - 1) <= as_of:
@@ -472,6 +480,12 @@ def validate_usage_integrity(order: MembershipUsageOrder) -> None:
 @transaction.atomic
 def create_usage_order(*, membership_id, actor, idempotency_key, lines: list[dict], note=""):
     membership = Membership.objects.select_for_update().select_related("user").get(pk=membership_id)
+    today = timezone.localdate()
+    membership = sync_membership_status(membership, as_of=today)
+    if membership.status != MembershipStatus.ACTIVE or not (
+        membership.start_date <= today < membership.end_date
+    ):
+        raise QuotaError("Membership is not active today")
     requested = _normalized_usage_lines(lines)
     existing = (
         MembershipUsageOrder.objects.filter(membership=membership, idempotency_key=idempotency_key)
@@ -488,7 +502,6 @@ def create_usage_order(*, membership_id, actor, idempotency_key, lines: list[dic
                 "Idempotency key was used with a different usage payload"
             )
         return existing, False
-    today = timezone.localdate()
     ensure_due_cycles(membership, as_of=today)
     membership.refresh_from_db()
     if membership.status != MembershipStatus.ACTIVE or not (
@@ -555,6 +568,12 @@ def create_usage_order(*, membership_id, actor, idempotency_key, lines: list[dic
 def undo_usage_order(*, order_id, actor, reason: str):
     if not reason.strip():
         raise UsageUndoConflict("An undo reason is required")
+    membership_id = MembershipUsageOrder.objects.only("membership_id").get(
+        pk=order_id
+    ).membership_id
+    membership = Membership.objects.select_for_update().get(pk=membership_id)
+    if membership.status == MembershipStatus.REVOKED:
+        raise UsageUndoConflict("Usage cannot be undone for a revoked membership")
     order = MembershipUsageOrder.objects.select_for_update().get(pk=order_id)
     if (
         order.status != UsageOrderStatus.APPLIED
@@ -587,3 +606,38 @@ def undo_usage_order(*, order_id, actor, reason: str):
     order.reversed_at = timezone.now()
     order.save(update_fields=["status", "reversed_at"])
     return order
+
+
+def revoke_membership(*, membership_id, reason: str, actor) -> Membership:
+    """Revoke an active or scheduled membership. Sets status=REVOKED and clears current_slot."""
+    if not reason.strip():
+        raise MembershipNotRevocable("A revoke reason is required")
+    with transaction.atomic():
+        membership = Membership.objects.select_for_update().get(pk=membership_id)
+        membership = sync_membership_status(
+            membership, as_of=timezone.localdate()
+        )
+        if membership.status in {
+            MembershipStatus.SCHEDULED,
+            MembershipStatus.ACTIVE,
+        }:
+            membership.status = MembershipStatus.REVOKED
+            membership.current_slot = None
+            membership.revoked_at = timezone.now()
+            membership.revoked_by = actor
+            membership.revoke_reason = reason.strip()
+            membership.save(
+                update_fields=[
+                    "status",
+                    "current_slot",
+                    "revoked_at",
+                    "revoked_by",
+                    "revoke_reason",
+                    "updated_at",
+                ]
+            )
+            return membership
+        rejected_status = membership.status
+    raise MembershipNotRevocable(
+        f"Membership cannot be revoked: current status is '{rejected_status}'"
+    )

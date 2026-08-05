@@ -235,3 +235,12 @@ class UsageCreateSerializer(StrictSerializer):
 
 class UsageUndoSerializer(ReasonSerializer):
     pass
+
+
+class MembershipRevokeSerializer(StrictSerializer):
+    reason = serializers.CharField(
+        max_length=500,
+        min_length=1,
+        trim_whitespace=True,
+        error_messages={"blank": "Revoke reason is required."},
+    )

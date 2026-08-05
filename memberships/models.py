@@ -17,6 +17,7 @@ class MembershipStatus(models.TextChoices):
     SCHEDULED = "scheduled", "Scheduled"
     ACTIVE = "active", "Active"
     ENDED = "ended", "Ended"
+    REVOKED = "revoked", "Revoked"
 
 
 class UsageOrderStatus(models.TextChoices):
@@ -215,6 +216,15 @@ class Membership(models.Model):
     )
     activated_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    revoked_at = models.DateTimeField(null=True, blank=True)
+    revoked_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        related_name="memberships_revoked",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+    )
+    revoke_reason = models.TextField(blank=True)
 
     class Meta:
         ordering = ["-activated_at", "-id"]
@@ -251,7 +261,10 @@ class Membership(models.Model):
                         status__in=[MembershipStatus.SCHEDULED, MembershipStatus.ACTIVE],
                         current_slot=True,
                     )
-                    | Q(status=MembershipStatus.ENDED, current_slot__isnull=True)
+                    | Q(
+                        status__in=[MembershipStatus.ENDED, MembershipStatus.REVOKED],
+                        current_slot__isnull=True,
+                    )
                 ),
                 name="memberships_current_slot_consistent",
             ),

@@ -31,6 +31,7 @@ from memberships.serializers import (
     LocalePageQuerySerializer,
     LocaleQuerySerializer,
     MembershipAssignSerializer,
+    MembershipRevokeSerializer,
     PackageWriteSerializer,
     ProductWriteSerializer,
     PublicPackageQuerySerializer,
@@ -39,12 +40,14 @@ from memberships.serializers import (
 )
 from memberships.services import (
     MembershipError,
+    MembershipNotRevocable,
     PriceOptionConflict,
     PriceOptionTotalInvalid,
     assign_membership,
     create_usage_order,
     ensure_due_cycles,
     refresh_membership_statuses,
+    revoke_membership,
     sync_package_price_options,
     undo_usage_order,
 )
@@ -288,7 +291,20 @@ def membership_payload(
         "start_date": item.start_date.isoformat(),
         "end_date": item.end_date.isoformat(),
         "activated_at": item.activated_at.isoformat(),
+        **({"current_slot": item.current_slot} if admin else {}),
     }
+    if item.revoked_at:
+        data["revoked_at"] = item.revoked_at.isoformat()
+        data["revoked_by"] = (
+            {
+                "id": str(item.revoked_by_id),
+                "name": item.revoked_by.name,
+                "email": item.revoked_by.email,
+            }
+            if item.revoked_by_id
+            else None
+        )
+        data["revoke_reason"] = item.revoke_reason
     if include_quota:
         data["quota"] = quota_payload(item, locale=locale, admin=admin)
     if include_user:
@@ -435,7 +451,7 @@ def package_queryset():
 
 def membership_queryset():
     return Membership.objects.select_related(
-        "user", "user__member_profile", "package", "price_option"
+        "user", "user__member_profile", "package", "price_option", "revoked_by"
     ).prefetch_related("product_snapshots")
 
 
@@ -823,6 +839,35 @@ class AdminMembershipViewSet(viewsets.ViewSet):
         )
         data["cycles"] = cycle_payload(item, locale=locale)
         return no_store(Response({"data": data}))
+
+    @action(detail=True, methods=["post"], url_path="revoke")
+    def revoke(self, request, pk=None):
+        locale = requested_locale(request)
+        serializer = MembershipRevokeSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            item = revoke_membership(
+                membership_id=pk,
+                reason=serializer.validated_data["reason"],
+                actor=request.user,
+            )
+        except Membership.DoesNotExist:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        except MembershipNotRevocable as error:
+            return membership_error(error)
+        item = membership_queryset().get(pk=item.pk)
+        return no_store(
+            Response(
+                {
+                    "data": membership_payload(
+                        item,
+                        locale=locale,
+                        include_user=True,
+                        admin=True,
+                    )
+                }
+            )
+        )
 
     @action(detail=True, methods=["get"], url_path="history")
     def history(self, request, pk=None):

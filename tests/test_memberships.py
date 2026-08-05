@@ -17,6 +17,7 @@ from identity.models import AccountStatus, User
 from members.models import MemberProfile
 from memberships.models import (
     Membership,
+    MembershipCycle,
     MembershipCycleQuota,
     MembershipPackage,
     MembershipPackageItem,
@@ -24,6 +25,7 @@ from memberships.models import (
     MembershipPackageTranslation,
     MembershipStatus,
     MembershipUsageAllocation,
+    MembershipUsageLine,
     MembershipUsageOrder,
     MembershipUsageReversal,
     Product,
@@ -36,6 +38,7 @@ from memberships.services import (
     ActiveMembershipExists,
     DuplicateFarmbriteOrderReference,
     InsufficientQuota,
+    MembershipNotRevocable,
     PriceOptionTotalInvalid,
     PriceOptionUnavailable,
     ProductNotInMembership,
@@ -46,6 +49,7 @@ from memberships.services import (
     assign_membership,
     create_usage_order,
     ensure_due_cycles,
+    revoke_membership,
     sync_membership_status,
     undo_usage_order,
 )
@@ -1122,3 +1126,412 @@ def test_concurrent_current_and_quota_views_initialize_cycles_once(active_user, 
     ]
     assert list(membership.cycles.values_list("sequence", flat=True)) == [1]
     assert MembershipCycleQuota.objects.filter(cycle__membership=membership).count() == 1
+
+
+@pytest.mark.django_db
+def test_revoke_active_membership_succeeds(active_user, admin_api):
+    membership, _product, _option = assign(active_user, reference="REVOKE-001")
+    url = f"/api/v1/admin/memberships/{membership.pk}/revoke"
+    response = admin_api.post(url, {"reason": "Gán nhầm"}, format="json")
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["status"] == "revoked"
+    assert data["revoked_at"] is not None
+    assert data["revoke_reason"] == "Gán nhầm"
+    membership.refresh_from_db()
+    assert membership.current_slot is None
+
+
+@pytest.mark.django_db
+def test_revoke_scheduled_membership_succeeds(active_user, admin_api):
+    tomorrow = timezone.localdate() + timedelta(days=1)
+    membership, _product, _option = assign(
+        active_user, reference="REVOKE-SCH-001", start_date=tomorrow
+    )
+    url = f"/api/v1/admin/memberships/{membership.pk}/revoke"
+    response = admin_api.post(url, {"reason": "Gán nhầm"}, format="json")
+    assert response.status_code == 200
+    assert response.json()["data"]["status"] == "revoked"
+
+
+@pytest.mark.django_db
+def test_revoke_already_revoked_is_rejected(active_user, admin_api):
+    membership, _product, _option = assign(active_user, reference="REVOKE-002")
+    url = f"/api/v1/admin/memberships/{membership.pk}/revoke"
+    admin_api.post(url, {"reason": "first"}, format="json")
+    response = admin_api.post(url, {"reason": "second"}, format="json")
+    assert response.status_code == 409
+    assert response.json()["errors"][0]["code"] == "membership_not_revocable"
+
+
+@pytest.mark.django_db
+def test_revoke_ended_membership_is_rejected(active_user, admin_api):
+    membership, _product, _option = assign(active_user, reference="REVOKE-003")
+    Membership.objects.filter(pk=membership.pk).update(
+        status=MembershipStatus.ENDED,
+        current_slot=None,
+    )
+    url = f"/api/v1/admin/memberships/{membership.pk}/revoke"
+    response = admin_api.post(url, {"reason": "too late"}, format="json")
+    assert response.status_code == 409
+
+
+@pytest.mark.django_db
+def test_revoke_stale_active_membership_past_end_transitions_to_ended(
+    active_user, admin_api
+):
+    membership, _product, _option = assign(
+        active_user, reference="REVOKE-STALE-ENDED"
+    )
+    today = timezone.localdate()
+    Membership.objects.filter(pk=membership.pk).update(
+        start_date=add_months(today, -1),
+        end_date=today,
+        status=MembershipStatus.ACTIVE,
+        current_slot=True,
+    )
+
+    response = admin_api.post(
+        f"/api/v1/admin/memberships/{membership.pk}/revoke",
+        {"reason": "Too late"},
+        format="json",
+    )
+
+    assert response.status_code == 409
+    assert response.json()["errors"] == [{"code": "membership_not_revocable"}]
+    membership.refresh_from_db()
+    assert membership.status == MembershipStatus.ENDED
+    assert membership.current_slot is None
+    assert membership.revoked_at is None
+    assert membership.revoked_by_id is None
+    assert membership.revoke_reason == ""
+
+
+@pytest.mark.django_db
+def test_revoke_empty_reason_is_rejected(active_user, admin_api):
+    membership, _product, _option = assign(active_user, reference="REVOKE-004")
+    url = f"/api/v1/admin/memberships/{membership.pk}/revoke"
+    response = admin_api.post(url, {"reason": "   "}, format="json")
+    assert response.status_code == 400
+
+
+@pytest.mark.django_db
+def test_revoke_missing_reason_is_rejected(active_user, admin_api):
+    membership, _product, _option = assign(active_user, reference="REVOKE-005")
+    url = f"/api/v1/admin/memberships/{membership.pk}/revoke"
+    response = admin_api.post(url, {}, format="json")
+    assert response.status_code == 400
+
+
+@pytest.mark.django_db
+def test_revoke_reason_too_long_is_rejected(active_user, admin_api):
+    membership, _product, _option = assign(active_user, reference="REVOKE-006")
+    url = f"/api/v1/admin/memberships/{membership.pk}/revoke"
+    response = admin_api.post(url, {"reason": "x" * 501}, format="json")
+    assert response.status_code == 400
+
+
+@pytest.mark.django_db
+def test_revoke_nonexistent_membership_returns_404(admin_api):
+    url = "/api/v1/admin/memberships/00000000-0000-0000-0000-000000000000/revoke"
+    response = admin_api.post(url, {"reason": "test"}, format="json")
+    assert response.status_code == 404
+
+
+@pytest.mark.django_db
+def test_revoke_frees_slot_for_new_assignment(active_user, admin_api):
+    """After revoke, user can receive a new membership with a new UUID."""
+    package, product, option = create_package()
+    membership, _product, _option = assign(
+        active_user, package=package, option=option, reference="REVOKE-007"
+    )
+    old_id = membership.pk
+    url = f"/api/v1/admin/memberships/{old_id}/revoke"
+    admin_api.post(url, {"reason": "Gán nhầm"}, format="json")
+
+    new_membership, _product, _option = assign(
+        active_user, package=package, option=option, reference="REVOKE-NEW-001"
+    )
+    assert new_membership.pk != old_id
+    assert new_membership.status == MembershipStatus.ACTIVE
+
+
+@pytest.mark.django_db
+def test_revoke_does_not_alter_usage_history(active_user, admin_api):
+    membership, product, _option = assign(active_user, reference="REVOKE-008")
+    idempotency_key = uuid.uuid4()
+    order, created = create_usage_order(
+        membership_id=membership.pk,
+        actor=active_user,
+        idempotency_key=idempotency_key,
+        lines=[{"product_id": product.pk, "units": 1}],
+        note="Historical delivery",
+    )
+    assert created is True
+    line = MembershipUsageLine.objects.get(order=order)
+    allocation = MembershipUsageAllocation.objects.get(line=line)
+    quota = allocation.cycle_quota
+    before = {
+        "order": (order.status, order.note, order.reversed_at),
+        "line": (line.product_snapshot_id, line.units),
+        "allocation": (allocation.cycle_quota_id, allocation.units),
+        "quota": (quota.granted_units, quota.remaining_units, quota.expired_units),
+    }
+
+    url = f"/api/v1/admin/memberships/{membership.pk}/revoke"
+    response = admin_api.post(url, {"reason": "test"}, format="json")
+    assert response.status_code == 200
+
+    usage_payload = {
+        "membership_id": str(membership.pk),
+        "lines": [{"product_id": str(product.pk), "units": 1}],
+        "note": "Historical delivery",
+    }
+    replay = admin_api.post(
+        "/api/v1/admin/membership-usage",
+        {**usage_payload, "idempotency_key": str(idempotency_key)},
+        format="json",
+    )
+    fresh = admin_api.post(
+        "/api/v1/admin/membership-usage",
+        {**usage_payload, "idempotency_key": str(uuid.uuid4())},
+        format="json",
+    )
+    assert replay.status_code == fresh.status_code == 409
+    assert replay.json()["errors"] == fresh.json()["errors"] == [
+        {"code": "invalid_quota_usage"}
+    ]
+
+    membership.refresh_from_db()
+    order.refresh_from_db()
+    line.refresh_from_db()
+    allocation.refresh_from_db()
+    quota.refresh_from_db()
+    assert membership.status == MembershipStatus.REVOKED
+    assert membership.revoke_reason == "test"
+    assert MembershipUsageOrder.objects.filter(pk=order.pk).exists()
+    assert MembershipUsageLine.objects.filter(pk=line.pk).exists()
+    assert MembershipUsageAllocation.objects.filter(pk=allocation.pk).exists()
+    assert MembershipCycleQuota.objects.filter(pk=quota.pk).exists()
+    assert MembershipUsageOrder.objects.filter(membership=membership).count() == 1
+    assert MembershipUsageLine.objects.filter(order=order).count() == 1
+    assert MembershipUsageAllocation.objects.filter(line=line).count() == 1
+    assert (order.status, order.note, order.reversed_at) == before["order"]
+    assert (line.product_snapshot_id, line.units) == before["line"]
+    assert (allocation.cycle_quota_id, allocation.units) == before["allocation"]
+    assert (quota.granted_units, quota.remaining_units, quota.expired_units) == before["quota"]
+
+
+@pytest.mark.django_db
+def test_revoked_membership_is_terminal_when_cycles_are_ensured(active_user, admin_api):
+    membership, _product, _option = assign(active_user, reference="REVOKE-TERMINAL")
+    quota = MembershipCycleQuota.objects.get(cycle__membership=membership)
+    original_quota = (quota.granted_units, quota.remaining_units, quota.expired_units)
+    assert admin_api.post(
+        f"/api/v1/admin/memberships/{membership.pk}/revoke",
+        {"reason": "terminal"},
+        format="json",
+    ).status_code == 200
+
+    assert ensure_due_cycles(membership, as_of=membership.end_date) == []
+    membership.refresh_from_db()
+    quota.refresh_from_db()
+    assert membership.status == MembershipStatus.REVOKED
+    assert membership.current_slot is None
+    assert membership.cycles.count() == 1
+    assert (quota.granted_units, quota.remaining_units, quota.expired_units) == original_quota
+
+
+@pytest.mark.django_db
+def test_admin_membership_detail_does_not_revive_revoked_membership(active_user, admin_api):
+    membership, _product, _option = assign(active_user, reference="REVOKE-DETAIL")
+    assert admin_api.post(
+        f"/api/v1/admin/memberships/{membership.pk}/revoke",
+        {"reason": "Keep the audit trail"},
+        format="json",
+    ).status_code == 200
+    membership.refresh_from_db()
+    revoked_at = membership.revoked_at.isoformat()
+
+    response = admin_api.get(f"/api/v1/admin/memberships/{membership.pk}?locale=en")
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["status"] == MembershipStatus.REVOKED
+    assert data["current_slot"] is None
+    assert data["revoked_at"] == revoked_at
+    assert data["revoked_by"] == {
+        "id": str(active_user.pk),
+        "name": active_user.name,
+        "email": active_user.email,
+    }
+    assert set(data["revoked_by"]) == {"id", "name", "email"}
+    assert data["revoke_reason"] == "Keep the audit trail"
+    membership.refresh_from_db()
+    assert membership.status == MembershipStatus.REVOKED
+    assert membership.current_slot is None
+    assert membership.revoked_at.isoformat() == revoked_at
+    assert membership.revoke_reason == "Keep the audit trail"
+
+
+@pytest.mark.django_db
+def test_admin_usage_undo_rejects_revoked_membership_without_mutating_history(
+    active_user, admin_api
+):
+    membership, product, _option = assign(active_user, reference="REVOKE-UNDO")
+    order, _created = create_usage_order(
+        membership_id=membership.pk,
+        actor=active_user,
+        idempotency_key=uuid.uuid4(),
+        lines=[{"product_id": product.pk, "units": 1}],
+        note="Closed audit record",
+    )
+    line = MembershipUsageLine.objects.get(order=order)
+    allocation = MembershipUsageAllocation.objects.get(line=line)
+    quota = allocation.cycle_quota
+    before = {
+        "order": (order.status, order.reversed_at),
+        "line": (line.product_snapshot_id, line.units),
+        "allocation": (allocation.cycle_quota_id, allocation.units),
+        "quota": (quota.granted_units, quota.remaining_units, quota.expired_units),
+    }
+    assert admin_api.post(
+        f"/api/v1/admin/memberships/{membership.pk}/revoke",
+        {"reason": "Close audit record"},
+        format="json",
+    ).status_code == 200
+
+    response = admin_api.post(
+        f"/api/v1/admin/membership-usage/{order.pk}/undo",
+        {"reason": "Stale open dialog"},
+        format="json",
+    )
+
+    assert response.status_code == 409
+    assert response.json()["errors"] == [{"code": "usage_undo_conflict"}]
+    order.refresh_from_db()
+    line.refresh_from_db()
+    allocation.refresh_from_db()
+    quota.refresh_from_db()
+    assert not MembershipUsageReversal.objects.filter(order=order).exists()
+    assert (order.status, order.reversed_at) == before["order"]
+    assert (line.product_snapshot_id, line.units) == before["line"]
+    assert (allocation.cycle_quota_id, allocation.units) == before["allocation"]
+    assert (quota.granted_units, quota.remaining_units, quota.expired_units) == before["quota"]
+
+
+@pytest.mark.django_db
+def test_revoked_membership_not_in_current_quota(active_user, admin_api, access_token):
+    membership, _product, _option = assign(active_user, reference="REVOKE-009")
+    url = f"/api/v1/admin/memberships/{membership.pk}/revoke"
+    admin_api.post(url, {"reason": "test"}, format="json")
+    member_client = bearer_client(access_token)
+    for path in ("/api/v1/memberships/current?locale=vi", "/api/v1/memberships/quota?locale=vi"):
+        response = member_client.get(path)
+        assert response.status_code == 200
+        assert response.json()["data"] is None
+
+
+@pytest.mark.skipif(
+    not connection.features.has_select_for_update,
+    reason="SQLite does not provide row-level SELECT FOR UPDATE semantics",
+)
+@pytest.mark.django_db(transaction=True)
+def test_concurrent_revoke_only_commits_once():
+    user = create_active_user("concurrent-revoke@example.com")
+    actor = create_active_user("concurrent-revoke-admin@example.com")
+    membership, _product, _option = assign(user, reference="REVOKE-CONCURRENT")
+    barrier = threading.Barrier(3)
+    outcomes = []
+
+    def revoke_once(reason):
+        close_old_connections()
+        try:
+            barrier.wait()
+            revoke_membership(
+                membership_id=membership.pk,
+                reason=reason,
+                actor=User.objects.get(pk=actor.pk),
+            )
+            outcomes.append("revoked")
+        except MembershipNotRevocable:
+            outcomes.append("conflict")
+        finally:
+            close_old_connections()
+
+    threads = [
+        threading.Thread(target=revoke_once, args=(reason,))
+        for reason in ("first", "second")
+    ]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(outcomes) == ["conflict", "revoked"]
+    membership.refresh_from_db()
+    assert membership.status == MembershipStatus.REVOKED
+    assert membership.current_slot is None
+    assert membership.revoke_reason in {"first", "second"}
+
+
+@pytest.mark.django_db
+def test_non_admin_cannot_revoke(active_user, access_token):
+    membership, _product, _option = assign(active_user, reference="REVOKE-010")
+    url = f"/api/v1/admin/memberships/{membership.pk}/revoke"
+    member_client = bearer_client(access_token)
+    response = member_client.post(url, {"reason": "test"}, format="json")
+    assert response.status_code in [401, 403]
+
+
+@pytest.mark.django_db
+def test_reassign_same_package_creates_new_uuid(active_user, admin_api):
+    """After revoke, reassigning the same package creates a new membership UUID."""
+    package, product, option = create_package()
+    membership, _product, _option = assign(
+        active_user, package=package, option=option, reference="REVOKE-011"
+    )
+    old_id = membership.pk
+    revoke_url = f"/api/v1/admin/memberships/{old_id}/revoke"
+    admin_api.post(revoke_url, {"reason": "test"}, format="json")
+
+    new_membership, _product, _option = assign(
+        active_user,
+        package=package,
+        option=option,
+        reference="REVOKE-SAME-PACKAGE-001",
+    )
+    assert new_membership.pk != old_id
+
+    membership.refresh_from_db()
+    assert membership.status == "revoked"
+
+
+@pytest.mark.django_db
+def test_reassign_creates_fresh_quota(active_user, admin_api):
+    """New membership after revoke gets its own quota cycle, not the old one's."""
+    package, product, option = create_package()
+    membership, _product, _option = assign(
+        active_user, package=package, option=option, reference="REVOKE-012"
+    )
+    old_id = membership.pk
+    revoke_url = f"/api/v1/admin/memberships/{old_id}/revoke"
+    admin_api.post(revoke_url, {"reason": "test"}, format="json")
+
+    new_membership, _product, _option = assign(
+        active_user,
+        package=package,
+        option=option,
+        reference="REVOKE-NEW-QUOTA-001",
+    )
+
+    old_cycles = set(
+        MembershipCycle.objects.filter(membership_id=old_id).values_list("pk", flat=True)
+    )
+    new_cycles = set(
+        MembershipCycle.objects.filter(
+            membership_id=new_membership.pk
+        ).values_list("pk", flat=True)
+    )
+    assert old_cycles.isdisjoint(new_cycles)
