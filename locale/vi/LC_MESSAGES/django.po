@@ -22,6 +22,9 @@ msgstr "Mã giới thiệu"
 msgid "Enter a valid referral code."
 msgstr "Hãy nhập mã giới thiệu hợp lệ."
 
+msgid "This referral code was applied from your invitation link and cannot be changed."
+msgstr "Mã giới thiệu này được áp dụng từ liên kết mời của bạn và không thể thay đổi."
+
 msgid "Phone number"
 msgstr "Số điện thoại"
 
@@ -485,6 +488,28 @@ msgstr "Đã có tài khoản?"
 
 msgid "Authorize access"
 msgstr "Cho phép truy cập"
+
+msgid "Create another account"
+msgstr "Tạo tài khoản khác"
+
+msgid "Create account"
+msgstr "Tạo tài khoản"
+
+msgid "You are already signed in"
+msgstr "Bạn đang đăng nhập"
+
+#, python-format
+msgid "Signed in as <strong>%(email)s</strong>."
+msgstr "Đang đăng nhập bằng <strong>%(email)s</strong>."
+
+msgid "To create a different account, sign out first. Your signup request will continue afterward."
+msgstr "Để tạo tài khoản khác, hãy đăng xuất trước. Yêu cầu đăng ký của bạn sẽ tiếp tục sau đó."
+
+msgid "Continue with this account"
+msgstr "Tiếp tục với tài khoản này"
+
+msgid "Sign out and create another account"
+msgstr "Đăng xuất và tạo tài khoản khác"
 
 msgid "Connect account"
 msgstr "Kết nối tài khoản"

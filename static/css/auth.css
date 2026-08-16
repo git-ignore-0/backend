@@ -32,6 +32,9 @@ button:disabled { cursor: not-allowed; opacity: .5; }
 button.secondary { color: #244b35; background: #e8eee6; }
 .links, .actions { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 1rem; margin-top: 1.25rem; }
 .links a, .actions a { min-height: 2.75rem; display: inline-flex; align-items: center; }
+.account-choice-actions { align-items: stretch; }
+.account-choice-actions form { display: flex; flex: 1 1 14rem; }
+.account-choice-actions button { width: 100%; }
 .messages { margin-bottom: 1rem; padding: .65rem .85rem; border: 1px solid #cee1ca; border-radius: .65rem; background: #edf6ea; font-size: .9rem; line-height: 1.45; }
 .messages p { margin: 0; }
 .errorlist { padding-left: 1.25rem; color: #a12b28; }
@@ -63,6 +66,7 @@ code { font-size: .85em; }
     .account-form { grid-template-columns: 1fr; }
     .account-form .field-group-wide, .account-form .form-alert, .account-form .form-actions, .account-form .address-status { grid-column: auto; }
     .account-form .form-actions button { width: 100%; }
+    .account-choice-actions { display: grid; }
 }
 
 @media (prefers-reduced-motion: reduce) {

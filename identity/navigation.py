@@ -53,6 +53,19 @@ def safe_local_next(value: str | None) -> str | None:
     return urlunsplit(("", "", parsed.path or "/", parsed.query, parsed.fragment))
 
 
+def safe_oauth_signup_next(value: str | None) -> str | None:
+    next_url = safe_local_next(value)
+    if not next_url:
+        return None
+    parsed = urlsplit(next_url)
+    if parsed.path.rstrip("/") != "/oauth/authorize":
+        return None
+    query = parse_qs(parsed.query)
+    if query.get("screen_hint", [""])[0] != "signup":
+        return None
+    return next_url
+
+
 def public_return_from_oauth_next(value: str | None) -> str | None:
     next_url = safe_local_next(value)
     if not next_url:

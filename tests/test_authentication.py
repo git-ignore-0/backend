@@ -2,9 +2,11 @@ import pytest
 from allauth.account import app_settings
 from allauth.account.models import EmailAddress
 from django.db import IntegrityError, transaction
+from django.test import override_settings
 from django.utils import timezone
 
 from identity.models import AccountStatus, AuditLog, User
+from identity.signup import SIGNUP_REFERRAL_SESSION_KEY
 from members.models import MemberProfile
 
 
@@ -19,6 +21,55 @@ def test_active_user_can_log_in(client, active_user):
     assert response.url == "/account"
     assert client.session.get("_auth_user_id") == str(active_user.pk)
     assert AuditLog.objects.filter(user=active_user, action="auth.login").exists()
+
+
+@override_settings(
+    PUBLIC_SITE_ORIGINS=(
+        "https://naturalfarmingvietnam.com",
+        "https://preview.naturalfarmingvietnam.com",
+    )
+)
+@pytest.mark.django_db
+def test_public_logout_clears_core_and_referral_session_then_returns_to_public_site(
+    client, active_user
+):
+    client.force_login(active_user, backend="identity.backends.CoreAuthenticationBackend")
+    session = client.session
+    session[SIGNUP_REFERRAL_SESSION_KEY] = active_user.referral_account.code
+    session.save()
+
+    response = client.get(
+        "/logout/public/",
+        {
+            "locale": "en",
+            "return_to": "https://preview.naturalfarmingvietnam.com/en",
+        },
+    )
+
+    assert response.status_code == 302
+    assert response.url == "https://preview.naturalfarmingvietnam.com/en"
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["Pragma"] == "no-cache"
+    assert "_auth_user_id" not in client.session
+    assert SIGNUP_REFERRAL_SESSION_KEY not in client.session
+
+
+@override_settings(
+    PUBLIC_SITE_ORIGINS=("https://naturalfarmingvietnam.com",),
+    LANGUAGE_CODE="vi",
+)
+@pytest.mark.django_db
+def test_public_logout_rejects_external_return_target(client, active_user):
+    client.force_login(active_user, backend="identity.backends.CoreAuthenticationBackend")
+
+    response = client.get(
+        "/logout/public/",
+        {"locale": "invalid", "return_to": "https://attacker.example/session"},
+    )
+
+    assert response.status_code == 302
+    assert response.url == "https://naturalfarmingvietnam.com/vi"
+    assert "_auth_user_id" not in client.session
 
 
 @pytest.mark.django_db

@@ -67,6 +67,13 @@ def normalize_referral_code(value: str) -> str:
     return value.strip().upper()
 
 
+def is_referral_code_format(value: str) -> bool:
+    code = normalize_referral_code(value)
+    return len(code) == REFERRAL_CODE_LENGTH and all(
+        character in REFERRAL_ALPHABET for character in code
+    )
+
+
 def generate_referral_code() -> str:
     return "".join(secrets.choice(REFERRAL_ALPHABET) for _ in range(REFERRAL_CODE_LENGTH))
 

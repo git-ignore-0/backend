@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% load i18n %}
+{% block title %}{% translate "Create another account" %}{% endblock %}
+{% block content %}
+<section class="card" aria-labelledby="signup-account-title">
+    <p class="eyebrow">{% translate "Create account" %}</p>
+    <h1 id="signup-account-title">{% translate "You are already signed in" %}</h1>
+    <p>{% blocktranslate with email=account_email %}Signed in as <strong>{{ email }}</strong>.{% endblocktranslate %}</p>
+    <p>{% translate "To create a different account, sign out first. Your signup request will continue afterward." %}</p>
+    <div class="actions account-choice-actions">
+        <form method="post" action="{% url 'resolve-signup-account' %}">
+            {% csrf_token %}
+            <input type="hidden" name="next" value="{{ oauth_next }}">
+            <button class="secondary" type="submit" name="action" value="continue">{% translate "Continue with this account" %}</button>
+        </form>
+        <form method="post" action="{% url 'resolve-signup-account' %}">
+            {% csrf_token %}
+            <input type="hidden" name="next" value="{{ oauth_next }}">
+            <button type="submit" name="action" value="logout">{% translate "Sign out and create another account" %}</button>
+        </form>
+    </div>
+</section>
+{% endblock %}

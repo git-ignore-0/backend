@@ -1,14 +1,18 @@
 import importlib
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from allauth.account.models import EmailAddress
 from django.apps import apps
+from django.conf import settings
 from django.contrib.auth.models import Group
+from django.urls import reverse
 from django.utils import timezone
 from oauth2_provider.models import AccessToken
 from rest_framework.test import APIClient
 
 from identity.models import AccountStatus, User
+from identity.signup import SIGNUP_REFERRAL_SESSION_KEY
 from members.models import MemberProfile
 from referrals.models import PointTransaction, Referral, ReferralAccount
 from referrals.services import (
@@ -39,6 +43,20 @@ def bearer_client(token):
     client = APIClient()
     client.credentials(HTTP_AUTHORIZATION=f"Bearer {token.token}")
     return client
+
+
+def start_referral_signup(client, code):
+    response = client.get(
+        "/oauth/authorize",
+        {
+            "client_id": "public-client",
+            "response_type": "code",
+            "screen_hint": "signup",
+            "referral_code": code,
+        },
+    )
+    assert response.status_code == 302
+    return parse_qs(urlparse(response.url).query)["next"][0]
 
 
 @pytest.fixture
@@ -104,6 +122,102 @@ def test_invalid_signup_code_does_not_create_user(client):
     )
     assert response.status_code == 200
     assert not User.objects.filter(email="invalid-code@example.com").exists()
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("signup_path", ["/register", reverse("account_signup")])
+@pytest.mark.parametrize(
+    ("language", "expected_help"),
+    [
+        (
+            "en",
+            "This referral code was applied from your invitation link and cannot be changed.",
+        ),
+        (
+            "vi",
+            "Mã giới thiệu này được áp dụng từ liên kết mời của bạn và không thể thay đổi.",
+        ),
+    ],
+)
+def test_locked_signup_referral_is_prefilled_readonly_on_both_routes(
+    client, signup_path, language, expected_help
+):
+    referrer = create_active_user("locked-form-referrer@example.com")
+    continuation = start_referral_signup(client, referrer.referral_account.code)
+    client.cookies[settings.LANGUAGE_COOKIE_NAME] = language
+
+    response = client.get(signup_path, {"next": continuation})
+    field = response.context["form"].fields["referral_code"]
+
+    assert response.status_code == 200
+    assert response.context["form"]["referral_code"].value() == referrer.referral_account.code
+    assert field.widget.attrs["readonly"] is True
+    assert str(field.help_text) == expected_help
+    assert expected_help in response.content.decode()
+
+
+@pytest.mark.django_db
+def test_locked_signup_uses_session_code_over_forged_post_and_clears_session(client):
+    session_referrer = create_active_user("session-referrer@example.com")
+    forged_referrer = create_active_user("forged-referrer@example.com")
+    continuation = start_referral_signup(client, session_referrer.referral_account.code)
+
+    response = client.post(
+        "/register",
+        {
+            "name": "Locked Referral Member",
+            "email": "locked-referee@example.com",
+            "password1": "StrongPassword12",
+            "password2": "StrongPassword12",
+            "referral_code": forged_referrer.referral_account.code,
+            "next": continuation,
+        },
+    )
+
+    assert response.status_code == 302
+    referral = Referral.objects.get(referee__email="locked-referee@example.com")
+    assert referral.referrer == session_referrer
+    assert SIGNUP_REFERRAL_SESSION_KEY not in client.session
+
+
+@pytest.mark.django_db
+def test_locked_signup_keeps_session_and_does_not_create_user_when_code_is_gone(client):
+    referrer = create_active_user("removed-referrer@example.com")
+    code = referrer.referral_account.code
+    continuation = start_referral_signup(client, code)
+    ReferralAccount.objects.filter(user=referrer).delete()
+
+    response = client.post(
+        reverse("account_signup"),
+        {
+            "name": "Invalid Locked Referral",
+            "email": "invalid-locked-referee@example.com",
+            "password1": "StrongPassword12",
+            "password2": "StrongPassword12",
+            "referral_code": "NFV2345678",
+            "next": continuation,
+        },
+    )
+
+    assert response.status_code == 200
+    assert not User.objects.filter(email="invalid-locked-referee@example.com").exists()
+    assert SIGNUP_REFERRAL_SESSION_KEY in client.session
+    assert response.context["form"].errors["referral_code"] == ["Hãy nhập mã giới thiệu hợp lệ."]
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("signup_path", ["/register", reverse("account_signup")])
+def test_generic_signup_clears_abandoned_referral_session(client, signup_path):
+    referrer = create_active_user("abandoned-referrer@example.com")
+    start_referral_signup(client, referrer.referral_account.code)
+    assert SIGNUP_REFERRAL_SESSION_KEY in client.session
+
+    response = client.get(signup_path)
+
+    assert response.status_code == 200
+    assert SIGNUP_REFERRAL_SESSION_KEY not in client.session
+    assert response.context["form"]["referral_code"].value() in (None, "")
+    assert "readonly" not in response.context["form"].fields["referral_code"].widget.attrs
 
 
 @pytest.mark.django_db

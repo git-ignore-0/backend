@@ -1,5 +1,6 @@
 from django.conf import settings
 from django.contrib import messages
+from django.contrib.auth import logout as django_logout
 from django.contrib.auth.decorators import login_required
 from django.http import JsonResponse
 from django.shortcuts import redirect, render
@@ -7,6 +8,7 @@ from django.utils.translation import gettext as _
 from django.views.decorators.http import require_GET, require_http_methods, require_POST
 from django.views.i18n import set_language as django_set_language
 
+from identity.navigation import safe_public_return_to
 from identity.oauth import access_token_from_request, has_me_scopes
 from members.forms import MemberProfileForm
 from members.models import MemberProfile
@@ -30,6 +32,21 @@ def oauth_error(code: str, status: int) -> JsonResponse:
 
 def home(request):
     return redirect("account" if request.user.is_authenticated else "account_login_alias")
+
+
+@require_GET
+def public_logout(request):
+    requested_locale = request.GET.get("locale")
+    supported_locales = {code for code, _name in settings.LANGUAGES}
+    locale = requested_locale if requested_locale in supported_locales else settings.LANGUAGE_CODE
+    return_to = safe_public_return_to(request.GET.get("return_to"))
+    if not return_to:
+        return_to = f"{settings.PUBLIC_SITE_ORIGINS[0]}/{locale}"
+    django_logout(request)
+    response = redirect(return_to)
+    response["Cache-Control"] = "no-store"
+    response["Pragma"] = "no-cache"
+    return response
 
 
 @login_required

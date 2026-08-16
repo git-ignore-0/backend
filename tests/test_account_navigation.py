@@ -8,6 +8,7 @@ from identity.navigation import (
     PUBLIC_RETURN_TO_SESSION_KEY,
     public_return_from_oauth_next,
     safe_local_next,
+    safe_oauth_signup_next,
     safe_public_return_to,
 )
 
@@ -52,6 +53,17 @@ def test_public_return_url_accepts_an_allowlisted_path_query_and_fragment():
 )
 def test_login_next_rejects_external_or_malformed_targets(value):
     assert safe_local_next(value) is None
+
+
+def test_signup_oauth_next_accepts_only_local_signup_authorization():
+    valid = (
+        "/oauth/authorize?client_id=public&screen_hint=signup&state=state&code_challenge=challenge"
+    )
+
+    assert safe_oauth_signup_next(valid) == valid
+    assert safe_oauth_signup_next("/oauth/authorize?client_id=public") is None
+    external = "https://attacker.example/oauth/authorize?screen_hint=signup"
+    assert safe_oauth_signup_next(external) is None
 
 
 @override_settings(PUBLIC_SITE_ORIGINS=PUBLIC_ORIGINS)
