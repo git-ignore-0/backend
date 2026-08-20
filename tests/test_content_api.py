@@ -1,7 +1,9 @@
+import importlib
 import io
 from datetime import timedelta
 
 import pytest
+from django.apps import apps as django_apps
 from django.contrib.auth.models import Group
 from django.core.exceptions import ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -177,6 +179,107 @@ def test_public_settings_are_seeded(client):
         "store",
         "forum",
     }
+    assert "farms" not in {item["kind"] for item in data["links"]}
+
+
+@pytest.mark.django_db
+def test_farms_link_is_available_to_admin_and_hidden_publicly_by_default(client, admin_api):
+    admin_data = admin_api.get("/api/v1/admin/site-settings").json()["data"]
+    farms = next(item for item in admin_data["links"] if item["kind"] == "farms")
+
+    assert farms["label"] == "See our farms"
+    assert farms["url"] == ""
+    assert farms["is_enabled"] is False
+    public_data = client.get("/api/v1/public/site-settings?locale=en").json()["data"]
+    assert "farms" not in {item["kind"] for item in public_data["links"]}
+
+
+@pytest.mark.django_db
+def test_farms_seed_migration_is_idempotent():
+    migration = importlib.import_module("content.migrations.0015_add_farms_external_link")
+    ExternalLink = django_apps.get_model("content", "ExternalLink")
+    ExternalLink.objects.filter(kind="farms").delete()
+
+    migration.add_disabled_farms_link(django_apps, None)
+    migration.add_disabled_farms_link(django_apps, None)
+
+    farms_links = ExternalLink.objects.filter(kind="farms")
+    assert farms_links.count() == 1
+    farms = farms_links.get()
+    assert farms.url == ""
+    assert farms.is_enabled is False
+
+
+@pytest.mark.django_db
+def test_admin_can_enable_update_and_disable_farms_link(client, admin_api):
+    current = admin_api.get("/api/v1/admin/site-settings").json()["data"]
+    farms = next(item for item in current["links"] if item["kind"] == "farms")
+    farms.update(url="https://farms.example.com/visit", is_enabled=True)
+
+    enabled_response = admin_api.patch(
+        "/api/v1/admin/site-settings", current, format="json"
+    )
+
+    assert enabled_response.status_code == 200, enabled_response.json()
+    enabled = next(
+        item for item in enabled_response.json()["data"]["links"] if item["kind"] == "farms"
+    )
+    assert enabled["url"] == "https://farms.example.com/visit"
+    assert enabled["is_enabled"] is True
+    public_links = client.get("/api/v1/public/site-settings?locale=vi").json()["data"][
+        "links"
+    ]
+    assert next(item for item in public_links if item["kind"] == "farms")["url"] == (
+        "https://farms.example.com/visit"
+    )
+
+    updated = enabled_response.json()["data"]
+    next(item for item in updated["links"] if item["kind"] == "farms")[
+        "is_enabled"
+    ] = False
+    disabled_response = admin_api.patch(
+        "/api/v1/admin/site-settings", updated, format="json"
+    )
+
+    assert disabled_response.status_code == 200, disabled_response.json()
+    saved = next(
+        item for item in disabled_response.json()["data"]["links"] if item["kind"] == "farms"
+    )
+    assert saved["url"] == "https://farms.example.com/visit"
+    assert saved["is_enabled"] is False
+    public_links = client.get("/api/v1/public/site-settings?locale=en").json()["data"][
+        "links"
+    ]
+    assert "farms" not in {item["kind"] for item in public_links}
+
+    updated = disabled_response.json()["data"]
+    next(item for item in updated["links"] if item["kind"] == "farms")[
+        "is_enabled"
+    ] = True
+    re_enabled_response = admin_api.patch(
+        "/api/v1/admin/site-settings", updated, format="json"
+    )
+
+    assert re_enabled_response.status_code == 200, re_enabled_response.json()
+    public_links = client.get("/api/v1/public/site-settings?locale=vi").json()["data"][
+        "links"
+    ]
+    assert next(item for item in public_links if item["kind"] == "farms")["url"] == (
+        "https://farms.example.com/visit"
+    )
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("url", ["", "ftp://farms.example.com", "javascript:alert(1)"])
+def test_enabled_farms_link_requires_valid_http_url(admin_api, url):
+    current = admin_api.get("/api/v1/admin/site-settings").json()["data"]
+    farms = next(item for item in current["links"] if item["kind"] == "farms")
+    farms.update(url=url, is_enabled=True)
+
+    response = admin_api.patch("/api/v1/admin/site-settings", current, format="json")
+
+    assert response.status_code == 400
+    assert "links" in response.json()
 
 
 @pytest.mark.django_db

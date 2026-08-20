@@ -73,6 +73,11 @@ class ExternalLinkSerializer(serializers.ModelSerializer):
         fields = ["id", "kind", "label", "url", "position", "is_enabled"]
         read_only_fields = ["id"]
 
+    def validate_url(self, value):
+        if value and not value.lower().startswith(("http://", "https://")):
+            raise serializers.ValidationError("URL must use HTTP or HTTPS.")
+        return value
+
     def validate(self, attrs):
         if attrs.get("is_enabled") and not attrs.get("url"):
             raise serializers.ValidationError({"url": "URL is required when the link is enabled."})

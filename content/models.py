@@ -34,6 +34,7 @@ class ExternalLinkKind(models.TextChoices):
     YOUTUBE = "youtube", "YouTube"
     STORE = "store", "Store"
     FORUM = "forum", "Forum"
+    FARMS = "farms", "See our farms"
     OTHER = "other", "Other"
 
 
