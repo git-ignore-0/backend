@@ -216,9 +216,7 @@ def test_admin_can_enable_update_and_disable_farms_link(client, admin_api):
     farms = next(item for item in current["links"] if item["kind"] == "farms")
     farms.update(url="https://farms.example.com/visit", is_enabled=True)
 
-    enabled_response = admin_api.patch(
-        "/api/v1/admin/site-settings", current, format="json"
-    )
+    enabled_response = admin_api.patch("/api/v1/admin/site-settings", current, format="json")
 
     assert enabled_response.status_code == 200, enabled_response.json()
     enabled = next(
@@ -226,20 +224,14 @@ def test_admin_can_enable_update_and_disable_farms_link(client, admin_api):
     )
     assert enabled["url"] == "https://farms.example.com/visit"
     assert enabled["is_enabled"] is True
-    public_links = client.get("/api/v1/public/site-settings?locale=vi").json()["data"][
-        "links"
-    ]
+    public_links = client.get("/api/v1/public/site-settings?locale=vi").json()["data"]["links"]
     assert next(item for item in public_links if item["kind"] == "farms")["url"] == (
         "https://farms.example.com/visit"
     )
 
     updated = enabled_response.json()["data"]
-    next(item for item in updated["links"] if item["kind"] == "farms")[
-        "is_enabled"
-    ] = False
-    disabled_response = admin_api.patch(
-        "/api/v1/admin/site-settings", updated, format="json"
-    )
+    next(item for item in updated["links"] if item["kind"] == "farms")["is_enabled"] = False
+    disabled_response = admin_api.patch("/api/v1/admin/site-settings", updated, format="json")
 
     assert disabled_response.status_code == 200, disabled_response.json()
     saved = next(
@@ -247,23 +239,15 @@ def test_admin_can_enable_update_and_disable_farms_link(client, admin_api):
     )
     assert saved["url"] == "https://farms.example.com/visit"
     assert saved["is_enabled"] is False
-    public_links = client.get("/api/v1/public/site-settings?locale=en").json()["data"][
-        "links"
-    ]
+    public_links = client.get("/api/v1/public/site-settings?locale=en").json()["data"]["links"]
     assert "farms" not in {item["kind"] for item in public_links}
 
     updated = disabled_response.json()["data"]
-    next(item for item in updated["links"] if item["kind"] == "farms")[
-        "is_enabled"
-    ] = True
-    re_enabled_response = admin_api.patch(
-        "/api/v1/admin/site-settings", updated, format="json"
-    )
+    next(item for item in updated["links"] if item["kind"] == "farms")["is_enabled"] = True
+    re_enabled_response = admin_api.patch("/api/v1/admin/site-settings", updated, format="json")
 
     assert re_enabled_response.status_code == 200, re_enabled_response.json()
-    public_links = client.get("/api/v1/public/site-settings?locale=vi").json()["data"][
-        "links"
-    ]
+    public_links = client.get("/api/v1/public/site-settings?locale=vi").json()["data"]["links"]
     assert next(item for item in public_links if item["kind"] == "farms")["url"] == (
         "https://farms.example.com/visit"
     )

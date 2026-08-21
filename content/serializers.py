@@ -278,9 +278,38 @@ class TrackerFarmWriteSerializer(TestimonialStrictSerializer):
     name_vi = serializers.CharField(max_length=240, trim_whitespace=True)
     location_en = serializers.CharField(max_length=240, trim_whitespace=True)
     location_vi = serializers.CharField(max_length=240, trim_whitespace=True)
+    description_en = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        default="",
+        trim_whitespace=True,
+    )
+    description_vi = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        default="",
+        trim_whitespace=True,
+    )
+    image_id = serializers.UUIDField(required=False, allow_null=True)
     signup_count = serializers.IntegerField(min_value=0, required=False, default=0)
     is_visible = serializers.BooleanField(required=False, default=True)
     sort_order = serializers.IntegerField(min_value=0, required=False)
+
+    def validate_image_id(self, value):
+        if value is None:
+            return None
+        try:
+            return MediaAsset.objects.get(pk=value)
+        except MediaAsset.DoesNotExist as error:
+            raise serializers.ValidationError("Media asset does not exist.") from error
+
+    def validate_description_en(self, value):
+        return value or ""
+
+    def validate_description_vi(self, value):
+        return value or ""
 
 
 class TrackerFarmUpdateSerializer(TrackerFarmWriteSerializer):
@@ -312,23 +341,39 @@ class TrackerFarmReorderSerializer(TestimonialStrictSerializer):
         return value
 
 
-def public_tracker_farm_payload(farm: TrackerFarm, locale: str):
+def public_tracker_farm_payload(farm: TrackerFarm, locale: str, request):
+    name = getattr(farm, f"name_{locale}")
+    image = None
+    if farm.image:
+        asset = media_payload(farm.image, request)
+        image = {
+            "id": asset["id"],
+            "url": asset["url"],
+            "width": asset["width"],
+            "height": asset["height"],
+            "alt": name,
+        }
     return {
         "id": str(farm.pk),
-        "name": getattr(farm, f"name_{locale}"),
+        "name": name,
         "location": getattr(farm, f"location_{locale}"),
+        "description": getattr(farm, f"description_{locale}"),
+        "image": image,
         "signup_count": farm.signup_count,
         "sort_order": farm.sort_order,
     }
 
 
-def admin_tracker_farm_payload(farm: TrackerFarm):
+def admin_tracker_farm_payload(farm: TrackerFarm, request):
     return {
         "id": str(farm.pk),
         "name_en": farm.name_en,
         "name_vi": farm.name_vi,
         "location_en": farm.location_en,
         "location_vi": farm.location_vi,
+        "description_en": farm.description_en,
+        "description_vi": farm.description_vi,
+        "image": media_payload(farm.image, request) if farm.image else None,
         "signup_count": farm.signup_count,
         "is_visible": farm.is_visible,
         "sort_order": farm.sort_order,

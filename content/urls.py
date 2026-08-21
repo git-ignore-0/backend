@@ -23,6 +23,7 @@ urlpatterns = [
     path("admin/dashboard", views.AdminDashboardView.as_view()),
     path("admin/site-settings", views.AdminSiteSettingsView.as_view()),
     path("admin/tracker-farms", views.AdminTrackerFarmListView.as_view()),
+    path("admin/tracker-farms/media", views.AdminTrackerFarmMediaUploadView.as_view()),
     path("admin/tracker-farms/reorder", views.AdminTrackerFarmReorderView.as_view()),
     path(
         "admin/tracker-farms/<uuid:farm_id>",

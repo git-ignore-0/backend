@@ -1,13 +1,16 @@
 import importlib
+import io
 from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
 from django.contrib.auth.models import Group
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import IntegrityError, migrations, transaction
+from PIL import Image
 from rest_framework.test import APIClient
 
-from content.models import TrackerFarm
+from content.models import MediaAsset, TrackerFarm
 
 
 def farm_payload(**overrides):
@@ -25,6 +28,24 @@ def farm_payload(**overrides):
 
 def create_farm(**overrides):
     return TrackerFarm.objects.create(**farm_payload(**overrides))
+
+
+def image_upload():
+    output = io.BytesIO()
+    Image.new("RGB", (24, 16), "green").save(output, "PNG")
+    return SimpleUploadedFile("farm.png", output.getvalue(), content_type="image/png")
+
+
+def create_media_asset(**overrides):
+    values = {
+        "file": f"farms/test-{uuid4()}.webp",
+        "variants": [],
+        "width": 1200,
+        "height": 900,
+        "original_name": "farm.webp",
+    }
+    values.update(overrides)
+    return MediaAsset.objects.create(**values)
 
 
 @pytest.fixture
@@ -51,6 +72,9 @@ def test_tracker_farm_model_defaults_and_database_constraints():
     assert farm.is_visible is True
     assert farm.sort_order == 0
     assert farm.version == 1
+    assert farm.image is None
+    assert farm.description_en == ""
+    assert farm.description_vi == ""
     assert farm.created_at is not None
     assert farm.updated_at is not None
 
@@ -62,9 +86,16 @@ def test_tracker_farm_model_defaults_and_database_constraints():
 
 @pytest.mark.django_db
 def test_admin_create_update_and_permanent_delete(tracker_admin_api):
+    image = create_media_asset()
     first = tracker_admin_api.post(
         "/api/v1/admin/tracker-farms",
-        farm_payload(name_en="  First Farm  ", location_en="  First Place  "),
+        farm_payload(
+            name_en="  First Farm  ",
+            location_en="  First Place  ",
+            description_en="  A family farm  ",
+            description_vi="  Nông trại gia đình  ",
+            image_id=str(image.pk),
+        ),
         format="json",
     )
     second = tracker_admin_api.post(
@@ -79,6 +110,9 @@ def test_admin_create_update_and_permanent_delete(tracker_admin_api):
     second_data = second.json()["data"]
     assert first_data["name_en"] == "First Farm"
     assert first_data["location_en"] == "First Place"
+    assert first_data["description_en"] == "A family farm"
+    assert first_data["description_vi"] == "Nông trại gia đình"
+    assert first_data["image"]["id"] == str(image.pk)
     assert first_data["sort_order"] == 0
     assert second_data["sort_order"] == 1
 
@@ -89,6 +123,9 @@ def test_admin_create_update_and_permanent_delete(tracker_admin_api):
             "signup_count": 27,
             "is_visible": False,
             "name_vi": "  Nông trại đầu tiên  ",
+            "description_en": None,
+            "description_vi": "  Mô tả mới  ",
+            "image_id": None,
         },
         format="json",
     )
@@ -96,6 +133,9 @@ def test_admin_create_update_and_permanent_delete(tracker_admin_api):
     assert updated.json()["data"]["signup_count"] == 27
     assert updated.json()["data"]["is_visible"] is False
     assert updated.json()["data"]["name_vi"] == "Nông trại đầu tiên"
+    assert updated.json()["data"]["description_en"] == ""
+    assert updated.json()["data"]["description_vi"] == "Mô tả mới"
+    assert updated.json()["data"]["image"] is None
     assert updated.json()["data"]["version"] == first_data["version"] + 1
 
     deleted = tracker_admin_api.delete(f"/api/v1/admin/tracker-farms/{first_data['id']}")
@@ -135,7 +175,14 @@ def test_required_bilingual_fields_are_trimmed_and_required(tracker_admin_api, f
 
 @pytest.mark.django_db
 def test_public_tracker_farms_localize_en_and_vi_and_hide_internal_fields(client):
-    farm = create_farm(sort_order=4, signup_count=14)
+    image = create_media_asset()
+    farm = create_farm(
+        sort_order=4,
+        signup_count=14,
+        image=image,
+        description_en="English description",
+        description_vi="Mô tả tiếng Việt",
+    )
 
     english = client.get("/api/v1/public/tracker-farms?locale=en")
     vietnamese = client.get("/api/v1/public/tracker-farms?locale=vi")
@@ -146,6 +193,14 @@ def test_public_tracker_farms_localize_en_and_vi_and_hide_internal_fields(client
             "id": str(farm.pk),
             "name": "Green Valley Farm",
             "location": "Da Lat, Vietnam",
+            "description": "English description",
+            "image": {
+                "id": str(image.pk),
+                "url": f"http://testserver/media/{image.file.name}",
+                "width": 1200,
+                "height": 900,
+                "alt": "Green Valley Farm",
+            },
             "signup_count": 14,
             "sort_order": 4,
         }
@@ -155,12 +210,63 @@ def test_public_tracker_farms_localize_en_and_vi_and_hide_internal_fields(client
         "id": str(farm.pk),
         "name": "Nông trại Thung Lũng Xanh",
         "location": "Đà Lạt, Việt Nam",
+        "description": "Mô tả tiếng Việt",
+        "image": {
+            "id": str(image.pk),
+            "url": f"http://testserver/media/{image.file.name}",
+            "width": 1200,
+            "height": 900,
+            "alt": "Nông trại Thung Lũng Xanh",
+        },
         "signup_count": 14,
         "sort_order": 4,
     }
     assert "is_visible" not in english.json()["data"][0]
     assert "version" not in english.json()["data"][0]
     assert client.get("/api/v1/public/tracker-farms?locale=fr").status_code == 400
+
+
+@pytest.mark.django_db
+def test_tracker_farm_allows_missing_image_and_empty_descriptions(client, tracker_admin_api):
+    created = tracker_admin_api.post(
+        "/api/v1/admin/tracker-farms",
+        farm_payload(description_en=None, description_vi=None),
+        format="json",
+    )
+
+    assert created.status_code == 201, created.json()
+    assert created.json()["data"]["image"] is None
+    assert created.json()["data"]["description_en"] == ""
+    assert created.json()["data"]["description_vi"] == ""
+
+    public = client.get("/api/v1/public/tracker-farms?locale=en")
+    assert public.json()["data"][0]["image"] is None
+    assert public.json()["data"][0]["description"] == ""
+
+
+@pytest.mark.django_db
+def test_tracker_farm_rejects_an_unknown_image_id(tracker_admin_api):
+    response = tracker_admin_api.post(
+        "/api/v1/admin/tracker-farms",
+        farm_payload(image_id=str(uuid4())),
+        format="json",
+    )
+
+    assert response.status_code == 400
+    assert "image_id" in response.json()
+
+
+@pytest.mark.django_db
+def test_tracker_farm_media_upload_uses_the_farms_prefix(tracker_admin_api):
+    response = tracker_admin_api.post(
+        "/api/v1/admin/tracker-farms/media",
+        {"image": image_upload()},
+        format="multipart",
+    )
+
+    assert response.status_code == 201, response.json()
+    asset = MediaAsset.objects.get(pk=response.json()["data"]["id"])
+    assert asset.file.name.startswith("farms/")
 
 
 @pytest.mark.django_db
@@ -196,6 +302,14 @@ def test_tracker_farm_admin_api_enforces_website_admin_permission(access_token):
     assert bearer.get("/api/v1/admin/tracker-farms").status_code == 403
     assert (
         bearer.post("/api/v1/admin/tracker-farms", farm_payload(), format="json").status_code == 403
+    )
+    assert (
+        bearer.post(
+            "/api/v1/admin/tracker-farms/media",
+            {"image": image_upload()},
+            format="multipart",
+        ).status_code
+        == 403
     )
 
 
@@ -347,7 +461,7 @@ def test_mutations_revalidate_tracker_farms_after_commit(
 
 @pytest.mark.django_db
 def test_tracker_farm_migration_creates_no_sample_records():
-    migration = importlib.import_module("content.migrations.0016_tracker_farm")
+    migration = importlib.import_module("content.migrations.0017_tracker_farm_content")
 
     assert not any(
         isinstance(operation, migrations.RunPython) for operation in migration.Migration.operations

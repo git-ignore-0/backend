@@ -61,8 +61,8 @@ from content.services import (
     read_preview_token,
     reorder_tracker_farms,
     request_frontend_revalidation,
+    store_media_image,
     store_testimonial_image,
-    store_workshop_image,
     testimonial_queryset,
     tracker_farm_queryset,
     translation_is_ready,
@@ -309,7 +309,9 @@ class PublicTrackerFarmListView(APIView):
         query.is_valid(raise_exception=True)
         locale = query.validated_data["locale"]
         farms = tracker_farm_queryset().filter(is_visible=True)
-        response = Response({"data": [public_tracker_farm_payload(farm, locale) for farm in farms]})
+        response = Response(
+            {"data": [public_tracker_farm_payload(farm, locale, request) for farm in farms]}
+        )
         response["Cache-Control"] = "public, max-age=60, stale-while-revalidate=300"
         return response
 
@@ -318,7 +320,7 @@ class AdminTrackerFarmListView(APIView):
     permission_classes = [IsWebsiteAdmin]
 
     def get(self, request):
-        data = [admin_tracker_farm_payload(farm) for farm in tracker_farm_queryset()]
+        data = [admin_tracker_farm_payload(farm, request) for farm in tracker_farm_queryset()]
         return admin_no_store(Response({"data": data}))
 
     def post(self, request):
@@ -327,7 +329,7 @@ class AdminTrackerFarmListView(APIView):
         farm = create_tracker_farm(actor=request.user, data=serializer.validated_data)
         return admin_no_store(
             Response(
-                {"data": admin_tracker_farm_payload(farm)},
+                {"data": admin_tracker_farm_payload(farm, request)},
                 status=status.HTTP_201_CREATED,
             )
         )
@@ -356,7 +358,7 @@ class AdminTrackerFarmDetailView(APIView):
                     status=status.HTTP_409_CONFLICT,
                 )
             )
-        return admin_no_store(Response({"data": admin_tracker_farm_payload(farm)}))
+        return admin_no_store(Response({"data": admin_tracker_farm_payload(farm, request)}))
 
     def delete(self, request, farm_id):
         get_object_or_404(TrackerFarm, pk=farm_id)
@@ -385,7 +387,7 @@ class AdminTrackerFarmReorderView(APIView):
         except DjangoValidationError as error:
             raise ValidationError(error.message_dict) from error
         return admin_no_store(
-            Response({"data": [admin_tracker_farm_payload(farm) for farm in farms]})
+            Response({"data": [admin_tracker_farm_payload(farm, request) for farm in farms]})
         )
 
 
@@ -782,17 +784,28 @@ class AdminTestimonialViewSet(viewsets.ViewSet):
 class AdminMediaUploadView(APIView):
     permission_classes = [IsWebsiteAdmin]
     parser_classes = [MultiPartParser, FormParser]
+    storage_prefix = "workshops"
+    audit_action = "media.upload"
 
     def post(self, request):
         upload = request.FILES.get("image")
         if upload is None:
             raise ValidationError({"image": "An image is required."})
         try:
-            asset = store_workshop_image(upload, actor=request.user)
+            asset = store_media_image(
+                upload,
+                actor=request.user,
+                storage_prefix=self.storage_prefix,
+            )
         except ValueError as error:
             raise ValidationError({"image": str(error)}) from error
-        audit(actor=request.user, action="media.upload", entity=asset)
+        audit(actor=request.user, action=self.audit_action, entity=asset)
         return Response({"data": media_payload(asset, request)}, status=status.HTTP_201_CREATED)
+
+
+class AdminTrackerFarmMediaUploadView(AdminMediaUploadView):
+    storage_prefix = "farms"
+    audit_action = "tracker_farm.media.upload"
 
 
 class AdminDashboardView(APIView):

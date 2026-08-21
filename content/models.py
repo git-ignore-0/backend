@@ -329,6 +329,15 @@ class TrackerFarm(models.Model):
     name_vi = models.CharField(max_length=240)
     location_en = models.CharField(max_length=240)
     location_vi = models.CharField(max_length=240)
+    description_en = models.TextField(blank=True, default="")
+    description_vi = models.TextField(blank=True, default="")
+    image = models.ForeignKey(
+        MediaAsset,
+        related_name="tracker_farms",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+    )
     signup_count = models.PositiveIntegerField(default=0)
     is_visible = models.BooleanField(default=True)
     sort_order = models.PositiveIntegerField(default=0)

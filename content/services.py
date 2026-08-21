@@ -209,7 +209,7 @@ def request_frontend_revalidation(tags):
 
 
 def tracker_farm_queryset():
-    return TrackerFarm.objects.order_by("sort_order", "created_at", "id")
+    return TrackerFarm.objects.select_related("image").order_by("sort_order", "created_at", "id")
 
 
 def _revalidate_tracker_farms():
@@ -220,6 +220,8 @@ def _revalidate_tracker_farms():
 def create_tracker_farm(*, actor, data):
     farms = list(TrackerFarm.objects.select_for_update().order_by("sort_order", "created_at", "id"))
     values = dict(data)
+    if "image_id" in values:
+        values["image"] = values.pop("image_id")
     if "sort_order" not in values:
         values["sort_order"] = max((farm.sort_order for farm in farms), default=-1) + 1
     farm = TrackerFarm.objects.create(**values)
@@ -233,7 +235,10 @@ def update_tracker_farm(*, farm_id, actor, expected_version, data):
     farm = TrackerFarm.objects.select_for_update().get(pk=farm_id)
     if farm.version != expected_version:
         raise TrackerFarmVersionConflict
-    for field, value in data.items():
+    values = dict(data)
+    if "image_id" in values:
+        values["image"] = values.pop("image_id")
+    for field, value in values.items():
         setattr(farm, field, value)
     farm.version += 1
     farm.save()
@@ -280,7 +285,7 @@ def reorder_tracker_farms(*, actor, items):
 
 
 def store_media_image(upload, *, actor, storage_prefix: str) -> MediaAsset:
-    if storage_prefix not in {"rewards", "testimonials", "workshops"}:
+    if storage_prefix not in {"farms", "rewards", "testimonials", "workshops"}:
         raise ValueError("Unsupported media storage prefix.")
     if upload.size > settings.CONTENT_MAX_UPLOAD_BYTES:
         raise ValueError("Image exceeds the upload size limit.")
