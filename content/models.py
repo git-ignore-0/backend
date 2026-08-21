@@ -323,6 +323,42 @@ class TestimonialTranslation(models.Model):
             raise ValidationError({"locale": "Unsupported locale."})
 
 
+class TrackerFarm(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name_en = models.CharField(max_length=240)
+    name_vi = models.CharField(max_length=240)
+    location_en = models.CharField(max_length=240)
+    location_vi = models.CharField(max_length=240)
+    signup_count = models.PositiveIntegerField(default=0)
+    is_visible = models.BooleanField(default=True)
+    sort_order = models.PositiveIntegerField(default=0)
+    version = models.PositiveIntegerField(default=1)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["sort_order", "created_at", "id"]
+        indexes = [
+            models.Index(
+                fields=["is_visible", "sort_order", "created_at"],
+                name="content_tracker_public_idx",
+            )
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(signup_count__gte=0),
+                name="content_tracker_signup_nonnegative",
+            ),
+            models.CheckConstraint(
+                condition=Q(sort_order__gte=0),
+                name="content_tracker_sort_nonnegative",
+            ),
+        ]
+
+    def __str__(self):
+        return self.name_en
+
+
 class ContentAuditLog(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     actor = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL)

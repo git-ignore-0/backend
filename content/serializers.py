@@ -9,6 +9,7 @@ from content.models import (
     MediaAsset,
     TestimonialStatus,
     TestimonialType,
+    TrackerFarm,
 )
 from content.validators import validate_tiptap_document
 
@@ -266,6 +267,75 @@ class PublicTestimonialQuerySerializer(serializers.Serializer):
     )
     page_size = serializers.IntegerField(min_value=1, max_value=50, default=20)
     page = serializers.IntegerField(min_value=1, max_value=10_000, default=1)
+
+
+class PublicTrackerFarmQuerySerializer(serializers.Serializer):
+    locale = serializers.ChoiceField(choices=["en", "vi"], default="vi")
+
+
+class TrackerFarmWriteSerializer(TestimonialStrictSerializer):
+    name_en = serializers.CharField(max_length=240, trim_whitespace=True)
+    name_vi = serializers.CharField(max_length=240, trim_whitespace=True)
+    location_en = serializers.CharField(max_length=240, trim_whitespace=True)
+    location_vi = serializers.CharField(max_length=240, trim_whitespace=True)
+    signup_count = serializers.IntegerField(min_value=0, required=False, default=0)
+    is_visible = serializers.BooleanField(required=False, default=True)
+    sort_order = serializers.IntegerField(min_value=0, required=False)
+
+
+class TrackerFarmUpdateSerializer(TrackerFarmWriteSerializer):
+    version = serializers.IntegerField(min_value=1)
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        if "version" not in attrs:
+            raise serializers.ValidationError({"version": "This field is required."})
+        return attrs
+
+
+class TrackerFarmReorderItemSerializer(TestimonialStrictSerializer):
+    id = serializers.UUIDField()
+    sort_order = serializers.IntegerField(min_value=0)
+    version = serializers.IntegerField(min_value=1)
+
+
+class TrackerFarmReorderSerializer(TestimonialStrictSerializer):
+    items = TrackerFarmReorderItemSerializer(many=True, allow_empty=False)
+
+    def validate_items(self, value):
+        ids = [item["id"] for item in value]
+        if len(ids) != len(set(ids)):
+            raise serializers.ValidationError("Farm IDs must be unique.")
+        sort_orders = [item["sort_order"] for item in value]
+        if len(sort_orders) != len(set(sort_orders)):
+            raise serializers.ValidationError("Sort orders must be unique.")
+        return value
+
+
+def public_tracker_farm_payload(farm: TrackerFarm, locale: str):
+    return {
+        "id": str(farm.pk),
+        "name": getattr(farm, f"name_{locale}"),
+        "location": getattr(farm, f"location_{locale}"),
+        "signup_count": farm.signup_count,
+        "sort_order": farm.sort_order,
+    }
+
+
+def admin_tracker_farm_payload(farm: TrackerFarm):
+    return {
+        "id": str(farm.pk),
+        "name_en": farm.name_en,
+        "name_vi": farm.name_vi,
+        "location_en": farm.location_en,
+        "location_vi": farm.location_vi,
+        "signup_count": farm.signup_count,
+        "is_visible": farm.is_visible,
+        "sort_order": farm.sort_order,
+        "version": farm.version,
+        "created_at": farm.created_at.isoformat(),
+        "updated_at": farm.updated_at.isoformat(),
+    }
 
 
 def admin_translation_payload(item):

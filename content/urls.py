@@ -9,6 +9,7 @@ router.register("admin/testimonials", views.AdminTestimonialViewSet, basename="a
 
 urlpatterns = [
     path("public/site-settings", views.PublicSiteSettingsView.as_view()),
+    path("public/tracker-farms", views.PublicTrackerFarmListView.as_view()),
     path("public/workshops", views.PublicWorkshopListView.as_view()),
     path("public/workshops/<slug:slug>", views.PublicWorkshopDetailView.as_view()),
     path("public/workshops/preview/<str:token>", views.PublicWorkshopPreviewView.as_view()),
@@ -21,6 +22,12 @@ urlpatterns = [
     path("admin/session", views.AdminSessionView.as_view()),
     path("admin/dashboard", views.AdminDashboardView.as_view()),
     path("admin/site-settings", views.AdminSiteSettingsView.as_view()),
+    path("admin/tracker-farms", views.AdminTrackerFarmListView.as_view()),
+    path("admin/tracker-farms/reorder", views.AdminTrackerFarmReorderView.as_view()),
+    path(
+        "admin/tracker-farms/<uuid:farm_id>",
+        views.AdminTrackerFarmDetailView.as_view(),
+    ),
     path("admin/media", views.AdminMediaUploadView.as_view()),
     path("", include(router.urls)),
 ]

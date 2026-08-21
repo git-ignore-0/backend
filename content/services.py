@@ -25,6 +25,7 @@ from content.models import (
     TestimonialStatus,
     TestimonialTranslation,
     TestimonialType,
+    TrackerFarm,
     Workshop,
     WorkshopRevision,
     WorkshopTranslation,
@@ -43,6 +44,10 @@ class TestimonialTransitionConflict(ValueError):
     def __init__(self, code, message):
         self.code = code
         super().__init__(message)
+
+
+class TrackerFarmVersionConflict(ValueError):
+    """A tracker farm changed after the administrator loaded it."""
 
 
 def translation_is_ready(translation: WorkshopTranslation) -> bool:
@@ -201,6 +206,77 @@ def request_frontend_revalidation(tags):
         logger.warning("Frontend content cache revalidation failed", exc_info=True)
         return False
     return True
+
+
+def tracker_farm_queryset():
+    return TrackerFarm.objects.order_by("sort_order", "created_at", "id")
+
+
+def _revalidate_tracker_farms():
+    transaction.on_commit(lambda: request_frontend_revalidation(["tracker-farms"]))
+
+
+@transaction.atomic
+def create_tracker_farm(*, actor, data):
+    farms = list(TrackerFarm.objects.select_for_update().order_by("sort_order", "created_at", "id"))
+    values = dict(data)
+    if "sort_order" not in values:
+        values["sort_order"] = max((farm.sort_order for farm in farms), default=-1) + 1
+    farm = TrackerFarm.objects.create(**values)
+    audit(actor=actor, action="tracker_farm.create", entity=farm)
+    _revalidate_tracker_farms()
+    return farm
+
+
+@transaction.atomic
+def update_tracker_farm(*, farm_id, actor, expected_version, data):
+    farm = TrackerFarm.objects.select_for_update().get(pk=farm_id)
+    if farm.version != expected_version:
+        raise TrackerFarmVersionConflict
+    for field, value in data.items():
+        setattr(farm, field, value)
+    farm.version += 1
+    farm.save()
+    audit(actor=actor, action="tracker_farm.update", entity=farm)
+    _revalidate_tracker_farms()
+    return farm
+
+
+@transaction.atomic
+def delete_tracker_farm(*, farm_id, actor):
+    farm = TrackerFarm.objects.select_for_update().get(pk=farm_id)
+    audit(actor=actor, action="tracker_farm.delete", entity=farm)
+    farm.delete()
+    _revalidate_tracker_farms()
+
+
+@transaction.atomic
+def reorder_tracker_farms(*, actor, items):
+    farms = list(TrackerFarm.objects.select_for_update().order_by("sort_order", "created_at", "id"))
+    by_id = {farm.pk: farm for farm in farms}
+    submitted_ids = {item["id"] for item in items}
+    if submitted_ids != set(by_id):
+        raise ValidationError(
+            {"items": "Reorder must include every existing tracker farm exactly once."}
+        )
+    if any(by_id[item["id"]].version != item["version"] for item in items):
+        raise TrackerFarmVersionConflict
+
+    updated_at = timezone.now()
+    for item in items:
+        farm = by_id[item["id"]]
+        farm.sort_order = item["sort_order"]
+        farm.version += 1
+        farm.updated_at = updated_at
+    TrackerFarm.objects.bulk_update(farms, ["sort_order", "version", "updated_at"])
+    audit(
+        actor=actor,
+        action="tracker_farm.reorder",
+        entity=farms[0],
+        context={"farm_ids": [str(item["id"]) for item in items]},
+    )
+    _revalidate_tracker_farms()
+    return tracker_farm_queryset()
 
 
 def store_media_image(upload, *, actor, storage_prefix: str) -> MediaAsset:

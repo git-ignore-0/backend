@@ -18,6 +18,7 @@ from content.models import (
     SiteSettings,
     Testimonial,
     TestimonialStatus,
+    TrackerFarm,
     Workshop,
     WorkshopRevision,
     WorkshopTranslation,
@@ -26,38 +27,50 @@ from content.permissions import IsWebsiteAdmin
 from content.serializers import (
     AdminTestimonialQuerySerializer,
     PublicTestimonialQuerySerializer,
+    PublicTrackerFarmQuerySerializer,
     PublicWorkshopQuerySerializer,
     SiteSettingsWriteSerializer,
     TestimonialActionSerializer,
     TestimonialUpdateSerializer,
     TestimonialWriteSerializer,
+    TrackerFarmReorderSerializer,
+    TrackerFarmUpdateSerializer,
+    TrackerFarmWriteSerializer,
     WorkshopDraftWriteSerializer,
     WorkshopPublishSerializer,
     admin_revision_payload,
     admin_testimonial_payload,
+    admin_tracker_farm_payload,
     media_payload,
     public_testimonial_payload,
+    public_tracker_farm_payload,
     public_workshop_payload,
 )
 from content.services import (
     RevisionConflict,
     TestimonialTransitionConflict,
+    TrackerFarmVersionConflict,
     audit,
     create_preview_token,
     create_testimonial,
+    create_tracker_farm,
+    delete_tracker_farm,
     hide_testimonial,
     publish_revision,
     publish_testimonial,
     read_preview_token,
+    reorder_tracker_farms,
     request_frontend_revalidation,
     store_testimonial_image,
     store_workshop_image,
     testimonial_queryset,
+    tracker_farm_queryset,
     translation_is_ready,
     unique_workshop_slug,
     unpublish_testimonial,
     unpublish_workshop,
     update_testimonial,
+    update_tracker_farm,
 )
 
 
@@ -285,6 +298,95 @@ def admin_no_store(response):
     response["Cache-Control"] = "private, no-store"
     response["Pragma"] = "no-cache"
     return response
+
+
+class PublicTrackerFarmListView(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def get(self, request):
+        query = PublicTrackerFarmQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+        locale = query.validated_data["locale"]
+        farms = tracker_farm_queryset().filter(is_visible=True)
+        response = Response({"data": [public_tracker_farm_payload(farm, locale) for farm in farms]})
+        response["Cache-Control"] = "public, max-age=60, stale-while-revalidate=300"
+        return response
+
+
+class AdminTrackerFarmListView(APIView):
+    permission_classes = [IsWebsiteAdmin]
+
+    def get(self, request):
+        data = [admin_tracker_farm_payload(farm) for farm in tracker_farm_queryset()]
+        return admin_no_store(Response({"data": data}))
+
+    def post(self, request):
+        serializer = TrackerFarmWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        farm = create_tracker_farm(actor=request.user, data=serializer.validated_data)
+        return admin_no_store(
+            Response(
+                {"data": admin_tracker_farm_payload(farm)},
+                status=status.HTTP_201_CREATED,
+            )
+        )
+
+
+class AdminTrackerFarmDetailView(APIView):
+    permission_classes = [IsWebsiteAdmin]
+
+    def patch(self, request, farm_id):
+        get_object_or_404(TrackerFarm, pk=farm_id)
+        serializer = TrackerFarmUpdateSerializer(data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        data = dict(serializer.validated_data)
+        expected_version = data.pop("version")
+        try:
+            farm = update_tracker_farm(
+                farm_id=farm_id,
+                actor=request.user,
+                expected_version=expected_version,
+                data=data,
+            )
+        except TrackerFarmVersionConflict:
+            return admin_no_store(
+                Response(
+                    {"errors": [{"code": "version_conflict"}]},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            )
+        return admin_no_store(Response({"data": admin_tracker_farm_payload(farm)}))
+
+    def delete(self, request, farm_id):
+        get_object_or_404(TrackerFarm, pk=farm_id)
+        delete_tracker_farm(farm_id=farm_id, actor=request.user)
+        return admin_no_store(Response(status=status.HTTP_204_NO_CONTENT))
+
+
+class AdminTrackerFarmReorderView(APIView):
+    permission_classes = [IsWebsiteAdmin]
+
+    def patch(self, request):
+        serializer = TrackerFarmReorderSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            farms = reorder_tracker_farms(
+                actor=request.user,
+                items=serializer.validated_data["items"],
+            )
+        except TrackerFarmVersionConflict:
+            return admin_no_store(
+                Response(
+                    {"errors": [{"code": "version_conflict"}]},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            )
+        except DjangoValidationError as error:
+            raise ValidationError(error.message_dict) from error
+        return admin_no_store(
+            Response({"data": [admin_tracker_farm_payload(farm) for farm in farms]})
+        )
 
 
 class PublicTestimonialListView(APIView):
