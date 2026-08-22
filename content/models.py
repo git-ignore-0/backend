@@ -8,6 +8,7 @@ from django.db.models import Q
 from django.utils import timezone
 
 SUPPORTED_LOCALES = {"en", "vi"}
+TRACKER_FARM_MAX_PHOTOS = 12
 
 
 class SiteSettings(models.Model):
@@ -366,6 +367,39 @@ class TrackerFarm(models.Model):
 
     def __str__(self):
         return self.name_en
+
+
+class TrackerFarmPhoto(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    farm = models.ForeignKey(
+        TrackerFarm,
+        related_name="photos",
+        on_delete=models.CASCADE,
+    )
+    image = models.ForeignKey(
+        MediaAsset,
+        related_name="tracker_farm_photos",
+        on_delete=models.PROTECT,
+    )
+    sort_order = models.PositiveIntegerField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["sort_order", "created_at", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["farm", "sort_order"],
+                name="content_tracker_photo_order_unique",
+            ),
+            models.UniqueConstraint(
+                fields=["farm", "image"],
+                name="content_tracker_photo_image_unique",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.farm_id}:{self.sort_order}"
 
 
 class ContentAuditLog(models.Model):

@@ -15,6 +15,7 @@ from rest_framework.views import APIView
 from content.models import (
     ContentAuditLog,
     ExternalLink,
+    MediaAsset,
     SiteSettings,
     Testimonial,
     TestimonialStatus,
@@ -49,11 +50,14 @@ from content.serializers import (
 from content.services import (
     RevisionConflict,
     TestimonialTransitionConflict,
+    TrackerFarmMediaReferenced,
+    TrackerFarmMediaStorageMismatch,
     TrackerFarmVersionConflict,
     audit,
     create_preview_token,
     create_testimonial,
     create_tracker_farm,
+    delete_temporary_tracker_farm_media,
     delete_tracker_farm,
     hide_testimonial,
     publish_revision,
@@ -326,7 +330,10 @@ class AdminTrackerFarmListView(APIView):
     def post(self, request):
         serializer = TrackerFarmWriteSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        farm = create_tracker_farm(actor=request.user, data=serializer.validated_data)
+        try:
+            farm = create_tracker_farm(actor=request.user, data=serializer.validated_data)
+        except DjangoValidationError as error:
+            raise ValidationError(error.message_dict) from error
         return admin_no_store(
             Response(
                 {"data": admin_tracker_farm_payload(farm, request)},
@@ -358,6 +365,8 @@ class AdminTrackerFarmDetailView(APIView):
                     status=status.HTTP_409_CONFLICT,
                 )
             )
+        except DjangoValidationError as error:
+            raise ValidationError(error.message_dict) from error
         return admin_no_store(Response({"data": admin_tracker_farm_payload(farm, request)}))
 
     def delete(self, request, farm_id):
@@ -806,6 +815,28 @@ class AdminMediaUploadView(APIView):
 class AdminTrackerFarmMediaUploadView(AdminMediaUploadView):
     storage_prefix = "farms"
     audit_action = "tracker_farm.media.upload"
+
+
+class AdminTrackerFarmMediaDetailView(APIView):
+    permission_classes = [IsWebsiteAdmin]
+
+    def delete(self, request, media_id):
+        try:
+            delete_temporary_tracker_farm_media(media_id=media_id, actor=request.user)
+        except MediaAsset.DoesNotExist as error:
+            raise NotFound("Tracker farm media was not found.") from error
+        except TrackerFarmMediaStorageMismatch as error:
+            raise ValidationError(
+                {"media": "Only media stored for tracker farms can be deleted."}
+            ) from error
+        except TrackerFarmMediaReferenced:
+            return admin_no_store(
+                Response(
+                    {"errors": [{"code": "media_asset_referenced"}]},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            )
+        return admin_no_store(Response(status=status.HTTP_204_NO_CONTENT))
 
 
 class AdminDashboardView(APIView):

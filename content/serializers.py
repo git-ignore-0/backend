@@ -5,6 +5,7 @@ from django.core.files.storage import default_storage
 from rest_framework import serializers
 
 from content.models import (
+    TRACKER_FARM_MAX_PHOTOS,
     ExternalLink,
     MediaAsset,
     TestimonialStatus,
@@ -293,6 +294,11 @@ class TrackerFarmWriteSerializer(TestimonialStrictSerializer):
         trim_whitespace=True,
     )
     image_id = serializers.UUIDField(required=False, allow_null=True)
+    photo_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        required=False,
+        max_length=TRACKER_FARM_MAX_PHOTOS,
+    )
     signup_count = serializers.IntegerField(min_value=0, required=False, default=0)
     is_visible = serializers.BooleanField(required=False, default=True)
     sort_order = serializers.IntegerField(min_value=0, required=False)
@@ -305,11 +311,34 @@ class TrackerFarmWriteSerializer(TestimonialStrictSerializer):
         except MediaAsset.DoesNotExist as error:
             raise serializers.ValidationError("Media asset does not exist.") from error
 
+    def validate_photo_ids(self, value):
+        if len(value) != len(set(value)):
+            raise serializers.ValidationError("Media asset IDs must be unique.")
+        assets_by_id = MediaAsset.objects.in_bulk(value)
+        unknown_ids = [str(asset_id) for asset_id in value if asset_id not in assets_by_id]
+        if unknown_ids:
+            raise serializers.ValidationError(
+                f"Media assets do not exist: {', '.join(unknown_ids)}."
+            )
+        return [assets_by_id[asset_id] for asset_id in value]
+
     def validate_description_en(self, value):
         return value or ""
 
     def validate_description_vi(self, value):
         return value or ""
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        if "image_id" in attrs and "photo_ids" in attrs:
+            raise serializers.ValidationError(
+                {
+                    "photo_ids": (
+                        "Do not submit photo_ids and image_id in the same request."
+                    )
+                }
+            )
+        return attrs
 
 
 class TrackerFarmUpdateSerializer(TrackerFarmWriteSerializer):
@@ -343,28 +372,45 @@ class TrackerFarmReorderSerializer(TestimonialStrictSerializer):
 
 def public_tracker_farm_payload(farm: TrackerFarm, locale: str, request):
     name = getattr(farm, f"name_{locale}")
-    image = None
-    if farm.image:
-        asset = media_payload(farm.image, request)
-        image = {
-            "id": asset["id"],
-            "url": asset["url"],
-            "width": asset["width"],
-            "height": asset["height"],
-            "alt": name,
-        }
+    photo_assets = [photo.image for photo in farm.photos.all()]
+    if not photo_assets and farm.image:
+        photo_assets = [farm.image]
+    images = []
+    for photo_asset in photo_assets:
+        asset = media_payload(photo_asset, request)
+        images.append(
+            {
+                "id": asset["id"],
+                "url": asset["url"],
+                "width": asset["width"],
+                "height": asset["height"],
+                "alt": name,
+                "variants": [
+                    {
+                        "url": variant["url"],
+                        "width": variant["width"],
+                        "height": variant["height"],
+                    }
+                    for variant in asset["variants"]
+                ],
+            }
+        )
     return {
         "id": str(farm.pk),
         "name": name,
         "location": getattr(farm, f"location_{locale}"),
         "description": getattr(farm, f"description_{locale}"),
-        "image": image,
+        "image": images[0] if images else None,
+        "images": images,
         "signup_count": farm.signup_count,
         "sort_order": farm.sort_order,
     }
 
 
 def admin_tracker_farm_payload(farm: TrackerFarm, request):
+    photos = [media_payload(photo.image, request) for photo in farm.photos.all()]
+    if not photos and farm.image:
+        photos = [media_payload(farm.image, request)]
     return {
         "id": str(farm.pk),
         "name_en": farm.name_en,
@@ -374,6 +420,7 @@ def admin_tracker_farm_payload(farm: TrackerFarm, request):
         "description_en": farm.description_en,
         "description_vi": farm.description_vi,
         "image": media_payload(farm.image, request) if farm.image else None,
+        "photos": photos,
         "signup_count": farm.signup_count,
         "is_visible": farm.is_visible,
         "sort_order": farm.sort_order,

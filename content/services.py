@@ -5,6 +5,7 @@ import json
 import logging
 import time
 import uuid
+from functools import partial
 
 import requests
 from django.conf import settings
@@ -13,6 +14,7 @@ from django.core.files.base import ContentFile
 from django.core.files.storage import default_storage
 from django.core.signing import TimestampSigner
 from django.db import transaction
+from django.db.models import Prefetch
 from django.utils import timezone
 from django.utils.text import slugify
 from PIL import Image, UnidentifiedImageError
@@ -26,6 +28,7 @@ from content.models import (
     TestimonialTranslation,
     TestimonialType,
     TrackerFarm,
+    TrackerFarmPhoto,
     Workshop,
     WorkshopRevision,
     WorkshopTranslation,
@@ -48,6 +51,14 @@ class TestimonialTransitionConflict(ValueError):
 
 class TrackerFarmVersionConflict(ValueError):
     """A tracker farm changed after the administrator loaded it."""
+
+
+class TrackerFarmMediaReferenced(ValueError):
+    """A tracker farm media asset is still referenced by persisted content."""
+
+
+class TrackerFarmMediaStorageMismatch(ValueError):
+    """A media asset is outside the tracker farm storage namespace."""
 
 
 def translation_is_ready(translation: WorkshopTranslation) -> bool:
@@ -209,22 +220,95 @@ def request_frontend_revalidation(tags):
 
 
 def tracker_farm_queryset():
-    return TrackerFarm.objects.select_related("image").order_by("sort_order", "created_at", "id")
+    return (
+        TrackerFarm.objects.select_related("image")
+        .prefetch_related(
+            Prefetch(
+                "photos",
+                queryset=TrackerFarmPhoto.objects.select_related("image").order_by(
+                    "sort_order", "created_at", "id"
+                ),
+            )
+        )
+        .order_by("sort_order", "created_at", "id")
+    )
 
 
 def _revalidate_tracker_farms():
     transaction.on_commit(lambda: request_frontend_revalidation(["tracker-farms"]))
 
 
+def _replace_tracker_farm_photos(farm, assets):
+    TrackerFarmPhoto.objects.filter(farm=farm).delete()
+    TrackerFarmPhoto.objects.bulk_create(
+        [
+            TrackerFarmPhoto(farm=farm, image=asset, sort_order=index)
+            for index, asset in enumerate(assets)
+        ]
+    )
+    farm.image = assets[0] if assets else None
+
+
+def _tracker_farm_media_ids(farm):
+    candidate_ids = set(farm.photos.values_list("image_id", flat=True))
+    if farm.image_id:
+        candidate_ids.add(farm.image_id)
+    return candidate_ids
+
+
+def _lock_submitted_tracker_farm_media(values, *, additional_ids=()):
+    field_name = None
+    submitted_assets = []
+    if "photo_ids" in values:
+        field_name = "photo_ids"
+        submitted_assets = values["photo_ids"]
+    elif "image_id" in values and values["image_id"] is not None:
+        field_name = "image_id"
+        submitted_assets = [values["image_id"]]
+
+    submitted_ids = [asset.pk for asset in submitted_assets]
+    lock_ids = set(additional_ids) | set(submitted_ids)
+    locked_assets = list(
+        MediaAsset.objects.select_for_update().filter(pk__in=lock_ids).order_by("pk")
+    )
+    locked_by_id = {asset.pk: asset for asset in locked_assets}
+    missing_ids = [asset_id for asset_id in submitted_ids if asset_id not in locked_by_id]
+    if missing_ids:
+        if field_name == "image_id":
+            raise ValidationError({"image_id": "Media asset does not exist."})
+        raise ValidationError(
+            {
+                "photo_ids": (
+                    "Media assets do not exist: "
+                    f"{', '.join(str(asset_id) for asset_id in missing_ids)}."
+                )
+            }
+        )
+
+    if field_name == "photo_ids":
+        values["photo_ids"] = [locked_by_id[asset_id] for asset_id in submitted_ids]
+    elif field_name == "image_id":
+        values["image_id"] = locked_by_id[submitted_ids[0]]
+
+
 @transaction.atomic
 def create_tracker_farm(*, actor, data):
     farms = list(TrackerFarm.objects.select_for_update().order_by("sort_order", "created_at", "id"))
     values = dict(data)
-    if "image_id" in values:
-        values["image"] = values.pop("image_id")
+    _lock_submitted_tracker_farm_media(values)
+    gallery_assets = None
+    if "photo_ids" in values:
+        gallery_assets = values.pop("photo_ids")
+    elif "image_id" in values:
+        legacy_image = values.pop("image_id")
+        gallery_assets = [legacy_image] if legacy_image else []
+    if gallery_assets is not None:
+        values["image"] = gallery_assets[0] if gallery_assets else None
     if "sort_order" not in values:
         values["sort_order"] = max((farm.sort_order for farm in farms), default=-1) + 1
     farm = TrackerFarm.objects.create(**values)
+    if gallery_assets is not None:
+        _replace_tracker_farm_photos(farm, gallery_assets)
     audit(actor=actor, action="tracker_farm.create", entity=farm)
     _revalidate_tracker_farms()
     return farm
@@ -236,22 +320,158 @@ def update_tracker_farm(*, farm_id, actor, expected_version, data):
     if farm.version != expected_version:
         raise TrackerFarmVersionConflict
     values = dict(data)
-    if "image_id" in values:
-        values["image"] = values.pop("image_id")
+    if "photo_ids" in values or "image_id" in values:
+        _lock_submitted_tracker_farm_media(
+            values,
+            additional_ids=_tracker_farm_media_ids(farm),
+        )
+    gallery_assets = None
+    previous_candidate_ids = set()
+    if "photo_ids" in values:
+        gallery_assets = values.pop("photo_ids")
+        current_photo_ids = list(
+            farm.photos.order_by("sort_order", "created_at", "id").values_list(
+                "image_id", flat=True
+            )
+        )
+        submitted_photo_ids = [asset.pk for asset in gallery_assets]
+        submitted_legacy_id = submitted_photo_ids[0] if submitted_photo_ids else None
+        if current_photo_ids == submitted_photo_ids and farm.image_id == submitted_legacy_id:
+            gallery_assets = None
+        else:
+            previous_candidate_ids = _tracker_farm_media_ids(farm)
+    elif "image_id" in values:
+        legacy_image = values.pop("image_id")
+        if legacy_image is None:
+            if farm.image_id or farm.photos.exists():
+                gallery_assets = []
+                previous_candidate_ids = _tracker_farm_media_ids(farm)
+        elif farm.image_id != legacy_image.pk:
+            gallery_assets = [legacy_image]
+            previous_candidate_ids = _tracker_farm_media_ids(farm)
+        elif not farm.photos.exists():
+            gallery_assets = [legacy_image]
+            previous_candidate_ids = _tracker_farm_media_ids(farm)
     for field, value in values.items():
         setattr(farm, field, value)
+    if gallery_assets is not None:
+        _replace_tracker_farm_photos(farm, gallery_assets)
     farm.version += 1
     farm.save()
+    if gallery_assets is not None:
+        retained_ids = {asset.pk for asset in gallery_assets}
+        _cleanup_orphan_tracker_farm_media(
+            actor=actor,
+            candidate_ids=previous_candidate_ids - retained_ids,
+            farm_id=farm.pk,
+            reason="gallery_update",
+        )
     audit(actor=actor, action="tracker_farm.update", entity=farm)
     _revalidate_tracker_farms()
     return farm
 
 
+def _media_asset_has_references(asset):
+    for relation in asset._meta.related_objects:
+        accessor_name = relation.get_accessor_name()
+        if not accessor_name or accessor_name == "+":
+            continue
+        if relation.one_to_one:
+            try:
+                getattr(asset, accessor_name)
+            except relation.related_model.DoesNotExist:
+                continue
+            return True
+        related = getattr(asset, accessor_name)
+        if related.exists():
+            return True
+    return False
+
+
+def _delete_media_files(file_names):
+    for file_name in file_names:
+        try:
+            default_storage.delete(file_name)
+        except Exception:
+            logger.warning("Orphan media file cleanup failed for %s", file_name, exc_info=True)
+
+
+def _media_asset_file_names(asset):
+    return {
+        file_name
+        for file_name in [
+            asset.file.name,
+            *(variant.get("file") for variant in asset.variants),
+        ]
+        if file_name
+    }
+
+
+def _cleanup_orphan_tracker_farm_media(
+    *,
+    actor,
+    candidate_ids,
+    reason,
+    farm_id=None,
+    required_storage_prefix=None,
+    reject_referenced=False,
+    require_asset=False,
+):
+    assets = list(
+        MediaAsset.objects.select_for_update().filter(pk__in=candidate_ids).order_by("pk")
+    )
+    if require_asset and not assets:
+        raise MediaAsset.DoesNotExist
+    for asset in assets:
+        file_names = _media_asset_file_names(asset)
+        if required_storage_prefix:
+            prefix = f"{required_storage_prefix}/"
+            if not asset.file.name.startswith(prefix) or any(
+                not file_name.startswith(prefix) for file_name in file_names
+            ):
+                raise TrackerFarmMediaStorageMismatch
+        if _media_asset_has_references(asset):
+            if reject_referenced:
+                raise TrackerFarmMediaReferenced
+            continue
+        context = {"reason": reason}
+        if farm_id is not None:
+            context["farm_id"] = str(farm_id)
+        audit(
+            actor=actor,
+            action="tracker_farm.media.orphan_cleanup",
+            entity=asset,
+            context=context,
+        )
+        asset.delete()
+        transaction.on_commit(partial(_delete_media_files, file_names))
+
+
+@transaction.atomic
+def delete_temporary_tracker_farm_media(*, media_id, actor):
+    _cleanup_orphan_tracker_farm_media(
+        actor=actor,
+        candidate_ids={media_id},
+        reason="temporary_upload_cancel",
+        required_storage_prefix="farms",
+        reject_referenced=True,
+        require_asset=True,
+    )
+
+
 @transaction.atomic
 def delete_tracker_farm(*, farm_id, actor):
     farm = TrackerFarm.objects.select_for_update().get(pk=farm_id)
+    candidate_ids = _tracker_farm_media_ids(farm)
     audit(actor=actor, action="tracker_farm.delete", entity=farm)
+    farm.photos.all().delete()
     farm.delete()
+    _cleanup_orphan_tracker_farm_media(
+        actor=actor,
+        candidate_ids=candidate_ids,
+        farm_id=farm_id,
+        reason="farm_delete",
+    )
     _revalidate_tracker_farms()
 
 

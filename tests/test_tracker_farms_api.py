@@ -4,13 +4,24 @@ from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
+from django.apps import apps as django_apps
 from django.contrib.auth.models import Group
+from django.core.files.base import ContentFile
+from django.core.files.storage import default_storage
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.db import IntegrityError, migrations, transaction
+from django.db import IntegrityError, transaction
 from PIL import Image
 from rest_framework.test import APIClient
 
-from content.models import MediaAsset, TrackerFarm
+from content import models as content_models
+from content.models import (
+    ContentAuditLog,
+    MediaAsset,
+    TrackerFarm,
+    TrackerFarmPhoto,
+)
+from content.serializers import TrackerFarmUpdateSerializer, TrackerFarmWriteSerializer
+from referrals.models import Reward
 
 
 def farm_payload(**overrides):
@@ -46,6 +57,22 @@ def create_media_asset(**overrides):
     }
     values.update(overrides)
     return MediaAsset.objects.create(**values)
+
+
+def create_stored_media_asset(prefix, storage_prefix="farms"):
+    original_file = default_storage.save(
+        f"{storage_prefix}/{prefix}-original.webp",
+        ContentFile(b"original"),
+    )
+    variant_file = default_storage.save(
+        f"{storage_prefix}/{prefix}-480.webp",
+        ContentFile(b"variant"),
+    )
+    asset = create_media_asset(
+        file=original_file,
+        variants=[{"file": variant_file, "width": 480, "height": 360}],
+    )
+    return asset, {original_file, variant_file}
 
 
 @pytest.fixture
@@ -85,6 +112,21 @@ def test_tracker_farm_model_defaults_and_database_constraints():
 
 
 @pytest.mark.django_db
+def test_tracker_farm_photo_database_constraints():
+    farm = create_farm()
+    first = create_media_asset()
+    second = create_media_asset()
+    TrackerFarmPhoto.objects.create(farm=farm, image=first, sort_order=0)
+
+    with pytest.raises(IntegrityError), transaction.atomic():
+        TrackerFarmPhoto.objects.create(farm=farm, image=second, sort_order=0)
+    with pytest.raises(IntegrityError), transaction.atomic():
+        TrackerFarmPhoto.objects.create(farm=farm, image=first, sort_order=1)
+    with pytest.raises(IntegrityError), transaction.atomic():
+        TrackerFarmPhoto.objects.create(farm=farm, image=second, sort_order=-1)
+
+
+@pytest.mark.django_db
 def test_admin_create_update_and_permanent_delete(tracker_admin_api):
     image = create_media_asset()
     first = tracker_admin_api.post(
@@ -113,6 +155,7 @@ def test_admin_create_update_and_permanent_delete(tracker_admin_api):
     assert first_data["description_en"] == "A family farm"
     assert first_data["description_vi"] == "Nông trại gia đình"
     assert first_data["image"]["id"] == str(image.pk)
+    assert [item["id"] for item in first_data["photos"]] == [str(image.pk)]
     assert first_data["sort_order"] == 0
     assert second_data["sort_order"] == 1
 
@@ -136,12 +179,132 @@ def test_admin_create_update_and_permanent_delete(tracker_admin_api):
     assert updated.json()["data"]["description_en"] == ""
     assert updated.json()["data"]["description_vi"] == "Mô tả mới"
     assert updated.json()["data"]["image"] is None
+    assert updated.json()["data"]["photos"] == []
     assert updated.json()["data"]["version"] == first_data["version"] + 1
 
     deleted = tracker_admin_api.delete(f"/api/v1/admin/tracker-farms/{first_data['id']}")
     assert deleted.status_code == 204
     assert not TrackerFarm.objects.filter(pk=first_data["id"]).exists()
     assert TrackerFarm.objects.filter(pk=second_data["id"]).exists()
+
+
+@pytest.mark.django_db
+def test_farm_delete_cleans_exclusive_gallery_assets_and_files(
+    tracker_admin_api,
+    settings,
+    tmp_path,
+    django_capture_on_commit_callbacks,
+):
+    settings.MEDIA_ROOT = tmp_path
+    asset, file_names = create_stored_media_asset("exclusive")
+    created = tracker_admin_api.post(
+        "/api/v1/admin/tracker-farms",
+        farm_payload(photo_ids=[str(asset.pk)]),
+        format="json",
+    ).json()["data"]
+    assert all(default_storage.exists(file_name) for file_name in file_names)
+
+    with django_capture_on_commit_callbacks(execute=True):
+        response = tracker_admin_api.delete(
+            f"/api/v1/admin/tracker-farms/{created['id']}"
+        )
+
+    assert response.status_code == 204
+    assert not TrackerFarm.objects.filter(pk=created["id"]).exists()
+    assert not TrackerFarmPhoto.objects.filter(farm_id=created["id"]).exists()
+    assert not MediaAsset.objects.filter(pk=asset.pk).exists()
+    assert all(not default_storage.exists(file_name) for file_name in file_names)
+    assert ContentAuditLog.objects.filter(
+        action="tracker_farm.delete",
+        entity_id=created["id"],
+    ).exists()
+    assert ContentAuditLog.objects.filter(
+        action="tracker_farm.media.orphan_cleanup",
+        entity_id=str(asset.pk),
+        context__farm_id=created["id"],
+        context__reason="farm_delete",
+    ).exists()
+
+
+@pytest.mark.django_db
+def test_farm_delete_preserves_shared_gallery_asset_until_last_reference_is_removed(
+    tracker_admin_api,
+    settings,
+    tmp_path,
+    django_capture_on_commit_callbacks,
+):
+    settings.MEDIA_ROOT = tmp_path
+    asset, file_names = create_stored_media_asset("shared")
+    first = tracker_admin_api.post(
+        "/api/v1/admin/tracker-farms",
+        farm_payload(name_en="First", photo_ids=[str(asset.pk)]),
+        format="json",
+    ).json()["data"]
+    second = tracker_admin_api.post(
+        "/api/v1/admin/tracker-farms",
+        farm_payload(name_en="Second", photo_ids=[str(asset.pk)]),
+        format="json",
+    ).json()["data"]
+
+    with django_capture_on_commit_callbacks(execute=True):
+        first_delete = tracker_admin_api.delete(
+            f"/api/v1/admin/tracker-farms/{first['id']}"
+        )
+
+    assert first_delete.status_code == 204
+    assert MediaAsset.objects.filter(pk=asset.pk).exists()
+    assert all(default_storage.exists(file_name) for file_name in file_names)
+    assert not ContentAuditLog.objects.filter(
+        action="tracker_farm.media.orphan_cleanup",
+        entity_id=str(asset.pk),
+    ).exists()
+
+    with django_capture_on_commit_callbacks(execute=True):
+        second_delete = tracker_admin_api.delete(
+            f"/api/v1/admin/tracker-farms/{second['id']}"
+        )
+
+    assert second_delete.status_code == 204
+    assert not MediaAsset.objects.filter(pk=asset.pk).exists()
+    assert all(not default_storage.exists(file_name) for file_name in file_names)
+    assert ContentAuditLog.objects.filter(
+        action="tracker_farm.media.orphan_cleanup",
+        entity_id=str(asset.pk),
+    ).count() == 1
+
+
+@pytest.mark.django_db
+def test_farm_delete_preserves_assets_referenced_by_testimonials_and_rewards(
+    tracker_admin_api,
+    django_capture_on_commit_callbacks,
+):
+    testimonial_asset = create_media_asset(original_name="testimonial.webp")
+    reward_asset = create_media_asset(original_name="reward.webp")
+    content_models.Testimonial.objects.create(
+        type=content_models.TestimonialType.FARMER,
+        status=content_models.TestimonialStatus.DRAFT,
+        display_name="Shared farmer",
+        image=testimonial_asset,
+    )
+    Reward.objects.create(point_cost=10, image=reward_asset)
+    created = tracker_admin_api.post(
+        "/api/v1/admin/tracker-farms",
+        farm_payload(photo_ids=[str(testimonial_asset.pk), str(reward_asset.pk)]),
+        format="json",
+    ).json()["data"]
+
+    with django_capture_on_commit_callbacks(execute=True):
+        response = tracker_admin_api.delete(
+            f"/api/v1/admin/tracker-farms/{created['id']}"
+        )
+
+    assert response.status_code == 204
+    assert MediaAsset.objects.filter(pk=testimonial_asset.pk).exists()
+    assert MediaAsset.objects.filter(pk=reward_asset.pk).exists()
+    assert not ContentAuditLog.objects.filter(
+        action="tracker_farm.media.orphan_cleanup",
+        entity_id__in=[str(testimonial_asset.pk), str(reward_asset.pk)],
+    ).exists()
 
 
 @pytest.mark.django_db
@@ -200,7 +363,18 @@ def test_public_tracker_farms_localize_en_and_vi_and_hide_internal_fields(client
                 "width": 1200,
                 "height": 900,
                 "alt": "Green Valley Farm",
+                "variants": [],
             },
+            "images": [
+                {
+                    "id": str(image.pk),
+                    "url": f"http://testserver/media/{image.file.name}",
+                    "width": 1200,
+                    "height": 900,
+                    "alt": "Green Valley Farm",
+                    "variants": [],
+                }
+            ],
             "signup_count": 14,
             "sort_order": 4,
         }
@@ -217,7 +391,18 @@ def test_public_tracker_farms_localize_en_and_vi_and_hide_internal_fields(client
             "width": 1200,
             "height": 900,
             "alt": "Nông trại Thung Lũng Xanh",
+            "variants": [],
         },
+        "images": [
+            {
+                "id": str(image.pk),
+                "url": f"http://testserver/media/{image.file.name}",
+                "width": 1200,
+                "height": 900,
+                "alt": "Nông trại Thung Lũng Xanh",
+                "variants": [],
+            }
+        ],
         "signup_count": 14,
         "sort_order": 4,
     }
@@ -236,12 +421,80 @@ def test_tracker_farm_allows_missing_image_and_empty_descriptions(client, tracke
 
     assert created.status_code == 201, created.json()
     assert created.json()["data"]["image"] is None
+    assert created.json()["data"]["photos"] == []
     assert created.json()["data"]["description_en"] == ""
     assert created.json()["data"]["description_vi"] == ""
 
     public = client.get("/api/v1/public/tracker-farms?locale=en")
     assert public.json()["data"][0]["image"] is None
+    assert public.json()["data"][0]["images"] == []
     assert public.json()["data"][0]["description"] == ""
+
+
+@pytest.mark.django_db
+def test_admin_and_public_gallery_payloads_are_ordered_localized_and_query_bounded(
+    client,
+    tracker_admin_api,
+    django_assert_num_queries,
+):
+    first = create_media_asset(
+        original_name="first.webp",
+        variants=[{"file": "farms/first-480.webp", "width": 480, "height": 360}],
+    )
+    second = create_media_asset(original_name="second.webp")
+    created = tracker_admin_api.post(
+        "/api/v1/admin/tracker-farms",
+        farm_payload(
+            description_en="English description",
+            description_vi="Mô tả tiếng Việt",
+            photo_ids=[str(second.pk), str(first.pk)],
+        ),
+        format="json",
+    )
+    assert created.status_code == 201, created.json()
+
+    admin = tracker_admin_api.get("/api/v1/admin/tracker-farms")
+    assert admin.status_code == 200
+    assert [item["id"] for item in admin.json()["data"][0]["photos"]] == [
+        str(second.pk),
+        str(first.pk),
+    ]
+    assert admin.json()["data"][0]["photos"][1]["variants"] == [
+        {
+            "file": "farms/first-480.webp",
+            "url": "http://testserver/media/farms/first-480.webp",
+            "width": 480,
+            "height": 360,
+        }
+    ]
+
+    with django_assert_num_queries(2):
+        english = client.get("/api/v1/public/tracker-farms?locale=en")
+    vietnamese = client.get("/api/v1/public/tracker-farms?locale=vi")
+
+    assert english.status_code == 200
+    assert vietnamese.status_code == 200
+    english_data = english.json()["data"][0]
+    vietnamese_data = vietnamese.json()["data"][0]
+    assert [item["id"] for item in english_data["images"]] == [
+        str(second.pk),
+        str(first.pk),
+    ]
+    assert english_data["image"] == english_data["images"][0]
+    assert english_data["images"][0]["alt"] == "Green Valley Farm"
+    assert english_data["images"][1]["variants"] == [
+        {
+            "url": "http://testserver/media/farms/first-480.webp",
+            "width": 480,
+            "height": 360,
+        }
+    ]
+    assert vietnamese_data["image"] == vietnamese_data["images"][0]
+    assert [item["alt"] for item in vietnamese_data["images"]] == [
+        "Nông trại Thung Lũng Xanh",
+        "Nông trại Thung Lũng Xanh",
+    ]
+    assert vietnamese_data["description"] == "Mô tả tiếng Việt"
 
 
 @pytest.mark.django_db
@@ -257,6 +510,406 @@ def test_tracker_farm_rejects_an_unknown_image_id(tracker_admin_api):
 
 
 @pytest.mark.django_db
+def test_photo_ids_race_returns_field_error_without_partial_create(tracker_admin_api):
+    asset = create_media_asset()
+    original_is_valid = TrackerFarmWriteSerializer.is_valid
+
+    def validate_then_remove_asset(serializer, *args, **kwargs):
+        result = original_is_valid(serializer, *args, **kwargs)
+        MediaAsset.objects.filter(pk=asset.pk).delete()
+        return result
+
+    with patch.object(TrackerFarmWriteSerializer, "is_valid", validate_then_remove_asset):
+        response = tracker_admin_api.post(
+            "/api/v1/admin/tracker-farms",
+            farm_payload(photo_ids=[str(asset.pk)]),
+            format="json",
+        )
+
+    assert response.status_code == 400
+    assert response.json() == {"photo_ids": [f"Media assets do not exist: {asset.pk}."]}
+    assert TrackerFarm.objects.count() == 0
+    assert TrackerFarmPhoto.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_legacy_image_id_race_returns_field_error_without_partial_update(tracker_admin_api):
+    farm = create_farm(name_en="Original name")
+    asset = create_media_asset()
+    original_is_valid = TrackerFarmUpdateSerializer.is_valid
+
+    def validate_then_remove_asset(serializer, *args, **kwargs):
+        result = original_is_valid(serializer, *args, **kwargs)
+        MediaAsset.objects.filter(pk=asset.pk).delete()
+        return result
+
+    with patch.object(TrackerFarmUpdateSerializer, "is_valid", validate_then_remove_asset):
+        response = tracker_admin_api.patch(
+            f"/api/v1/admin/tracker-farms/{farm.pk}",
+            {
+                "version": farm.version,
+                "name_en": "Should roll back",
+                "image_id": str(asset.pk),
+            },
+            format="json",
+        )
+
+    assert response.status_code == 400
+    assert response.json() == {"image_id": ["Media asset does not exist."]}
+    farm.refresh_from_db()
+    assert farm.name_en == "Original name"
+    assert farm.version == 1
+    assert farm.image_id is None
+    assert not farm.photos.exists()
+
+
+@pytest.mark.django_db
+def test_admin_create_and_update_ordered_tracker_farm_gallery(tracker_admin_api):
+    first = create_media_asset(original_name="first.webp")
+    second = create_media_asset(original_name="second.webp")
+    third = create_media_asset(original_name="third.webp")
+
+    created = tracker_admin_api.post(
+        "/api/v1/admin/tracker-farms",
+        farm_payload(photo_ids=[str(second.pk), str(first.pk), str(third.pk)]),
+        format="json",
+    )
+
+    assert created.status_code == 201, created.json()
+    created_data = created.json()["data"]
+    assert [item["id"] for item in created_data["photos"]] == [
+        str(second.pk),
+        str(first.pk),
+        str(third.pk),
+    ]
+    assert created_data["image"]["id"] == str(second.pk)
+    assert created_data["version"] == 1
+    farm = TrackerFarm.objects.get(pk=created_data["id"])
+    assert list(farm.photos.values_list("image_id", "sort_order")) == [
+        (second.pk, 0),
+        (first.pk, 1),
+        (third.pk, 2),
+    ]
+
+    updated = tracker_admin_api.patch(
+        f"/api/v1/admin/tracker-farms/{farm.pk}",
+        {
+            "version": created_data["version"],
+            "photo_ids": [str(third.pk), str(first.pk)],
+        },
+        format="json",
+    )
+
+    assert updated.status_code == 200, updated.json()
+    updated_data = updated.json()["data"]
+    assert [item["id"] for item in updated_data["photos"]] == [
+        str(third.pk),
+        str(first.pk),
+    ]
+    assert updated_data["image"]["id"] == str(third.pk)
+    assert updated_data["version"] == 2
+    farm.refresh_from_db()
+    assert farm.image_id == third.pk
+    assert list(farm.photos.values_list("image_id", "sort_order")) == [
+        (third.pk, 0),
+        (first.pk, 1),
+    ]
+
+    cleared = tracker_admin_api.patch(
+        f"/api/v1/admin/tracker-farms/{farm.pk}",
+        {"version": updated_data["version"], "photo_ids": []},
+        format="json",
+    )
+    assert cleared.status_code == 200, cleared.json()
+    assert cleared.json()["data"]["photos"] == []
+    assert cleared.json()["data"]["image"] is None
+    assert cleared.json()["data"]["version"] == 3
+
+
+@pytest.mark.django_db
+def test_gallery_update_cleans_removed_exclusive_asset_and_files(
+    tracker_admin_api,
+    settings,
+    tmp_path,
+    django_capture_on_commit_callbacks,
+):
+    settings.MEDIA_ROOT = tmp_path
+    removed_asset, removed_files = create_stored_media_asset("gallery-removed")
+    retained_asset, retained_files = create_stored_media_asset("gallery-retained")
+    created = tracker_admin_api.post(
+        "/api/v1/admin/tracker-farms",
+        farm_payload(photo_ids=[str(removed_asset.pk), str(retained_asset.pk)]),
+        format="json",
+    ).json()["data"]
+
+    with django_capture_on_commit_callbacks(execute=True):
+        response = tracker_admin_api.patch(
+            f"/api/v1/admin/tracker-farms/{created['id']}",
+            {
+                "version": created["version"],
+                "photo_ids": [str(retained_asset.pk)],
+            },
+            format="json",
+        )
+
+    assert response.status_code == 200, response.json()
+    assert not MediaAsset.objects.filter(pk=removed_asset.pk).exists()
+    assert all(not default_storage.exists(file_name) for file_name in removed_files)
+    assert MediaAsset.objects.filter(pk=retained_asset.pk).exists()
+    assert all(default_storage.exists(file_name) for file_name in retained_files)
+    assert ContentAuditLog.objects.filter(
+        action="tracker_farm.media.orphan_cleanup",
+        entity_id=str(removed_asset.pk),
+        context__farm_id=created["id"],
+        context__reason="gallery_update",
+    ).exists()
+
+
+@pytest.mark.django_db
+def test_legacy_gallery_replacement_cleans_old_exclusive_asset(
+    tracker_admin_api,
+    settings,
+    tmp_path,
+    django_capture_on_commit_callbacks,
+):
+    settings.MEDIA_ROOT = tmp_path
+    old_asset, old_files = create_stored_media_asset("legacy-old")
+    new_asset, new_files = create_stored_media_asset("legacy-new")
+    created = tracker_admin_api.post(
+        "/api/v1/admin/tracker-farms",
+        farm_payload(image_id=str(old_asset.pk)),
+        format="json",
+    ).json()["data"]
+
+    with django_capture_on_commit_callbacks(execute=True):
+        response = tracker_admin_api.patch(
+            f"/api/v1/admin/tracker-farms/{created['id']}",
+            {"version": created["version"], "image_id": str(new_asset.pk)},
+            format="json",
+        )
+
+    assert response.status_code == 200, response.json()
+    assert response.json()["data"]["image"]["id"] == str(new_asset.pk)
+    assert not MediaAsset.objects.filter(pk=old_asset.pk).exists()
+    assert all(not default_storage.exists(file_name) for file_name in old_files)
+    assert MediaAsset.objects.filter(pk=new_asset.pk).exists()
+    assert all(default_storage.exists(file_name) for file_name in new_files)
+    assert ContentAuditLog.objects.filter(
+        action="tracker_farm.media.orphan_cleanup",
+        entity_id=str(old_asset.pk),
+        context__reason="gallery_update",
+    ).exists()
+
+
+@pytest.mark.django_db
+def test_gallery_update_retains_asset_shared_with_another_farm(
+    tracker_admin_api,
+    settings,
+    tmp_path,
+    django_capture_on_commit_callbacks,
+):
+    settings.MEDIA_ROOT = tmp_path
+    shared_asset, shared_files = create_stored_media_asset("gallery-shared")
+    replacement = create_media_asset(original_name="replacement.webp")
+    first = tracker_admin_api.post(
+        "/api/v1/admin/tracker-farms",
+        farm_payload(name_en="First", photo_ids=[str(shared_asset.pk)]),
+        format="json",
+    ).json()["data"]
+    second = tracker_admin_api.post(
+        "/api/v1/admin/tracker-farms",
+        farm_payload(name_en="Second", photo_ids=[str(shared_asset.pk)]),
+        format="json",
+    ).json()["data"]
+
+    with django_capture_on_commit_callbacks(execute=True):
+        response = tracker_admin_api.patch(
+            f"/api/v1/admin/tracker-farms/{first['id']}",
+            {"version": first["version"], "photo_ids": [str(replacement.pk)]},
+            format="json",
+        )
+
+    assert response.status_code == 200, response.json()
+    assert MediaAsset.objects.filter(pk=shared_asset.pk).exists()
+    assert all(default_storage.exists(file_name) for file_name in shared_files)
+    assert TrackerFarmPhoto.objects.filter(
+        farm_id=second["id"], image_id=shared_asset.pk
+    ).exists()
+    assert not ContentAuditLog.objects.filter(
+        action="tracker_farm.media.orphan_cleanup",
+        entity_id=str(shared_asset.pk),
+    ).exists()
+
+
+@pytest.mark.django_db
+def test_unchanged_photo_ids_do_not_replace_relations_or_run_cleanup(
+    tracker_admin_api,
+    settings,
+    tmp_path,
+    django_capture_on_commit_callbacks,
+):
+    settings.MEDIA_ROOT = tmp_path
+    first, first_files = create_stored_media_asset("unchanged-first")
+    second, second_files = create_stored_media_asset("unchanged-second")
+    created = tracker_admin_api.post(
+        "/api/v1/admin/tracker-farms",
+        farm_payload(photo_ids=[str(first.pk), str(second.pk)]),
+        format="json",
+    ).json()["data"]
+    relation_ids = list(
+        TrackerFarmPhoto.objects.filter(farm_id=created["id"])
+        .order_by("sort_order")
+        .values_list("pk", flat=True)
+    )
+
+    with django_capture_on_commit_callbacks(execute=True):
+        response = tracker_admin_api.patch(
+            f"/api/v1/admin/tracker-farms/{created['id']}",
+            {
+                "version": created["version"],
+                "photo_ids": [str(first.pk), str(second.pk)],
+            },
+            format="json",
+        )
+
+    assert response.status_code == 200, response.json()
+    assert list(
+        TrackerFarmPhoto.objects.filter(farm_id=created["id"])
+        .order_by("sort_order")
+        .values_list("pk", flat=True)
+    ) == relation_ids
+    assert MediaAsset.objects.filter(pk__in=[first.pk, second.pk]).count() == 2
+    assert all(
+        default_storage.exists(file_name)
+        for file_name in first_files | second_files
+    )
+    assert not ContentAuditLog.objects.filter(
+        action="tracker_farm.media.orphan_cleanup",
+        context__farm_id=created["id"],
+        context__reason="gallery_update",
+    ).exists()
+
+
+@pytest.mark.django_db
+def test_tracker_farm_gallery_rejects_limit_duplicates_unknown_and_legacy_mix(
+    tracker_admin_api,
+):
+    assets = [create_media_asset() for _index in range(13)]
+    unknown_id = uuid4()
+
+    too_many = tracker_admin_api.post(
+        "/api/v1/admin/tracker-farms",
+        farm_payload(photo_ids=[str(asset.pk) for asset in assets]),
+        format="json",
+    )
+    duplicate = tracker_admin_api.post(
+        "/api/v1/admin/tracker-farms",
+        farm_payload(photo_ids=[str(assets[0].pk), str(assets[0].pk)]),
+        format="json",
+    )
+    unknown = tracker_admin_api.post(
+        "/api/v1/admin/tracker-farms",
+        farm_payload(photo_ids=[str(assets[0].pk), str(unknown_id)]),
+        format="json",
+    )
+    mixed = tracker_admin_api.post(
+        "/api/v1/admin/tracker-farms",
+        farm_payload(image_id=str(assets[0].pk), photo_ids=[str(assets[1].pk)]),
+        format="json",
+    )
+
+    assert too_many.status_code == 400
+    assert "photo_ids" in too_many.json()
+    assert duplicate.status_code == 400
+    assert "unique" in str(duplicate.json()["photo_ids"]).lower()
+    assert unknown.status_code == 400
+    assert str(unknown_id) in str(unknown.json()["photo_ids"])
+    assert mixed.status_code == 400
+    assert "photo_ids" in mixed.json()
+    assert TrackerFarm.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_legacy_image_id_create_update_and_null_gallery_compatibility(tracker_admin_api):
+    first = create_media_asset(original_name="first.webp")
+    second = create_media_asset(original_name="second.webp")
+    third = create_media_asset(original_name="third.webp")
+    created = tracker_admin_api.post(
+        "/api/v1/admin/tracker-farms",
+        farm_payload(image_id=str(first.pk)),
+        format="json",
+    )
+
+    assert created.status_code == 201, created.json()
+    data = created.json()["data"]
+    assert [item["id"] for item in data["photos"]] == [str(first.pk)]
+
+    gallery = tracker_admin_api.patch(
+        f"/api/v1/admin/tracker-farms/{data['id']}",
+        {
+            "version": data["version"],
+            "photo_ids": [str(first.pk), str(second.pk), str(third.pk)],
+        },
+        format="json",
+    ).json()["data"]
+    unchanged_legacy = tracker_admin_api.patch(
+        f"/api/v1/admin/tracker-farms/{data['id']}",
+        {"version": gallery["version"], "image_id": str(first.pk)},
+        format="json",
+    )
+
+    assert unchanged_legacy.status_code == 200, unchanged_legacy.json()
+    unchanged_data = unchanged_legacy.json()["data"]
+    assert [item["id"] for item in unchanged_data["photos"]] == [
+        str(first.pk),
+        str(second.pk),
+        str(third.pk),
+    ]
+
+    changed_legacy = tracker_admin_api.patch(
+        f"/api/v1/admin/tracker-farms/{data['id']}",
+        {"version": unchanged_data["version"], "image_id": str(second.pk)},
+        format="json",
+    )
+    assert changed_legacy.status_code == 200, changed_legacy.json()
+    changed_data = changed_legacy.json()["data"]
+    assert [item["id"] for item in changed_data["photos"]] == [str(second.pk)]
+    assert changed_data["image"]["id"] == str(second.pk)
+
+    removed = tracker_admin_api.patch(
+        f"/api/v1/admin/tracker-farms/{data['id']}",
+        {"version": changed_data["version"], "image_id": None},
+        format="json",
+    )
+    assert removed.status_code == 200, removed.json()
+    assert removed.json()["data"]["photos"] == []
+    assert removed.json()["data"]["image"] is None
+
+
+@pytest.mark.django_db
+def test_gallery_stale_version_conflict_is_atomic(tracker_admin_api):
+    first = create_media_asset()
+    second = create_media_asset()
+    created = tracker_admin_api.post(
+        "/api/v1/admin/tracker-farms",
+        farm_payload(photo_ids=[str(first.pk)]),
+        format="json",
+    ).json()["data"]
+
+    response = tracker_admin_api.patch(
+        f"/api/v1/admin/tracker-farms/{created['id']}",
+        {"version": created["version"] + 1, "photo_ids": [str(second.pk)]},
+        format="json",
+    )
+
+    assert response.status_code == 409
+    farm = TrackerFarm.objects.get(pk=created["id"])
+    assert farm.version == created["version"]
+    assert farm.image_id == first.pk
+    assert list(farm.photos.values_list("image_id", flat=True)) == [first.pk]
+
+
+@pytest.mark.django_db
 def test_tracker_farm_media_upload_uses_the_farms_prefix(tracker_admin_api):
     response = tracker_admin_api.post(
         "/api/v1/admin/tracker-farms/media",
@@ -267,6 +920,92 @@ def test_tracker_farm_media_upload_uses_the_farms_prefix(tracker_admin_api):
     assert response.status_code == 201, response.json()
     asset = MediaAsset.objects.get(pk=response.json()["data"]["id"])
     assert asset.file.name.startswith("farms/")
+
+
+@pytest.mark.django_db
+def test_temporary_tracker_farm_media_cleanup_deletes_unreferenced_asset_and_files(
+    tracker_admin_api,
+    settings,
+    tmp_path,
+    django_capture_on_commit_callbacks,
+):
+    settings.MEDIA_ROOT = tmp_path
+    asset, file_names = create_stored_media_asset("temporary-cleanup")
+
+    with django_capture_on_commit_callbacks(execute=True):
+        response = tracker_admin_api.delete(
+            f"/api/v1/admin/tracker-farms/media/{asset.pk}"
+        )
+
+    assert response.status_code == 204
+    assert not MediaAsset.objects.filter(pk=asset.pk).exists()
+    assert all(not default_storage.exists(file_name) for file_name in file_names)
+    assert ContentAuditLog.objects.filter(
+        action="tracker_farm.media.orphan_cleanup",
+        entity_id=str(asset.pk),
+        context__reason="temporary_upload_cancel",
+    ).exists()
+
+
+@pytest.mark.django_db
+def test_temporary_tracker_farm_media_cleanup_retains_referenced_asset(
+    tracker_admin_api,
+    settings,
+    tmp_path,
+    django_capture_on_commit_callbacks,
+):
+    settings.MEDIA_ROOT = tmp_path
+    asset, file_names = create_stored_media_asset("temporary-referenced")
+    farm = create_farm(image=asset)
+    TrackerFarmPhoto.objects.create(farm=farm, image=asset, sort_order=0)
+
+    with django_capture_on_commit_callbacks(execute=True):
+        response = tracker_admin_api.delete(
+            f"/api/v1/admin/tracker-farms/media/{asset.pk}"
+        )
+
+    assert response.status_code == 409
+    assert response.json() == {"errors": [{"code": "media_asset_referenced"}]}
+    assert MediaAsset.objects.filter(pk=asset.pk).exists()
+    assert all(default_storage.exists(file_name) for file_name in file_names)
+    assert not ContentAuditLog.objects.filter(
+        action="tracker_farm.media.orphan_cleanup",
+        entity_id=str(asset.pk),
+        context__reason="temporary_upload_cancel",
+    ).exists()
+
+
+@pytest.mark.django_db
+def test_temporary_tracker_farm_media_cleanup_rejects_non_farm_asset(
+    tracker_admin_api,
+    settings,
+    tmp_path,
+    django_capture_on_commit_callbacks,
+):
+    settings.MEDIA_ROOT = tmp_path
+    asset, file_names = create_stored_media_asset("not-a-farm", "rewards")
+
+    with django_capture_on_commit_callbacks(execute=True):
+        response = tracker_admin_api.delete(
+            f"/api/v1/admin/tracker-farms/media/{asset.pk}"
+        )
+
+    assert response.status_code == 400
+    assert "media" in response.json()
+    assert MediaAsset.objects.filter(pk=asset.pk).exists()
+    assert all(default_storage.exists(file_name) for file_name in file_names)
+
+
+@pytest.mark.django_db
+def test_temporary_tracker_farm_media_cleanup_requires_website_admin(access_token):
+    bearer = APIClient()
+    bearer.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token.token}")
+    asset = create_media_asset()
+
+    response = bearer.delete(f"/api/v1/admin/tracker-farms/media/{asset.pk}")
+
+    assert response.status_code == 403
+    assert MediaAsset.objects.filter(pk=asset.pk).exists()
 
 
 @pytest.mark.django_db
@@ -460,10 +1199,56 @@ def test_mutations_revalidate_tracker_farms_after_commit(
 
 
 @pytest.mark.django_db
-def test_tracker_farm_migration_creates_no_sample_records():
-    migration = importlib.import_module("content.migrations.0017_tracker_farm_content")
+def test_tracker_farm_photo_migration_backfills_legacy_image_at_zero_when_empty():
+    migration = importlib.import_module("content.migrations.0018_tracker_farm_photos")
+    image = create_media_asset()
+    farm = create_farm(image=image)
 
-    assert not any(
-        isinstance(operation, migrations.RunPython) for operation in migration.Migration.operations
-    )
+    migration.backfill_tracker_farm_photos(django_apps, None)
+    migration.backfill_tracker_farm_photos(django_apps, None)
+
+    assert list(farm.photos.values_list("image_id", "sort_order")) == [(image.pk, 0)]
+
+
+@pytest.mark.django_db
+def test_tracker_farm_photo_migration_ignores_an_existing_legacy_image_row():
+    migration = importlib.import_module("content.migrations.0018_tracker_farm_photos")
+    image = create_media_asset()
+    farm = create_farm(image=image)
+    existing = TrackerFarmPhoto.objects.create(farm=farm, image=image, sort_order=4)
+
+    migration.backfill_tracker_farm_photos(django_apps, None)
+
+    assert list(farm.photos.values_list("id", "image_id", "sort_order")) == [
+        (existing.pk, image.pk, 4)
+    ]
+
+
+@pytest.mark.django_db
+def test_tracker_farm_photo_migration_uses_next_free_order_for_legacy_image():
+    migration = importlib.import_module("content.migrations.0018_tracker_farm_photos")
+    legacy_image = create_media_asset()
+    first_existing_image = create_media_asset()
+    second_existing_image = create_media_asset()
+    farm = create_farm(image=legacy_image)
+    TrackerFarmPhoto.objects.create(farm=farm, image=first_existing_image, sort_order=0)
+    TrackerFarmPhoto.objects.create(farm=farm, image=second_existing_image, sort_order=2)
+
+    migration.backfill_tracker_farm_photos(django_apps, None)
+    migration.backfill_tracker_farm_photos(django_apps, None)
+
+    assert list(farm.photos.values_list("image_id", "sort_order")) == [
+        (first_existing_image.pk, 0),
+        (legacy_image.pk, 1),
+        (second_existing_image.pk, 2),
+    ]
+
+
+@pytest.mark.django_db
+def test_tracker_farm_photo_migration_creates_no_sample_records():
+    migration = importlib.import_module("content.migrations.0018_tracker_farm_photos")
+
+    migration.backfill_tracker_farm_photos(django_apps, None)
+
     assert TrackerFarm.objects.count() == 0
+    assert TrackerFarmPhoto.objects.count() == 0
