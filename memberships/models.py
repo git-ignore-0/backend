@@ -30,6 +30,30 @@ class MembershipContentLocale(models.TextChoices):
     EN = "en", "English"
 
 
+class CSACustomer(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        related_name="csa_customer",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+    )
+    name = models.CharField(max_length=150)
+    phone_e164 = models.CharField(max_length=13, null=True, blank=True, unique=True)
+    province_code = models.CharField(max_length=2, blank=True)
+    ward_code = models.CharField(max_length=5, blank=True)
+    address = models.CharField(max_length=500, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["name", "id"]
+
+    def __str__(self) -> str:
+        return self.name
+
+
 class Product(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=200)
@@ -179,9 +203,7 @@ class MembershipPackageItem(models.Model):
 
 class Membership(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    user = models.ForeignKey(
-        settings.AUTH_USER_MODEL, related_name="memberships", on_delete=models.PROTECT
-    )
+    customer = models.ForeignKey(CSACustomer, related_name="memberships", on_delete=models.PROTECT)
     package = models.ForeignKey(
         MembershipPackage, related_name="memberships", on_delete=models.PROTECT
     )
@@ -199,9 +221,7 @@ class Membership(models.Model):
     duration_months_snapshot = models.PositiveSmallIntegerField()
     quota_policy_snapshot = models.CharField(max_length=16, choices=QuotaPolicy.choices)
     farmbrite_order_reference = models.CharField(max_length=120, unique=True)
-    farmbrite_order_reference_key = models.CharField(
-        max_length=240, unique=True, editable=False
-    )
+    farmbrite_order_reference_key = models.CharField(max_length=240, unique=True, editable=False)
     start_date = models.DateField()
     end_date = models.DateField()
     status = models.CharField(
@@ -229,9 +249,6 @@ class Membership(models.Model):
     class Meta:
         ordering = ["-activated_at", "-id"]
         constraints = [
-            models.UniqueConstraint(
-                fields=["user", "current_slot"], name="memberships_one_current_per_user"
-            ),
             models.CheckConstraint(
                 condition=Q(end_date__gt=models.F("start_date")), name="memberships_dates_valid"
             ),
@@ -360,9 +377,7 @@ class MembershipUsageOrder(models.Model):
     membership = models.ForeignKey(
         Membership, related_name="usage_orders", on_delete=models.PROTECT
     )
-    user = models.ForeignKey(
-        settings.AUTH_USER_MODEL, related_name="membership_usage_orders", on_delete=models.PROTECT
-    )
+    customer = models.ForeignKey(CSACustomer, related_name="usage_orders", on_delete=models.PROTECT)
     idempotency_key = models.UUIDField()
     status = models.CharField(
         max_length=12, choices=UsageOrderStatus.choices, default=UsageOrderStatus.APPLIED
@@ -381,7 +396,7 @@ class MembershipUsageOrder(models.Model):
         ordering = ["-created_at", "-id"]
         indexes = [
             models.Index(fields=["membership", "-created_at"]),
-            models.Index(fields=["user", "-created_at"]),
+            models.Index(fields=["customer", "-created_at"]),
         ]
         constraints = [
             models.UniqueConstraint(

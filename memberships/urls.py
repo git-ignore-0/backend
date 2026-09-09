@@ -11,6 +11,7 @@ router.register(
     "admin/membership-packages", views.AdminPackageViewSet, basename="admin-membership-package"
 )
 router.register("admin/memberships", views.AdminMembershipViewSet, basename="admin-membership")
+router.register("admin/csa-customers", views.AdminCSACustomerViewSet, basename="admin-csa-customer")
 router.register(
     "admin/membership-usage", views.AdminUsageViewSet, basename="admin-membership-usage"
 )

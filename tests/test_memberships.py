@@ -16,6 +16,7 @@ from rest_framework.test import APIClient
 from identity.models import AccountStatus, User
 from members.models import MemberProfile
 from memberships.models import (
+    CSACustomer,
     Membership,
     MembershipCycle,
     MembershipCycleQuota,
@@ -35,10 +36,10 @@ from memberships.models import (
 )
 from memberships.pricing import MAX_POSITIVE_BIG_INTEGER
 from memberships.services import (
-    ActiveMembershipExists,
     DuplicateFarmbriteOrderReference,
     InsufficientQuota,
     MembershipNotRevocable,
+    MembershipOverlap,
     PriceOptionTotalInvalid,
     PriceOptionUnavailable,
     ProductNotInMembership,
@@ -47,6 +48,8 @@ from memberships.services import (
     UsageUndoConflict,
     add_months,
     assign_membership,
+    create_csa_customer_for_user,
+    create_managed_csa_customer,
     create_usage_order,
     ensure_due_cycles,
     revoke_membership,
@@ -72,6 +75,21 @@ def create_active_user(email, *, phone="0901234567"):
     if phone is not None:
         MemberProfile.objects.create(user=user, phone_number=phone)
     return user
+
+
+def customer_for(user):
+    try:
+        return CSACustomer.objects.get(user=user)
+    except CSACustomer.DoesNotExist:
+        suffix = str(user.pk.int)[-8:].zfill(8)
+        return create_csa_customer_for_user(
+            user=user,
+            name=user.name,
+            phone=f"090{suffix[-7:]}",
+            province_code="66",
+            ward_code="22015",
+            address="Số 12, ngõ 5",
+        )
 
 
 def product_translations(
@@ -150,7 +168,7 @@ def assign(
     else:
         product = package.items.get().product
     membership = assign_membership(
-        user_id=user.pk,
+        customer_id=customer_for(user).pk,
         package_id=package.pk,
         price_option_id=option.pk,
         start_date=start_date or timezone.localdate(),
@@ -485,7 +503,7 @@ def test_assignment_rejects_wrong_or_inactive_option(active_user):
     other_package, _other_product, other_option = create_package()
     with pytest.raises(PriceOptionUnavailable):
         assign_membership(
-            user_id=active_user.pk,
+            customer_id=customer_for(active_user).pk,
             package_id=package.pk,
             price_option_id=other_option.pk,
             start_date=timezone.localdate(),
@@ -496,7 +514,7 @@ def test_assignment_rejects_wrong_or_inactive_option(active_user):
     other_option.save(update_fields=["is_active", "updated_at"])
     with pytest.raises(PriceOptionUnavailable):
         assign_membership(
-            user_id=active_user.pk,
+            customer_id=customer_for(active_user).pk,
             package_id=other_package.pk,
             price_option_id=other_option.pk,
             start_date=timezone.localdate(),
@@ -529,6 +547,7 @@ def test_price_total_overflow_returns_400_for_package_and_assignment(admin_api, 
     assert "monthly_price_vnd" in package_response.json()["price_options"][0]
 
     package, _product, option = create_package()
+    customer = customer_for(active_user)
     patch_response = admin_api.patch(
         f"/api/v1/admin/membership-packages/{package.pk}",
         {
@@ -557,7 +576,7 @@ def test_price_total_overflow_returns_400_for_package_and_assignment(admin_api, 
     response = admin_api.post(
         "/api/v1/admin/memberships",
         {
-            "user_id": str(active_user.pk),
+            "customer_id": str(customer.pk),
             "package_id": str(package.pk),
             "price_option_id": str(overflow_option.pk),
             "start_date": timezone.localdate().isoformat(),
@@ -567,11 +586,11 @@ def test_price_total_overflow_returns_400_for_package_and_assignment(admin_api, 
     )
     assert response.status_code == 400
     assert "price_option_id" in response.json()
-    assert not Membership.objects.filter(user=active_user).exists()
+    assert not Membership.objects.filter(customer__user=active_user).exists()
 
     with pytest.raises(PriceOptionTotalInvalid):
         assign_membership(
-            user_id=active_user.pk,
+            customer_id=customer.pk,
             package_id=package.pk,
             price_option_id=overflow_option.pk,
             start_date=timezone.localdate(),
@@ -595,7 +614,7 @@ def test_assignment_dates_allow_today_and_future_but_reject_past(active_user):
     past = timezone.localdate() - timedelta(days=1)
     with pytest.raises(StartDateInPast):
         assign_membership(
-            user_id=active_user.pk,
+            customer_id=customer_for(active_user).pk,
             package_id=package.pk,
             price_option_id=option.pk,
             start_date=past,
@@ -621,12 +640,12 @@ def test_assignment_dates_allow_today_and_future_but_reject_past(active_user):
 
 
 @pytest.mark.django_db
-def test_user_cannot_have_multiple_current_memberships(active_user):
+def test_customer_memberships_cannot_overlap(active_user):
     package, _product, option = create_package()
     assign(active_user, package=package, option=option, reference="FB-FIRST")
-    with pytest.raises(ActiveMembershipExists):
+    with pytest.raises(MembershipOverlap):
         assign(active_user, package=package, option=option, reference="FB-SECOND")
-    assert Membership.objects.filter(user=active_user).count() == 1
+    assert Membership.objects.filter(customer__user=active_user).count() == 1
 
 
 @pytest.mark.django_db
@@ -657,8 +676,9 @@ def test_live_catalog_and_price_changes_do_not_change_membership_snapshot(active
 @pytest.mark.django_db
 def test_admin_assignment_api_rejects_unknown_fields_and_returns_snapshot(admin_api, active_user):
     package, _product, option = create_package()
+    customer = customer_for(active_user)
     payload = {
-        "user_id": str(active_user.pk),
+        "customer_id": str(customer.pk),
         "package_id": str(package.pk),
         "price_option_id": str(option.pk),
         "start_date": timezone.localdate().isoformat(),
@@ -673,7 +693,7 @@ def test_admin_assignment_api_rejects_unknown_fields_and_returns_snapshot(admin_
     response = admin_api.post("/api/v1/admin/memberships", payload, format="json")
     assert response.status_code == 201
     data = response.json()["data"]
-    assert data["user"]["id"] == str(active_user.pk)
+    assert data["customer"]["user"]["id"] == str(active_user.pk)
     assert data["price_option_id"] == str(option.pk)
     assert data["price_option"] == {
         "duration_months": 6,
@@ -787,8 +807,14 @@ def test_usage_rejects_other_product_and_corrupted_membership_user(active_user):
         idempotency_key=uuid.uuid4(),
         lines=[{"product_id": product.pk, "units": 1}],
     )
-    other_user = create_active_user("corrupt-membership@example.com")
-    MembershipUsageOrder.objects.filter(pk=order.pk).update(user=other_user)
+    other_customer = create_managed_csa_customer(
+        name="Other customer",
+        phone="0909999999",
+        province_code="66",
+        ward_code="22015",
+        address="Số 20",
+    )
+    MembershipUsageOrder.objects.filter(pk=order.pk).update(customer=other_customer)
     with pytest.raises(UsageIntegrityConflict):
         undo_usage_order(order_id=order.pk, actor=active_user, reason="Must fail")
 
@@ -1002,14 +1028,10 @@ def test_price_option_migration_preserves_historical_membership_price_and_usage(
 
 
 @pytest.mark.django_db
-def test_mysql_safe_current_slot_constraint_has_no_partial_index():
-    constraint = next(
-        item
-        for item in Membership._meta.constraints
-        if item.name == "memberships_one_current_per_user"
-    )
-    assert constraint.condition is None
-    assert constraint.fields == ("user", "current_slot")
+def test_scheduling_has_no_single_current_membership_constraint():
+    assert "memberships_one_current_per_customer" not in {
+        item.name for item in Membership._meta.constraints
+    }
 
 
 @pytest.mark.skipif(
@@ -1019,6 +1041,7 @@ def test_mysql_safe_current_slot_constraint_has_no_partial_index():
 @pytest.mark.django_db(transaction=True)
 def test_concurrent_manual_assignment_creates_only_one_current_membership():
     user = create_active_user("concurrent-assignment@example.com")
+    customer = customer_for(user)
     package, _product, option = create_package()
     barrier = threading.Barrier(3)
     outcomes = []
@@ -1028,7 +1051,7 @@ def test_concurrent_manual_assignment_creates_only_one_current_membership():
         try:
             barrier.wait()
             assign_membership(
-                user_id=user.pk,
+                customer_id=customer.pk,
                 package_id=package.pk,
                 price_option_id=option.pk,
                 start_date=timezone.localdate(),
@@ -1036,8 +1059,8 @@ def test_concurrent_manual_assignment_creates_only_one_current_membership():
                 actor=User.objects.get(pk=user.pk),
             )
             outcomes.append("created")
-        except ActiveMembershipExists:
-            outcomes.append("active_exists")
+        except MembershipOverlap:
+            outcomes.append("overlap")
         finally:
             close_old_connections()
 
@@ -1050,8 +1073,8 @@ def test_concurrent_manual_assignment_creates_only_one_current_membership():
     barrier.wait()
     for thread in threads:
         thread.join()
-    assert sorted(outcomes) == ["active_exists", "created"]
-    assert Membership.objects.filter(user=user, current_slot=True).count() == 1
+    assert sorted(outcomes) == ["created", "overlap"]
+    assert Membership.objects.filter(customer__user=user, current_slot=True).count() == 1
 
 
 @pytest.mark.skipif(

@@ -56,6 +56,44 @@ class AdminMembershipQuerySerializer(LocalePageQuerySerializer):
     search = serializers.CharField(max_length=254, allow_blank=True, default="")
 
 
+class AdminCSACustomerQuerySerializer(PageQuerySerializer):
+    page_size = serializers.IntegerField(min_value=1, max_value=50, default=30)
+    search = serializers.CharField(max_length=150, allow_blank=True, default="")
+    linked = serializers.ChoiceField(choices=("all", "linked", "managed"), default="all")
+    membership_status = serializers.ChoiceField(
+        choices=("scheduled", "active", "ended", "revoked"), required=False
+    )
+
+
+class CSACustomerCreateSerializer(StrictSerializer):
+    user_id = serializers.UUIDField(required=False)
+    name = serializers.CharField(
+        max_length=150, trim_whitespace=True, allow_blank=True, required=False
+    )
+    phone = serializers.CharField(
+        max_length=32, trim_whitespace=True, allow_blank=True, allow_null=True, required=False
+    )
+    province_code = serializers.CharField(max_length=2, allow_blank=True, required=False)
+    ward_code = serializers.CharField(max_length=5, allow_blank=True, required=False)
+    address = serializers.CharField(max_length=500, allow_blank=True, required=False)
+
+
+class CSACustomerUpdateSerializer(StrictSerializer):
+    name = serializers.CharField(
+        max_length=150, trim_whitespace=True, allow_blank=True, required=False
+    )
+    phone = serializers.CharField(
+        max_length=32, trim_whitespace=True, allow_blank=True, allow_null=True, required=False
+    )
+    province_code = serializers.CharField(max_length=2, allow_blank=True, required=False)
+    ward_code = serializers.CharField(max_length=5, allow_blank=True, required=False)
+    address = serializers.CharField(max_length=500, allow_blank=True, required=False)
+
+
+class CSACustomerLinkUserSerializer(StrictSerializer):
+    user_id = serializers.UUIDField()
+
+
 class ProductTranslationWriteSerializer(StrictSerializer):
     locale = serializers.ChoiceField(choices=MembershipContentLocale.choices)
     name = serializers.CharField(max_length=200, trim_whitespace=True)
@@ -121,9 +159,7 @@ class PackageItemWriteSerializer(StrictSerializer):
 class PackagePriceOptionWriteSerializer(StrictSerializer):
     id = serializers.UUIDField(required=False)
     duration_months = serializers.IntegerField(min_value=1, max_value=120)
-    monthly_price_vnd = serializers.IntegerField(
-        min_value=1, max_value=MAX_POSITIVE_BIG_INTEGER
-    )
+    monthly_price_vnd = serializers.IntegerField(min_value=1, max_value=MAX_POSITIVE_BIG_INTEGER)
     is_active = serializers.BooleanField(required=False, default=True)
     sort_order = serializers.IntegerField(min_value=0, required=False, default=0)
 
@@ -134,9 +170,7 @@ class PackagePriceOptionWriteSerializer(StrictSerializer):
                 monthly_price_vnd=attrs["monthly_price_vnd"],
             )
         except ValueError as error:
-            raise serializers.ValidationError(
-                {"monthly_price_vnd": str(error)}
-            ) from error
+            raise serializers.ValidationError({"monthly_price_vnd": str(error)}) from error
         return attrs
 
 
@@ -160,9 +194,7 @@ class PackageWriteSerializer(StrictSerializer):
         return value
 
     def validate_price_options(self, value):
-        active_durations = [
-            item["duration_months"] for item in value if item["is_active"]
-        ]
+        active_durations = [item["duration_months"] for item in value if item["is_active"]]
         if len(active_durations) != len(set(active_durations)):
             raise serializers.ValidationError(
                 "Active duration months must be unique within a package."
@@ -171,9 +203,7 @@ class PackageWriteSerializer(StrictSerializer):
         if len(option_ids) != len(set(option_ids)):
             raise serializers.ValidationError("Price option IDs must be unique.")
         if not any(item["is_active"] for item in value):
-            raise serializers.ValidationError(
-                "At least one active price option is required."
-            )
+            raise serializers.ValidationError("At least one active price option is required.")
         return value
 
     def validate(self, attrs):
@@ -199,16 +229,14 @@ class ReasonSerializer(StrictSerializer):
 
 
 class MembershipAssignSerializer(StrictSerializer):
-    user_id = serializers.UUIDField()
+    customer_id = serializers.UUIDField(required=False)
     package_id = serializers.UUIDField()
     price_option_id = serializers.UUIDField()
-    start_date = serializers.DateField()
-    farmbrite_order_reference = serializers.CharField(
-        max_length=120, trim_whitespace=True
-    )
+    start_date = serializers.DateField(required=False, allow_null=True, default=None)
+    farmbrite_order_reference = serializers.CharField(max_length=120, trim_whitespace=True)
 
     def validate_start_date(self, value):
-        if value < timezone.localdate():
+        if value is not None and value < timezone.localdate():
             raise serializers.ValidationError("Start date cannot be in the past.")
         return value
 

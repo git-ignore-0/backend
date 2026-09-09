@@ -249,6 +249,17 @@ def test_administrative_wards_endpoint_returns_localized_wards(client):
     assert response.json()["data"][0] == {"code": "00004", "name": "Ba Dinh Ward"}
 
 
+def test_administrative_provinces_endpoint_returns_auth_form_source(client):
+    response = client.get(
+        "/api/v1/administrative-units/provinces",
+        HTTP_ACCEPT_LANGUAGE="en",
+    )
+
+    assert response.status_code == 200
+    assert response.json()["data"][0] == {"code": "01", "name": "Ha Noi City"}
+    assert len(response.json()["data"]) == 34
+
+
 def test_administrative_wards_endpoint_rejects_unknown_province(client):
     response = client.get(
         "/api/v1/administrative-units/wards",

@@ -14,6 +14,7 @@ from rest_framework.test import APIClient
 from identity.models import AccountStatus, User
 from identity.signup import SIGNUP_REFERRAL_SESSION_KEY
 from members.models import MemberProfile
+from memberships.models import CSACustomer
 from referrals.models import PointTransaction, Referral, ReferralAccount
 from referrals.services import (
     InvalidPointTransaction,
@@ -370,18 +371,33 @@ def test_point_transaction_requires_message(active_user):
 @pytest.mark.django_db
 def test_admin_authorization_search_pagination_detail_and_point_creation(admin_api):
     target = create_active_user("search-target@example.com", "Target", "+84 912 345 678")
+    profile = target.member_profile
+    profile.province_code = "01"
+    profile.ward_code = "00004"
+    profile.address = "No. 12"
+    profile.save(update_fields=["province_code", "ward_code", "address"])
+    CSACustomer.objects.create(user=target, name=target.name, phone_e164="+84912345678")
     for index in range(31):
         create_active_user(f"page-{index:02d}@example.com")
 
     searched = admin_api.get("/api/v1/admin/users?search=912%20345&page=1")
     assert searched.status_code == 200
     assert searched.json()["data"][0]["id"] == str(target.pk)
+    summary = searched.json()["data"][0]
+    assert summary["province_code"] == "01"
+    assert summary["ward_code"] == "00004"
+    assert summary["address"] == "No. 12"
+    assert summary["has_csa_customer"] is True
     assert searched.json()["meta"]["page_size"] == 30
     assert admin_api.get("/api/v1/admin/users?page=2").json()["data"]
 
     detail = admin_api.get(f"/api/v1/admin/users/{target.pk}").json()["data"]
     assert detail["source"] == "organic"
     assert detail["points_balance"] == 0
+    assert detail["province_code"] == "01"
+    assert detail["ward_code"] == "00004"
+    assert detail["address"] == "No. 12"
+    assert detail["has_csa_customer"] is True
     assert "password" not in detail
 
     created = admin_api.post(

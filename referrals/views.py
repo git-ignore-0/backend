@@ -423,6 +423,16 @@ def balance_expression():
     )
 
 
+def admin_user_csa_fields(user):
+    profile = getattr(user, "member_profile", None)
+    return {
+        "province_code": profile.province_code if profile else "",
+        "ward_code": profile.ward_code if profile else "",
+        "address": profile.address if profile else "",
+        "has_csa_customer": hasattr(user, "csa_customer"),
+    }
+
+
 class AdminUserListView(APIView):
     permission_classes = [IsWebsiteAdmin]
 
@@ -430,12 +440,14 @@ class AdminUserListView(APIView):
         query = AdminUserQuerySerializer(data=request.query_params)
         query.is_valid(raise_exception=True)
         search = query.validated_data["search"].strip()
-        queryset = User.objects.select_related("member_profile").annotate(
+        queryset = User.objects.select_related("member_profile", "csa_customer").annotate(
             points_balance=balance_expression()
         )
         if search:
             queryset = queryset.filter(
-                Q(email__icontains=search) | Q(member_profile__phone_number__icontains=search)
+                Q(name__icontains=search)
+                | Q(email__icontains=search)
+                | Q(member_profile__phone_number__icontains=search)
             )
         queryset = queryset.order_by("-date_joined", "-id")
         items, meta = paginate(queryset, query.validated_data["page"], page_size=ADMIN_PAGE_SIZE)
@@ -448,6 +460,7 @@ class AdminUserListView(APIView):
                             "name": user.name,
                             "email": user.email,
                             "phone": user_phone(user),
+                            **admin_user_csa_fields(user),
                             "status": user.status,
                             "date_joined": user.date_joined.isoformat(),
                             "points_balance": user.points_balance,
@@ -475,6 +488,7 @@ def admin_user_payload(user, invited_page: int = 1) -> tuple[dict, dict]:
             "name": user.name,
             "email": user.email,
             "phone": profile.phone_number if profile else "",
+            **admin_user_csa_fields(user),
             "date_joined": user.date_joined.isoformat(),
             "status": user.status,
             "referral_code": account.code,
@@ -503,7 +517,9 @@ class AdminUserDetailView(APIView):
     def get(self, request, user_id):
         query = PageQuerySerializer(data={"page": request.query_params.get("invited_page", 1)})
         query.is_valid(raise_exception=True)
-        user = get_object_or_404(User.objects.select_related("member_profile"), pk=user_id)
+        user = get_object_or_404(
+            User.objects.select_related("member_profile", "csa_customer"), pk=user_id
+        )
         data, invited_meta = admin_user_payload(user, query.validated_data["page"])
         return no_store(Response({"data": data, "meta": {"invited": invited_meta}}))
 

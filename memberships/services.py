@@ -5,8 +5,10 @@ from django.db import IntegrityError, transaction
 from django.db.models import F
 from django.utils import timezone
 
-from identity.models import User
+from identity.models import AuditLog, User
+from members.administrative_units import province_exists, ward_choices
 from memberships.models import (
+    CSACustomer,
     Membership,
     MembershipCycle,
     MembershipCycleQuota,
@@ -25,6 +27,7 @@ from memberships.models import (
     QuotaPolicy,
     UsageOrderStatus,
 )
+from memberships.phones import InvalidPhoneNumber, normalize_vietnam_phone
 from memberships.pricing import calculate_total_price_vnd
 
 
@@ -92,6 +95,222 @@ class UsageIntegrityConflict(QuotaError):
     code = "usage_integrity_conflict"
 
 
+class CSACustomerError(ValueError):
+    code = "invalid_csa_customer"
+
+
+class DuplicateCSACustomerUser(CSACustomerError):
+    code = "csa_customer_user_exists"
+
+
+class DuplicateCSACustomerPhone(CSACustomerError):
+    code = "csa_customer_phone_exists"
+
+
+class CSACustomerPhoneInvalid(CSACustomerError):
+    code = "invalid_csa_customer_phone"
+
+
+class CSACustomerPhoneRequired(CSACustomerError):
+    code = "csa_customer_phone_required"
+
+
+class CSACustomerNameRequired(CSACustomerError):
+    code = "csa_customer_name_required"
+
+
+class CSACustomerProvinceRequired(CSACustomerError):
+    code = "csa_customer_province_required"
+
+
+class CSACustomerWardRequired(CSACustomerError):
+    code = "csa_customer_ward_required"
+
+
+class CSACustomerAddressRequired(CSACustomerError):
+    code = "csa_customer_address_required"
+
+
+class CSACustomerAddressInvalid(CSACustomerError):
+    code = "invalid_csa_customer_address"
+
+
+class CSACustomerIncomplete(CSACustomerError):
+    code = "csa_customer_incomplete"
+
+
+class CSACustomerRequiredForMembership(CSACustomerError):
+    code = "csa_customer_required_for_membership"
+
+
+class MembershipOverlap(MembershipError):
+    code = "membership_overlap"
+
+
+def _required_name(name) -> str:
+    value = (name or "").strip()
+    if not value:
+        raise CSACustomerNameRequired("Customer name is required")
+    return value
+
+
+def _normalized_required_phone(phone) -> str:
+    if phone is None or not str(phone).strip():
+        raise CSACustomerPhoneRequired("Phone number is required")
+    try:
+        return normalize_vietnam_phone(str(phone))
+    except InvalidPhoneNumber as error:
+        raise CSACustomerPhoneInvalid(str(error)) from error
+
+
+def _validated_required_address(*, province_code="", ward_code="", address="") -> dict:
+    province_code = (province_code or "").strip()
+    ward_code = (ward_code or "").strip()
+    address = (address or "").strip()
+    if not province_code:
+        raise CSACustomerProvinceRequired("Province is required")
+    if not ward_code:
+        raise CSACustomerWardRequired("Ward is required")
+    if not address:
+        raise CSACustomerAddressRequired("Detailed address is required")
+    if not province_exists(province_code):
+        raise CSACustomerAddressInvalid("Province code is invalid")
+    valid_wards = {code for code, _name in ward_choices(province_code, "vi")}
+    if ward_code not in valid_wards:
+        raise CSACustomerAddressInvalid("Ward code does not belong to province")
+    return {
+        "province_code": province_code,
+        "ward_code": ward_code,
+        "address": address,
+    }
+
+
+@transaction.atomic
+def create_csa_customer_for_user(
+    *, user, name=None, phone=None, province_code="", ward_code="", address=""
+) -> CSACustomer:
+    user = User.objects.select_for_update().get(pk=user.pk)
+    if CSACustomer.objects.select_for_update().filter(user=user).exists():
+        raise DuplicateCSACustomerUser("User already has a CSA customer")
+    customer_name = _required_name(name)
+    normalized_phone = _normalized_required_phone(phone)
+    delivery_address = _validated_required_address(
+        province_code=province_code,
+        ward_code=ward_code,
+        address=address,
+    )
+    try:
+        with transaction.atomic():
+            return CSACustomer.objects.create(
+                user=user,
+                name=customer_name,
+                phone_e164=normalized_phone,
+                **delivery_address,
+            )
+    except IntegrityError as error:
+        if normalized_phone and CSACustomer.objects.filter(phone_e164=normalized_phone).exists():
+            raise DuplicateCSACustomerPhone(
+                "Phone number already belongs to a CSA customer"
+            ) from error
+        raise DuplicateCSACustomerUser("User already has a CSA customer") from error
+
+
+@transaction.atomic
+def create_managed_csa_customer(
+    *, name, phone, province_code="", ward_code="", address=""
+) -> CSACustomer:
+    customer_name = _required_name(name)
+    normalized_phone = _normalized_required_phone(phone)
+    try:
+        with transaction.atomic():
+            return CSACustomer.objects.create(
+                name=customer_name,
+                phone_e164=normalized_phone,
+                **_validated_required_address(
+                    province_code=province_code, ward_code=ward_code, address=address
+                ),
+            )
+    except IntegrityError as error:
+        raise DuplicateCSACustomerPhone("Phone number already belongs to a CSA customer") from error
+
+
+@transaction.atomic
+def update_csa_customer(
+    *, customer, name=..., phone=..., province_code=..., ward_code=..., address=...
+) -> CSACustomer:
+    customer = CSACustomer.objects.select_for_update().get(pk=customer.pk)
+    if name is not ...:
+        customer.name = _required_name(name)
+    if phone is not ...:
+        customer.phone_e164 = _normalized_required_phone(phone)
+    if (
+        province_code is not ...
+        and (province_code or "").strip()
+        and (province_code or "").strip() != customer.province_code
+        and ward_code is ...
+    ):
+        raise CSACustomerWardRequired("Ward is required when province changes")
+    delivery_address = _validated_required_address(
+        province_code=customer.province_code if province_code is ... else province_code,
+        ward_code=customer.ward_code if ward_code is ... else ward_code,
+        address=customer.address if address is ... else address,
+    )
+    for field, value in delivery_address.items():
+        setattr(customer, field, value)
+    try:
+        with transaction.atomic():
+            customer.save(
+                update_fields=[
+                    "name",
+                    "phone_e164",
+                    "province_code",
+                    "ward_code",
+                    "address",
+                    "updated_at",
+                ]
+            )
+    except IntegrityError as error:
+        raise DuplicateCSACustomerPhone("Phone number already belongs to a CSA customer") from error
+    return customer
+
+
+def ensure_csa_customer_complete(customer: CSACustomer) -> None:
+    try:
+        _required_name(customer.name)
+        _normalized_required_phone(customer.phone_e164)
+        _validated_required_address(
+            province_code=customer.province_code,
+            ward_code=customer.ward_code,
+            address=customer.address,
+        )
+    except CSACustomerError as error:
+        raise CSACustomerIncomplete(
+            "Complete the CSA customer before assigning a package"
+        ) from error
+
+
+@transaction.atomic
+def link_csa_customer_to_user(*, customer, user, actor) -> CSACustomer:
+    user = User.objects.select_for_update().get(pk=user.pk)
+    customer = CSACustomer.objects.select_for_update().get(pk=customer.pk)
+    if customer.user_id:
+        raise DuplicateCSACustomerUser("CSA customer is already linked to a user")
+    if CSACustomer.objects.select_for_update().filter(user=user).exists():
+        raise DuplicateCSACustomerUser("User already has a CSA customer")
+    customer.user = user
+    try:
+        with transaction.atomic():
+            customer.save(update_fields=["user", "updated_at"])
+    except IntegrityError as error:
+        raise DuplicateCSACustomerUser("User already has a CSA customer") from error
+    AuditLog.objects.create(
+        user=actor,
+        action="csa_customer.link_user",
+        context={"customer_id": str(customer.pk), "linked_user_id": str(user.pk)},
+    )
+    return customer
+
+
 def add_months(value: date, months: int) -> date:
     month_index = value.month - 1 + months
     year = value.year + month_index // 12
@@ -120,16 +339,12 @@ def sync_package_price_options(*, package: MembershipPackage, options: list[dict
         .filter(package=package)
         .order_by("id")
     }
-    supplied_ids = {
-        str(item["id"]) for item in normalized_options if item.get("id")
-    }
+    supplied_ids = {str(item["id"]) for item in normalized_options if item.get("id")}
     if unknown := supplied_ids - set(existing):
         raise PriceOptionConflict(f"Price options do not belong to package: {sorted(unknown)}")
     if not any(item["is_active"] for item in normalized_options):
         raise PriceOptionConflict("A package requires at least one active price option")
-    active_durations = [
-        item["duration_months"] for item in normalized_options if item["is_active"]
-    ]
+    active_durations = [item["duration_months"] for item in normalized_options if item["is_active"]]
     if len(active_durations) != len(set(active_durations)):
         raise PriceOptionConflict(
             "A package cannot have two active price options with the same duration"
@@ -155,9 +370,7 @@ def sync_package_price_options(*, package: MembershipPackage, options: list[dict
                     "A used price option's duration and monthly price are immutable"
                 )
             if not option.is_active and item["is_active"]:
-                raise PriceOptionConflict(
-                    "A historical used price option cannot be reactivated"
-                )
+                raise PriceOptionConflict("A historical used price option cannot be reactivated")
 
     for option_id, option in existing.items():
         if option_id in supplied_ids:
@@ -165,32 +378,22 @@ def sync_package_price_options(*, package: MembershipPackage, options: list[dict
         if option.memberships.exists():
             option.is_active = False
             option.active_duration_key = None
-            option.save(
-                update_fields=["is_active", "active_duration_key", "updated_at"]
-            )
+            option.save(update_fields=["is_active", "active_duration_key", "updated_at"])
         else:
             option.delete()
 
-    desired_by_id = {
-        str(item["id"]): item for item in normalized_options if item.get("id")
-    }
+    desired_by_id = {str(item["id"]): item for item in normalized_options if item.get("id")}
     for option_id, desired in desired_by_id.items():
         option = existing[option_id]
         desired_key = desired["duration_months"] if desired["is_active"] else None
-        if option.active_duration_key is not None and (
-            option.active_duration_key != desired_key
-        ):
+        if option.active_duration_key is not None and (option.active_duration_key != desired_key):
             option.is_active = False
             option.active_duration_key = None
-            option.save(
-                update_fields=["is_active", "active_duration_key", "updated_at"]
-            )
+            option.save(update_fields=["is_active", "active_duration_key", "updated_at"])
 
     for item in normalized_options:
         option_id = str(item.pop("id")) if item.get("id") else None
-        item["active_duration_key"] = (
-            item["duration_months"] if item["is_active"] else None
-        )
+        item["active_duration_key"] = item["duration_months"] if item["is_active"] else None
         if option_id:
             option = existing[option_id]
             for field, value in item.items():
@@ -204,33 +407,40 @@ def sync_package_price_options(*, package: MembershipPackage, options: list[dict
 
 
 @transaction.atomic
-def assign_membership(
+def assign_membership_to_customer(
     *,
-    user_id,
+    customer_id,
     package_id,
     price_option_id,
-    start_date: date,
+    start_date: date | None = None,
     farmbrite_order_reference: str,
     actor,
 ):
-    reference, reference_key = normalize_farmbrite_order_reference(
-        farmbrite_order_reference
-    )
+    reference, reference_key = normalize_farmbrite_order_reference(farmbrite_order_reference)
+    customer = CSACustomer.objects.select_for_update().get(pk=customer_id)
+    ensure_csa_customer_complete(customer)
     today = timezone.localdate()
+    Membership.objects.filter(customer=customer, current_slot=True, end_date__lte=today).update(
+        status=MembershipStatus.ENDED, current_slot=None
+    )
+    existing_memberships = list(
+        Membership.objects.select_for_update()
+        .filter(customer=customer)
+        .exclude(status=MembershipStatus.REVOKED)
+        .order_by("start_date", "id")
+    )
+    if start_date is None:
+        future_boundaries = [
+            membership.end_date
+            for membership in existing_memberships
+            if membership.end_date > today
+        ]
+        start_date = max([today, *future_boundaries])
     if start_date < today:
         raise StartDateInPast("Membership start date cannot be in the past")
 
-    user = User.objects.select_for_update().get(pk=user_id)
-    Membership.objects.filter(
-        user=user, current_slot=True, end_date__lte=today
-    ).update(status=MembershipStatus.ENDED, current_slot=None)
-    if Membership.objects.filter(user=user, current_slot=True).exists():
-        raise ActiveMembershipExists("User already has a scheduled or active membership")
-
     try:
-        package = MembershipPackage.objects.select_for_update().get(
-            pk=package_id, is_active=True
-        )
+        package = MembershipPackage.objects.select_for_update().get(pk=package_id, is_active=True)
     except MembershipPackage.DoesNotExist as error:
         raise PackageUnavailable("Package does not exist or is inactive") from error
     try:
@@ -250,19 +460,22 @@ def assign_membership(
     except ValueError as error:
         raise PriceOptionTotalInvalid(str(error)) from error
 
+    end_date = add_months(start_date, price_option.duration_months)
+    if any(
+        membership.start_date < end_date and membership.end_date > start_date
+        for membership in existing_memberships
+    ):
+        raise MembershipOverlap("Membership dates overlap an existing membership")
+
     items = list(
-        MembershipPackageItem.objects.select_for_update()
-        .filter(package=package)
-        .order_by("id")
+        MembershipPackageItem.objects.select_for_update().filter(package=package).order_by("id")
     )
     if not items:
         raise PackageUnavailable("Package has no quota items")
     product_ids = [item.product_id for item in items]
     products = {
         product.pk: product
-        for product in Product.objects.select_for_update()
-        .filter(pk__in=product_ids)
-        .order_by("id")
+        for product in Product.objects.select_for_update().filter(pk__in=product_ids).order_by("id")
     }
     if len(products) != len(product_ids) or any(
         not products[item.product_id].is_active for item in items
@@ -286,7 +499,7 @@ def assign_membership(
     try:
         with transaction.atomic():
             membership = Membership.objects.create(
-                user=user,
+                customer=customer,
                 package=package,
                 price_option=price_option,
                 package_name_snapshot=package.name,
@@ -296,9 +509,7 @@ def assign_membership(
                 package_description_vi_snapshot=(
                     package_vi.description if package_vi else package.description
                 ),
-                package_description_en_snapshot=(
-                    package_en.description if package_en else ""
-                ),
+                package_description_en_snapshot=(package_en.description if package_en else ""),
                 monthly_price_vnd_snapshot=price_option.monthly_price_vnd,
                 total_price_vnd_snapshot=total_price_vnd,
                 duration_months_snapshot=price_option.duration_months,
@@ -306,19 +517,15 @@ def assign_membership(
                 farmbrite_order_reference=reference,
                 farmbrite_order_reference_key=reference_key,
                 start_date=start_date,
-                end_date=add_months(start_date, price_option.duration_months),
+                end_date=end_date,
                 status=(
-                    MembershipStatus.SCHEDULED
-                    if start_date > today
-                    else MembershipStatus.ACTIVE
+                    MembershipStatus.SCHEDULED if start_date > today else MembershipStatus.ACTIVE
                 ),
                 current_slot=True,
                 activated_by=actor,
             )
     except IntegrityError as error:
-        if Membership.objects.filter(
-            farmbrite_order_reference_key=reference_key
-        ).exists():
+        if Membership.objects.filter(farmbrite_order_reference_key=reference_key).exists():
             raise DuplicateFarmbriteOrderReference(
                 "Farmbrite order reference has already been assigned"
             ) from error
@@ -351,6 +558,29 @@ def assign_membership(
     if start_date <= today:
         ensure_due_cycles(membership, as_of=today)
     return membership
+
+
+@transaction.atomic
+def assign_membership(
+    *,
+    package_id,
+    price_option_id,
+    start_date: date | None = None,
+    farmbrite_order_reference: str,
+    actor,
+    customer_id=None,
+):
+    """Assign by canonical customer ID only; assignment never creates customers."""
+    if not customer_id:
+        raise CSACustomerRequiredForMembership("A CSA customer is required")
+    return assign_membership_to_customer(
+        customer_id=customer_id,
+        package_id=package_id,
+        price_option_id=price_option_id,
+        start_date=start_date,
+        farmbrite_order_reference=farmbrite_order_reference,
+        actor=actor,
+    )
 
 
 def _create_cycle(membership: Membership, sequence: int) -> MembershipCycle:
@@ -453,8 +683,8 @@ def _normalized_usage_lines(lines: list[dict]) -> list[tuple[str, int]]:
 
 def validate_usage_integrity(order: MembershipUsageOrder) -> None:
     membership = order.membership
-    if order.user_id != membership.user_id:
-        raise UsageIntegrityConflict("Usage order user does not match membership user")
+    if order.customer_id != membership.customer_id:
+        raise UsageIntegrityConflict("Usage order customer does not match membership customer")
     lines = list(
         order.lines.select_related("product_snapshot").prefetch_related(
             "allocations__cycle_quota__cycle"
@@ -479,7 +709,9 @@ def validate_usage_integrity(order: MembershipUsageOrder) -> None:
 
 @transaction.atomic
 def create_usage_order(*, membership_id, actor, idempotency_key, lines: list[dict], note=""):
-    membership = Membership.objects.select_for_update().select_related("user").get(pk=membership_id)
+    membership = (
+        Membership.objects.select_for_update().select_related("customer").get(pk=membership_id)
+    )
     today = timezone.localdate()
     membership = sync_membership_status(membership, as_of=today)
     if membership.status != MembershipStatus.ACTIVE or not (
@@ -533,13 +765,12 @@ def create_usage_order(*, membership_id, actor, idempotency_key, lines: list[dic
     for quota in quotas:
         by_product.setdefault(str(quota.product_snapshot.product_id), []).append(quota)
     if any(
-        sum(q.remaining_units for q in by_product.get(pid, [])) < units
-        for pid, units in requested
+        sum(q.remaining_units for q in by_product.get(pid, [])) < units for pid, units in requested
     ):
         raise InsufficientQuota("Requested units exceed available quota")
     order = MembershipUsageOrder.objects.create(
         membership=membership,
-        user=membership.user,
+        customer=membership.customer,
         idempotency_key=idempotency_key,
         note=note.strip(),
         created_by=actor,
@@ -555,9 +786,7 @@ def create_usage_order(*, membership_id, actor, idempotency_key, lines: list[dic
                 continue
             quota.remaining_units -= allocated
             quota.save(update_fields=["remaining_units"])
-            MembershipUsageAllocation.objects.create(
-                line=line, cycle_quota=quota, units=allocated
-            )
+            MembershipUsageAllocation.objects.create(line=line, cycle_quota=quota, units=allocated)
             needed -= allocated
             if not needed:
                 break
@@ -568,9 +797,9 @@ def create_usage_order(*, membership_id, actor, idempotency_key, lines: list[dic
 def undo_usage_order(*, order_id, actor, reason: str):
     if not reason.strip():
         raise UsageUndoConflict("An undo reason is required")
-    membership_id = MembershipUsageOrder.objects.only("membership_id").get(
-        pk=order_id
-    ).membership_id
+    membership_id = (
+        MembershipUsageOrder.objects.only("membership_id").get(pk=order_id).membership_id
+    )
     membership = Membership.objects.select_for_update().get(pk=membership_id)
     if membership.status == MembershipStatus.REVOKED:
         raise UsageUndoConflict("Usage cannot be undone for a revoked membership")
@@ -614,9 +843,7 @@ def revoke_membership(*, membership_id, reason: str, actor) -> Membership:
         raise MembershipNotRevocable("A revoke reason is required")
     with transaction.atomic():
         membership = Membership.objects.select_for_update().get(pk=membership_id)
-        membership = sync_membership_status(
-            membership, as_of=timezone.localdate()
-        )
+        membership = sync_membership_status(membership, as_of=timezone.localdate())
         if membership.status in {
             MembershipStatus.SCHEDULED,
             MembershipStatus.ACTIVE,

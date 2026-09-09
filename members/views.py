@@ -1,7 +1,19 @@
 from django.http import JsonResponse
 from django.views.decorators.http import require_GET
 
-from members.administrative_units import province_exists, ward_choices
+from members.administrative_units import province_choices, province_exists, ward_choices
+
+
+@require_GET
+def provinces(request):
+    return JsonResponse(
+        {
+            "data": [
+                {"code": code, "name": name}
+                for code, name in province_choices(request.LANGUAGE_CODE)
+            ]
+        }
+    )
 
 
 @require_GET

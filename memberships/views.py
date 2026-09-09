@@ -2,6 +2,7 @@ from django.db import IntegrityError, transaction
 from django.db.models import Q, Sum
 from django.db.models.deletion import ProtectedError
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
@@ -12,6 +13,7 @@ from rest_framework.views import APIView
 from content.permissions import IsWebsiteAdmin
 from identity.models import User
 from memberships.models import (
+    CSACustomer,
     Membership,
     MembershipContentLocale,
     MembershipCycleQuota,
@@ -25,9 +27,13 @@ from memberships.models import (
 )
 from memberships.permissions import HasMembershipSelfScopes
 from memberships.serializers import (
+    AdminCSACustomerQuerySerializer,
     AdminMembershipQuerySerializer,
     AdminPackageQuerySerializer,
     AdminProductQuerySerializer,
+    CSACustomerCreateSerializer,
+    CSACustomerLinkUserSerializer,
+    CSACustomerUpdateSerializer,
     LocalePageQuerySerializer,
     LocaleQuerySerializer,
     MembershipAssignSerializer,
@@ -39,17 +45,22 @@ from memberships.serializers import (
     UsageUndoSerializer,
 )
 from memberships.services import (
+    CSACustomerError,
     MembershipError,
     MembershipNotRevocable,
     PriceOptionConflict,
     PriceOptionTotalInvalid,
     assign_membership,
+    create_csa_customer_for_user,
+    create_managed_csa_customer,
     create_usage_order,
     ensure_due_cycles,
+    link_csa_customer_to_user,
     refresh_membership_statuses,
     revoke_membership,
     sync_package_price_options,
     undo_usage_order,
+    update_csa_customer,
 )
 
 PAGE_SIZE = 30
@@ -61,20 +72,104 @@ def no_store(response):
     return response
 
 
-def paginate(queryset, page):
+def paginate(queryset, page, page_size=PAGE_SIZE):
     total = queryset.count()
-    start = (page - 1) * PAGE_SIZE
-    return queryset[start : start + PAGE_SIZE], {
+    start = (page - 1) * page_size
+    return queryset[start : start + page_size], {
         "page": page,
-        "page_size": PAGE_SIZE,
+        "page_size": page_size,
         "total": total,
     }
 
 
 def membership_error(error):
-    return no_store(
-        Response({"errors": [{"code": error.code}]}, status=status.HTTP_409_CONFLICT)
+    http_status = (
+        status.HTTP_400_BAD_REQUEST
+        if error.code in {"csa_customer_incomplete", "csa_customer_required_for_membership"}
+        else status.HTTP_409_CONFLICT
     )
+    return no_store(Response({"errors": [{"code": error.code}]}, status=http_status))
+
+
+def csa_customer_error(error):
+    http_status = (
+        status.HTTP_400_BAD_REQUEST
+        if error.code
+        in {
+            "invalid_csa_customer",
+            "invalid_csa_customer_phone",
+            "csa_customer_phone_required",
+            "csa_customer_name_required",
+            "csa_customer_province_required",
+            "csa_customer_ward_required",
+            "csa_customer_address_required",
+            "csa_customer_incomplete",
+            "invalid_csa_customer_address",
+        }
+        else status.HTTP_409_CONFLICT
+    )
+    return no_store(Response({"errors": [{"code": error.code}]}, status=http_status))
+
+
+def customer_payload(item, *, include_memberships=False):
+    user = item.user
+    today = timezone.localdate()
+    memberships = list(item.memberships.all())
+    current = next(
+        (
+            membership
+            for membership in memberships
+            if membership.status == MembershipStatus.ACTIVE
+            and membership.start_date <= today < membership.end_date
+        ),
+        None,
+    )
+    scheduled = next(
+        (
+            membership
+            for membership in sorted(memberships, key=lambda value: (value.start_date, value.pk))
+            if membership.status == MembershipStatus.SCHEDULED and membership.start_date > today
+        ),
+        None,
+    )
+    data = {
+        "id": str(item.pk),
+        "name": item.name,
+        "phone": item.phone_e164,
+        "province_code": item.province_code,
+        "ward_code": item.ward_code,
+        "address": item.address,
+        "user": ({"id": str(user.pk), "name": user.name, "email": user.email} if user else None),
+        "created_at": item.created_at.isoformat(),
+        "updated_at": item.updated_at.isoformat(),
+    }
+    data["current_membership"] = (
+        {"id": str(current.pk), "status": current.status} if current else None
+    )
+    data["next_scheduled_membership"] = (
+        {
+            "id": str(scheduled.pk),
+            "status": scheduled.status,
+            "start_date": scheduled.start_date.isoformat(),
+        }
+        if scheduled
+        else None
+    )
+    data["status"] = (
+        "active"
+        if current
+        else "scheduled"
+        if scheduled
+        else "history_only"
+        if memberships
+        else "new"
+    )
+    if include_memberships:
+        data["memberships"] = [
+            membership_payload(membership, include_user=False, admin=True)
+            for membership in memberships
+        ]
+    return data
 
 
 def requested_locale(request):
@@ -268,7 +363,8 @@ def membership_payload(
     )
     data = {
         "id": str(item.pk),
-        "user_id": str(item.user_id),
+        "customer_id": str(item.customer_id),
+        "user_id": str(item.customer.user_id) if item.customer.user_id else None,
         "package_id": str(item.package_id),
         "price_option_id": str(item.price_option_id),
         "status": item.status,
@@ -308,11 +404,14 @@ def membership_payload(
     if include_quota:
         data["quota"] = quota_payload(item, locale=locale, admin=admin)
     if include_user:
-        data["user"] = {
-            "id": str(item.user_id),
-            "name": item.user.name,
-            "email": item.user.email,
-            "phone": getattr(getattr(item.user, "member_profile", None), "phone_number", ""),
+        user = item.customer.user
+        data["customer"] = {
+            "id": str(item.customer_id),
+            "name": item.customer.name,
+            "phone": item.customer.phone_e164,
+            "user": (
+                {"id": str(user.pk), "name": user.name, "email": user.email} if user else None
+            ),
         }
     return data
 
@@ -451,14 +550,24 @@ def package_queryset():
 
 def membership_queryset():
     return Membership.objects.select_related(
-        "user", "user__member_profile", "package", "price_option", "revoked_by"
+        "customer", "customer__user", "package", "price_option", "revoked_by"
     ).prefetch_related("product_snapshots")
 
 
 def usage_queryset():
     return MembershipUsageOrder.objects.select_related(
-        "membership", "user", "reversal"
+        "membership", "customer", "customer__user", "reversal"
     ).prefetch_related("lines__product_snapshot", "lines__allocations__cycle_quota__cycle")
+
+
+def customer_queryset():
+    return CSACustomer.objects.select_related("user").prefetch_related(
+        "memberships__customer",
+        "memberships__customer__user",
+        "memberships__package",
+        "memberships__price_option",
+        "memberships__revoked_by",
+    )
 
 
 class PublicPackageListView(APIView):
@@ -494,17 +603,24 @@ class SelfMembershipView(APIView):
     @transaction.atomic
     def get(self, request):
         locale = requested_locale(request)
+        refresh_membership_statuses()
+        today = timezone.localdate()
         item = (
             membership_queryset()
             .select_for_update()
-            .filter(user=request.user, current_slot=True)
+            .filter(
+                customer__user=request.user,
+                status=MembershipStatus.ACTIVE,
+                start_date__lte=today,
+                end_date__gt=today,
+            )
             .first()
         )
         if not item:
             return no_store(Response({"data": None}))
         ensure_due_cycles(item)
         item.refresh_from_db()
-        if item.status not in {MembershipStatus.SCHEDULED, MembershipStatus.ACTIVE}:
+        if item.status != MembershipStatus.ACTIVE:
             return no_store(Response({"data": None}))
         return no_store(Response({"data": membership_payload(item, locale=locale)}))
 
@@ -515,10 +631,17 @@ class SelfQuotaView(APIView):
     @transaction.atomic
     def get(self, request):
         locale = requested_locale(request)
+        refresh_membership_statuses()
+        today = timezone.localdate()
         item = (
             membership_queryset()
             .select_for_update()
-            .filter(user=request.user, current_slot=True)
+            .filter(
+                customer__user=request.user,
+                status=MembershipStatus.ACTIVE,
+                start_date__lte=today,
+                end_date__gt=today,
+            )
             .first()
         )
         if not item:
@@ -547,14 +670,14 @@ class SelfUsageHistoryView(APIView):
         query = LocalePageQuerySerializer(data=request.query_params)
         query.is_valid(raise_exception=True)
         items, meta = paginate(
-            usage_queryset().filter(user=request.user), query.validated_data["page"]
+            usage_queryset().filter(customer__user=request.user),
+            query.validated_data["page"],
         )
         return no_store(
             Response(
                 {
                     "data": [
-                        usage_payload(item, locale=query.validated_data["locale"])
-                        for item in items
+                        usage_payload(item, locale=query.validated_data["locale"]) for item in items
                     ],
                     "meta": meta,
                 }
@@ -579,9 +702,7 @@ class AdminProductViewSet(viewsets.ViewSet):
         if "active" in request.query_params:
             queryset = queryset.filter(is_active=query.validated_data["active"])
         items, meta = paginate(queryset, query.validated_data["page"])
-        return no_store(
-            Response({"data": [product_payload(item) for item in items], "meta": meta})
-        )
+        return no_store(Response({"data": [product_payload(item) for item in items], "meta": meta}))
 
     @transaction.atomic
     def create(self, request):
@@ -597,9 +718,7 @@ class AdminProductViewSet(viewsets.ViewSet):
             [ProductTranslation(product=item, **translation) for translation in translations]
         )
         item = Product.objects.prefetch_related("translations").get(pk=item.pk)
-        return no_store(
-            Response({"data": product_payload(item)}, status=status.HTTP_201_CREATED)
-        )
+        return no_store(Response({"data": product_payload(item)}, status=status.HTTP_201_CREATED))
 
     def retrieve(self, request, pk=None):
         item = get_object_or_404(Product.objects.prefetch_related("translations"), pk=pk)
@@ -665,9 +784,7 @@ class AdminPackageViewSet(viewsets.ViewSet):
         if "active" in request.query_params:
             queryset = queryset.filter(is_active=query.validated_data["active"])
         items, meta = paginate(queryset, query.validated_data["page"])
-        return no_store(
-            Response({"data": [package_payload(item) for item in items], "meta": meta})
-        )
+        return no_store(Response({"data": [package_payload(item) for item in items], "meta": meta}))
 
     @transaction.atomic
     def create(self, request):
@@ -752,9 +869,7 @@ class AdminPackageViewSet(viewsets.ViewSet):
                 raise ValidationError(
                     {"price_options": "Duration months must be unique within a package."}
                 ) from error
-        return no_store(
-            Response({"data": package_payload(package_queryset().get(pk=package.pk))})
-        )
+        return no_store(Response({"data": package_payload(package_queryset().get(pk=package.pk))}))
 
     def destroy(self, request, pk=None):
         package = get_object_or_404(MembershipPackage, pk=pk)
@@ -763,6 +878,102 @@ class AdminPackageViewSet(viewsets.ViewSet):
         except ProtectedError as error:
             raise ValidationError({"package": "Package is in use."}) from error
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class AdminCSACustomerViewSet(viewsets.ViewSet):
+    permission_classes = [IsWebsiteAdmin]
+
+    def list(self, request):
+        query = AdminCSACustomerQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+        refresh_membership_statuses()
+        queryset = customer_queryset().order_by("name", "id")
+        data = query.validated_data
+        if search := data["search"].strip():
+            queryset = queryset.filter(Q(name__icontains=search) | Q(phone_e164__icontains=search))
+        if data["linked"] == "linked":
+            queryset = queryset.filter(user__isnull=False)
+        elif data["linked"] == "managed":
+            queryset = queryset.filter(user__isnull=True)
+        if membership_status := data.get("membership_status"):
+            queryset = queryset.filter(memberships__status=membership_status).distinct()
+        items, meta = paginate(queryset, data["page"], data["page_size"])
+        return no_store(
+            Response({"data": [customer_payload(item) for item in items], "meta": meta})
+        )
+
+    def create(self, request):
+        serializer = CSACustomerCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        try:
+            if user_id := data.get("user_id"):
+                user = User.objects.get(pk=user_id)
+                item = create_csa_customer_for_user(
+                    user=user,
+                    name=data.get("name"),
+                    phone=data.get("phone"),
+                    province_code=data.get("province_code", ""),
+                    ward_code=data.get("ward_code", ""),
+                    address=data.get("address", ""),
+                )
+            else:
+                item = create_managed_csa_customer(
+                    name=data.get("name"),
+                    phone=data.get("phone"),
+                    province_code=data.get("province_code", ""),
+                    ward_code=data.get("ward_code", ""),
+                    address=data.get("address", ""),
+                )
+        except User.DoesNotExist:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        except CSACustomerError as error:
+            return csa_customer_error(error)
+        return no_store(
+            Response(
+                {"data": customer_payload(customer_queryset().get(pk=item.pk))},
+                status=status.HTTP_201_CREATED,
+            )
+        )
+
+    def retrieve(self, request, pk=None):
+        refresh_membership_statuses()
+        item = get_object_or_404(customer_queryset(), pk=pk)
+        return no_store(Response({"data": customer_payload(item, include_memberships=True)}))
+
+    def partial_update(self, request, pk=None):
+        item = get_object_or_404(CSACustomer, pk=pk)
+        serializer = CSACustomerUpdateSerializer(data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        try:
+            item = update_csa_customer(
+                customer=item,
+                name=data.get("name", ...),
+                phone=data.get("phone", ...),
+                province_code=data.get("province_code", ...),
+                ward_code=data.get("ward_code", ...),
+                address=data.get("address", ...),
+            )
+        except CSACustomerError as error:
+            return csa_customer_error(error)
+        return no_store(Response({"data": customer_payload(customer_queryset().get(pk=item.pk))}))
+
+    @action(detail=True, methods=["post"], url_path="link-user")
+    def link_user(self, request, pk=None):
+        serializer = CSACustomerLinkUserSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        customer = get_object_or_404(CSACustomer, pk=pk)
+        try:
+            user = User.objects.get(pk=serializer.validated_data["user_id"])
+            customer = link_csa_customer_to_user(customer=customer, user=user, actor=request.user)
+        except User.DoesNotExist:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        except CSACustomerError as error:
+            return csa_customer_error(error)
+        return no_store(
+            Response({"data": customer_payload(customer_queryset().get(pk=customer.pk))})
+        )
 
 
 class AdminMembershipViewSet(viewsets.ViewSet):
@@ -775,9 +986,9 @@ class AdminMembershipViewSet(viewsets.ViewSet):
         queryset = membership_queryset()
         if search := query.validated_data["search"].strip():
             queryset = queryset.filter(
-                Q(user__email__icontains=search)
-                | Q(user__name__icontains=search)
-                | Q(user__member_profile__phone_number__icontains=search)
+                Q(customer__user__email__icontains=search)
+                | Q(customer__name__icontains=search)
+                | Q(customer__phone_e164__icontains=search)
                 | Q(farmbrite_order_reference__icontains=search)
             )
         items, meta = paginate(queryset, query.validated_data["page"])
@@ -804,11 +1015,13 @@ class AdminMembershipViewSet(viewsets.ViewSet):
         serializer.is_valid(raise_exception=True)
         try:
             item = assign_membership(actor=request.user, **serializer.validated_data)
-        except User.DoesNotExist:
+        except (User.DoesNotExist, CSACustomer.DoesNotExist):
             return Response(status=status.HTTP_404_NOT_FOUND)
         except PriceOptionTotalInvalid as error:
             raise ValidationError({"price_option_id": str(error)}) from error
         except MembershipError as error:
+            return membership_error(error)
+        except CSACustomerError as error:
             return membership_error(error)
         return no_store(
             Response(
