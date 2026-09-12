@@ -2,9 +2,11 @@
 import uuid
 
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.db import models
 from django.db.models import Q
 
+from memberships.phones import InvalidPhoneNumber, normalize_vietnam_phone
 from memberships.pricing import calculate_total_price_vnd
 
 
@@ -28,6 +30,50 @@ class UsageOrderStatus(models.TextChoices):
 class MembershipContentLocale(models.TextChoices):
     VI = "vi", "Vietnamese"
     EN = "en", "English"
+
+
+class CSAPurchaseRequestStatus(models.TextChoices):
+    PENDING = "pending", "Pending"
+    PAYMENT_CONFIRMED = "payment_confirmed", "Payment confirmed"
+    APPROVED = "approved", "Approved"
+    REJECTED = "rejected", "Rejected"
+    EXPIRED = "expired", "Expired"
+
+
+class CSAPurchaseRefundStatus(models.TextChoices):
+    NOT_APPLICABLE = "not_applicable", "Not applicable"
+    PENDING = "pending", "Pending"
+    COMPLETED = "completed", "Completed"
+
+
+class CSAContractSource(models.TextChoices):
+    ONLINE = "online", "Online"
+    ADMIN_MANUAL = "admin_manual", "Admin manual"
+
+
+class CSAContractStatus(models.TextChoices):
+    ACTIVE = "active", "Active"
+    REVOKED = "revoked", "Revoked"
+
+
+class CSAContractTermsAcceptanceMethod(models.TextChoices):
+    ONLINE = "online", "Online"
+    IN_STORE = "in_store", "In store"
+
+
+OPEN_CSA_PURCHASE_REQUEST_STATUSES = [
+    CSAPurchaseRequestStatus.PENDING,
+    CSAPurchaseRequestStatus.PAYMENT_CONFIRMED,
+]
+TERMINAL_CSA_PURCHASE_REQUEST_STATUSES = [
+    CSAPurchaseRequestStatus.APPROVED,
+    CSAPurchaseRequestStatus.REJECTED,
+    CSAPurchaseRequestStatus.EXPIRED,
+]
+
+
+def generate_csa_purchase_request_code() -> str:
+    return f"CSA-{uuid.uuid4().hex[:12].upper()}"
 
 
 class CSACustomer(models.Model):
@@ -184,6 +230,400 @@ class MembershipPackageTranslation(models.Model):
         ]
 
 
+class MembershipPaymentSettings(models.Model):
+    key = models.CharField(primary_key=True, max_length=20, default="default", editable=False)
+    direct_transfer_enabled = models.BooleanField(default=False)
+    bank_bin = models.CharField(max_length=6)
+    bank_name = models.CharField(max_length=160)
+    account_number = models.CharField(max_length=19)
+    account_name = models.CharField(max_length=160)
+    version = models.PositiveIntegerField(default=1)
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="membership_payment_settings_updates",
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(key="default"), name="memberships_payment_settings_singleton_key"
+            )
+        ]
+
+    def save(self, *args, **kwargs):
+        self.full_clean(validate_unique=False, validate_constraints=False)
+        return super().save(*args, **kwargs)
+
+    def clean(self):
+        super().clean()
+        from memberships.banks import BankDirectoryUnavailable, find_transfer_bank
+
+        self.bank_bin = self.bank_bin.strip()
+        self.bank_name = self.bank_name.strip()
+        self.account_number = self.account_number.strip()
+        self.account_name = self.account_name.strip()
+        errors = {}
+        if len(self.bank_bin) != 6 or not self.bank_bin.isdigit():
+            errors["bank_bin"] = "Bank BIN must contain exactly 6 digits."
+        if not (6 <= len(self.account_number) <= 19) or not self.account_number.isdigit():
+            errors["account_number"] = "Account number must contain 6 to 19 digits."
+        if not self.bank_name:
+            errors["bank_name"] = "Bank name is required."
+        if not self.account_name:
+            errors["account_name"] = "Account name is required."
+        if errors:
+            raise ValidationError(errors)
+        try:
+            bank = find_transfer_bank(self.bank_bin)
+        except BankDirectoryUnavailable as error:
+            raise ValidationError({"bank_bin": "The bank directory is unavailable."}) from error
+        if not bank:
+            raise ValidationError({"bank_bin": "Select a supported VietQR bank."})
+        if self.bank_name != bank["name"].strip():
+            raise ValidationError({"bank_name": "Bank name does not match the selected BIN."})
+
+
+class CSAPurchaseRequest(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        related_name="csa_purchase_requests",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+    )
+    request_code = models.CharField(
+        max_length=20, unique=True, default=generate_csa_purchase_request_code, editable=False
+    )
+    phone_e164 = models.CharField(max_length=13, db_index=True)
+    name_snapshot = models.CharField(max_length=150)
+    email_snapshot = models.EmailField(max_length=254, null=True, blank=True, editable=False)
+    zalo_whatsapp_snapshot = models.CharField(max_length=64, null=True, blank=True, editable=False)
+    province_code_snapshot = models.CharField(max_length=2)
+    ward_code_snapshot = models.CharField(max_length=5)
+    address_snapshot = models.CharField(max_length=500)
+    package = models.ForeignKey(
+        MembershipPackage, related_name="purchase_requests", on_delete=models.PROTECT
+    )
+    price_option = models.ForeignKey(
+        MembershipPackagePriceOption,
+        related_name="purchase_requests",
+        on_delete=models.PROTECT,
+    )
+    package_name_snapshot = models.CharField(max_length=200)
+    price_option_name_snapshot = models.CharField(max_length=120)
+    duration_months_snapshot = models.PositiveSmallIntegerField()
+    amount_snapshot = models.PositiveBigIntegerField()
+    currency_snapshot = models.CharField(max_length=3, default="VND")
+    bank_bin_snapshot = models.CharField(max_length=6)
+    bank_name_snapshot = models.CharField(max_length=160)
+    account_number_snapshot = models.CharField(max_length=19)
+    account_name_snapshot = models.CharField(max_length=160)
+    transfer_content = models.CharField(max_length=80, unique=True, editable=False)
+    guest_token_hash = models.CharField(max_length=128, blank=True, editable=False)
+    payment_config_version = models.PositiveIntegerField()
+    terms_version = models.CharField(max_length=64, null=True, blank=True, editable=False)
+    terms_locale = models.CharField(
+        max_length=2,
+        choices=MembershipContentLocale.choices,
+        null=True,
+        blank=True,
+        editable=False,
+    )
+    terms_snapshot = models.JSONField(null=True, blank=True, editable=False)
+    terms_hash = models.CharField(max_length=64, null=True, blank=True, editable=False)
+    terms_accepted_at = models.DateTimeField(null=True, blank=True, editable=False)
+    terms_acceptance_ip = models.GenericIPAddressField(null=True, blank=True, editable=False)
+    terms_acceptance_user_agent = models.TextField(null=True, blank=True, editable=False)
+    terms_acceptance_method = models.CharField(
+        max_length=16,
+        choices=[(CSAContractTermsAcceptanceMethod.ONLINE, "Online")],
+        null=True,
+        blank=True,
+        editable=False,
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=CSAPurchaseRequestStatus.choices,
+        default=CSAPurchaseRequestStatus.PENDING,
+        db_index=True,
+    )
+    open_slot = models.BooleanField(null=True, default=True, editable=False)
+    expires_at = models.DateTimeField(null=True, blank=True, db_index=True, editable=False)
+    expired_at = models.DateTimeField(null=True, blank=True, editable=False)
+    expired_reason = models.CharField(max_length=64, blank=True, editable=False)
+    payment_confirmed_at = models.DateTimeField(null=True, blank=True)
+    approved_at = models.DateTimeField(null=True, blank=True)
+    rejected_at = models.DateTimeField(null=True, blank=True)
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        related_name="csa_purchase_requests_approved",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+    )
+    rejected_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        related_name="csa_purchase_requests_rejected",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+    )
+    rejection_reason = models.TextField(blank=True)
+    refund_status = models.CharField(
+        max_length=16,
+        choices=CSAPurchaseRefundStatus.choices,
+        default=CSAPurchaseRefundStatus.NOT_APPLICABLE,
+    )
+    refund_marked_at = models.DateTimeField(null=True, blank=True)
+    refund_marked_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        related_name="csa_purchase_requests_refunded",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+    )
+    refund_note = models.CharField(max_length=1000, null=True, blank=True)
+    customer = models.ForeignKey(
+        CSACustomer,
+        related_name="purchase_requests",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+    )
+    membership = models.OneToOneField(
+        "Membership",
+        related_name="purchase_request",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+    )
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    IMMUTABLE_FIELDS = (
+        "user_id",
+        "request_code",
+        "phone_e164",
+        "name_snapshot",
+        "email_snapshot",
+        "zalo_whatsapp_snapshot",
+        "province_code_snapshot",
+        "ward_code_snapshot",
+        "address_snapshot",
+        "package_id",
+        "price_option_id",
+        "package_name_snapshot",
+        "price_option_name_snapshot",
+        "duration_months_snapshot",
+        "amount_snapshot",
+        "currency_snapshot",
+        "bank_bin_snapshot",
+        "bank_name_snapshot",
+        "account_number_snapshot",
+        "account_name_snapshot",
+        "transfer_content",
+        "guest_token_hash",
+        "payment_config_version",
+        "terms_version",
+        "terms_locale",
+        "terms_snapshot",
+        "terms_hash",
+        "terms_accepted_at",
+        "terms_acceptance_ip",
+        "terms_acceptance_user_agent",
+        "terms_acceptance_method",
+        "expires_at",
+    )
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["phone_e164", "open_slot"],
+                name="memberships_csa_purchase_one_open_phone",
+            ),
+            models.CheckConstraint(
+                condition=Q(status__in=CSAPurchaseRequestStatus.values),
+                name="memberships_csa_purchase_status_valid",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(status__in=OPEN_CSA_PURCHASE_REQUEST_STATUSES, open_slot=True)
+                    | Q(status__in=TERMINAL_CSA_PURCHASE_REQUEST_STATUSES, open_slot__isnull=True)
+                ),
+                name="memberships_csa_purchase_open_slot_consistent",
+            ),
+            models.CheckConstraint(
+                condition=Q(duration_months_snapshot__gt=0),
+                name="memberships_csa_purchase_duration_positive",
+            ),
+            models.CheckConstraint(
+                condition=Q(amount_snapshot__gt=0),
+                name="memberships_csa_purchase_amount_positive",
+            ),
+            models.CheckConstraint(
+                condition=Q(currency_snapshot="VND"),
+                name="memberships_csa_purchase_currency_vnd",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(
+                        terms_version__isnull=True,
+                        terms_locale__isnull=True,
+                        terms_snapshot__isnull=True,
+                        terms_hash__isnull=True,
+                        terms_accepted_at__isnull=True,
+                        terms_acceptance_method__isnull=True,
+                    )
+                    | Q(
+                        terms_version__isnull=False,
+                        terms_locale__in=MembershipContentLocale.values,
+                        terms_snapshot__isnull=False,
+                        terms_hash__isnull=False,
+                        terms_accepted_at__isnull=False,
+                        terms_acceptance_method=CSAContractTermsAcceptanceMethod.ONLINE,
+                    )
+                ),
+                name="memberships_csa_purchase_terms_complete",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(
+                        refund_status=CSAPurchaseRefundStatus.NOT_APPLICABLE,
+                        refund_marked_at__isnull=True,
+                        refund_marked_by__isnull=True,
+                        refund_note__isnull=True,
+                    )
+                    | Q(
+                        status=CSAPurchaseRequestStatus.REJECTED,
+                        refund_status=CSAPurchaseRefundStatus.PENDING,
+                        refund_marked_at__isnull=True,
+                        refund_marked_by__isnull=True,
+                        refund_note__isnull=True,
+                    )
+                    | Q(
+                        status=CSAPurchaseRequestStatus.REJECTED,
+                        refund_status=CSAPurchaseRefundStatus.COMPLETED,
+                        refund_marked_at__isnull=False,
+                        refund_marked_by__isnull=False,
+                    )
+                ),
+                name="memberships_csa_purchase_refund_consistent",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(
+                        status=CSAPurchaseRequestStatus.EXPIRED,
+                        expires_at__isnull=False,
+                        expired_at__isnull=False,
+                        expired_reason="request_expiry_elapsed",
+                        customer__isnull=True,
+                        membership__isnull=True,
+                        approved_at__isnull=True,
+                        approved_by__isnull=True,
+                        rejected_at__isnull=True,
+                        rejected_by__isnull=True,
+                        rejection_reason="",
+                    )
+                    | Q(
+                        ~Q(status=CSAPurchaseRequestStatus.EXPIRED),
+                        expired_at__isnull=True,
+                        expired_reason="",
+                    )
+                ),
+                name="memberships_csa_purchase_expiry_consistent",
+            ),
+        ]
+
+    def save(self, *args, **kwargs):
+        try:
+            self.phone_e164 = normalize_vietnam_phone(self.phone_e164)
+        except InvalidPhoneNumber as error:
+            raise ValidationError({"phone_e164": str(error)}) from error
+        self.open_slot = self.status in OPEN_CSA_PURCHASE_REQUEST_STATUSES or None
+        self._validate_immutable_fields()
+        self.full_clean(validate_unique=False, validate_constraints=False)
+        if update_fields := kwargs.get("update_fields"):
+            kwargs["update_fields"] = set(update_fields) | {"phone_e164", "open_slot"}
+        return super().save(*args, **kwargs)
+
+    def clean(self):
+        super().clean()
+        errors = {}
+        if self.package_id and self.price_option_id:
+            option = self.price_option
+            if option.package_id != self.package_id:
+                errors["price_option"] = "Price option does not belong to the selected package."
+            if self._state.adding and (not self.package.is_active or not option.is_active):
+                errors["price_option"] = "Package and price option must be active."
+        terms_core = (
+            self.terms_version,
+            self.terms_locale,
+            self.terms_snapshot,
+            self.terms_hash,
+            self.terms_accepted_at,
+            self.terms_acceptance_method,
+        )
+        if any(value is not None for value in terms_core):
+            if any(value is None for value in terms_core):
+                errors["terms_snapshot"] = "Terms acceptance snapshot must be complete."
+            else:
+                from memberships.terms import InvalidCSATerms, validate_csa_terms_snapshot
+
+                try:
+                    validate_csa_terms_snapshot(
+                        version=self.terms_version,
+                        locale=self.terms_locale,
+                        content=self.terms_snapshot,
+                        content_hash=self.terms_hash,
+                    )
+                except InvalidCSATerms as error:
+                    errors["terms_snapshot"] = str(error)
+                if self.terms_acceptance_method != CSAContractTermsAcceptanceMethod.ONLINE:
+                    errors["terms_acceptance_method"] = (
+                        "Purchase request terms must be accepted online."
+                    )
+        if errors:
+            raise ValidationError(errors)
+
+    def _validate_immutable_fields(self):
+        if self._state.adding:
+            return
+        current = type(self).objects.filter(pk=self.pk).values(*self.IMMUTABLE_FIELDS).first()
+        if not current:
+            return
+        changed = [
+            field for field in self.IMMUTABLE_FIELDS if getattr(self, field) != current[field]
+        ]
+        if changed:
+            raise ValidationError(
+                {
+                    field.removesuffix("_id"): "Purchase request snapshots are immutable."
+                    for field in changed
+                }
+            )
+
+
+class CSATrackerSession(models.Model):
+    token_hash = models.CharField(primary_key=True, max_length=64, editable=False)
+    purchase_request = models.ForeignKey(
+        CSAPurchaseRequest,
+        related_name="tracker_sessions",
+        on_delete=models.CASCADE,
+        editable=False,
+    )
+    expires_at = models.DateTimeField(db_index=True, editable=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+
 class MembershipPackageItem(models.Model):
     package = models.ForeignKey(MembershipPackage, related_name="items", on_delete=models.CASCADE)
     product = models.ForeignKey(Product, related_name="package_items", on_delete=models.PROTECT)
@@ -286,6 +726,373 @@ class Membership(models.Model):
                 name="memberships_current_slot_consistent",
             ),
         ]
+
+
+class CSAContract(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    reference_code = models.CharField(max_length=20, unique=True, editable=False)
+    source = models.CharField(max_length=20, choices=CSAContractSource.choices, editable=False)
+    membership = models.OneToOneField(
+        Membership,
+        related_name="csa_contract",
+        on_delete=models.PROTECT,
+        editable=False,
+    )
+    purchase_request = models.OneToOneField(
+        CSAPurchaseRequest,
+        related_name="csa_contract",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        editable=False,
+    )
+    status = models.CharField(
+        max_length=12,
+        choices=CSAContractStatus.choices,
+        default=CSAContractStatus.ACTIVE,
+        db_index=True,
+    )
+
+    member_name_snapshot = models.CharField(max_length=150, editable=False)
+    phone_e164_snapshot = models.CharField(max_length=13, editable=False)
+    email_snapshot = models.EmailField(max_length=254, null=True, blank=True, editable=False)
+    zalo_whatsapp_snapshot = models.CharField(max_length=64, null=True, blank=True, editable=False)
+    province_code_snapshot = models.CharField(max_length=2, editable=False)
+    ward_code_snapshot = models.CharField(max_length=5, editable=False)
+    address_snapshot = models.CharField(max_length=500, editable=False)
+
+    package_name_snapshot = models.CharField(max_length=200, editable=False)
+    price_option_name_snapshot = models.CharField(max_length=120, editable=False)
+    duration_months_snapshot = models.PositiveSmallIntegerField(editable=False)
+    amount_snapshot = models.PositiveBigIntegerField(editable=False)
+    currency_snapshot = models.CharField(max_length=3, editable=False)
+    quota_snapshot = models.JSONField(null=True, blank=True, editable=False)
+    payment_snapshot = models.JSONField(null=True, blank=True, editable=False)
+
+    terms_version = models.CharField(max_length=64, editable=False)
+    terms_locale = models.CharField(
+        max_length=2, choices=MembershipContentLocale.choices, editable=False
+    )
+    terms_snapshot = models.JSONField(editable=False)
+    terms_accepted_at = models.DateTimeField(editable=False)
+    terms_acceptance_method = models.CharField(
+        max_length=16,
+        choices=CSAContractTermsAcceptanceMethod.choices,
+        editable=False,
+    )
+    terms_acceptance_ip = models.GenericIPAddressField(null=True, blank=True, editable=False)
+    terms_acceptance_user_agent = models.TextField(null=True, blank=True, editable=False)
+
+    start_date = models.DateField(editable=False)
+    end_date = models.DateField(editable=False)
+    issued_at = models.DateTimeField(editable=False)
+
+    provider_version = models.CharField(
+        max_length=64,
+        default="NFV_PROVIDER_V1",
+        editable=False,
+    )
+    terms_snapshot_vi = models.JSONField(null=True, blank=True, editable=False)
+    terms_snapshot_en = models.JSONField(null=True, blank=True, editable=False)
+
+    pdf_vi_storage_key = models.CharField(max_length=500, null=True, blank=True, editable=False)
+    pdf_en_storage_key = models.CharField(max_length=500, null=True, blank=True, editable=False)
+    pdf_vi_sha256 = models.CharField(max_length=64, null=True, blank=True, editable=False)
+    pdf_en_sha256 = models.CharField(max_length=64, null=True, blank=True, editable=False)
+    original_pdf_vi_storage_key = models.CharField(
+        max_length=500, null=True, blank=True, editable=False
+    )
+    original_pdf_en_storage_key = models.CharField(
+        max_length=500, null=True, blank=True, editable=False
+    )
+    original_pdf_vi_sha256 = models.CharField(max_length=64, null=True, blank=True, editable=False)
+    original_pdf_en_sha256 = models.CharField(max_length=64, null=True, blank=True, editable=False)
+    pdf_generated_at = models.DateTimeField(null=True, blank=True, editable=False)
+    pdf_version = models.PositiveIntegerField(default=1, editable=False)
+
+    revoked_at = models.DateTimeField(null=True, blank=True)
+    revoked_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        related_name="csa_contracts_revoked",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+    )
+    revoked_by_name_snapshot = models.CharField(
+        max_length=254, null=True, blank=True, editable=False
+    )
+    revocation_reason = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    IMMUTABLE_FIELDS = (
+        "reference_code",
+        "source",
+        "membership_id",
+        "purchase_request_id",
+        "member_name_snapshot",
+        "phone_e164_snapshot",
+        "email_snapshot",
+        "zalo_whatsapp_snapshot",
+        "province_code_snapshot",
+        "ward_code_snapshot",
+        "address_snapshot",
+        "package_name_snapshot",
+        "price_option_name_snapshot",
+        "duration_months_snapshot",
+        "amount_snapshot",
+        "currency_snapshot",
+        "quota_snapshot",
+        "payment_snapshot",
+        "terms_version",
+        "terms_locale",
+        "terms_snapshot",
+        "terms_accepted_at",
+        "terms_acceptance_method",
+        "terms_acceptance_ip",
+        "terms_acceptance_user_agent",
+        "start_date",
+        "end_date",
+        "issued_at",
+        "provider_version",
+        "terms_snapshot_vi",
+        "terms_snapshot_en",
+    )
+    REVOCATION_IMMUTABLE_FIELDS = (
+        "status",
+        "revoked_at",
+        "revoked_by_id",
+        "revoked_by_name_snapshot",
+        "revocation_reason",
+    )
+
+    class Meta:
+        ordering = ["-issued_at", "-id"]
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(source__in=CSAContractSource.values),
+                name="memberships_csa_contract_source_valid",
+            ),
+            models.CheckConstraint(
+                condition=Q(status__in=CSAContractStatus.values),
+                name="memberships_csa_contract_status_valid",
+            ),
+            models.CheckConstraint(
+                condition=Q(terms_locale__in=MembershipContentLocale.values),
+                name="memberships_csa_contract_terms_locale_valid",
+            ),
+            models.CheckConstraint(
+                condition=Q(terms_acceptance_method__in=CSAContractTermsAcceptanceMethod.values),
+                name="memberships_csa_contract_acceptance_valid",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(source=CSAContractSource.ONLINE, purchase_request__isnull=False)
+                    | Q(source=CSAContractSource.ADMIN_MANUAL)
+                ),
+                name="memberships_csa_contract_online_request",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(
+                        status=CSAContractStatus.ACTIVE,
+                        revoked_at__isnull=True,
+                        revoked_by__isnull=True,
+                        revocation_reason="",
+                    )
+                    | (
+                        Q(
+                            status=CSAContractStatus.REVOKED,
+                            revoked_at__isnull=False,
+                            revoked_by__isnull=False,
+                        )
+                        & ~Q(revocation_reason="")
+                    )
+                ),
+                name="memberships_csa_contract_revoke_consistent",
+            ),
+            models.CheckConstraint(
+                condition=Q(duration_months_snapshot__gte=1),
+                name="memberships_csa_contract_duration_positive",
+            ),
+            models.CheckConstraint(
+                condition=Q(amount_snapshot__gte=0),
+                name="memberships_csa_contract_amount_nonnegative",
+            ),
+            models.CheckConstraint(
+                condition=Q(end_date__gt=models.F("start_date")),
+                name="memberships_csa_contract_dates_valid",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~Q(member_name_snapshot="")
+                    & ~Q(phone_e164_snapshot="")
+                    & ~Q(province_code_snapshot="")
+                    & ~Q(ward_code_snapshot="")
+                    & ~Q(address_snapshot="")
+                ),
+                name="memberships_csa_contract_identity_present",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~Q(package_name_snapshot="")
+                    & ~Q(price_option_name_snapshot="")
+                    & ~Q(currency_snapshot="")
+                ),
+                name="memberships_csa_contract_package_present",
+            ),
+            models.CheckConstraint(
+                condition=~Q(terms_version=""),
+                name="memberships_csa_contract_terms_present",
+            ),
+            models.CheckConstraint(
+                condition=Q(pdf_version__gte=1),
+                name="memberships_csa_contract_pdf_version_positive",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(
+                        pdf_vi_storage_key__isnull=True,
+                        pdf_en_storage_key__isnull=True,
+                        pdf_vi_sha256__isnull=True,
+                        pdf_en_sha256__isnull=True,
+                        original_pdf_vi_storage_key__isnull=True,
+                        original_pdf_en_storage_key__isnull=True,
+                        original_pdf_vi_sha256__isnull=True,
+                        original_pdf_en_sha256__isnull=True,
+                        pdf_generated_at__isnull=True,
+                    )
+                    | Q(
+                        pdf_vi_storage_key__isnull=False,
+                        pdf_en_storage_key__isnull=False,
+                        pdf_vi_sha256__isnull=False,
+                        pdf_en_sha256__isnull=False,
+                        original_pdf_vi_storage_key__isnull=False,
+                        original_pdf_en_storage_key__isnull=False,
+                        original_pdf_vi_sha256__isnull=False,
+                        original_pdf_en_sha256__isnull=False,
+                        pdf_generated_at__isnull=False,
+                    )
+                ),
+                name="memberships_csa_contract_pdf_metadata_complete",
+            ),
+        ]
+
+    def save(self, *args, **kwargs):
+        try:
+            self.phone_e164_snapshot = normalize_vietnam_phone(self.phone_e164_snapshot)
+        except InvalidPhoneNumber as error:
+            raise ValidationError({"phone_e164_snapshot": str(error)}) from error
+        self._validate_immutable_fields()
+        self._validate_revocation_immutability()
+        if (
+            self.status == CSAContractStatus.REVOKED
+            and self.revoked_by_id
+            and not self.revoked_by_name_snapshot
+        ):
+            self.revoked_by_name_snapshot = self.revoked_by.name or self.revoked_by.email
+        self.full_clean(validate_unique=False, validate_constraints=False)
+        if update_fields := kwargs.get("update_fields"):
+            kwargs["update_fields"] = set(update_fields) | {"phone_e164_snapshot"}
+            if self.status == CSAContractStatus.REVOKED and self.revoked_by_name_snapshot:
+                kwargs["update_fields"].add("revoked_by_name_snapshot")
+        return super().save(*args, **kwargs)
+
+    def clean(self):
+        super().clean()
+        errors = {}
+        required_text = (
+            "reference_code",
+            "member_name_snapshot",
+            "province_code_snapshot",
+            "ward_code_snapshot",
+            "address_snapshot",
+            "package_name_snapshot",
+            "price_option_name_snapshot",
+            "currency_snapshot",
+            "terms_version",
+            "provider_version",
+        )
+        for field in required_text:
+            if not str(getattr(self, field, "") or "").strip():
+                errors[field] = "This contract snapshot field is required."
+        if self.terms_snapshot in (None, "", {}, []):
+            errors["terms_snapshot"] = "Terms snapshot is required."
+        if self.source == CSAContractSource.ONLINE:
+            if not self.purchase_request_id:
+                errors["purchase_request"] = "Online contracts require a purchase request."
+            else:
+                purchase_request = self.purchase_request
+                if purchase_request.status != CSAPurchaseRequestStatus.APPROVED:
+                    errors["purchase_request"] = (
+                        "Online contracts require an approved purchase request."
+                    )
+                elif purchase_request.membership_id != self.membership_id:
+                    errors["purchase_request"] = (
+                        "Purchase request does not belong to the contract membership."
+                    )
+                if self.reference_code != purchase_request.request_code:
+                    errors["reference_code"] = (
+                        "Online contract reference must match the purchase request code."
+                    )
+        if self.source == CSAContractSource.ONLINE and (
+            self.terms_acceptance_method != CSAContractTermsAcceptanceMethod.ONLINE
+        ):
+            errors["terms_acceptance_method"] = "Online contracts require online acceptance."
+        if self.source == CSAContractSource.ADMIN_MANUAL and (
+            self.terms_acceptance_method != CSAContractTermsAcceptanceMethod.IN_STORE
+        ):
+            errors["terms_acceptance_method"] = "Manual contracts require in-store acceptance."
+        if self.status == CSAContractStatus.ACTIVE and (
+            self.revoked_at or self.revoked_by_id or self.revocation_reason
+        ):
+            errors["status"] = "Active contracts cannot contain revocation data."
+        if self.status == CSAContractStatus.REVOKED and (
+            not self.revoked_at or not self.revoked_by_id or not self.revocation_reason.strip()
+        ):
+            errors["status"] = "Revoked contracts require time, actor, and reason."
+        if errors:
+            raise ValidationError(errors)
+
+    def _validate_immutable_fields(self):
+        if self._state.adding:
+            return
+        current = type(self).objects.filter(pk=self.pk).values(*self.IMMUTABLE_FIELDS).first()
+        if not current:
+            return
+        changed = [
+            field for field in self.IMMUTABLE_FIELDS if getattr(self, field) != current[field]
+        ]
+        if changed:
+            raise ValidationError(
+                {
+                    field.removesuffix("_id"): "Contract identity and snapshots are immutable."
+                    for field in changed
+                }
+            )
+
+    def _validate_revocation_immutability(self):
+        if self._state.adding:
+            return
+        current = (
+            type(self).objects.filter(pk=self.pk).values(*self.REVOCATION_IMMUTABLE_FIELDS).first()
+        )
+        if not current or current["status"] != CSAContractStatus.REVOKED:
+            return
+        changed = [
+            field
+            for field in self.REVOCATION_IMMUTABLE_FIELDS
+            if getattr(self, field) != current[field]
+        ]
+        if changed:
+            raise ValidationError(
+                {
+                    field.removesuffix("_id"): (
+                        "Contract revocation data is immutable after revocation."
+                    )
+                    for field in changed
+                }
+            )
 
 
 class MembershipProductSnapshot(models.Model):

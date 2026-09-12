@@ -32,6 +32,17 @@ def required_env(name: str) -> str:
     return value
 
 
+def env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    value = os.getenv(name, str(default)).strip()
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise ImproperlyConfigured(f"{name} must be an integer") from error
+    if not minimum <= parsed <= maximum:
+        raise ImproperlyConfigured(f"{name} must be between {minimum} and {maximum}")
+    return parsed
+
+
 def parse_origins(name: str, value: str) -> tuple[str, ...]:
     origins: list[str] = []
     for item in value.split(","):
@@ -192,6 +203,24 @@ STATIC_ROOT = BASE_DIR / "staticfiles"
 STATICFILES_DIRS = [BASE_DIR / "static"]
 MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
+CSA_CONTRACT_PRIVATE_STORAGE_ROOT = Path(
+    os.getenv("CSA_CONTRACT_PRIVATE_STORAGE_ROOT", "").strip()
+    or BASE_DIR / "private" / "csa-contracts"
+)
+CSA_CONTRACT_PDF_FONT_PATH = Path(
+    os.getenv("CSA_CONTRACT_PDF_FONT_PATH", "").strip()
+    or BASE_DIR / "assets" / "fonts" / "NotoSans-Regular.ttf"
+)
+CSA_CONTRACT_PDF_BOLD_FONT_PATH = Path(
+    os.getenv("CSA_CONTRACT_PDF_BOLD_FONT_PATH", "").strip()
+    or BASE_DIR / "assets" / "fonts" / "NotoSans-Bold.ttf"
+)
+CSA_PURCHASE_REQUEST_EXPIRY_SECONDS = env_int(
+    "CSA_PURCHASE_REQUEST_EXPIRY_SECONDS",
+    7 * 24 * 60 * 60,
+    minimum=5 * 60,
+    maximum=30 * 24 * 60 * 60,
+)
 CONTENT_MAX_UPLOAD_BYTES = int(os.getenv("CONTENT_MAX_UPLOAD_BYTES", str(8 * 1024 * 1024)))
 CONTENT_MAX_IMAGE_PIXELS = int(os.getenv("CONTENT_MAX_IMAGE_PIXELS", "16000000"))
 CONTENT_SERVE_MEDIA = env_bool("CONTENT_SERVE_MEDIA", True)

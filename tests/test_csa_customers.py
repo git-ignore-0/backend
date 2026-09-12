@@ -11,7 +11,12 @@ from rest_framework.test import APIClient
 
 from identity.models import AccountStatus, AuditLog, User
 from members.models import MemberProfile
-from memberships.models import CSACustomer, Membership, MembershipStatus
+from memberships.models import (
+    CSACustomer,
+    Membership,
+    MembershipPaymentSettings,
+    MembershipStatus,
+)
 from memberships.phones import InvalidPhoneNumber, normalize_vietnam_phone
 from memberships.services import (
     CSACustomerRequiredForMembership,
@@ -62,6 +67,19 @@ def admin_api(active_user, access_token):
     access_token.scope = "profile email content:manage"
     access_token.save(update_fields=["scope"])
     return bearer_client(access_token)
+
+
+@pytest.fixture
+def manual_payment_settings(monkeypatch, settings, tmp_path):
+    bank = {"bin": "970436", "name": "Vietcombank"}
+    monkeypatch.setattr("memberships.banks.get_transfer_banks", lambda: [bank])
+    settings.CSA_CONTRACT_PRIVATE_STORAGE_ROOT = tmp_path / "contracts"
+    return MembershipPaymentSettings.objects.create(
+        bank_bin=bank["bin"],
+        bank_name=bank["name"],
+        account_number="123456789",
+        account_name="NATURAL FARMING VIETNAM",
+    )
 
 
 @pytest.mark.parametrize(
@@ -388,7 +406,9 @@ def test_link_rejects_user_owned_by_another_customer(active_user):
 
 
 @pytest.mark.django_db
-def test_managed_customer_assignment_and_self_ownership(admin_api, active_user, access_token):
+def test_managed_customer_assignment_and_self_ownership(
+    admin_api, active_user, access_token, manual_payment_settings
+):
     customer = create_complete_managed_customer()
     package, _product, option = create_package()
     response = admin_api.post(
@@ -466,7 +486,7 @@ def test_membership_assignment_requires_one_complete_canonical_customer(admin_ap
 
 @pytest.mark.django_db
 def test_memberships_schedule_back_to_back_and_self_returns_only_active(
-    active_user, access_token, admin_api
+    active_user, access_token, admin_api, manual_payment_settings
 ):
     customer = create_complete_customer_for_user(active_user)
     package, _product, option = create_package(duration=1)

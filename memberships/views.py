@@ -1,6 +1,9 @@
+from django.conf import settings
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import IntegrityError, transaction
 from django.db.models import Q, Sum
 from django.db.models.deletion import ProtectedError
+from django.http import FileResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import status, viewsets
@@ -12,31 +15,84 @@ from rest_framework.views import APIView
 
 from content.permissions import IsWebsiteAdmin
 from identity.models import User
+from memberships.banks import BankDirectoryUnavailable, get_transfer_banks
+from memberships.contract_access import (
+    CSAContractAccessError,
+    InvalidContractLocale,
+    contract_download_filename,
+    contract_payload,
+    contract_queryset,
+    contract_summary,
+    open_verified_current_contract_pdf,
+    validated_contract_locale,
+)
+from memberships.contract_pdfs import CSAContractPDFError, CSAContractPDFStorageError
+from memberships.contract_verification import (
+    CSAContractVerificationUnavailable,
+    csa_contract_verification_payload,
+    verify_csa_contract,
+)
+from memberships.contracts import CSAContractError
 from memberships.models import (
+    CSAContract,
     CSACustomer,
+    CSAPurchaseRequest,
     Membership,
     MembershipContentLocale,
     MembershipCycleQuota,
     MembershipPackage,
     MembershipPackageItem,
     MembershipPackageTranslation,
+    MembershipPaymentSettings,
     MembershipStatus,
     MembershipUsageOrder,
     Product,
     ProductTranslation,
 )
 from memberships.permissions import HasMembershipSelfScopes
+from memberships.purchases import (
+    CSAPurchaseError,
+    PaymentSettingsUnavailable,
+    PurchaseAdminNotFound,
+    PurchaseAdminWorkflowConflict,
+    PurchaseConfirmationDenied,
+    PurchaseCustomerConflict,
+    PurchaseCustomerIncomplete,
+    PurchaseCustomerResolutionRequired,
+    PurchasePackageUnavailable,
+    PurchaseRefundConflict,
+    PurchaseRequestConflict,
+    PurchaseRequestExpired,
+    PurchaseStartDateInvalid,
+    PurchaseTransitionConflict,
+    approve_csa_purchase_request,
+    confirm_csa_purchase_payment,
+    create_public_csa_purchase_request,
+    mark_csa_purchase_request_refunded,
+    reject_csa_purchase_request,
+    update_membership_payment_settings,
+)
 from memberships.serializers import (
     AdminCSACustomerQuerySerializer,
+    AdminCSAPurchaseRequestQuerySerializer,
     AdminMembershipQuerySerializer,
     AdminPackageQuerySerializer,
     AdminProductQuerySerializer,
+    AuthenticatedCSAPurchaseRequestCreateSerializer,
+    CSAContractVerificationSerializer,
     CSACustomerCreateSerializer,
     CSACustomerLinkUserSerializer,
     CSACustomerUpdateSerializer,
+    CSAPurchasePaymentConfirmSerializer,
+    CSAPurchaseRequestApproveSerializer,
+    CSAPurchaseRequestCreateSerializer,
+    CSAPurchaseRequestRefundSerializer,
+    CSAPurchaseRequestRejectSerializer,
+    CSATrackerLookupSerializer,
     LocalePageQuerySerializer,
     LocaleQuerySerializer,
     MembershipAssignSerializer,
+    MembershipPaymentSettingsWriteSerializer,
     MembershipRevokeSerializer,
     PackageWriteSerializer,
     ProductWriteSerializer,
@@ -50,7 +106,7 @@ from memberships.services import (
     MembershipNotRevocable,
     PriceOptionConflict,
     PriceOptionTotalInvalid,
-    assign_membership,
+    assign_membership_with_contract,
     create_csa_customer_for_user,
     create_managed_csa_customer,
     create_usage_order,
@@ -61,6 +117,28 @@ from memberships.services import (
     sync_package_price_options,
     undo_usage_order,
     update_csa_customer,
+)
+from memberships.throttles import (
+    CSAContractVerificationThrottle,
+    CSAPurchaseConfirmThrottle,
+    CSAPurchaseCreateThrottle,
+    CSATrackerCredentialThrottle,
+    CSATrackerIPThrottle,
+    CSATrackerSessionThrottle,
+)
+from memberships.tracker import (
+    TRACKER_COOKIE_NAME,
+    TRACKER_COOKIE_PATH,
+    CSATrackerError,
+    CSATrackerLookupUnavailable,
+    CSATrackerSessionExpired,
+    create_tracker_session,
+    lookup_tracker_request,
+    resolve_tracker_request,
+    tracker_contract,
+    tracker_contract_payload,
+    tracker_request_payload,
+    tracker_session_ttl,
 )
 
 PAGE_SIZE = 30
@@ -109,6 +187,135 @@ def csa_customer_error(error):
         else status.HTTP_409_CONFLICT
     )
     return no_store(Response({"errors": [{"code": error.code}]}, status=http_status))
+
+
+def csa_purchase_error(error):
+    if isinstance(error, PaymentSettingsUnavailable):
+        http_status = status.HTTP_503_SERVICE_UNAVAILABLE
+    elif isinstance(error, (PurchaseConfirmationDenied, PurchaseAdminNotFound)):
+        http_status = status.HTTP_404_NOT_FOUND
+    elif isinstance(
+        error,
+        (
+            PurchaseAdminWorkflowConflict,
+            PurchaseCustomerConflict,
+            PurchaseCustomerResolutionRequired,
+            PurchaseRequestConflict,
+            PurchaseRequestExpired,
+            PurchasePackageUnavailable,
+            PurchaseRefundConflict,
+            PurchaseTransitionConflict,
+        ),
+    ):
+        http_status = status.HTTP_409_CONFLICT
+    elif isinstance(error, (PurchaseCustomerIncomplete, PurchaseStartDateInvalid)):
+        http_status = status.HTTP_400_BAD_REQUEST
+    else:
+        http_status = status.HTTP_400_BAD_REQUEST
+    error_payload = {"code": error.code}
+    if client_message := getattr(error, "client_message", None):
+        error_payload["message"] = client_message
+    if context := getattr(error, "context", None):
+        error_payload["context"] = context
+    return no_store(Response({"errors": [error_payload]}, status=http_status))
+
+
+def csa_contract_error(error):
+    http_status = (
+        status.HTTP_503_SERVICE_UNAVAILABLE
+        if isinstance(error, CSAContractPDFStorageError)
+        else status.HTTP_400_BAD_REQUEST
+    )
+    return no_store(Response({"errors": [{"code": error.code}]}, status=http_status))
+
+
+def csa_contract_access_error(error):
+    http_status = (
+        status.HTTP_400_BAD_REQUEST
+        if isinstance(error, InvalidContractLocale)
+        else status.HTTP_404_NOT_FOUND
+    )
+    return no_store(Response({"errors": [{"code": error.code}]}, status=http_status))
+
+
+def csa_tracker_error(error):
+    http_status = (
+        status.HTTP_401_UNAUTHORIZED
+        if isinstance(error, CSATrackerSessionExpired)
+        else status.HTTP_404_NOT_FOUND
+    )
+    response = no_store(Response({"errors": [{"code": error.code}]}, status=http_status))
+    if isinstance(error, CSATrackerSessionExpired):
+        response.delete_cookie(
+            TRACKER_COOKIE_NAME,
+            path=TRACKER_COOKIE_PATH,
+            samesite="Lax",
+        )
+    return response
+
+
+def set_tracker_cookie(response, token):
+    response.set_cookie(
+        TRACKER_COOKIE_NAME,
+        token,
+        max_age=tracker_session_ttl(),
+        path=TRACKER_COOKIE_PATH,
+        secure=(not settings.DEBUG or settings.SESSION_COOKIE_SECURE),
+        httponly=True,
+        samesite="Lax",
+    )
+    return response
+
+
+def contract_pdf_response(contract, *, locale):
+    try:
+        locale = validated_contract_locale(locale)
+        pdf_file = open_verified_current_contract_pdf(contract, locale=locale)
+    except CSAContractAccessError as error:
+        return csa_contract_access_error(error)
+    response = FileResponse(
+        pdf_file,
+        as_attachment=True,
+        filename=contract_download_filename(contract, locale),
+        content_type="application/pdf",
+    )
+    response["Cache-Control"] = "private, no-store"
+    response["Pragma"] = "no-cache"
+    response["X-Content-Type-Options"] = "nosniff"
+    return response
+
+
+def csa_purchase_validation_error(*, code, fields):
+    return no_store(
+        Response(
+            {"errors": [{"code": code, "fields": fields}]},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    )
+
+
+def membership_payment_settings_payload(item=None):
+    if item is None:
+        return {
+            "key": "default",
+            "direct_transfer_enabled": False,
+            "bank_bin": "",
+            "bank_name": "",
+            "account_number": "",
+            "account_name": "",
+            "version": 0,
+            "updated_at": None,
+        }
+    return {
+        "key": item.key,
+        "direct_transfer_enabled": item.direct_transfer_enabled,
+        "bank_bin": item.bank_bin,
+        "bank_name": item.bank_name,
+        "account_number": item.account_number,
+        "account_name": item.account_name,
+        "version": item.version,
+        "updated_at": item.updated_at.isoformat(),
+    }
 
 
 def customer_payload(item, *, include_memberships=False):
@@ -170,6 +377,119 @@ def customer_payload(item, *, include_memberships=False):
             for membership in memberships
         ]
     return data
+
+
+def csa_purchase_payload(item: CSAPurchaseRequest, *, guest_confirmation_token=None):
+    amount = str(item.amount_snapshot)
+    data = {
+        "id": str(item.pk),
+        "request_code": item.request_code,
+        "status": item.status,
+        "package_snapshot": {
+            "id": str(item.package_id),
+            "name": item.package_name_snapshot,
+        },
+        "price_option_snapshot": {
+            "id": str(item.price_option_id),
+            "name": item.price_option_name_snapshot,
+            "duration_months": item.duration_months_snapshot,
+        },
+        "amount": amount,
+        "currency": item.currency_snapshot,
+        "transfer_content": item.transfer_content,
+        "bank_bin": item.bank_bin_snapshot,
+        "bank_name": item.bank_name_snapshot,
+        "account_number": item.account_number_snapshot,
+        "account_name": item.account_name_snapshot,
+        "terms_version": item.terms_version,
+        "terms_locale": item.terms_locale,
+        "terms_accepted_at": (
+            item.terms_accepted_at.isoformat() if item.terms_accepted_at else None
+        ),
+        "expires_at": item.expires_at.isoformat() if item.expires_at else None,
+        "qr_payload": {
+            "acqId": item.bank_bin_snapshot,
+            "accountNo": item.account_number_snapshot,
+            "accountName": item.account_name_snapshot,
+            "amount": amount,
+            "addInfo": item.transfer_content,
+            "format": "text",
+            "template": "compact2",
+        },
+    }
+    if guest_confirmation_token is not None:
+        data["guest_confirmation_token"] = guest_confirmation_token
+    return data
+
+
+def admin_csa_purchase_payload(item: CSAPurchaseRequest):
+    try:
+        contract = item.csa_contract
+    except CSAContract.DoesNotExist:
+        contract = None
+    return {
+        **csa_purchase_payload(item),
+        "user": (
+            {
+                "id": str(item.user_id),
+                "name": item.user.name,
+                "email": item.user.email,
+            }
+            if item.user_id
+            else None
+        ),
+        "customer_id": str(item.customer_id) if item.customer_id else None,
+        "membership_id": str(item.membership_id) if item.membership_id else None,
+        "contract": contract_summary(contract),
+        "name": item.name_snapshot,
+        "phone": item.phone_e164,
+        "province_code": item.province_code_snapshot,
+        "ward_code": item.ward_code_snapshot,
+        "address": item.address_snapshot,
+        "payment_config_version": item.payment_config_version,
+        "payment_confirmed_at": (
+            item.payment_confirmed_at.isoformat() if item.payment_confirmed_at else None
+        ),
+        "approved_at": item.approved_at.isoformat() if item.approved_at else None,
+        "rejected_at": item.rejected_at.isoformat() if item.rejected_at else None,
+        "expired_at": item.expired_at.isoformat() if item.expired_at else None,
+        "expired_reason": item.expired_reason or None,
+        "approved_by": (
+            {"id": str(item.approved_by_id), "name": item.approved_by.name}
+            if item.approved_by_id
+            else None
+        ),
+        "rejected_by": (
+            {"id": str(item.rejected_by_id), "name": item.rejected_by.name}
+            if item.rejected_by_id
+            else None
+        ),
+        "rejection_reason": item.rejection_reason,
+        "refund_status": item.refund_status,
+        "refund_marked_at": (item.refund_marked_at.isoformat() if item.refund_marked_at else None),
+        "refund_marked_by": (
+            {"id": str(item.refund_marked_by_id), "name": item.refund_marked_by.name}
+            if item.refund_marked_by_id
+            else None
+        ),
+        "refund_note": item.refund_note,
+        "created_at": item.created_at.isoformat(),
+        "updated_at": item.updated_at.isoformat(),
+    }
+
+
+def csa_purchase_admin_queryset():
+    return CSAPurchaseRequest.objects.select_related(
+        "user",
+        "customer",
+        "membership",
+        "csa_contract",
+        "package",
+        "price_option",
+        "approved_by",
+        "rejected_by",
+        "refund_marked_by",
+    ).order_by("-created_at", "-id")
 
 
 def requested_locale(request):
@@ -413,6 +733,12 @@ def membership_payload(
                 {"id": str(user.pk), "name": user.name, "email": user.email} if user else None
             ),
         }
+    if admin:
+        try:
+            contract = item.csa_contract
+        except CSAContract.DoesNotExist:
+            contract = None
+        data["contract"] = contract_summary(contract)
     return data
 
 
@@ -550,7 +876,12 @@ def package_queryset():
 
 def membership_queryset():
     return Membership.objects.select_related(
-        "customer", "customer__user", "package", "price_option", "revoked_by"
+        "customer",
+        "customer__user",
+        "package",
+        "price_option",
+        "revoked_by",
+        "csa_contract",
     ).prefetch_related("product_snapshots")
 
 
@@ -567,6 +898,7 @@ def customer_queryset():
         "memberships__package",
         "memberships__price_option",
         "memberships__revoked_by",
+        "memberships__csa_contract",
     )
 
 
@@ -582,6 +914,7 @@ class PublicPackageListView(APIView):
             .filter(is_active=True, items__isnull=False, price_options__is_active=True)
             .exclude(items__product__is_active=False)
             .distinct()
+            .order_by("created_at", "id")
         )
         items, meta = paginate(queryset, query.validated_data["page"])
         response = Response(
@@ -595,6 +928,158 @@ class PublicPackageListView(APIView):
         )
         response["Cache-Control"] = "public, max-age=60, stale-while-revalidate=300"
         return response
+
+
+class PublicCSAPurchaseRequestCreateView(APIView):
+    permission_classes = [AllowAny]
+    throttle_classes = [CSAPurchaseCreateThrottle]
+
+    def post(self, request):
+        user = request.user if request.user and request.user.is_authenticated else None
+        serializer_class = (
+            AuthenticatedCSAPurchaseRequestCreateSerializer
+            if user is not None
+            else CSAPurchaseRequestCreateSerializer
+        )
+        serializer = serializer_class(data=request.data)
+        if not serializer.is_valid():
+            return csa_purchase_validation_error(
+                code=(
+                    "csa_purchase_terms_required"
+                    if "terms_accepted" in serializer.errors
+                    else "invalid_csa_purchase_request"
+                ),
+                fields=serializer.errors,
+            )
+        data = dict(serializer.validated_data)
+        purchase_data = {
+            "package_id": data["package_id"],
+            "price_option_id": data["price_option_id"],
+            "zalo_whatsapp": data.get("zalo_whatsapp"),
+            "terms_locale": data["terms_locale"],
+            "terms_acceptance_ip": request.META.get("REMOTE_ADDR") or None,
+            "terms_acceptance_user_agent": request.META.get("HTTP_USER_AGENT") or None,
+        }
+        if user is None:
+            purchase_data.update(
+                {
+                    field: data[field]
+                    for field in ("name", "phone", "province_code", "ward_code", "address")
+                }
+            )
+            purchase_data["email"] = data.get("email")
+        try:
+            item, guest_token = create_public_csa_purchase_request(user=user, **purchase_data)
+        except CSAPurchaseError as error:
+            return csa_purchase_error(error)
+        return no_store(
+            Response(
+                {"data": csa_purchase_payload(item, guest_confirmation_token=guest_token)},
+                status=status.HTTP_201_CREATED,
+            )
+        )
+
+
+class PublicCSAPurchasePaymentConfirmView(APIView):
+    permission_classes = [AllowAny]
+    throttle_classes = [CSAPurchaseConfirmThrottle]
+
+    def post(self, request, request_id):
+        serializer = CSAPurchasePaymentConfirmSerializer(data=request.data)
+        if not serializer.is_valid():
+            return csa_purchase_validation_error(
+                code="invalid_csa_purchase_confirmation",
+                fields=serializer.errors,
+            )
+        user = request.user if request.user and request.user.is_authenticated else None
+        try:
+            item = confirm_csa_purchase_payment(
+                request_id=request_id,
+                user=user,
+                guest_confirmation_token=serializer.validated_data.get("guest_confirmation_token"),
+            )
+        except CSAPurchaseError as error:
+            return csa_purchase_error(error)
+        return no_store(Response({"data": csa_purchase_payload(item)}))
+
+
+class PublicCSAContractTrackerLookupView(APIView):
+    permission_classes = [AllowAny]
+    throttle_classes = [CSATrackerIPThrottle, CSATrackerCredentialThrottle]
+
+    def post(self, request):
+        serializer = CSATrackerLookupSerializer(data=request.data)
+        if not serializer.is_valid():
+            return csa_tracker_error(CSATrackerLookupUnavailable("Tracker lookup is unavailable"))
+        try:
+            item = lookup_tracker_request(
+                reference_code=serializer.validated_data["reference_code"],
+                phone_e164=serializer.validated_data["phone"],
+            )
+        except CSATrackerError as error:
+            return csa_tracker_error(error)
+        token = create_tracker_session(
+            request_id=item.pk,
+            previous_token=request.COOKIES.get(TRACKER_COOKIE_NAME),
+        )
+        response = no_store(Response({"data": tracker_request_payload(item)}))
+        return set_tracker_cookie(response, token)
+
+
+class PublicCSAContractVerificationView(APIView):
+    permission_classes = [AllowAny]
+    throttle_classes = [CSAContractVerificationThrottle]
+
+    def finalize_response(self, request, response, *args, **kwargs):
+        return no_store(super().finalize_response(request, response, *args, **kwargs))
+
+    def get(self, request):
+        serializer = CSAContractVerificationSerializer(data=request.query_params)
+        if not serializer.is_valid():
+            return no_store(
+                Response(
+                    {"errors": [{"code": CSAContractVerificationUnavailable.code}]},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+            )
+        try:
+            contract = verify_csa_contract(
+                reference_code=serializer.validated_data["reference_code"]
+            )
+        except CSAContractVerificationUnavailable as error:
+            return no_store(
+                Response(
+                    {"errors": [{"code": error.code}]},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+            )
+        return no_store(Response({"data": csa_contract_verification_payload(contract)}))
+
+
+class PublicCSAContractTrackerContractView(APIView):
+    permission_classes = [AllowAny]
+    throttle_classes = [CSATrackerSessionThrottle]
+
+    def get(self, request):
+        try:
+            item = resolve_tracker_request(request.COOKIES.get(TRACKER_COOKIE_NAME))
+            contract = tracker_contract(item)
+        except CSATrackerError as error:
+            return csa_tracker_error(error)
+        return no_store(Response({"data": tracker_contract_payload(contract)}))
+
+
+class PublicCSAContractTrackerPDFView(APIView):
+    permission_classes = [AllowAny]
+    throttle_classes = [CSATrackerSessionThrottle]
+
+    def get(self, request):
+        try:
+            item = resolve_tracker_request(request.COOKIES.get(TRACKER_COOKIE_NAME))
+            contract = tracker_contract(item)
+        except CSATrackerError as error:
+            return csa_tracker_error(error)
+        return contract_pdf_response(contract, locale=request.query_params.get("locale", "vi"))
 
 
 class SelfMembershipView(APIView):
@@ -623,6 +1108,44 @@ class SelfMembershipView(APIView):
         if item.status != MembershipStatus.ACTIVE:
             return no_store(Response({"data": None}))
         return no_store(Response({"data": membership_payload(item, locale=locale)}))
+
+
+class SelfMembershipContractView(APIView):
+    permission_classes = [HasMembershipSelfScopes]
+
+    def get(self, request, membership_id):
+        contract = (
+            contract_queryset()
+            .filter(
+                membership_id=membership_id,
+                membership__customer__user_id=request.user.pk,
+            )
+            .first()
+        )
+        if contract is None:
+            return no_store(Response(status=status.HTTP_404_NOT_FOUND))
+        return no_store(Response({"data": contract_payload(contract, admin=False)}))
+
+
+class SelfMembershipContractPDFView(APIView):
+    permission_classes = [HasMembershipSelfScopes]
+
+    def get(self, request, membership_id):
+        try:
+            locale = validated_contract_locale(request.query_params.get("locale", "vi"))
+        except CSAContractAccessError as error:
+            return csa_contract_access_error(error)
+        contract = (
+            contract_queryset()
+            .filter(
+                membership_id=membership_id,
+                membership__customer__user_id=request.user.pk,
+            )
+            .first()
+        )
+        if contract is None:
+            return no_store(Response(status=status.HTTP_404_NOT_FOUND))
+        return contract_pdf_response(contract, locale=locale)
 
 
 class SelfQuotaView(APIView):
@@ -880,6 +1403,145 @@ class AdminPackageViewSet(viewsets.ViewSet):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
+class AdminMembershipPaymentSettingsView(APIView):
+    permission_classes = [IsWebsiteAdmin]
+
+    def get(self, request):
+        item = MembershipPaymentSettings.objects.filter(pk="default").first()
+        return no_store(Response({"data": membership_payment_settings_payload(item)}))
+
+    def patch(self, request):
+        serializer = MembershipPaymentSettingsWriteSerializer(data=request.data)
+        if not serializer.is_valid():
+            return no_store(
+                Response(
+                    {
+                        "errors": [
+                            {
+                                "code": "invalid_membership_payment_settings",
+                                "fields": serializer.errors,
+                            }
+                        ]
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            )
+        try:
+            item = update_membership_payment_settings(
+                **serializer.validated_data,
+                actor=request.user,
+            )
+        except DjangoValidationError as error:
+            return no_store(
+                Response(
+                    {
+                        "errors": [
+                            {
+                                "code": "invalid_membership_payment_settings",
+                                "fields": error.message_dict,
+                            }
+                        ]
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            )
+        return no_store(Response({"data": membership_payment_settings_payload(item)}))
+
+
+class AdminMembershipBanksView(APIView):
+    permission_classes = [IsWebsiteAdmin]
+
+    def get(self, request):
+        try:
+            banks = get_transfer_banks()
+        except BankDirectoryUnavailable:
+            return no_store(
+                Response(
+                    {"errors": [{"code": "membership_bank_directory_unavailable"}]},
+                    status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                )
+            )
+        return no_store(Response({"data": banks}))
+
+
+class AdminCSAPurchaseRequestViewSet(viewsets.ViewSet):
+    permission_classes = [IsWebsiteAdmin]
+    lookup_value_converter = "uuid"
+
+    def list(self, request):
+        query = AdminCSAPurchaseRequestQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+        data = query.validated_data
+        queryset = csa_purchase_admin_queryset()
+        if search := data["search"].strip():
+            queryset = queryset.filter(
+                Q(request_code__icontains=search)
+                | Q(phone_e164__icontains=search)
+                | Q(name_snapshot__icontains=search)
+            )
+        if request_status := data.get("status"):
+            queryset = queryset.filter(status=request_status)
+        items, meta = paginate(queryset, data["page"], data["page_size"])
+        return no_store(
+            Response({"data": [admin_csa_purchase_payload(item) for item in items], "meta": meta})
+        )
+
+    def retrieve(self, request, pk=None):
+        item = get_object_or_404(csa_purchase_admin_queryset(), pk=pk)
+        return no_store(Response({"data": admin_csa_purchase_payload(item)}))
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        serializer = CSAPurchaseRequestApproveSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            item, _membership = approve_csa_purchase_request(
+                request_id=pk,
+                start_date=serializer.validated_data["start_date"],
+                customer_resolution=serializer.validated_data.get("customer_resolution"),
+                rejection_reason=serializer.validated_data.get("rejection_reason"),
+                actor=request.user,
+            )
+        except CSAPurchaseError as error:
+            return csa_purchase_error(error)
+        except MembershipError as error:
+            return membership_error(error)
+        except (CSAContractError, CSAContractPDFError) as error:
+            return csa_contract_error(error)
+        item = csa_purchase_admin_queryset().get(pk=item.pk)
+        return no_store(Response({"data": admin_csa_purchase_payload(item)}))
+
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        serializer = CSAPurchaseRequestRejectSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            item = reject_csa_purchase_request(
+                request_id=pk,
+                reason=serializer.validated_data["rejection_reason"],
+                actor=request.user,
+            )
+        except CSAPurchaseError as error:
+            return csa_purchase_error(error)
+        item = csa_purchase_admin_queryset().get(pk=item.pk)
+        return no_store(Response({"data": admin_csa_purchase_payload(item)}))
+
+    @action(detail=True, methods=["post"], url_path="mark-refunded")
+    def mark_refunded(self, request, pk=None):
+        serializer = CSAPurchaseRequestRefundSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            item = mark_csa_purchase_request_refunded(
+                request_id=pk,
+                actor=request.user,
+                note=serializer.validated_data["refund_note"],
+            )
+        except CSAPurchaseError as error:
+            return csa_purchase_error(error)
+        item = csa_purchase_admin_queryset().get(pk=item.pk)
+        return no_store(Response({"data": admin_csa_purchase_payload(item)}))
+
+
 class AdminCSACustomerViewSet(viewsets.ViewSet):
     permission_classes = [IsWebsiteAdmin]
 
@@ -1014,7 +1676,7 @@ class AdminMembershipViewSet(viewsets.ViewSet):
         serializer = MembershipAssignSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         try:
-            item = assign_membership(actor=request.user, **serializer.validated_data)
+            item = assign_membership_with_contract(actor=request.user, **serializer.validated_data)
         except (User.DoesNotExist, CSACustomer.DoesNotExist):
             return Response(status=status.HTTP_404_NOT_FOUND)
         except PriceOptionTotalInvalid as error:
@@ -1023,16 +1685,17 @@ class AdminMembershipViewSet(viewsets.ViewSet):
             return membership_error(error)
         except CSACustomerError as error:
             return membership_error(error)
+        except (CSAContractError, CSAContractPDFError) as error:
+            return csa_contract_error(error)
+        result = membership_payload(
+            membership_queryset().get(pk=item.pk),
+            locale=locale,
+            include_user=True,
+            admin=True,
+        )
         return no_store(
             Response(
-                {
-                    "data": membership_payload(
-                        membership_queryset().get(pk=item.pk),
-                        locale=locale,
-                        include_user=True,
-                        admin=True,
-                    )
-                },
+                {"data": result},
                 status=status.HTTP_201_CREATED,
             )
         )
@@ -1052,6 +1715,24 @@ class AdminMembershipViewSet(viewsets.ViewSet):
         )
         data["cycles"] = cycle_payload(item, locale=locale)
         return no_store(Response({"data": data}))
+
+    @action(detail=True, methods=["get"], url_path="contract")
+    def contract_detail(self, request, pk=None):
+        contract = contract_queryset().filter(membership_id=pk).first()
+        if contract is None:
+            return no_store(Response(status=status.HTTP_404_NOT_FOUND))
+        return no_store(Response({"data": contract_payload(contract, admin=True)}))
+
+    @action(detail=True, methods=["get"], url_path="contract/pdf")
+    def contract_pdf(self, request, pk=None):
+        try:
+            locale = validated_contract_locale(request.query_params.get("locale", "vi"))
+        except CSAContractAccessError as error:
+            return csa_contract_access_error(error)
+        contract = contract_queryset().filter(membership_id=pk).first()
+        if contract is None:
+            return no_store(Response(status=status.HTTP_404_NOT_FOUND))
+        return contract_pdf_response(contract, locale=locale)
 
     @action(detail=True, methods=["post"], url_path="revoke")
     def revoke(self, request, pk=None):

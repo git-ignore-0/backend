@@ -13,9 +13,12 @@ from django.db.models.deletion import ProtectedError
 from django.utils import timezone
 from rest_framework.test import APIClient
 
-from identity.models import AccountStatus, User
+from identity.models import AccountStatus, AuditLog, User
 from members.models import MemberProfile
 from memberships.models import (
+    CSAContract,
+    CSAContractSource,
+    CSAContractTermsAcceptanceMethod,
     CSACustomer,
     Membership,
     MembershipCycle,
@@ -24,6 +27,7 @@ from memberships.models import (
     MembershipPackageItem,
     MembershipPackagePriceOption,
     MembershipPackageTranslation,
+    MembershipPaymentSettings,
     MembershipStatus,
     MembershipUsageAllocation,
     MembershipUsageLine,
@@ -40,6 +44,7 @@ from memberships.services import (
     InsufficientQuota,
     MembershipNotRevocable,
     MembershipOverlap,
+    PackageUnavailable,
     PriceOptionTotalInvalid,
     PriceOptionUnavailable,
     ProductNotInMembership,
@@ -62,6 +67,19 @@ def bearer_client(token):
     client = APIClient()
     client.credentials(HTTP_AUTHORIZATION=f"Bearer {token.token}")
     return client
+
+
+@pytest.fixture
+def manual_payment_settings(monkeypatch, settings, tmp_path):
+    bank = {"bin": "970436", "name": "Vietcombank"}
+    monkeypatch.setattr("memberships.banks.get_transfer_banks", lambda: [bank])
+    settings.CSA_CONTRACT_PRIVATE_STORAGE_ROOT = tmp_path / "contracts"
+    return MembershipPaymentSettings.objects.create(
+        bank_bin=bank["bin"],
+        bank_name=bank["name"],
+        account_number="123456789",
+        account_name="NATURAL FARMING VIETNAM",
+    )
 
 
 def create_active_user(email, *, phone="0901234567"):
@@ -471,6 +489,33 @@ def test_public_catalog_localizes_and_only_exposes_active_safe_price_options(cli
 
 
 @pytest.mark.django_db
+def test_public_catalog_orders_packages_by_created_at_then_id(client):
+    oldest, _oldest_product, _oldest_option = create_package()
+    tied_a, _tied_a_product, _tied_a_option = create_package()
+    tied_b, _tied_b_product, _tied_b_option = create_package()
+    now = timezone.now()
+    oldest_at = now - timedelta(days=2)
+    tied_at = now - timedelta(days=1)
+    MembershipPackage.objects.filter(pk=oldest.pk).update(
+        name="Zulu package",
+        created_at=oldest_at,
+    )
+    MembershipPackage.objects.filter(pk__in=[tied_a.pk, tied_b.pk]).update(
+        name="Alpha package",
+        created_at=tied_at,
+    )
+
+    response = client.get("/api/v1/public/membership-packages?locale=vi")
+
+    assert response.status_code == 200
+    tied_ids = sorted([str(tied_a.pk), str(tied_b.pk)])
+    assert [item["id"] for item in response.json()["data"]] == [
+        str(oldest.pk),
+        *tied_ids,
+    ]
+
+
+@pytest.mark.django_db
 def test_manual_assignment_snapshots_bilingual_catalog_price_and_products(active_user):
     package, product, option = create_package(quota=3, duration=3, monthly_price=400_001)
     membership, _product, _option = assign(
@@ -498,8 +543,8 @@ def test_manual_assignment_snapshots_bilingual_catalog_price_and_products(active
 
 
 @pytest.mark.django_db
-def test_assignment_rejects_wrong_or_inactive_option(active_user):
-    package, _product, _option = create_package()
+def test_assignment_rejects_wrong_or_inactive_package_or_option(active_user):
+    package, _product, package_option = create_package()
     other_package, _other_product, other_option = create_package()
     with pytest.raises(PriceOptionUnavailable):
         assign_membership(
@@ -508,6 +553,17 @@ def test_assignment_rejects_wrong_or_inactive_option(active_user):
             price_option_id=other_option.pk,
             start_date=timezone.localdate(),
             farmbrite_order_reference="FB-WRONG-PACKAGE",
+            actor=active_user,
+        )
+    package.is_active = False
+    package.save(update_fields=["is_active", "updated_at"])
+    with pytest.raises(PackageUnavailable):
+        assign_membership(
+            customer_id=customer_for(active_user).pk,
+            package_id=package.pk,
+            price_option_id=package_option.pk,
+            start_date=timezone.localdate(),
+            farmbrite_order_reference="FB-INACTIVE-PACKAGE",
             actor=active_user,
         )
     other_option.is_active = False
@@ -674,7 +730,9 @@ def test_live_catalog_and_price_changes_do_not_change_membership_snapshot(active
 
 
 @pytest.mark.django_db
-def test_admin_assignment_api_rejects_unknown_fields_and_returns_snapshot(admin_api, active_user):
+def test_admin_assignment_api_rejects_unknown_fields_and_returns_snapshot(
+    admin_api, active_user, manual_payment_settings
+):
     package, _product, option = create_package()
     customer = customer_for(active_user)
     payload = {
@@ -701,6 +759,86 @@ def test_admin_assignment_api_rejects_unknown_fields_and_returns_snapshot(admin_
         "total_price_vnd": "6000000",
     }
     assert data["farmbrite_order_reference"] == "FB-API-001"
+    contract = CSAContract.objects.get(membership_id=data["id"])
+    assert data["contract"] == {
+        "id": str(contract.pk),
+        "reference_code": contract.reference_code,
+        "status": "active",
+    }
+    assert contract.source == CSAContractSource.ADMIN_MANUAL
+    assert contract.purchase_request_id is None
+    assert contract.terms_acceptance_method == CSAContractTermsAcceptanceMethod.IN_STORE
+    assert contract.member_name_snapshot == customer.name
+    assert contract.package_name_snapshot == data["package_name"]
+    assert contract.quota_snapshot["policy"] == package.quota_policy
+    assert contract.payment_snapshot == {
+        "bank_bin": manual_payment_settings.bank_bin,
+        "bank_name": manual_payment_settings.bank_name,
+        "account_number": manual_payment_settings.account_number,
+        "account_name": manual_payment_settings.account_name,
+        "transfer_content": "FB-API-001",
+        "payment_config_version": manual_payment_settings.version,
+    }
+    assert contract.terms_snapshot_vi and contract.terms_snapshot_en
+    assert contract.pdf_vi_storage_key and contract.pdf_en_storage_key
+    original_snapshot = (
+        contract.member_name_snapshot,
+        contract.payment_snapshot.copy(),
+        contract.pdf_vi_sha256,
+        contract.pdf_en_sha256,
+    )
+    customer.name = "Changed live customer"
+    customer.save(update_fields=["name", "updated_at"])
+    manual_payment_settings.account_number = "987654321"
+    manual_payment_settings.save(update_fields=["account_number", "updated_at"])
+    contract.refresh_from_db()
+    assert (
+        contract.member_name_snapshot,
+        contract.payment_snapshot,
+        contract.pdf_vi_sha256,
+        contract.pdf_en_sha256,
+    ) == original_snapshot
+    assignment_log = AuditLog.objects.get(action="membership.assigned")
+    assert assignment_log.context["contract_id"] == str(contract.pk)
+    assert assignment_log.context["contract_reference_code"] == contract.reference_code
+
+
+@pytest.mark.django_db
+def test_manual_assignment_pdf_failure_rolls_back_and_retry_is_clean(
+    admin_api, active_user, manual_payment_settings, monkeypatch
+):
+    package, _product, option = create_package()
+    customer = customer_for(active_user)
+    payload = {
+        "customer_id": str(customer.pk),
+        "package_id": str(package.pk),
+        "price_option_id": str(option.pk),
+        "start_date": timezone.localdate().isoformat(),
+        "farmbrite_order_reference": "FB-PDF-RETRY",
+    }
+    from memberships import services
+    from memberships.contract_pdfs import CSAContractPDFStorageError
+
+    original_generator = services.generate_contract_documents
+
+    def fail_pdf(*_args, **_kwargs):
+        raise CSAContractPDFStorageError("Simulated storage failure")
+
+    monkeypatch.setattr(services, "generate_contract_documents", fail_pdf)
+    failed = admin_api.post("/api/v1/admin/memberships", payload, format="json")
+
+    assert failed.status_code == 503
+    assert failed.json()["errors"] == [{"code": "csa_contract_pdf_storage_error"}]
+    assert not Membership.objects.filter(customer=customer).exists()
+    assert not CSAContract.objects.exists()
+    assert not AuditLog.objects.filter(action="membership.assigned").exists()
+
+    monkeypatch.setattr(services, "generate_contract_documents", original_generator)
+    retried = admin_api.post("/api/v1/admin/memberships", payload, format="json")
+    assert retried.status_code == 201
+    assert Membership.objects.filter(customer=customer).count() == 1
+    assert CSAContract.objects.count() == 1
+    assert AuditLog.objects.filter(action="membership.assigned").count() == 1
 
 
 @pytest.mark.django_db
@@ -840,8 +978,6 @@ def test_old_request_and_payment_routes_are_removed(admin_api):
         "/api/v1/memberships/requests",
         f"/api/v1/memberships/requests/{uuid.uuid4()}/payment-submitted",
         "/api/v1/public/membership-payment-availability",
-        "/api/v1/admin/membership-payment-settings",
-        "/api/v1/admin/membership-banks",
         "/api/v1/admin/membership-requests",
         f"/api/v1/admin/membership-requests/{uuid.uuid4()}/approve",
     ]

@@ -10,6 +10,11 @@ router.register(
 router.register(
     "admin/membership-packages", views.AdminPackageViewSet, basename="admin-membership-package"
 )
+router.register(
+    "admin/csa-purchase-requests",
+    views.AdminCSAPurchaseRequestViewSet,
+    basename="admin-csa-purchase-request",
+)
 router.register("admin/memberships", views.AdminMembershipViewSet, basename="admin-membership")
 router.register("admin/csa-customers", views.AdminCSACustomerViewSet, basename="admin-csa-customer")
 router.register(
@@ -17,8 +22,45 @@ router.register(
 )
 
 urlpatterns = [
+    path(
+        "admin/membership-payment-settings",
+        views.AdminMembershipPaymentSettingsView.as_view(),
+    ),
+    path("admin/membership-banks", views.AdminMembershipBanksView.as_view()),
     path("public/membership-packages", views.PublicPackageListView.as_view()),
+    path(
+        "public/csa-purchase-requests",
+        views.PublicCSAPurchaseRequestCreateView.as_view(),
+    ),
+    path(
+        "public/csa-purchase-requests/<uuid:request_id>/confirm-payment",
+        views.PublicCSAPurchasePaymentConfirmView.as_view(),
+    ),
+    path(
+        "public/csa-contract-tracker/lookup",
+        views.PublicCSAContractTrackerLookupView.as_view(),
+    ),
+    path(
+        "public/csa-contracts/verify",
+        views.PublicCSAContractVerificationView.as_view(),
+    ),
+    path(
+        "public/csa-contract-tracker/contract",
+        views.PublicCSAContractTrackerContractView.as_view(),
+    ),
+    path(
+        "public/csa-contract-tracker/contract/pdf",
+        views.PublicCSAContractTrackerPDFView.as_view(),
+    ),
     path("memberships/current", views.SelfMembershipView.as_view()),
+    path(
+        "memberships/<uuid:membership_id>/contract",
+        views.SelfMembershipContractView.as_view(),
+    ),
+    path(
+        "memberships/<uuid:membership_id>/contract/pdf",
+        views.SelfMembershipContractPDFView.as_view(),
+    ),
     path("memberships/quota", views.SelfQuotaView.as_view()),
     path("memberships/usage", views.SelfUsageHistoryView.as_view()),
 ] + router.urls

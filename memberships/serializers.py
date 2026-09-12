@@ -1,13 +1,17 @@
+import re
 from decimal import Decimal
 
 from django.utils import timezone
 from rest_framework import serializers
 
+from members.administrative_units import province_exists, ward_choices
 from memberships.models import (
+    CSAPurchaseRequestStatus,
     MembershipContentLocale,
     Product,
     QuotaPolicy,
 )
+from memberships.phones import InvalidPhoneNumber, normalize_vietnam_phone
 from memberships.pricing import MAX_POSITIVE_BIG_INTEGER, calculate_total_price_vnd
 
 MAX_PAGE = 10_000
@@ -52,6 +56,86 @@ class PublicPackageQuerySerializer(LocalePageQuerySerializer):
     pass
 
 
+class TermsAcceptedField(serializers.Field):
+    default_error_messages = {"required": "CSA terms must be accepted."}
+
+    def to_internal_value(self, data):
+        if data is not True:
+            self.fail("required")
+        return True
+
+    def to_representation(self, value):
+        return bool(value)
+
+
+class CSAPurchaseRequestCreateSerializer(StrictSerializer):
+    package_id = serializers.UUIDField()
+    price_option_id = serializers.UUIDField()
+    name = serializers.CharField(max_length=150, trim_whitespace=True)
+    phone = serializers.CharField(max_length=32, trim_whitespace=True)
+    province_code = serializers.CharField(max_length=2, trim_whitespace=True)
+    ward_code = serializers.CharField(max_length=5, trim_whitespace=True)
+    address = serializers.CharField(max_length=500, trim_whitespace=True)
+    email = serializers.EmailField(
+        max_length=254, allow_blank=True, allow_null=True, required=False
+    )
+    zalo_whatsapp = serializers.CharField(
+        max_length=64, allow_blank=True, allow_null=True, required=False, trim_whitespace=True
+    )
+    terms_accepted = TermsAcceptedField()
+    terms_locale = serializers.ChoiceField(
+        choices=MembershipContentLocale.choices,
+        default=MembershipContentLocale.VI,
+    )
+    amount = serializers.JSONField(required=False, write_only=True)
+
+    def validate_phone(self, value):
+        try:
+            return normalize_vietnam_phone(value)
+        except InvalidPhoneNumber as error:
+            raise serializers.ValidationError(str(error)) from error
+
+    def validate(self, attrs):
+        province_code = attrs["province_code"]
+        ward_code = attrs["ward_code"]
+        if not province_exists(province_code):
+            raise serializers.ValidationError({"province_code": "Province code is invalid."})
+        valid_wards = {code for code, _name in ward_choices(province_code, "vi")}
+        if ward_code not in valid_wards:
+            raise serializers.ValidationError(
+                {"ward_code": "Ward code does not belong to province."}
+            )
+        return attrs
+
+
+class AuthenticatedCSAPurchaseRequestCreateSerializer(StrictSerializer):
+    package_id = serializers.UUIDField()
+    price_option_id = serializers.UUIDField()
+    zalo_whatsapp = serializers.CharField(
+        max_length=64, allow_blank=True, allow_null=True, required=False, trim_whitespace=True
+    )
+    terms_accepted = TermsAcceptedField()
+    terms_locale = serializers.ChoiceField(
+        choices=MembershipContentLocale.choices,
+        default=MembershipContentLocale.VI,
+    )
+    amount = serializers.JSONField(required=False, write_only=True)
+    name = serializers.JSONField(required=False, write_only=True)
+    phone = serializers.JSONField(required=False, write_only=True)
+    province_code = serializers.JSONField(required=False, write_only=True)
+    ward_code = serializers.JSONField(required=False, write_only=True)
+    address = serializers.JSONField(required=False, write_only=True)
+    email = serializers.JSONField(required=False, write_only=True)
+
+
+class CSAPurchasePaymentConfirmSerializer(StrictSerializer):
+    guest_confirmation_token = serializers.CharField(
+        max_length=128,
+        trim_whitespace=True,
+        required=False,
+    )
+
+
 class AdminMembershipQuerySerializer(LocalePageQuerySerializer):
     search = serializers.CharField(max_length=254, allow_blank=True, default="")
 
@@ -63,6 +147,82 @@ class AdminCSACustomerQuerySerializer(PageQuerySerializer):
     membership_status = serializers.ChoiceField(
         choices=("scheduled", "active", "ended", "revoked"), required=False
     )
+
+
+class AdminCSAPurchaseRequestQuerySerializer(PageQuerySerializer):
+    page_size = serializers.IntegerField(min_value=1, max_value=50, default=30)
+    search = serializers.CharField(max_length=200, allow_blank=True, default="")
+    status = serializers.ChoiceField(
+        choices=CSAPurchaseRequestStatus.choices,
+        required=False,
+    )
+
+
+class CSAPurchaseRequestApproveSerializer(StrictSerializer):
+    start_date = serializers.DateField()
+    customer_resolution = serializers.ChoiceField(
+        choices=("keep_existing", "use_request_data", "reject_conflict"),
+        required=False,
+    )
+    rejection_reason = serializers.CharField(max_length=1000, trim_whitespace=True, required=False)
+
+    def validate(self, attrs):
+        if attrs.get("customer_resolution") == "reject_conflict" and not attrs.get(
+            "rejection_reason"
+        ):
+            raise serializers.ValidationError(
+                {"rejection_reason": "Rejection reason is required for conflict rejection."}
+            )
+        return attrs
+
+
+class CSAPurchaseRequestRejectSerializer(StrictSerializer):
+    rejection_reason = serializers.CharField(max_length=1000, trim_whitespace=True)
+
+
+class CSAPurchaseRequestRefundSerializer(StrictSerializer):
+    refund_note = serializers.CharField(
+        max_length=1000,
+        trim_whitespace=True,
+        allow_blank=True,
+        required=False,
+        default="",
+    )
+
+
+class CSATrackerLookupSerializer(StrictSerializer):
+    reference_code = serializers.CharField(max_length=20, trim_whitespace=True)
+    phone = serializers.CharField(max_length=32, trim_whitespace=True)
+
+    def validate_reference_code(self, value):
+        return value.upper()
+
+    def validate_phone(self, value):
+        try:
+            return normalize_vietnam_phone(value)
+        except InvalidPhoneNumber as error:
+            raise serializers.ValidationError(str(error)) from error
+
+
+class CSAContractVerificationSerializer(StrictSerializer):
+    reference_code = serializers.CharField(max_length=20, trim_whitespace=True)
+
+    def validate_reference_code(self, value):
+        normalized = value.upper()
+        if not re.fullmatch(
+            r"CSA-(?:[A-F0-9]{12}|\d{6}-[A-HJ-NP-Z2-9]{6})",
+            normalized,
+        ):
+            raise serializers.ValidationError("Contract reference is unavailable.")
+        return normalized
+
+
+class MembershipPaymentSettingsWriteSerializer(StrictSerializer):
+    bank_bin = serializers.RegexField(r"^\d{6}$", max_length=6)
+    bank_name = serializers.CharField(max_length=160, trim_whitespace=True)
+    account_number = serializers.RegexField(r"^\d{6,19}$", max_length=19)
+    account_name = serializers.CharField(max_length=160, trim_whitespace=True)
+    direct_transfer_enabled = serializers.BooleanField()
 
 
 class CSACustomerCreateSerializer(StrictSerializer):

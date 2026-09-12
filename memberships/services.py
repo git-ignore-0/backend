@@ -1,14 +1,25 @@
 import calendar
 from datetime import date
 
+from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
 from django.db.models import F
 from django.utils import timezone
 
 from identity.models import AuditLog, User
 from members.administrative_units import province_exists, ward_choices
+from memberships.contract_pdfs import (
+    delete_contract_documents,
+    generate_contract_documents,
+    get_contract_pdf_storage,
+)
+from memberships.contracts import (
+    build_manual_contract_snapshot,
+    create_manual_contract,
+)
 from memberships.models import (
     CSACustomer,
+    CSAPurchaseRequest,
     Membership,
     MembershipCycle,
     MembershipCycleQuota,
@@ -16,6 +27,7 @@ from memberships.models import (
     MembershipPackageItem,
     MembershipPackagePriceOption,
     MembershipPackageTranslation,
+    MembershipPaymentSettings,
     MembershipProductSnapshot,
     MembershipStatus,
     MembershipUsageAllocation,
@@ -89,6 +101,10 @@ class UsageUndoConflict(QuotaError):
 
 class MembershipNotRevocable(MembershipError):
     code = "membership_not_revocable"
+
+
+class MembershipPaymentSettingsUnavailable(MembershipError):
+    code = "membership_payment_settings_unavailable"
 
 
 class UsageIntegrityConflict(QuotaError):
@@ -415,6 +431,7 @@ def assign_membership_to_customer(
     start_date: date | None = None,
     farmbrite_order_reference: str,
     actor,
+    purchase_request: CSAPurchaseRequest | None = None,
 ):
     reference, reference_key = normalize_farmbrite_order_reference(farmbrite_order_reference)
     customer = CSACustomer.objects.select_for_update().get(pk=customer_id)
@@ -439,28 +456,63 @@ def assign_membership_to_customer(
     if start_date < today:
         raise StartDateInPast("Membership start date cannot be in the past")
 
-    try:
-        package = MembershipPackage.objects.select_for_update().get(pk=package_id, is_active=True)
-    except MembershipPackage.DoesNotExist as error:
-        raise PackageUnavailable("Package does not exist or is inactive") from error
-    try:
-        price_option = MembershipPackagePriceOption.objects.select_for_update().get(
-            pk=price_option_id, package=package, is_active=True
-        )
-    except MembershipPackagePriceOption.DoesNotExist as error:
-        raise PriceOptionUnavailable(
-            "Price option must be active and belong to the selected package"
-        ) from error
+    if purchase_request is None:
+        try:
+            package = MembershipPackage.objects.select_for_update().get(
+                pk=package_id, is_active=True
+            )
+        except MembershipPackage.DoesNotExist as error:
+            raise PackageUnavailable("Package does not exist or is inactive") from error
+        try:
+            price_option = MembershipPackagePriceOption.objects.select_for_update().get(
+                pk=price_option_id, package=package, is_active=True
+            )
+        except MembershipPackagePriceOption.DoesNotExist as error:
+            raise PriceOptionUnavailable(
+                "Price option must be active and belong to the selected package"
+            ) from error
+    else:
+        try:
+            package = MembershipPackage.objects.select_for_update().get(pk=package_id)
+        except MembershipPackage.DoesNotExist as error:
+            raise PackageUnavailable("Purchase request package does not exist") from error
+        try:
+            price_option = MembershipPackagePriceOption.objects.select_for_update().get(
+                pk=price_option_id, package=package
+            )
+        except MembershipPackagePriceOption.DoesNotExist as error:
+            raise PriceOptionUnavailable(
+                "Purchase request price option must belong to the selected package"
+            ) from error
 
-    try:
-        total_price_vnd = calculate_total_price_vnd(
-            duration_months=price_option.duration_months,
-            monthly_price_vnd=price_option.monthly_price_vnd,
-        )
-    except ValueError as error:
-        raise PriceOptionTotalInvalid(str(error)) from error
+    if purchase_request is None:
+        duration_months = price_option.duration_months
+        monthly_price_vnd = price_option.monthly_price_vnd
+        try:
+            total_price_vnd = calculate_total_price_vnd(
+                duration_months=duration_months,
+                monthly_price_vnd=monthly_price_vnd,
+            )
+        except ValueError as error:
+            raise PriceOptionTotalInvalid(str(error)) from error
+        package_name_snapshot = package.name
+    else:
+        if (
+            purchase_request.package_id != package.pk
+            or purchase_request.price_option_id != price_option.pk
+            or purchase_request.currency_snapshot != "VND"
+            or purchase_request.duration_months_snapshot <= 0
+            or purchase_request.amount_snapshot <= 0
+            or not purchase_request.package_name_snapshot.strip()
+            or purchase_request.amount_snapshot % purchase_request.duration_months_snapshot
+        ):
+            raise PriceOptionTotalInvalid("Purchase request pricing snapshot is invalid")
+        duration_months = purchase_request.duration_months_snapshot
+        total_price_vnd = purchase_request.amount_snapshot
+        monthly_price_vnd = total_price_vnd // duration_months
+        package_name_snapshot = purchase_request.package_name_snapshot
 
-    end_date = add_months(start_date, price_option.duration_months)
+    end_date = add_months(start_date, duration_months)
     if any(
         membership.start_date < end_date and membership.end_date > start_date
         for membership in existing_memberships
@@ -502,17 +554,23 @@ def assign_membership_to_customer(
                 customer=customer,
                 package=package,
                 price_option=price_option,
-                package_name_snapshot=package.name,
+                package_name_snapshot=package_name_snapshot,
                 package_description_snapshot=package.description,
-                package_name_vi_snapshot=(package_vi.name if package_vi else package.name),
+                package_name_vi_snapshot=(
+                    package_name_snapshot
+                    if purchase_request
+                    else package_vi.name
+                    if package_vi
+                    else package.name
+                ),
                 package_name_en_snapshot=(package_en.name if package_en else ""),
                 package_description_vi_snapshot=(
                     package_vi.description if package_vi else package.description
                 ),
                 package_description_en_snapshot=(package_en.description if package_en else ""),
-                monthly_price_vnd_snapshot=price_option.monthly_price_vnd,
+                monthly_price_vnd_snapshot=monthly_price_vnd,
                 total_price_vnd_snapshot=total_price_vnd,
-                duration_months_snapshot=price_option.duration_months,
+                duration_months_snapshot=duration_months,
                 quota_policy_snapshot=package.quota_policy,
                 farmbrite_order_reference=reference,
                 farmbrite_order_reference_key=reference_key,
@@ -569,6 +627,7 @@ def assign_membership(
     farmbrite_order_reference: str,
     actor,
     customer_id=None,
+    purchase_request: CSAPurchaseRequest | None = None,
 ):
     """Assign by canonical customer ID only; assignment never creates customers."""
     if not customer_id:
@@ -580,7 +639,73 @@ def assign_membership(
         start_date=start_date,
         farmbrite_order_reference=farmbrite_order_reference,
         actor=actor,
+        purchase_request=purchase_request,
     )
+
+
+def _locked_manual_payment_settings() -> MembershipPaymentSettings:
+    try:
+        payment_settings = MembershipPaymentSettings.objects.select_for_update().get(pk="default")
+    except MembershipPaymentSettings.DoesNotExist as error:
+        raise MembershipPaymentSettingsUnavailable("CSA payment settings are missing") from error
+    try:
+        payment_settings.full_clean(validate_unique=False, validate_constraints=False)
+    except ValidationError as error:
+        raise MembershipPaymentSettingsUnavailable("CSA payment settings are invalid") from error
+    return payment_settings
+
+
+def assign_membership_with_contract(
+    *,
+    package_id,
+    price_option_id,
+    start_date: date | None = None,
+    farmbrite_order_reference: str,
+    actor,
+    customer_id=None,
+):
+    """Admin assignment boundary: Membership, Contract, and PDFs succeed together."""
+    storage = get_contract_pdf_storage()
+    documents = None
+    try:
+        with transaction.atomic():
+            if not customer_id:
+                raise CSACustomerRequiredForMembership("A CSA customer is required")
+            customer = (
+                CSACustomer.objects.select_for_update().select_related("user").get(pk=customer_id)
+            )
+            ensure_csa_customer_complete(customer)
+            membership = assign_membership(
+                customer_id=customer.pk,
+                package_id=package_id,
+                price_option_id=price_option_id,
+                start_date=start_date,
+                farmbrite_order_reference=farmbrite_order_reference,
+                actor=actor,
+            )
+            payment_settings = _locked_manual_payment_settings()
+            snapshot = build_manual_contract_snapshot(
+                customer=customer,
+                membership=membership,
+                payment_settings=payment_settings,
+            )
+            contract = create_manual_contract(membership_id=membership.pk, snapshot=snapshot)
+            AuditLog.objects.create(
+                user=actor,
+                action="membership.assigned",
+                context={
+                    "customer_id": str(customer.pk),
+                    "membership_id": str(membership.pk),
+                    "contract_id": str(contract.pk),
+                    "contract_reference_code": contract.reference_code,
+                },
+            )
+            documents = generate_contract_documents(contract, storage=storage)
+        return membership
+    except Exception:
+        if documents is not None:
+            delete_contract_documents(documents, storage=storage)
+        raise
 
 
 def _create_cycle(membership: Membership, sequence: int) -> MembershipCycle:

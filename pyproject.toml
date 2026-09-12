@@ -16,6 +16,7 @@ dependencies = [
     "gunicorn>=23,<24",
     "Pillow>=12.3,<13",
     "python-dotenv>=1.1,<2",
+    "reportlab>=4.4,<5",
     "requests>=2.32,<3",
     "sqlparse>=0.6.0,<0.7",
     "whitenoise>=6.8,<7",
@@ -28,6 +29,7 @@ dev = [
     "pytest>=9.0.3,<10",
     "pytest-django>=4.10,<5",
     "pytest-cov>=6,<7",
+    "pypdf>=6,<7",
     "ruff>=0.11,<1",
     "pip-audit>=2.9,<3",
 ]
