@@ -32,6 +32,19 @@ class MembershipContentLocale(models.TextChoices):
     EN = "en", "English"
 
 
+class MembershipPaymentType(models.TextChoices):
+    FULL = "full", "Full payment"
+    INSTALLMENT = "installment", "Installment payment"
+
+
+class CSAPurchasePaymentStatus(models.TextChoices):
+    PENDING = "pending", "Pending"
+    REPORTED = "reported", "Reported"
+    CONFIRMED = "confirmed", "Confirmed"
+    REJECTED = "rejected", "Rejected"
+    OVERDUE = "overdue", "Overdue"
+
+
 class CSAPurchaseRequestStatus(models.TextChoices):
     PENDING = "pending", "Pending"
     PAYMENT_CONFIRMED = "payment_confirmed", "Payment confirmed"
@@ -59,6 +72,12 @@ class CSAContractStatus(models.TextChoices):
 class CSAContractTermsAcceptanceMethod(models.TextChoices):
     ONLINE = "online", "Online"
     IN_STORE = "in_store", "In store"
+
+
+class CSAContractVersionReason(models.TextChoices):
+    ISSUED = "issued", "Issued"
+    PAYMENT_CONFIRMED = "payment_confirmed", "Payment confirmed"
+    MEMBERSHIP_REVOKED = "membership_revoked", "Membership revoked"
 
 
 OPEN_CSA_PURCHASE_REQUEST_STATUSES = [
@@ -209,6 +228,77 @@ class MembershipPackagePriceOption(models.Model):
         )
 
 
+class MembershipPaymentPlan(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    price_option = models.ForeignKey(
+        MembershipPackagePriceOption, related_name="payment_plans", on_delete=models.PROTECT
+    )
+    name = models.CharField(max_length=120)
+    payment_type = models.CharField(max_length=12, choices=MembershipPaymentType.choices)
+    total_amount = models.DecimalField(max_digits=19, decimal_places=0)
+    installment_count = models.PositiveSmallIntegerField()
+    # A newly assembled plan must pass cross-row validation before activation.
+    is_active = models.BooleanField(default=False)
+    sort_order = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["sort_order", "created_at", "id"]
+        indexes = [
+            models.Index(
+                fields=["price_option", "is_active", "sort_order"],
+                name="membership_plan_catalog_idx",
+            )
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(payment_type__in=MembershipPaymentType.values),
+                name="membership_plan_type_valid",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(payment_type=MembershipPaymentType.FULL, installment_count=1)
+                    | Q(payment_type=MembershipPaymentType.INSTALLMENT, installment_count__gte=2)
+                ),
+                name="membership_plan_type_count_valid",
+            ),
+            models.CheckConstraint(
+                condition=Q(total_amount__gt=0), name="membership_plan_total_positive"
+            ),
+        ]
+
+
+class MembershipPaymentPlanInstallment(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    payment_plan = models.ForeignKey(
+        MembershipPaymentPlan, related_name="installments", on_delete=models.CASCADE
+    )
+    sequence = models.PositiveSmallIntegerField()
+    amount = models.DecimalField(max_digits=19, decimal_places=0)
+    cycle_count = models.PositiveSmallIntegerField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["sequence", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["payment_plan", "sequence"],
+                name="membership_plan_installment_sequence_unique",
+            ),
+            models.CheckConstraint(
+                condition=Q(sequence__gt=0), name="membership_plan_sequence_positive"
+            ),
+            models.CheckConstraint(
+                condition=Q(amount__gt=0), name="membership_plan_installment_amount_positive"
+            ),
+            models.CheckConstraint(
+                condition=Q(cycle_count__gte=1), name="membership_plan_cycle_count_positive"
+            ),
+        ]
+
+
 class MembershipPackageTranslation(models.Model):
     package = models.ForeignKey(
         MembershipPackage, related_name="translations", on_delete=models.CASCADE
@@ -314,10 +404,38 @@ class CSAPurchaseRequest(models.Model):
         related_name="purchase_requests",
         on_delete=models.PROTECT,
     )
+    payment_plan = models.ForeignKey(
+        MembershipPaymentPlan,
+        related_name="purchase_requests",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        editable=False,
+    )
     package_name_snapshot = models.CharField(max_length=200)
     price_option_name_snapshot = models.CharField(max_length=120)
     duration_months_snapshot = models.PositiveSmallIntegerField()
     amount_snapshot = models.PositiveBigIntegerField()
+    price_option_monthly_amount_snapshot = models.PositiveBigIntegerField(
+        null=True, blank=True, editable=False
+    )
+    payment_plan_name_snapshot = models.CharField(
+        max_length=120, null=True, blank=True, editable=False
+    )
+    payment_type_snapshot = models.CharField(
+        max_length=12,
+        choices=MembershipPaymentType.choices,
+        null=True,
+        blank=True,
+        editable=False,
+    )
+    total_payment_amount_snapshot = models.DecimalField(
+        max_digits=19, decimal_places=0, null=True, blank=True, editable=False
+    )
+    installment_count_snapshot = models.PositiveSmallIntegerField(
+        null=True, blank=True, editable=False
+    )
+    payment_installments_snapshot = models.JSONField(null=True, blank=True, editable=False)
     currency_snapshot = models.CharField(max_length=3, default="VND")
     bank_bin_snapshot = models.CharField(max_length=6)
     bank_name_snapshot = models.CharField(max_length=160)
@@ -417,10 +535,17 @@ class CSAPurchaseRequest(models.Model):
         "address_snapshot",
         "package_id",
         "price_option_id",
+        "payment_plan_id",
         "package_name_snapshot",
         "price_option_name_snapshot",
         "duration_months_snapshot",
         "amount_snapshot",
+        "price_option_monthly_amount_snapshot",
+        "payment_plan_name_snapshot",
+        "payment_type_snapshot",
+        "total_payment_amount_snapshot",
+        "installment_count_snapshot",
+        "payment_installments_snapshot",
         "currency_snapshot",
         "bank_bin_snapshot",
         "bank_name_snapshot",
@@ -465,6 +590,28 @@ class CSAPurchaseRequest(models.Model):
             models.CheckConstraint(
                 condition=Q(amount_snapshot__gt=0),
                 name="memberships_csa_purchase_amount_positive",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(
+                        payment_plan__isnull=True,
+                        payment_plan_name_snapshot__isnull=True,
+                        payment_type_snapshot__isnull=True,
+                        total_payment_amount_snapshot__isnull=True,
+                        installment_count_snapshot__isnull=True,
+                        payment_installments_snapshot__isnull=True,
+                    )
+                    | Q(
+                        payment_plan__isnull=False,
+                        payment_plan_name_snapshot__isnull=False,
+                        payment_type_snapshot__in=MembershipPaymentType.values,
+                        total_payment_amount_snapshot__gt=0,
+                        installment_count_snapshot__gt=0,
+                        payment_installments_snapshot__isnull=False,
+                        amount_snapshot=models.F("total_payment_amount_snapshot"),
+                    )
+                ),
+                name="memberships_csa_purchase_plan_snapshot_complete",
             ),
             models.CheckConstraint(
                 condition=Q(currency_snapshot="VND"),
@@ -609,6 +756,171 @@ class CSAPurchaseRequest(models.Model):
             )
 
 
+class CSAPurchasePayment(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    purchase_request = models.ForeignKey(
+        CSAPurchaseRequest,
+        related_name="payments",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+    )
+    # Manual assignment has no purchase request; exactly one owner is required.
+    membership = models.ForeignKey(
+        "Membership",
+        related_name="manual_payments",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+    )
+    installment_sequence = models.PositiveSmallIntegerField()
+    amount_due = models.DecimalField(max_digits=19, decimal_places=0)
+    amount_paid = models.DecimalField(max_digits=19, decimal_places=0, null=True, blank=True)
+    cycle_count = models.PositiveSmallIntegerField()
+    currency = models.CharField(max_length=3, default="VND")
+    status = models.CharField(
+        max_length=12,
+        choices=CSAPurchasePaymentStatus.choices,
+        default=CSAPurchasePaymentStatus.PENDING,
+        db_index=True,
+    )
+    due_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    confirmed_at = models.DateTimeField(null=True, blank=True)
+    confirmed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        related_name="csa_payments_confirmed",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+    )
+    rejected_at = models.DateTimeField(null=True, blank=True)
+    rejected_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        related_name="csa_payments_rejected",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+    )
+    rejection_reason = models.CharField(max_length=1000, blank=True)
+    note = models.CharField(max_length=1000, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    IMMUTABLE_FIELDS = (
+        "purchase_request_id",
+        "membership_id",
+        "installment_sequence",
+        "amount_due",
+        "cycle_count",
+        "currency",
+    )
+
+    class Meta:
+        ordering = ["installment_sequence", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["purchase_request", "installment_sequence"],
+                name="memberships_payment_request_sequence_unique",
+            ),
+            models.UniqueConstraint(
+                fields=["membership", "installment_sequence"],
+                name="memberships_payment_manual_sequence_unique",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(purchase_request__isnull=False, membership__isnull=True)
+                    | Q(purchase_request__isnull=True, membership__isnull=False)
+                ),
+                name="memberships_payment_exactly_one_owner",
+            ),
+            models.CheckConstraint(
+                condition=Q(installment_sequence__gt=0),
+                name="memberships_payment_sequence_positive",
+            ),
+            models.CheckConstraint(
+                condition=Q(amount_due__gt=0), name="memberships_payment_due_positive"
+            ),
+            models.CheckConstraint(
+                condition=Q(amount_paid__isnull=True) | Q(amount_paid__gt=0),
+                name="memberships_payment_paid_positive",
+            ),
+            models.CheckConstraint(
+                condition=Q(cycle_count__gte=1), name="memberships_payment_cycles_positive"
+            ),
+            models.CheckConstraint(condition=Q(currency="VND"), name="memberships_payment_vnd"),
+            models.CheckConstraint(
+                condition=Q(status__in=CSAPurchasePaymentStatus.values),
+                name="memberships_payment_status_valid",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(
+                        status=CSAPurchasePaymentStatus.CONFIRMED,
+                        amount_paid=models.F("amount_due"),
+                        confirmed_at__isnull=False,
+                        confirmed_by__isnull=False,
+                        rejected_at__isnull=True,
+                        rejected_by__isnull=True,
+                        rejection_reason="",
+                    )
+                    | Q(
+                        status=CSAPurchasePaymentStatus.REJECTED,
+                        amount_paid__isnull=True,
+                        confirmed_at__isnull=True,
+                        confirmed_by__isnull=True,
+                        rejected_at__isnull=False,
+                        rejected_by__isnull=False,
+                    )
+                    & ~Q(rejection_reason="")
+                    | Q(
+                        status__in=[
+                            CSAPurchasePaymentStatus.PENDING,
+                            CSAPurchasePaymentStatus.REPORTED,
+                            CSAPurchasePaymentStatus.OVERDUE,
+                        ],
+                        amount_paid__isnull=True,
+                        confirmed_at__isnull=True,
+                        confirmed_by__isnull=True,
+                        rejected_at__isnull=True,
+                        rejected_by__isnull=True,
+                        rejection_reason="",
+                    )
+                ),
+                name="memberships_payment_state_consistent",
+            ),
+        ]
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            current = (
+                type(self)
+                .objects.filter(pk=self.pk)
+                .values("status", *self.IMMUTABLE_FIELDS)
+                .first()
+            )
+            if current:
+                if (
+                    current["status"]
+                    in {
+                        CSAPurchasePaymentStatus.CONFIRMED,
+                        CSAPurchasePaymentStatus.REJECTED,
+                    }
+                    and self.status != current["status"]
+                ):
+                    raise ValidationError({"status": "Terminal payment cannot change status."})
+                changed = [
+                    field
+                    for field in self.IMMUTABLE_FIELDS
+                    if getattr(self, field) != current[field]
+                ]
+                if changed:
+                    raise ValidationError(
+                        {field: "Payment schedule snapshots are immutable." for field in changed}
+                    )
+        self.full_clean(validate_unique=False, validate_constraints=False)
+        return super().save(*args, **kwargs)
+
+
 class CSATrackerSession(models.Model):
     token_hash = models.CharField(primary_key=True, max_length=64, editable=False)
     purchase_request = models.ForeignKey(
@@ -658,6 +970,11 @@ class Membership(models.Model):
     package_description_en_snapshot = models.TextField(blank=True, default="")
     monthly_price_vnd_snapshot = models.PositiveBigIntegerField()
     total_price_vnd_snapshot = models.PositiveBigIntegerField()
+    pricing_basis = models.CharField(
+        max_length=12,
+        choices=(("monthly", "Monthly"), ("payment_plan", "Payment plan")),
+        default="monthly",
+    )
     duration_months_snapshot = models.PositiveSmallIntegerField()
     quota_policy_snapshot = models.CharField(max_length=16, choices=QuotaPolicy.choices)
     farmbrite_order_reference = models.CharField(max_length=120, unique=True)
@@ -701,11 +1018,15 @@ class Membership(models.Model):
                 name="memberships_total_price_snapshot_positive",
             ),
             models.CheckConstraint(
-                condition=Q(
-                    total_price_vnd_snapshot=(
-                        models.F("monthly_price_vnd_snapshot")
-                        * models.F("duration_months_snapshot")
+                condition=(
+                    Q(
+                        pricing_basis="monthly",
+                        total_price_vnd_snapshot=(
+                            models.F("monthly_price_vnd_snapshot")
+                            * models.F("duration_months_snapshot")
+                        ),
                     )
+                    | Q(pricing_basis="payment_plan")
                 ),
                 name="memberships_price_snapshot_total_exact",
             ),
@@ -809,6 +1130,14 @@ class CSAContract(models.Model):
     original_pdf_en_sha256 = models.CharField(max_length=64, null=True, blank=True, editable=False)
     pdf_generated_at = models.DateTimeField(null=True, blank=True, editable=False)
     pdf_version = models.PositiveIntegerField(default=1, editable=False)
+    current_version = models.ForeignKey(
+        "CSAContractVersion",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="current_for_contracts",
+        editable=False,
+    )
 
     revoked_at = models.DateTimeField(null=True, blank=True)
     revoked_by = models.ForeignKey(
@@ -1051,6 +1380,8 @@ class CSAContract(models.Model):
             not self.revoked_at or not self.revoked_by_id or not self.revocation_reason.strip()
         ):
             errors["status"] = "Revoked contracts require time, actor, and reason."
+        if self.current_version_id and self.current_version.contract_id != self.pk:
+            errors["current_version"] = "Current version must belong to this contract."
         if errors:
             raise ValidationError(errors)
 
@@ -1093,6 +1424,110 @@ class CSAContract(models.Model):
                     for field in changed
                 }
             )
+
+
+class ImmutableContractVersionQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        raise ValidationError("Published CSA contract versions are immutable.")
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        raise ValidationError("Published CSA contract versions are immutable.")
+
+    def delete(self):
+        raise ValidationError("Published CSA contract versions cannot be deleted.")
+
+
+class CSAContractVersion(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    contract = models.ForeignKey(CSAContract, related_name="versions", on_delete=models.PROTECT)
+    version_number = models.PositiveIntegerField()
+    version_reason = models.CharField(max_length=24, choices=CSAContractVersionReason.choices)
+    created_at = models.DateTimeField(auto_now_add=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="csa_contract_versions_created",
+    )
+    created_by_name_snapshot = models.CharField(max_length=254, blank=True)
+    contract_status = models.CharField(max_length=12, choices=CSAContractStatus.choices)
+    membership_status = models.CharField(max_length=12, choices=MembershipStatus.choices)
+    issued_at = models.DateTimeField()
+    start_date = models.DateField()
+    end_date = models.DateField()
+    revoked_at = models.DateTimeField(null=True, blank=True)
+    revocation_reason = models.TextField(blank=True)
+    revoked_by_name_snapshot = models.CharField(max_length=254, blank=True)
+    package_name_snapshot = models.CharField(max_length=200)
+    price_option_name_snapshot = models.CharField(max_length=120)
+    duration_months_snapshot = models.PositiveSmallIntegerField()
+    amount_snapshot = models.DecimalField(max_digits=19, decimal_places=0)
+    currency_snapshot = models.CharField(max_length=3, default="VND")
+    payment_type = models.CharField(max_length=12, choices=MembershipPaymentType.choices)
+    total_payment_amount = models.DecimalField(max_digits=19, decimal_places=0)
+    paid_amount = models.DecimalField(max_digits=19, decimal_places=0)
+    remaining_amount = models.DecimalField(max_digits=19, decimal_places=0)
+    confirmed_installment_count = models.PositiveSmallIntegerField()
+    installment_count = models.PositiveSmallIntegerField()
+    paid_cycles = models.PositiveSmallIntegerField()
+    total_cycles = models.PositiveSmallIntegerField()
+    payment_schedule_snapshot = models.JSONField()
+    pdf_vi_storage_key = models.CharField(max_length=500)
+    pdf_en_storage_key = models.CharField(max_length=500)
+    pdf_vi_sha256 = models.CharField(max_length=64)
+    pdf_en_sha256 = models.CharField(max_length=64)
+    pdf_generated_at = models.DateTimeField()
+
+    objects = ImmutableContractVersionQuerySet.as_manager()
+
+    class Meta:
+        ordering = ["version_number", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["contract", "version_number"],
+                name="memberships_contract_version_unique",
+            ),
+            models.CheckConstraint(
+                condition=Q(version_number__gt=0), name="memberships_contract_version_positive"
+            ),
+            models.CheckConstraint(
+                condition=Q(version_reason__in=CSAContractVersionReason.values),
+                name="memberships_contract_version_reason_valid",
+            ),
+            models.CheckConstraint(
+                condition=Q(contract_status__in=CSAContractStatus.values),
+                name="memberships_contract_version_status_valid",
+            ),
+            models.CheckConstraint(
+                condition=Q(payment_type__in=MembershipPaymentType.values),
+                name="memberships_contract_version_payment_type_valid",
+            ),
+            models.CheckConstraint(
+                condition=Q(amount_snapshot__gt=0)
+                & Q(total_payment_amount__gt=0)
+                & Q(paid_amount__gte=0)
+                & Q(remaining_amount__gte=0)
+                & Q(total_payment_amount=models.F("paid_amount") + models.F("remaining_amount")),
+                name="memberships_contract_version_amounts_valid",
+            ),
+            models.CheckConstraint(
+                condition=Q(installment_count__gt=0)
+                & Q(total_cycles__gt=0)
+                & Q(confirmed_installment_count__lte=models.F("installment_count"))
+                & Q(paid_cycles__lte=models.F("total_cycles")),
+                name="memberships_contract_version_cycles_valid",
+            ),
+        ]
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            raise ValidationError("Published CSA contract versions are immutable.")
+        self.full_clean(validate_unique=False, validate_constraints=False)
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Published CSA contract versions cannot be deleted.")
 
 
 class MembershipProductSnapshot(models.Model):

@@ -5,18 +5,16 @@ from decimal import Decimal
 import pytest
 from allauth.account.models import EmailAddress
 from django.contrib.auth.models import Group
-from django.core.files.storage import FileSystemStorage
+from django.db import connection
 from django.utils import timezone
 from oauth2_provider.models import AccessToken
 from rest_framework.test import APIClient
 
 from identity.models import AccountStatus, User
-from memberships.contract_pdfs import generate_revoked_contract_documents
 from memberships.models import (
     CSAContract,
     CSAContractStatus,
     CSACustomer,
-    Membership,
     MembershipPackage,
     MembershipPackageItem,
     MembershipPackagePriceOption,
@@ -24,7 +22,11 @@ from memberships.models import (
     Product,
     QuotaPolicy,
 )
-from memberships.services import assign_membership_with_contract
+from memberships.services import (
+    assign_membership,
+    assign_membership_with_contract,
+    revoke_membership,
+)
 
 TEST_BANK = {"bin": "970436", "name": "Vietcombank"}
 
@@ -163,6 +165,10 @@ def test_admin_reads_contract_and_membership_customer_summaries(admin_api, contr
     assert data["status"] == CSAContractStatus.ACTIVE
     assert data["available_locales"] == ["vi", "en"]
     assert data["pdf_version"] == 1
+    assert data["current_version"]["version_number"] == 1
+    assert data["current_version"]["version_reason"] == "issued"
+    assert data["current_version"]["available_locales"] == ["vi", "en"]
+    assert [version["version_number"] for version in data["versions"]] == [1]
     assert_sensitive_contract_fields_absent(data)
 
     membership = admin_api.get(
@@ -182,23 +188,11 @@ def test_admin_reads_contract_and_membership_customer_summaries(admin_api, contr
 
 @pytest.mark.django_db
 def test_admin_reads_revoked_contract_reason(admin_api, contract, active_user, settings):
-    contract.status = CSAContractStatus.REVOKED
-    contract.revoked_at = timezone.now()
-    contract.revoked_by = active_user
-    contract.revoked_by_name_snapshot = active_user.name
-    contract.revocation_reason = "Customer requested cancellation"
-    contract.save(
-        update_fields=[
-            "status",
-            "revoked_at",
-            "revoked_by",
-            "revoked_by_name_snapshot",
-            "revocation_reason",
-            "updated_at",
-        ]
+    revoke_membership(
+        membership_id=contract.membership_id,
+        reason="Customer requested cancellation",
+        actor=active_user,
     )
-    storage = FileSystemStorage(location=settings.CSA_CONTRACT_PRIVATE_STORAGE_ROOT, base_url=None)
-    generate_revoked_contract_documents(contract, storage=storage)
 
     data = admin_api.get(admin_detail_url(contract)).json()["data"]
 
@@ -227,35 +221,159 @@ def test_admin_streams_verified_current_pdf_with_secure_headers(admin_api, contr
 def test_pdf_endpoint_never_exposes_or_selects_original_pdf(admin_api, contract, settings):
     original_key = contract.original_pdf_vi_storage_key
     original_hash = contract.original_pdf_vi_sha256
-    contract.status = CSAContractStatus.REVOKED
-    contract.revoked_at = timezone.now()
-    contract.revoked_by = contract.membership.customer.user
-    contract.revoked_by_name_snapshot = contract.membership.customer.user.name
-    contract.revocation_reason = "Cancelled"
-    contract.save(
-        update_fields=[
-            "status",
-            "revoked_at",
-            "revoked_by",
-            "revoked_by_name_snapshot",
-            "revocation_reason",
-            "updated_at",
-        ]
+    revoke_membership(
+        membership_id=contract.membership_id,
+        reason="Cancelled",
+        actor=contract.membership.customer.user,
     )
-    storage = FileSystemStorage(location=settings.CSA_CONTRACT_PRIVATE_STORAGE_ROOT, base_url=None)
-    generate_revoked_contract_documents(contract, storage=storage)
     contract.refresh_from_db()
     assert contract.pdf_vi_sha256 != original_hash
 
     response = admin_api.get(f"{admin_pdf_url(contract)}&original=true")
-    content = streamed_content(response)
-
-    assert response.status_code == 200
-    assert content.startswith(b"%PDF-")
+    assert response.status_code == 404
+    assert response.json()["errors"] == [{"code": "csa_contract_pdf_unavailable"}]
+    current = admin_api.get(admin_pdf_url(contract))
+    content = streamed_content(current)
     assert hashlib.sha256(content).hexdigest() == contract.pdf_vi_sha256
     assert hashlib.sha256(content).hexdigest() != original_hash
-    assert original_key not in response.headers.get("Content-Disposition", "")
-    assert str(settings.CSA_CONTRACT_PRIVATE_STORAGE_ROOT) not in str(response.headers)
+    assert original_key not in current.headers.get("Content-Disposition", "")
+    assert str(settings.CSA_CONTRACT_PRIVATE_STORAGE_ROOT) not in str(current.headers)
+
+
+@pytest.mark.parametrize("locale", ["vi", "en"])
+@pytest.mark.django_db
+def test_admin_and_owner_download_current_and_historical_versions(
+    admin_api, self_api, contract, active_user, locale
+):
+    original = contract.current_version
+    revoke_membership(
+        membership_id=contract.membership_id,
+        reason="Cancelled",
+        actor=active_user,
+    )
+    contract.refresh_from_db()
+    current = contract.current_version
+    for client, url in (
+        (admin_api, admin_pdf_url(contract, locale)),
+        (self_api, self_pdf_url(contract, locale)),
+    ):
+        old_pdf = client.get(f"{url}&version_id={original.pk}")
+        new_pdf = client.get(f"{url}&version_id={current.pk}")
+        default_pdf = client.get(url)
+        assert old_pdf.status_code == new_pdf.status_code == default_pdf.status_code == 200
+        assert f"{contract.reference_code}.v1.{locale}.pdf" in old_pdf["Content-Disposition"]
+        assert f"{contract.reference_code}.v2.{locale}.pdf" in new_pdf["Content-Disposition"]
+        assert f"{contract.reference_code}.{locale}.pdf" in default_pdf["Content-Disposition"]
+        assert hashlib.sha256(streamed_content(old_pdf)).hexdigest() == getattr(
+            original, f"pdf_{locale}_sha256"
+        )
+        assert hashlib.sha256(streamed_content(new_pdf)).hexdigest() == getattr(
+            current, f"pdf_{locale}_sha256"
+        )
+        assert hashlib.sha256(streamed_content(default_pdf)).hexdigest() == getattr(
+            current, f"pdf_{locale}_sha256"
+        )
+        detail = client.get(url.split("/pdf?")[0]).json()["data"]
+        assert [item["version_number"] for item in detail["versions"]] == [1, 2]
+        assert detail["versions"][0]["contract_status"] == "active"
+        assert detail["versions"][1]["contract_status"] == "revoked"
+        assert detail["versions"][1]["paid_cycles"] == current.paid_cycles
+        assert "paid_cycles" not in detail["versions"][0]
+        assert_sensitive_contract_fields_absent(detail)
+
+
+@pytest.mark.django_db
+def test_version_query_is_strict_and_scoped_to_owned_contract(
+    admin_api, self_api, contract, other_user_token
+):
+    url = self_pdf_url(contract)
+    for suffix in (
+        "&version_id=invalid",
+        "&version_id=00000000-0000-0000-0000-000000000000",
+        "&original=true",
+        "&locale=en",
+        "&version_id=",
+    ):
+        assert self_api.get(url + suffix).status_code == 404
+    assert admin_api.get(admin_pdf_url(contract) + "&extra=1").status_code == 404
+    _other_user, token = other_user_token
+    assert (
+        bearer_client(token).get(url + f"&version_id={contract.current_version_id}").status_code
+        == 404
+    )
+
+    other_customer = CSACustomer.objects.create(
+        user=_other_user,
+        name=_other_user.name,
+        phone_e164="0987654321",
+        province_code="66",
+        ward_code="22015",
+        address="Another street",
+    )
+    other_membership = assign_membership_with_contract(
+        customer_id=other_customer.pk,
+        package_id=contract.membership.package_id,
+        price_option_id=contract.membership.price_option_id,
+        start_date=timezone.localdate(),
+        farmbrite_order_reference="ORDER-OTHER-CONTRACT",
+        actor=_other_user,
+    )
+    other_contract = CSAContract.objects.get(membership=other_membership)
+    assert (
+        admin_api.get(
+            admin_pdf_url(contract) + f"&version_id={other_contract.current_version_id}"
+        ).status_code
+        == 404
+    )
+    assert (
+        self_api.get(
+            self_pdf_url(contract) + f"&version_id={other_contract.current_version_id}"
+        ).status_code
+        == 404
+    )
+
+
+@pytest.mark.django_db
+def test_legacy_contract_without_version_keeps_current_pdf(admin_api, contract):
+    legacy_version_id = contract.current_version_id
+    CSAContract.objects.filter(pk=contract.pk).update(current_version=None)
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "DELETE FROM memberships_csacontractversion WHERE id = %s",
+            [legacy_version_id.hex],
+        )
+
+    detail = admin_api.get(admin_detail_url(contract))
+    current = admin_api.get(admin_pdf_url(contract))
+    unavailable = admin_api.get(admin_pdf_url(contract) + f"&version_id={legacy_version_id}")
+    assert detail.status_code == 200
+    assert detail.json()["data"]["versions"] == []
+    assert current.status_code == 200
+    assert streamed_content(current).startswith(b"%PDF-")
+    assert unavailable.status_code == 404
+
+
+@pytest.mark.django_db
+def test_version_pdf_missing_hash_and_key_are_rejected(admin_api, contract, active_user, settings):
+    original = contract.current_version
+    revoke_membership(
+        membership_id=contract.membership_id,
+        reason="Cancelled",
+        actor=active_user,
+    )
+    url = admin_pdf_url(contract) + f"&version_id={original.pk}"
+    path = settings.CSA_CONTRACT_PRIVATE_STORAGE_ROOT / original.pdf_vi_storage_key
+    path.unlink()
+    assert admin_api.get(url).json()["errors"] == [{"code": "csa_contract_pdf_unavailable"}]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"tampered")
+    assert admin_api.get(url).json()["errors"] == [{"code": "csa_contract_pdf_unavailable"}]
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "UPDATE memberships_csacontractversion SET pdf_vi_storage_key = %s WHERE id = %s",
+            ["../../etc/passwd", original.pk.hex],
+        )
+    assert admin_api.get(url).json()["errors"] == [{"code": "csa_contract_pdf_unavailable"}]
 
 
 @pytest.mark.django_db
@@ -265,14 +383,27 @@ def test_non_admin_cannot_use_admin_contract_endpoints(self_api, contract):
 
 
 @pytest.mark.django_db
-def test_missing_contract_and_legacy_membership_remain_safe(admin_api, contract):
+def test_missing_contract_and_legacy_membership_remain_safe(admin_api, contract, active_user):
     missing = admin_api.get(
         "/api/v1/admin/memberships/00000000-0000-0000-0000-000000000000/contract"
     )
     assert missing.status_code == 404
 
-    legacy = Membership.objects.get(pk=contract.membership_id)
-    CSAContract.objects.filter(pk=contract.pk).delete()
+    customer = CSACustomer.objects.create(
+        name="Legacy customer",
+        phone_e164="0912345678",
+        province_code="66",
+        ward_code="22015",
+        address="Store",
+    )
+    legacy = assign_membership(
+        customer_id=customer.pk,
+        package_id=contract.membership.package_id,
+        price_option_id=contract.membership.price_option_id,
+        start_date=timezone.localdate(),
+        farmbrite_order_reference="LEGACY-NO-CONTRACT",
+        actor=active_user,
+    )
     detail = admin_api.get(f"/api/v1/admin/memberships/{legacy.pk}?locale=vi")
     assert detail.status_code == 200
     assert detail.json()["data"]["contract"] is None
@@ -287,6 +418,8 @@ def test_owner_reads_and_downloads_contract(self_api, contract, locale):
 
     assert detail.status_code == 200
     assert detail.json()["data"]["id"] == str(contract.pk)
+    assert detail.json()["data"]["current_version"]["version_number"] == 1
+    assert detail.json()["data"]["versions"][0]["version_reason"] == "issued"
     assert_sensitive_contract_fields_absent(detail.json()["data"])
     assert "revoked_by_name_snapshot" not in detail.json()["data"]
     assert pdf.status_code == 200
@@ -363,10 +496,17 @@ def test_missing_or_tampered_pdf_returns_stable_error(admin_api, contract, setti
 
 @pytest.mark.django_db
 def test_tampered_storage_key_and_path_traversal_are_rejected(admin_api, contract):
-    CSAContract.objects.filter(pk=contract.pk).update(
-        pdf_vi_storage_key="../../etc/passwd",
-        pdf_vi_sha256=hashlib.sha256(b"unrelated").hexdigest(),
-    )
+    # Simulate out-of-band database corruption; the version ORM intentionally forbids updates.
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "UPDATE memberships_csacontractversion "
+            "SET pdf_vi_storage_key = %s, pdf_vi_sha256 = %s WHERE id = %s",
+            [
+                "../../etc/passwd",
+                hashlib.sha256(b"unrelated").hexdigest(),
+                contract.current_version_id.hex,
+            ],
+        )
 
     response = admin_api.get(admin_pdf_url(contract))
 
@@ -386,8 +526,12 @@ def test_contract_gets_do_not_create_or_regenerate_records(self_api, contract):
     )
 
     assert self_api.get(self_detail_url(contract)).status_code == 200
-    assert self_api.get(self_pdf_url(contract)).status_code == 200
-    streamed_content(self_api.get(self_pdf_url(contract, "en")))
+    vi_response = self_api.get(self_pdf_url(contract))
+    assert vi_response.status_code == 200
+    vi_response.close()
+    response = self_api.get(self_pdf_url(contract, "en"))
+    streamed_content(response)
+    response.close()
     contract.refresh_from_db()
 
     assert (

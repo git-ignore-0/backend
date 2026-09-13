@@ -8,6 +8,7 @@ from django.conf import settings
 from django.contrib.auth.models import Group
 from django.core.cache import cache
 from django.db import close_old_connections, connection
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 from pypdf import PdfReader
 from rest_framework.test import APIClient
@@ -19,6 +20,8 @@ from memberships.models import (
     CSAContractSource,
     CSAContractTermsAcceptanceMethod,
     CSACustomer,
+    CSAPurchasePayment,
+    CSAPurchasePaymentStatus,
     CSAPurchaseRequestStatus,
     Membership,
     MembershipPackage,
@@ -35,6 +38,7 @@ from memberships.purchases import (
     update_membership_payment_settings,
 )
 from memberships.services import MembershipError, assign_membership
+from memberships.views import csa_purchase_admin_queryset
 
 LIST_URL = "/api/v1/admin/csa-purchase-requests"
 TEST_BANK = {
@@ -211,6 +215,41 @@ def test_admin_list_searches_filters_paginates_and_detail_hides_guest_hash(
     assert str(confirmed.guest_token_hash) not in detail.content.decode()
     newest_first = admin_api.get(LIST_URL).json()["data"]
     assert [row["id"] for row in newest_first[:2]] == [str(confirmed.pk), str(pending.pk)]
+
+
+@pytest.mark.django_db
+def test_admin_purchase_prefetches_both_payment_actors(request_factory, active_user):
+    requests = [
+        request_factory(phone="0903333333"),
+        request_factory(phone="0904444444"),
+    ]
+    for index, item in enumerate(requests):
+        CSAPurchasePayment.objects.create(
+            purchase_request=item,
+            installment_sequence=1,
+            amount_due=Decimal("1200000"),
+            amount_paid=Decimal("1200000") if index == 0 else None,
+            cycle_count=3,
+            status=(
+                CSAPurchasePaymentStatus.CONFIRMED
+                if index == 0
+                else CSAPurchasePaymentStatus.REJECTED
+            ),
+            confirmed_at=timezone.now() if index == 0 else None,
+            confirmed_by=active_user if index == 0 else None,
+            rejected_at=timezone.now() if index == 1 else None,
+            rejected_by=active_user if index == 1 else None,
+            rejection_reason="Bank transfer not found" if index == 1 else "",
+        )
+    with CaptureQueriesContext(connection) as queries:
+        records = list(csa_purchase_admin_queryset().filter(pk__in=[item.pk for item in requests]))
+        actors = [
+            (payment.confirmed_by or payment.rejected_by).name
+            for item in records
+            for payment in item.payments.all()
+        ]
+    assert actors == [active_user.name, active_user.name]
+    assert len(queries) == 2  # requests, then payments with both actors joined
 
 
 @pytest.mark.parametrize(
@@ -835,7 +874,7 @@ def test_approve_rolls_back_when_pdf_generation_fails(admin_api, request_factory
 
         raise CSAContractPDFStorageError("Simulated PDF storage failure")
 
-    monkeypatch.setattr("memberships.purchases.generate_contract_documents", fail_pdf)
+    monkeypatch.setattr("memberships.purchases.issue_contract_version", fail_pdf)
     response = admin_api.post(
         request_url(item, "approve"), {"start_date": str(timezone.localdate())}, format="json"
     )

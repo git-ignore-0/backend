@@ -96,7 +96,7 @@ def test_create_purchase_request_normalizes_phone_and_captures_required_snapshot
     assert purchase.account_number_snapshot == payment_settings.account_number
     assert purchase.account_name_snapshot == payment_settings.account_name
     assert purchase.payment_config_version == payment_settings.version
-    assert purchase.terms_version == "CSA_TERMS_V1"
+    assert purchase.terms_version == "CSA_TERMS_V2"
     assert purchase.terms_locale == "vi"
     assert purchase.terms_snapshot
     assert len(purchase.terms_hash) == 64

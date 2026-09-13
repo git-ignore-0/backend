@@ -7,13 +7,15 @@ from django.conf import settings
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
-from memberships.contract_access import contract_summary
+from memberships.contract_access import contract_summary, contract_versions_payload
 from memberships.models import (
     CSAContract,
     CSAPurchaseRequest,
     CSAPurchaseRequestStatus,
     CSATrackerSession,
 )
+from memberships.payment_plans import initial_payment_amount_snapshot, payment_plan_snapshot_payload
+from memberships.payments import public_csa_payment_schedule_payload
 
 TRACKER_COOKIE_NAME = "nfv_csa_tracker"
 TRACKER_COOKIE_PATH = "/api/v1/public/csa-contract-tracker"
@@ -85,7 +87,9 @@ def resolve_tracker_request(token) -> CSAPurchaseRequest:
             "purchase_request__membership",
             "purchase_request__csa_contract",
             "purchase_request__csa_contract__membership",
+            "purchase_request__csa_contract__current_version",
         )
+        .prefetch_related("purchase_request__csa_contract__versions", "purchase_request__payments")
         .filter(token_hash=token_hash, expires_at__gt=timezone.now())
         .first()
     )
@@ -101,7 +105,9 @@ def lookup_tracker_request(*, reference_code: str, phone_e164: str) -> CSAPurcha
             "membership",
             "csa_contract",
             "csa_contract__membership",
+            "csa_contract__current_version",
         )
+        .prefetch_related("csa_contract__versions", "payments")
         .filter(request_code=reference_code, phone_e164=phone_e164)
         .first()
     )
@@ -122,11 +128,11 @@ def lookup_tracker_request(*, reference_code: str, phone_e164: str) -> CSAPurcha
 
 
 def _available_pdf_locales(contract: CSAContract) -> list[str]:
+    source = contract.current_version if contract.current_version_id else contract
     return [
         locale
         for locale in ("vi", "en")
-        if getattr(contract, f"pdf_{locale}_storage_key")
-        and getattr(contract, f"pdf_{locale}_sha256")
+        if getattr(source, f"pdf_{locale}_storage_key") and getattr(source, f"pdf_{locale}_sha256")
     ]
 
 
@@ -137,8 +143,10 @@ def tracker_request_payload(item: CSAPurchaseRequest) -> dict:
         "status": item.status,
         "package_snapshot": {"name": item.package_name_snapshot},
         "price_option_snapshot": {"name": item.price_option_name_snapshot},
+        "payment_plan": payment_plan_snapshot_payload(item),
         "duration_months": item.duration_months_snapshot,
         "amount": str(item.amount_snapshot),
+        "initial_payment_amount": initial_payment_amount_snapshot(item),
         "currency": item.currency_snapshot,
         "created_at": item.created_at.isoformat(),
         "expires_at": item.expires_at.isoformat() if item.expires_at else None,
@@ -158,6 +166,7 @@ def tracker_request_payload(item: CSAPurchaseRequest) -> dict:
                 "membership_end_date": item.membership.end_date.isoformat(),
                 "contract": contract_summary(contract),
                 "contract_status": contract.status,
+                "versions": contract_versions_payload(contract),
                 "available_pdf_locales": locales,
                 "pdf_available": bool(locales),
                 "pdf_action": "/api/v1/public/csa-contract-tracker/contract/pdf",
@@ -188,6 +197,7 @@ def tracker_contract(item: CSAPurchaseRequest) -> CSAContract:
 
 def tracker_contract_payload(contract: CSAContract) -> dict:
     locales = _available_pdf_locales(contract)
+    versions = contract_versions_payload(contract)
     return {
         "id": str(contract.pk),
         "reference_code": contract.reference_code,
@@ -196,6 +206,21 @@ def tracker_contract_payload(contract: CSAContract) -> dict:
         "package_name_snapshot": contract.package_name_snapshot,
         "price_option_name_snapshot": contract.price_option_name_snapshot,
         "amount_snapshot": str(contract.amount_snapshot),
+        "payment_plan": (
+            payment_plan_snapshot_payload(contract.purchase_request)
+            if contract.purchase_request_id
+            else None
+        ),
+        "initial_payment_amount": (
+            initial_payment_amount_snapshot(contract.purchase_request)
+            if contract.purchase_request_id
+            else str(contract.amount_snapshot)
+        ),
+        **(
+            public_csa_payment_schedule_payload(contract.purchase_request)
+            if contract.purchase_request_id
+            else {"payment_summary": None, "payments": []}
+        ),
         "currency_snapshot": contract.currency_snapshot,
         "duration_months_snapshot": contract.duration_months_snapshot,
         "start_date": contract.start_date.isoformat(),
@@ -207,6 +232,11 @@ def tracker_contract_payload(contract: CSAContract) -> dict:
         "terms_locale": contract.terms_locale,
         "terms_accepted_at": contract.terms_accepted_at.isoformat(),
         "terms_acceptance_method": contract.terms_acceptance_method,
+        "current_version": next(
+            (version for version in versions if version["id"] == str(contract.current_version_id)),
+            None,
+        ),
+        "versions": versions,
         "available_pdf_locales": locales,
         "pdf_available": bool(locales),
         "pdf_action": "/api/v1/public/csa-contract-tracker/contract/pdf",

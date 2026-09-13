@@ -10,15 +10,20 @@ from identity.models import AuditLog, User
 from members.administrative_units import province_exists, ward_choices
 from memberships.contract_pdfs import (
     delete_contract_documents,
-    generate_contract_documents,
+    generate_revoked_contract_documents,
     get_contract_pdf_storage,
 )
+from memberships.contract_versions import issue_contract_version
 from memberships.contracts import (
     build_manual_contract_snapshot,
     create_manual_contract,
 )
 from memberships.models import (
+    CSAContract,
+    CSAContractStatus,
+    CSAContractVersionReason,
     CSACustomer,
+    CSAPurchasePayment,
     CSAPurchaseRequest,
     Membership,
     MembershipCycle,
@@ -39,6 +44,7 @@ from memberships.models import (
     QuotaPolicy,
     UsageOrderStatus,
 )
+from memberships.payments import confirm_locked_csa_payment, paid_cycle_count, payment_due_at
 from memberships.phones import InvalidPhoneNumber, normalize_vietnam_phone
 from memberships.pricing import calculate_total_price_vnd
 
@@ -504,12 +510,20 @@ def assign_membership_to_customer(
             or purchase_request.duration_months_snapshot <= 0
             or purchase_request.amount_snapshot <= 0
             or not purchase_request.package_name_snapshot.strip()
-            or purchase_request.amount_snapshot % purchase_request.duration_months_snapshot
+            or (
+                purchase_request.payment_plan_id is None
+                and purchase_request.amount_snapshot % purchase_request.duration_months_snapshot
+            )
         ):
             raise PriceOptionTotalInvalid("Purchase request pricing snapshot is invalid")
         duration_months = purchase_request.duration_months_snapshot
         total_price_vnd = purchase_request.amount_snapshot
-        monthly_price_vnd = total_price_vnd // duration_months
+        monthly_price_vnd = (
+            purchase_request.price_option_monthly_amount_snapshot
+            or max(1, total_price_vnd // duration_months)
+            if purchase_request.payment_plan_id
+            else total_price_vnd // duration_months
+        )
         package_name_snapshot = purchase_request.package_name_snapshot
 
     end_date = add_months(start_date, duration_months)
@@ -570,6 +584,11 @@ def assign_membership_to_customer(
                 package_description_en_snapshot=(package_en.description if package_en else ""),
                 monthly_price_vnd_snapshot=monthly_price_vnd,
                 total_price_vnd_snapshot=total_price_vnd,
+                pricing_basis=(
+                    "payment_plan"
+                    if purchase_request and purchase_request.payment_plan_id
+                    else "monthly"
+                ),
                 duration_months_snapshot=duration_months,
                 quota_policy_snapshot=package.quota_policy,
                 farmbrite_order_reference=reference,
@@ -613,7 +632,7 @@ def assign_membership_to_customer(
             for item in items
         ]
     )
-    if start_date <= today:
+    if start_date <= today and not (purchase_request and purchase_request.payment_plan_id):
         ensure_due_cycles(membership, as_of=today)
     return membership
 
@@ -683,6 +702,18 @@ def assign_membership_with_contract(
                 farmbrite_order_reference=farmbrite_order_reference,
                 actor=actor,
             )
+            manual_payment = CSAPurchasePayment.objects.create(
+                membership=membership,
+                installment_sequence=1,
+                amount_due=membership.total_price_vnd_snapshot,
+                cycle_count=membership.duration_months_snapshot,
+                due_at=payment_due_at(membership.start_date, 0),
+            )
+            confirm_locked_csa_payment(
+                payment=manual_payment,
+                amount_paid=manual_payment.amount_due,
+                actor=actor,
+            )
             payment_settings = _locked_manual_payment_settings()
             snapshot = build_manual_contract_snapshot(
                 customer=customer,
@@ -700,7 +731,12 @@ def assign_membership_with_contract(
                     "contract_reference_code": contract.reference_code,
                 },
             )
-            documents = generate_contract_documents(contract, storage=storage)
+            _version, documents = issue_contract_version(
+                contract_id=contract.pk,
+                reason=CSAContractVersionReason.ISSUED,
+                actor=actor,
+                storage=storage,
+            )
         return membership
     except Exception:
         if documents is not None:
@@ -780,6 +816,16 @@ def ensure_due_cycles(
         else:
             break
     due = min(due, membership.duration_months_snapshot)
+    plan_request_id = (
+        CSAPurchaseRequest.objects.filter(membership=membership, payment_plan__isnull=False)
+        .values_list("pk", flat=True)
+        .first()
+    )
+    if plan_request_id is not None:
+        paid = paid_cycle_count(request_id=plan_request_id)
+        if paid > membership.duration_months_snapshot:
+            raise QuotaError("Confirmed payment cycles exceed Membership duration")
+        due = min(due, paid)
     existing = {item.sequence: item for item in membership.cycles.all()}
     created = []
     for sequence in range(1, due + 1):
@@ -966,30 +1012,65 @@ def revoke_membership(*, membership_id, reason: str, actor) -> Membership:
     """Revoke an active or scheduled membership. Sets status=REVOKED and clears current_slot."""
     if not reason.strip():
         raise MembershipNotRevocable("A revoke reason is required")
-    with transaction.atomic():
-        membership = Membership.objects.select_for_update().get(pk=membership_id)
-        membership = sync_membership_status(membership, as_of=timezone.localdate())
-        if membership.status in {
-            MembershipStatus.SCHEDULED,
-            MembershipStatus.ACTIVE,
-        }:
-            membership.status = MembershipStatus.REVOKED
-            membership.current_slot = None
-            membership.revoked_at = timezone.now()
-            membership.revoked_by = actor
-            membership.revoke_reason = reason.strip()
-            membership.save(
-                update_fields=[
-                    "status",
-                    "current_slot",
-                    "revoked_at",
-                    "revoked_by",
-                    "revoke_reason",
-                    "updated_at",
-                ]
+    storage = get_contract_pdf_storage()
+    documents = None
+    rejected_status = None
+    try:
+        with transaction.atomic():
+            membership = Membership.objects.select_for_update().get(pk=membership_id)
+            membership = sync_membership_status(membership, as_of=timezone.localdate())
+            if membership.status not in {MembershipStatus.SCHEDULED, MembershipStatus.ACTIVE}:
+                rejected_status = membership.status
+            else:
+                membership.status = MembershipStatus.REVOKED
+                membership.current_slot = None
+                membership.revoked_at = timezone.now()
+                membership.revoked_by = actor
+                membership.revoke_reason = reason.strip()
+                membership.save(
+                    update_fields=[
+                        "status",
+                        "current_slot",
+                        "revoked_at",
+                        "revoked_by",
+                        "revoke_reason",
+                        "updated_at",
+                    ]
+                )
+                contract = (
+                    CSAContract.objects.select_for_update().filter(membership=membership).first()
+                )
+                if contract is not None:
+                    contract.status = CSAContractStatus.REVOKED
+                    contract.revoked_at = membership.revoked_at
+                    contract.revoked_by = actor
+                    contract.revoked_by_name_snapshot = actor.name or actor.email
+                    contract.revocation_reason = reason.strip()
+                    contract.save(
+                        update_fields=[
+                            "status",
+                            "revoked_at",
+                            "revoked_by",
+                            "revoked_by_name_snapshot",
+                            "revocation_reason",
+                            "updated_at",
+                        ]
+                    )
+                    if contract.current_version_id:
+                        _version, documents = issue_contract_version(
+                            contract_id=contract.pk,
+                            reason=CSAContractVersionReason.MEMBERSHIP_REVOKED,
+                            actor=actor,
+                            storage=storage,
+                        )
+                    elif contract.pdf_generated_at:
+                        documents = generate_revoked_contract_documents(contract, storage=storage)
+        if rejected_status is not None:
+            raise MembershipNotRevocable(
+                f"Membership cannot be revoked: current status is '{rejected_status}'"
             )
-            return membership
-        rejected_status = membership.status
-    raise MembershipNotRevocable(
-        f"Membership cannot be revoked: current status is '{rejected_status}'"
-    )
+        return membership
+    except Exception:
+        if documents is not None:
+            delete_contract_documents(documents, storage=storage)
+        raise

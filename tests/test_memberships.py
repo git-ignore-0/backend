@@ -482,6 +482,7 @@ def test_public_catalog_localizes_and_only_exposes_active_safe_price_options(cli
             "duration_months": 6,
             "monthly_price_vnd": "1000000",
             "total_price_vnd": "6000000",
+            "payment_plans": [],
         }
     ]
     assert "created_at" not in data
@@ -819,12 +820,12 @@ def test_manual_assignment_pdf_failure_rolls_back_and_retry_is_clean(
     from memberships import services
     from memberships.contract_pdfs import CSAContractPDFStorageError
 
-    original_generator = services.generate_contract_documents
+    original_generator = services.issue_contract_version
 
     def fail_pdf(*_args, **_kwargs):
         raise CSAContractPDFStorageError("Simulated storage failure")
 
-    monkeypatch.setattr(services, "generate_contract_documents", fail_pdf)
+    monkeypatch.setattr(services, "issue_contract_version", fail_pdf)
     failed = admin_api.post("/api/v1/admin/memberships", payload, format="json")
 
     assert failed.status_code == 503
@@ -833,7 +834,7 @@ def test_manual_assignment_pdf_failure_rolls_back_and_retry_is_clean(
     assert not CSAContract.objects.exists()
     assert not AuditLog.objects.filter(action="membership.assigned").exists()
 
-    monkeypatch.setattr(services, "generate_contract_documents", original_generator)
+    monkeypatch.setattr(services, "issue_contract_version", original_generator)
     retried = admin_api.post("/api/v1/admin/memberships", payload, format="json")
     assert retried.status_code == 201
     assert Membership.objects.filter(customer=customer).count() == 1

@@ -13,9 +13,9 @@ from members.models import MemberProfile
 from memberships.contract_pdfs import (
     CSAContractPDFStorageError,
     delete_contract_documents,
-    generate_contract_documents,
     get_contract_pdf_storage,
 )
+from memberships.contract_versions import issue_contract_version
 from memberships.contracts import build_online_contract_snapshot, create_online_contract
 from memberships.expiry import (
     expire_csa_purchase_request_if_due,
@@ -24,16 +24,31 @@ from memberships.expiry import (
 )
 from memberships.models import (
     CSAContract,
+    CSAContractVersionReason,
     CSACustomer,
+    CSAPurchasePayment,
+    CSAPurchasePaymentStatus,
     CSAPurchaseRefundStatus,
     CSAPurchaseRequest,
     CSAPurchaseRequestStatus,
     Membership,
     MembershipPackage,
     MembershipPackagePriceOption,
+    MembershipPaymentPlan,
+    MembershipPaymentPlanInstallment,
     MembershipPaymentSettings,
     MembershipStatus,
     generate_csa_purchase_request_code,
+)
+from memberships.payment_plans import (
+    PaymentPlanValidationError,
+    validate_payment_plan_configuration,
+)
+from memberships.payments import (
+    CSAPaymentError,
+    confirm_locked_csa_payment,
+    ensure_csa_payment_schedule,
+    set_csa_payment_due_dates,
 )
 from memberships.phones import InvalidPhoneNumber, normalize_vietnam_phone
 from memberships.services import (
@@ -60,6 +75,14 @@ class PurchaseRequestConflict(CSAPurchaseError):
 
 class PurchasePackageUnavailable(CSAPurchaseError):
     code = "csa_purchase_package_unavailable"
+
+
+class PurchasePaymentPlanRequired(CSAPurchaseError):
+    code = "csa_purchase_payment_plan_required"
+
+
+class PurchasePaymentPlanUnavailable(CSAPurchaseError):
+    code = "csa_purchase_payment_plan_unavailable"
 
 
 class PaymentSettingsUnavailable(CSAPurchaseError):
@@ -232,6 +255,7 @@ def _create_csa_purchase_request(
     *,
     package_id,
     price_option_id,
+    payment_plan_id=None,
     phone=None,
     name=None,
     province_code=None,
@@ -279,6 +303,40 @@ def _create_csa_purchase_request(
     except (MembershipPackage.DoesNotExist, MembershipPackagePriceOption.DoesNotExist) as error:
         raise PurchasePackageUnavailable("Package or price option is unavailable") from error
 
+    plan = None
+    plan_installments = []
+    if payment_plan_id is not None:
+        try:
+            plan = MembershipPaymentPlan.objects.select_for_update().get(pk=payment_plan_id)
+        except MembershipPaymentPlan.DoesNotExist as error:
+            raise PurchasePaymentPlanUnavailable("Payment plan is unavailable") from error
+        if plan.price_option_id != option.pk or not plan.is_active:
+            raise PurchasePaymentPlanUnavailable("Payment plan is unavailable")
+        plan_installments = list(
+            MembershipPaymentPlanInstallment.objects.select_for_update()
+            .filter(payment_plan=plan)
+            .order_by("sequence", "id")
+        )
+        try:
+            validate_payment_plan_configuration(plan, plan_installments)
+        except PaymentPlanValidationError as error:
+            raise PurchasePaymentPlanUnavailable("Payment plan is unavailable") from error
+    elif MembershipPaymentPlan.objects.filter(price_option=option, is_active=True).exists():
+        raise PurchasePaymentPlanRequired("Select a payment plan for this price option")
+
+    plan_snapshot = (
+        [
+            {
+                "sequence": row.sequence,
+                "amount": format(row.amount, "f"),
+                "cycle_count": row.cycle_count,
+            }
+            for row in plan_installments
+        ]
+        if plan is not None
+        else None
+    )
+
     expire_open_csa_purchase_request_for_phone(phone_e164=normalized_phone)
     if CSAPurchaseRequest.objects.filter(phone_e164=normalized_phone, open_slot=True).exists():
         raise PurchaseRequestConflict("Phone already has an open CSA purchase request")
@@ -297,10 +355,17 @@ def _create_csa_purchase_request(
         address_snapshot=address,
         package=package,
         price_option=option,
+        payment_plan=plan,
         package_name_snapshot=package.name,
         price_option_name_snapshot=f"{option.duration_months} months",
         duration_months_snapshot=option.duration_months,
-        amount_snapshot=option.total_price_vnd,
+        amount_snapshot=int(plan.total_amount) if plan is not None else option.total_price_vnd,
+        price_option_monthly_amount_snapshot=option.monthly_price_vnd,
+        payment_plan_name_snapshot=plan.name if plan is not None else None,
+        payment_type_snapshot=plan.payment_type if plan is not None else None,
+        total_payment_amount_snapshot=plan.total_amount if plan is not None else None,
+        installment_count_snapshot=plan.installment_count if plan is not None else None,
+        payment_installments_snapshot=plan_snapshot,
         currency_snapshot="VND",
         bank_bin_snapshot=payment.bank_bin,
         bank_name_snapshot=payment.bank_name,
@@ -328,6 +393,11 @@ def _create_csa_purchase_request(
                 "Phone already has an open CSA purchase request"
             ) from error
         raise
+    try:
+        if item.payment_plan_id is not None:
+            ensure_csa_payment_schedule(request_id=item.pk)
+    except CSAPaymentError as error:
+        raise CSAPurchaseError("Purchase payment schedule is invalid") from error
     return item
 
 
@@ -378,6 +448,17 @@ def confirm_csa_purchase_payment(
             raise PurchaseRequestExpired("Purchase request has expired")
         if item.status != CSAPurchaseRequestStatus.PENDING:
             raise PurchaseTransitionConflict("Purchase request is no longer pending")
+
+        try:
+            ensure_csa_payment_schedule(request_id=item.pk)
+        except CSAPaymentError as error:
+            raise CSAPurchaseError("Purchase payment schedule is invalid") from error
+        first = CSAPurchasePayment.objects.select_for_update().get(
+            purchase_request=item, installment_sequence=1
+        )
+        if first.status == CSAPurchasePaymentStatus.PENDING:
+            first.status = CSAPurchasePaymentStatus.REPORTED
+            first.save(update_fields=["status", "updated_at"])
 
         item.status = CSAPurchaseRequestStatus.PAYMENT_CONFIRMED
         item.payment_confirmed_at = timezone.now()
@@ -761,6 +842,8 @@ def approve_csa_purchase_request(
                     "Start date is before the next available customer date"
                 )
 
+            ensure_csa_payment_schedule(request_id=item.pk)
+
             membership = assign_membership(
                 customer_id=customer.pk,
                 package_id=item.package_id,
@@ -785,6 +868,14 @@ def approve_csa_purchase_request(
                     "updated_at",
                 ]
             )
+            set_csa_payment_due_dates(request_id=item.pk, start_date=start_date)
+            first = CSAPurchasePayment.objects.select_for_update().get(
+                purchase_request=item, installment_sequence=1
+            )
+            confirm_locked_csa_payment(payment=first, amount_paid=first.amount_due, actor=actor)
+            from memberships.services import ensure_due_cycles
+
+            ensure_due_cycles(membership)
             snapshot = build_online_contract_snapshot(
                 purchase_request=item,
                 membership=membership,
@@ -805,7 +896,12 @@ def approve_csa_purchase_request(
                 start_date=start_date.isoformat(),
                 customer_resolution=customer_resolution,
             )
-            documents = generate_contract_documents(contract, storage=storage)
+            _version, documents = issue_contract_version(
+                contract_id=contract.pk,
+                reason=CSAContractVersionReason.ISSUED,
+                actor=actor,
+                storage=storage,
+            )
         return item, membership
     except Exception:
         if documents is not None:

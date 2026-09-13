@@ -6,7 +6,8 @@ import secrets
 from memberships.models import MembershipContentLocale
 
 CSA_TERMS_V1 = "CSA_TERMS_V1"
-CURRENT_CSA_TERMS_VERSION = CSA_TERMS_V1
+CSA_TERMS_V2 = "CSA_TERMS_V2"
+CURRENT_CSA_TERMS_VERSION = CSA_TERMS_V2
 
 _CSA_TERMS_CONTENT = {
     CSA_TERMS_V1: {
@@ -260,6 +261,52 @@ _CSA_TERMS_CONTENT = {
             ],
         },
     }
+}
+
+# Keep V1 byte-for-byte stable: existing requests and Contracts verify their
+# accepted content against its original canonical hash.
+_CSA_TERMS_CONTENT[CSA_TERMS_V2] = copy.deepcopy(_CSA_TERMS_CONTENT[CSA_TERMS_V1])
+_CSA_TERMS_CONTENT[CSA_TERMS_V2][MembershipContentLocale.VI]["sections"][1] = {
+    "key": "payment",
+    "heading": "Thanh toán",
+    "paragraphs": [
+        (
+            "Tùy cấu hình từng gói, thành viên có thể trả thẳng hoặc trả góp. Tổng tiền, "
+            "số lần thanh toán, số tiền từng lần và số kỳ tương ứng được hiển thị trước khi "
+            "thành viên xác nhận yêu cầu."
+        ),
+        (
+            "Khoản thanh toán đầu tiên cần được chuyển để yêu cầu được tiếp nhận và xử lý "
+            "theo quy trình hiện hành. Membership chỉ được tạo sau khi yêu cầu được duyệt. "
+            "Các khoản tiếp theo phải thanh toán đúng hạn."
+        ),
+        (
+            "Admin kiểm tra và có quyền xác nhận hoặc từ chối thủ công từng giao dịch. "
+            "Khoản tiếp theo quá hạn có thể chuyển trạng thái quá hạn và Membership có thể "
+            "bị thu hồi theo quy định."
+        ),
+    ],
+}
+_CSA_TERMS_CONTENT[CSA_TERMS_V2][MembershipContentLocale.EN]["sections"][1] = {
+    "key": "payment",
+    "heading": "Payment",
+    "paragraphs": [
+        (
+            "Depending on the package configuration, a member may pay in full or in "
+            "installments. The total, number of payments, amount of each payment, and "
+            "corresponding cycles are shown before the member accepts the request."
+        ),
+        (
+            "The first payment must be transferred for the request to be received and "
+            "processed under the current workflow. Membership is created only after the "
+            "request is approved. Later installments must be paid by their due dates."
+        ),
+        (
+            "An admin reviews and may manually confirm or reject each transaction. "
+            "A later payment that misses its deadline may become overdue, and the "
+            "Membership may be revoked under the applicable rules."
+        ),
+    ],
 }
 
 

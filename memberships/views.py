@@ -1,7 +1,7 @@
 from django.conf import settings
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import IntegrityError, transaction
-from django.db.models import Q, Sum
+from django.db.models import Prefetch, Q, Sum
 from django.db.models.deletion import ProtectedError
 from django.http import FileResponse
 from django.shortcuts import get_object_or_404
@@ -23,8 +23,9 @@ from memberships.contract_access import (
     contract_payload,
     contract_queryset,
     contract_summary,
-    open_verified_current_contract_pdf,
-    validated_contract_locale,
+    open_verified_contract_pdf,
+    selected_contract_version,
+    validated_contract_pdf_query,
 )
 from memberships.contract_pdfs import CSAContractPDFError, CSAContractPDFStorageError
 from memberships.contract_verification import (
@@ -36,18 +37,41 @@ from memberships.contracts import CSAContractError
 from memberships.models import (
     CSAContract,
     CSACustomer,
+    CSAPurchasePayment,
     CSAPurchaseRequest,
     Membership,
     MembershipContentLocale,
     MembershipCycleQuota,
     MembershipPackage,
     MembershipPackageItem,
+    MembershipPackagePriceOption,
     MembershipPackageTranslation,
+    MembershipPaymentPlan,
     MembershipPaymentSettings,
     MembershipStatus,
     MembershipUsageOrder,
     Product,
     ProductTranslation,
+)
+from memberships.payment_plans import (
+    PaymentPlanValidationError,
+    admin_payment_plan_payload,
+    admin_payment_plan_queryset,
+    delete_admin_payment_plan,
+    initial_payment_amount_snapshot,
+    payment_plan_snapshot_payload,
+    save_admin_payment_plan,
+    set_admin_payment_plan_active,
+    validate_payment_plan_configuration,
+)
+from memberships.payments import (
+    CSAPaymentAmountMismatch,
+    CSAPaymentError,
+    CSAPaymentStateConflict,
+    CSAPaymentUnavailable,
+    confirm_csa_payment,
+    csa_payment_schedule_payload,
+    reject_csa_payment,
 )
 from memberships.permissions import HasMembershipSelfScopes
 from memberships.purchases import (
@@ -60,6 +84,8 @@ from memberships.purchases import (
     PurchaseCustomerIncomplete,
     PurchaseCustomerResolutionRequired,
     PurchasePackageUnavailable,
+    PurchasePaymentPlanRequired,
+    PurchasePaymentPlanUnavailable,
     PurchaseRefundConflict,
     PurchaseRequestConflict,
     PurchaseRequestExpired,
@@ -77,12 +103,15 @@ from memberships.serializers import (
     AdminCSAPurchaseRequestQuerySerializer,
     AdminMembershipQuerySerializer,
     AdminPackageQuerySerializer,
+    AdminPaymentPlanWriteSerializer,
     AdminProductQuerySerializer,
     AuthenticatedCSAPurchaseRequestCreateSerializer,
     CSAContractVerificationSerializer,
     CSACustomerCreateSerializer,
     CSACustomerLinkUserSerializer,
     CSACustomerUpdateSerializer,
+    CSAPaymentConfirmSerializer,
+    CSAPaymentRejectSerializer,
     CSAPurchasePaymentConfirmSerializer,
     CSAPurchaseRequestApproveSerializer,
     CSAPurchaseRequestCreateSerializer,
@@ -192,7 +221,9 @@ def csa_customer_error(error):
 def csa_purchase_error(error):
     if isinstance(error, PaymentSettingsUnavailable):
         http_status = status.HTTP_503_SERVICE_UNAVAILABLE
-    elif isinstance(error, (PurchaseConfirmationDenied, PurchaseAdminNotFound)):
+    elif isinstance(
+        error, (PurchaseConfirmationDenied, PurchaseAdminNotFound, CSAPaymentUnavailable)
+    ):
         http_status = status.HTTP_404_NOT_FOUND
     elif isinstance(
         error,
@@ -203,12 +234,17 @@ def csa_purchase_error(error):
             PurchaseRequestConflict,
             PurchaseRequestExpired,
             PurchasePackageUnavailable,
+            PurchasePaymentPlanRequired,
+            PurchasePaymentPlanUnavailable,
             PurchaseRefundConflict,
             PurchaseTransitionConflict,
+            CSAPaymentStateConflict,
         ),
     ):
         http_status = status.HTTP_409_CONFLICT
     elif isinstance(error, (PurchaseCustomerIncomplete, PurchaseStartDateInvalid)):
+        http_status = status.HTTP_400_BAD_REQUEST
+    elif isinstance(error, CSAPaymentAmountMismatch):
         http_status = status.HTTP_400_BAD_REQUEST
     else:
         http_status = status.HTTP_400_BAD_REQUEST
@@ -267,16 +303,18 @@ def set_tracker_cookie(response, token):
     return response
 
 
-def contract_pdf_response(contract, *, locale):
+def contract_pdf_response(contract, *, locale, version_id=None):
     try:
-        locale = validated_contract_locale(locale)
-        pdf_file = open_verified_current_contract_pdf(contract, locale=locale)
+        version = selected_contract_version(contract, version_id)
+        pdf_file = open_verified_contract_pdf(contract, locale=locale, version=version)
     except CSAContractAccessError as error:
         return csa_contract_access_error(error)
     response = FileResponse(
         pdf_file,
         as_attachment=True,
-        filename=contract_download_filename(contract, locale),
+        filename=contract_download_filename(
+            contract, locale, version=version if version_id is not None else None
+        ),
         content_type="application/pdf",
     )
     response["Cache-Control"] = "private, no-store"
@@ -381,6 +419,7 @@ def customer_payload(item, *, include_memberships=False):
 
 def csa_purchase_payload(item: CSAPurchaseRequest, *, guest_confirmation_token=None):
     amount = str(item.amount_snapshot)
+    initial_amount = initial_payment_amount_snapshot(item)
     data = {
         "id": str(item.pk),
         "request_code": item.request_code,
@@ -394,7 +433,9 @@ def csa_purchase_payload(item: CSAPurchaseRequest, *, guest_confirmation_token=N
             "name": item.price_option_name_snapshot,
             "duration_months": item.duration_months_snapshot,
         },
+        "payment_plan": payment_plan_snapshot_payload(item),
         "amount": amount,
+        "initial_payment_amount": initial_amount,
         "currency": item.currency_snapshot,
         "transfer_content": item.transfer_content,
         "bank_bin": item.bank_bin_snapshot,
@@ -411,7 +452,7 @@ def csa_purchase_payload(item: CSAPurchaseRequest, *, guest_confirmation_token=N
             "acqId": item.bank_bin_snapshot,
             "accountNo": item.account_number_snapshot,
             "accountName": item.account_name_snapshot,
-            "amount": amount,
+            "amount": initial_amount or "",
             "addInfo": item.transfer_content,
             "format": "text",
             "template": "compact2",
@@ -429,6 +470,7 @@ def admin_csa_purchase_payload(item: CSAPurchaseRequest):
         contract = None
     return {
         **csa_purchase_payload(item),
+        **csa_payment_schedule_payload(item),
         "user": (
             {
                 "id": str(item.user_id),
@@ -479,17 +521,28 @@ def admin_csa_purchase_payload(item: CSAPurchaseRequest):
 
 
 def csa_purchase_admin_queryset():
-    return CSAPurchaseRequest.objects.select_related(
-        "user",
-        "customer",
-        "membership",
-        "csa_contract",
-        "package",
-        "price_option",
-        "approved_by",
-        "rejected_by",
-        "refund_marked_by",
-    ).order_by("-created_at", "-id")
+    return (
+        CSAPurchaseRequest.objects.select_related(
+            "user",
+            "customer",
+            "membership",
+            "csa_contract",
+            "package",
+            "price_option",
+            "approved_by",
+            "rejected_by",
+            "refund_marked_by",
+        )
+        .prefetch_related(
+            Prefetch(
+                "payments",
+                queryset=CSAPurchasePayment.objects.select_related(
+                    "confirmed_by", "rejected_by"
+                ).order_by("installment_sequence", "id"),
+            )
+        )
+        .order_by("-created_at", "-id")
+    )
 
 
 def requested_locale(request):
@@ -563,6 +616,36 @@ def price_option_payload(option, *, public=False):
                 "updated_at": option.updated_at.isoformat(),
             }
         )
+        data["payment_plans"] = [
+            admin_payment_plan_payload(plan) for plan in getattr(option, "admin_payment_plans", [])
+        ]
+    else:
+        plans = []
+        for plan in getattr(option, "active_payment_plans", []):
+            installments = list(plan.installments.all())
+            try:
+                validate_payment_plan_configuration(plan, installments)
+            except PaymentPlanValidationError:
+                continue
+            plans.append(
+                {
+                    "id": str(plan.pk),
+                    "name": plan.name,
+                    "payment_type": plan.payment_type,
+                    "total_amount": format(plan.total_amount, "f"),
+                    "installment_count": plan.installment_count,
+                    "initial_payment_amount": format(installments[0].amount, "f"),
+                    "installments": [
+                        {
+                            "sequence": row.sequence,
+                            "amount": format(row.amount, "f"),
+                            "cycle_count": row.cycle_count,
+                        }
+                        for row in installments
+                    ],
+                }
+            )
+        data["payment_plans"] = plans
     return data
 
 
@@ -874,6 +957,29 @@ def package_queryset():
     )
 
 
+def admin_package_queryset():
+    return package_queryset().prefetch_related(
+        Prefetch(
+            "price_options__payment_plans",
+            queryset=admin_payment_plan_queryset(),
+            to_attr="admin_payment_plans",
+        )
+    )
+
+
+def public_package_queryset():
+    return package_queryset().prefetch_related(
+        Prefetch(
+            "price_options__payment_plans",
+            queryset=MembershipPaymentPlan.objects.filter(is_active=True)
+            .select_related("price_option")
+            .order_by("sort_order", "created_at", "id")
+            .prefetch_related("installments"),
+            to_attr="active_payment_plans",
+        )
+    )
+
+
 def membership_queryset():
     return Membership.objects.select_related(
         "customer",
@@ -910,7 +1016,7 @@ class PublicPackageListView(APIView):
         query = PublicPackageQuerySerializer(data=request.query_params)
         query.is_valid(raise_exception=True)
         queryset = (
-            package_queryset()
+            public_package_queryset()
             .filter(is_active=True, items__isnull=False, price_options__is_active=True)
             .exclude(items__product__is_active=False)
             .distinct()
@@ -955,6 +1061,7 @@ class PublicCSAPurchaseRequestCreateView(APIView):
         purchase_data = {
             "package_id": data["package_id"],
             "price_option_id": data["price_option_id"],
+            "payment_plan_id": data.get("payment_plan_id"),
             "zalo_whatsapp": data.get("zalo_whatsapp"),
             "terms_locale": data["terms_locale"],
             "terms_acceptance_ip": request.META.get("REMOTE_ADDR") or None,
@@ -1079,7 +1186,11 @@ class PublicCSAContractTrackerPDFView(APIView):
             contract = tracker_contract(item)
         except CSATrackerError as error:
             return csa_tracker_error(error)
-        return contract_pdf_response(contract, locale=request.query_params.get("locale", "vi"))
+        try:
+            locale, version_id = validated_contract_pdf_query(request.query_params)
+        except CSAContractAccessError as error:
+            return csa_contract_access_error(error)
+        return contract_pdf_response(contract, locale=locale, version_id=version_id)
 
 
 class SelfMembershipView(APIView):
@@ -1132,7 +1243,7 @@ class SelfMembershipContractPDFView(APIView):
 
     def get(self, request, membership_id):
         try:
-            locale = validated_contract_locale(request.query_params.get("locale", "vi"))
+            locale, version_id = validated_contract_pdf_query(request.query_params)
         except CSAContractAccessError as error:
             return csa_contract_access_error(error)
         contract = (
@@ -1145,7 +1256,7 @@ class SelfMembershipContractPDFView(APIView):
         )
         if contract is None:
             return no_store(Response(status=status.HTTP_404_NOT_FOUND))
-        return contract_pdf_response(contract, locale=locale)
+        return contract_pdf_response(contract, locale=locale, version_id=version_id)
 
 
 class SelfQuotaView(APIView):
@@ -1296,7 +1407,7 @@ class AdminPackageViewSet(viewsets.ViewSet):
     def list(self, request):
         query = AdminPackageQuerySerializer(data=request.query_params)
         query.is_valid(raise_exception=True)
-        queryset = package_queryset()
+        queryset = admin_package_queryset()
         if search := query.validated_data["search"]:
             queryset = queryset.filter(
                 Q(translations__name__icontains=search)
@@ -1338,14 +1449,14 @@ class AdminPackageViewSet(viewsets.ViewSet):
             raise ValidationError({"price_options": str(error)}) from error
         return no_store(
             Response(
-                {"data": package_payload(package_queryset().get(pk=package.pk))},
+                {"data": package_payload(admin_package_queryset().get(pk=package.pk))},
                 status=status.HTTP_201_CREATED,
             )
         )
 
     def retrieve(self, request, pk=None):
         return no_store(
-            Response({"data": package_payload(get_object_or_404(package_queryset(), pk=pk))})
+            Response({"data": package_payload(get_object_or_404(admin_package_queryset(), pk=pk))})
         )
 
     @transaction.atomic
@@ -1392,7 +1503,9 @@ class AdminPackageViewSet(viewsets.ViewSet):
                 raise ValidationError(
                     {"price_options": "Duration months must be unique within a package."}
                 ) from error
-        return no_store(Response({"data": package_payload(package_queryset().get(pk=package.pk))}))
+        return no_store(
+            Response({"data": package_payload(admin_package_queryset().get(pk=package.pk))})
+        )
 
     def destroy(self, request, pk=None):
         package = get_object_or_404(MembershipPackage, pk=pk)
@@ -1401,6 +1514,96 @@ class AdminPackageViewSet(viewsets.ViewSet):
         except ProtectedError as error:
             raise ValidationError({"package": "Package is in use."}) from error
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+def _payment_plan_error(code, *, fields=None, http_status=status.HTTP_400_BAD_REQUEST):
+    item = {"code": code}
+    if fields is not None:
+        item["fields"] = fields
+    return no_store(Response({"errors": [item]}, status=http_status))
+
+
+class AdminPaymentPlanListView(APIView):
+    permission_classes = [IsWebsiteAdmin]
+
+    def get(self, request, option_id):
+        get_object_or_404(MembershipPackagePriceOption, pk=option_id)
+        plans = admin_payment_plan_queryset().filter(price_option_id=option_id)
+        return no_store(Response({"data": [admin_payment_plan_payload(plan) for plan in plans]}))
+
+    def post(self, request, option_id):
+        serializer = AdminPaymentPlanWriteSerializer(data=request.data)
+        if not serializer.is_valid():
+            return _payment_plan_error("payment_plan_invalid", fields=serializer.errors)
+        try:
+            plan = save_admin_payment_plan(option_id=option_id, data=serializer.validated_data)
+        except MembershipPackagePriceOption.DoesNotExist:
+            return _payment_plan_error("payment_plan_unavailable", http_status=404)
+        except PaymentPlanValidationError as error:
+            return _payment_plan_error(error.code)
+        return no_store(
+            Response({"data": admin_payment_plan_payload(plan)}, status=status.HTTP_201_CREATED)
+        )
+
+
+class AdminPaymentPlanDetailView(APIView):
+    permission_classes = [IsWebsiteAdmin]
+
+    def _plan(self, option_id, plan_id):
+        return get_object_or_404(
+            admin_payment_plan_queryset(),
+            pk=plan_id,
+            price_option_id=option_id,
+        )
+
+    def get(self, request, option_id, plan_id):
+        return no_store(
+            Response({"data": admin_payment_plan_payload(self._plan(option_id, plan_id))})
+        )
+
+    def patch(self, request, option_id, plan_id):
+        serializer = AdminPaymentPlanWriteSerializer(data=request.data, partial=True)
+        if not serializer.is_valid():
+            return _payment_plan_error("payment_plan_invalid", fields=serializer.errors)
+        try:
+            plan = save_admin_payment_plan(
+                option_id=option_id, plan_id=plan_id, data=serializer.validated_data
+            )
+        except (MembershipPackagePriceOption.DoesNotExist, MembershipPaymentPlan.DoesNotExist):
+            return _payment_plan_error("payment_plan_unavailable", http_status=404)
+        except PaymentPlanValidationError as error:
+            return _payment_plan_error(
+                error.code, http_status=409 if error.code == "payment_plan_in_use" else 400
+            )
+        return no_store(Response({"data": admin_payment_plan_payload(plan)}))
+
+    def delete(self, request, option_id, plan_id):
+        try:
+            delete_admin_payment_plan(option_id=option_id, plan_id=plan_id)
+        except (MembershipPackagePriceOption.DoesNotExist, MembershipPaymentPlan.DoesNotExist):
+            return _payment_plan_error("payment_plan_unavailable", http_status=404)
+        except PaymentPlanValidationError as error:
+            return _payment_plan_error(error.code, http_status=409)
+        return no_store(Response(status=status.HTTP_204_NO_CONTENT))
+
+
+class AdminPaymentPlanActivationView(APIView):
+    permission_classes = [IsWebsiteAdmin]
+
+    def post(self, request, option_id, plan_id, action):
+        if action not in {"activate", "deactivate"}:
+            return _payment_plan_error("payment_plan_unavailable", http_status=404)
+        if request.data:
+            return _payment_plan_error("payment_plan_invalid")
+        try:
+            plan = set_admin_payment_plan_active(
+                option_id=option_id, plan_id=plan_id, active=action == "activate"
+            )
+        except (MembershipPackagePriceOption.DoesNotExist, MembershipPaymentPlan.DoesNotExist):
+            return _payment_plan_error("payment_plan_unavailable", http_status=404)
+        except PaymentPlanValidationError as error:
+            return _payment_plan_error(error.code)
+        return no_store(Response({"data": admin_payment_plan_payload(plan)}))
 
 
 class AdminMembershipPaymentSettingsView(APIView):
@@ -1502,7 +1705,7 @@ class AdminCSAPurchaseRequestViewSet(viewsets.ViewSet):
                 rejection_reason=serializer.validated_data.get("rejection_reason"),
                 actor=request.user,
             )
-        except CSAPurchaseError as error:
+        except (CSAPurchaseError, CSAPaymentError) as error:
             return csa_purchase_error(error)
         except MembershipError as error:
             return membership_error(error)
@@ -1539,6 +1742,47 @@ class AdminCSAPurchaseRequestViewSet(viewsets.ViewSet):
         except CSAPurchaseError as error:
             return csa_purchase_error(error)
         item = csa_purchase_admin_queryset().get(pk=item.pk)
+        return no_store(Response({"data": admin_csa_purchase_payload(item)}))
+
+
+class AdminCSAPaymentConfirmView(APIView):
+    permission_classes = [IsWebsiteAdmin]
+
+    def post(self, request, request_id, sequence):
+        serializer = CSAPaymentConfirmSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            confirm_csa_payment(
+                request_id=request_id,
+                installment_sequence=sequence,
+                amount_paid=serializer.validated_data["amount_paid"],
+                actor=request.user,
+                note=serializer.validated_data["note"],
+            )
+        except CSAPaymentError as error:
+            return csa_purchase_error(error)
+        except CSAContractPDFError as error:
+            return csa_contract_error(error)
+        item = csa_purchase_admin_queryset().get(pk=request_id)
+        return no_store(Response({"data": admin_csa_purchase_payload(item)}))
+
+
+class AdminCSAPaymentRejectView(APIView):
+    permission_classes = [IsWebsiteAdmin]
+
+    def post(self, request, request_id, sequence):
+        serializer = CSAPaymentRejectSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            reject_csa_payment(
+                request_id=request_id,
+                installment_sequence=sequence,
+                reason=serializer.validated_data["rejection_reason"],
+                actor=request.user,
+            )
+        except CSAPaymentError as error:
+            return csa_purchase_error(error)
+        item = csa_purchase_admin_queryset().get(pk=request_id)
         return no_store(Response({"data": admin_csa_purchase_payload(item)}))
 
 
@@ -1726,13 +1970,13 @@ class AdminMembershipViewSet(viewsets.ViewSet):
     @action(detail=True, methods=["get"], url_path="contract/pdf")
     def contract_pdf(self, request, pk=None):
         try:
-            locale = validated_contract_locale(request.query_params.get("locale", "vi"))
+            locale, version_id = validated_contract_pdf_query(request.query_params)
         except CSAContractAccessError as error:
             return csa_contract_access_error(error)
         contract = contract_queryset().filter(membership_id=pk).first()
         if contract is None:
             return no_store(Response(status=status.HTTP_404_NOT_FOUND))
-        return contract_pdf_response(contract, locale=locale)
+        return contract_pdf_response(contract, locale=locale, version_id=version_id)
 
     @action(detail=True, methods=["post"], url_path="revoke")
     def revoke(self, request, pk=None):
@@ -1749,6 +1993,8 @@ class AdminMembershipViewSet(viewsets.ViewSet):
             return Response(status=status.HTTP_404_NOT_FOUND)
         except MembershipNotRevocable as error:
             return membership_error(error)
+        except CSAContractPDFError as error:
+            return csa_contract_error(error)
         item = membership_queryset().get(pk=item.pk)
         return no_store(
             Response(

@@ -56,6 +56,21 @@ class PublicPackageQuerySerializer(LocalePageQuerySerializer):
     pass
 
 
+class PaymentPlanInstallmentWriteSerializer(StrictSerializer):
+    sequence = serializers.IntegerField(min_value=1)
+    amount = serializers.DecimalField(max_digits=19, decimal_places=0, min_value=Decimal(1))
+    cycle_count = serializers.IntegerField(min_value=1)
+
+
+class AdminPaymentPlanWriteSerializer(StrictSerializer):
+    name = serializers.CharField(max_length=120, trim_whitespace=True)
+    payment_type = serializers.ChoiceField(choices=("full", "installment"))
+    total_amount = serializers.DecimalField(max_digits=19, decimal_places=0, min_value=Decimal(1))
+    installment_count = serializers.IntegerField(min_value=1)
+    sort_order = serializers.IntegerField(min_value=0, required=False, default=0)
+    installments = PaymentPlanInstallmentWriteSerializer(many=True, allow_empty=False)
+
+
 class TermsAcceptedField(serializers.Field):
     default_error_messages = {"required": "CSA terms must be accepted."}
 
@@ -71,6 +86,7 @@ class TermsAcceptedField(serializers.Field):
 class CSAPurchaseRequestCreateSerializer(StrictSerializer):
     package_id = serializers.UUIDField()
     price_option_id = serializers.UUIDField()
+    payment_plan_id = serializers.UUIDField(required=False)
     name = serializers.CharField(max_length=150, trim_whitespace=True)
     phone = serializers.CharField(max_length=32, trim_whitespace=True)
     province_code = serializers.CharField(max_length=2, trim_whitespace=True)
@@ -111,6 +127,7 @@ class CSAPurchaseRequestCreateSerializer(StrictSerializer):
 class AuthenticatedCSAPurchaseRequestCreateSerializer(StrictSerializer):
     package_id = serializers.UUIDField()
     price_option_id = serializers.UUIDField()
+    payment_plan_id = serializers.UUIDField(required=False)
     zalo_whatsapp = serializers.CharField(
         max_length=64, allow_blank=True, allow_null=True, required=False, trim_whitespace=True
     )
@@ -188,6 +205,15 @@ class CSAPurchaseRequestRefundSerializer(StrictSerializer):
         required=False,
         default="",
     )
+
+
+class CSAPaymentConfirmSerializer(StrictSerializer):
+    amount_paid = serializers.DecimalField(max_digits=19, decimal_places=0, min_value=Decimal(1))
+    note = serializers.CharField(max_length=1000, allow_blank=True, required=False, default="")
+
+
+class CSAPaymentRejectSerializer(StrictSerializer):
+    rejection_reason = serializers.CharField(max_length=1000, trim_whitespace=True)
 
 
 class CSATrackerLookupSerializer(StrictSerializer):

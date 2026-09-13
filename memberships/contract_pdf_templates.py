@@ -1,5 +1,5 @@
 import json
-from datetime import timedelta
+from datetime import datetime, timedelta
 from html import escape
 from urllib.parse import urlencode
 
@@ -45,6 +45,23 @@ _LABELS = {
         "account_name": "Tên tài khoản",
         "transfer_content": "Nội dung chuyển khoản",
         "one_time": "Hình thức: Thanh toán một lần.",
+        "payment_method": "Phương thức thanh toán",
+        "payment_full": "Trả thẳng",
+        "payment_installment": "Trả góp {count} lần",
+        "total_payment": "Tổng giá trị",
+        "paid_payment": "Đã thanh toán",
+        "remaining_payment": "Còn phải thanh toán",
+        "paid_cycles": "Số kỳ đã mở",
+        "payment_schedule": "Lịch thanh toán",
+        "payment_sequence": (
+            "Lần {sequence}: {status} — phải trả {amount_due}; đã trả {amount_paid}; "
+            "áp dụng {cycles} kỳ; đến hạn {due}"
+        ),
+        "payment_pending": "Chờ thanh toán",
+        "payment_reported": "Đã báo chuyển khoản",
+        "payment_confirmed": "Đã thanh toán",
+        "payment_rejected": "Đã từ chối",
+        "payment_overdue": "Quá hạn",
         "terms": "4. Điều khoản CSA",
         "accepted_all": "Thành viên đã xác nhận toàn bộ các điều khoản dưới đây.",
         "confirmation": "5. Xác nhận",
@@ -94,6 +111,23 @@ _LABELS = {
         "account_name": "Account name",
         "transfer_content": "Transfer content",
         "one_time": "Payment method: One-time payment.",
+        "payment_method": "Payment method",
+        "payment_full": "Full payment",
+        "payment_installment": "Installments ({count})",
+        "total_payment": "Total value",
+        "paid_payment": "Paid",
+        "remaining_payment": "Remaining",
+        "paid_cycles": "Cycles opened",
+        "payment_schedule": "Payment schedule",
+        "payment_sequence": (
+            "Installment {sequence}: {status} — due {amount_due}; paid {amount_paid}; "
+            "covers {cycles} cycles; deadline {due}"
+        ),
+        "payment_pending": "Pending",
+        "payment_reported": "Transfer reported",
+        "payment_confirmed": "Confirmed",
+        "payment_rejected": "Rejected",
+        "payment_overdue": "Overdue",
         "terms": "4. CSA terms",
         "accepted_all": "The member confirmed all terms shown below.",
         "confirmation": "5. Confirmation",
@@ -204,7 +238,9 @@ def _verification_story(*, reference_code: str, label: str, styles):
     )
 
 
-def build_contract_story(*, contract, locale, provider, payment, terms, terms_hash, styles):
+def build_contract_story(
+    *, contract, locale, provider, payment, terms, terms_hash, styles, version=None
+):
     labels = _LABELS[locale]
     status_label = labels["revoked"] if contract.status == "revoked" else labels["active"]
     story = [
@@ -292,28 +328,78 @@ def build_contract_story(*, contract, locale, provider, payment, terms, terms_ha
         )
     )
 
-    story.append(
-        KeepTogether(
+    payment_story = [Spacer(1, 4 * mm), Paragraph(escape(labels["payment"]), styles["section"])]
+    if version is None:
+        payment_story.append(Paragraph(labels["one_time"], styles["body_spaced"]))
+    else:
+        method = (
+            labels["payment_full"]
+            if version.payment_type == "full"
+            else labels["payment_installment"].format(count=version.installment_count)
+        )
+        payment_story.append(
+            _details(
+                [
+                    (labels["payment_method"], method),
+                    (
+                        labels["total_payment"],
+                        _money(version.total_payment_amount, version.currency_snapshot),
+                    ),
+                    (
+                        labels["paid_payment"],
+                        _money(version.paid_amount, version.currency_snapshot),
+                    ),
+                    (
+                        labels["remaining_payment"],
+                        _money(version.remaining_amount, version.currency_snapshot),
+                    ),
+                    (labels["paid_cycles"], f"{version.paid_cycles}/{version.total_cycles}"),
+                ],
+                styles,
+            )
+        )
+        payment_story.append(Paragraph(labels["payment_schedule"], styles["subsection"]))
+        for line in version.payment_schedule_snapshot:
+            due = line.get("due_at")
+            due_text = _date(timezone.localtime(datetime.fromisoformat(due)).date()) if due else "—"
+            payment_story.append(
+                Paragraph(
+                    escape(
+                        labels["payment_sequence"].format(
+                            sequence=line["sequence"],
+                            status=labels[f"payment_{line['status']}"],
+                            amount_due=_money(int(line["amount_due"]), version.currency_snapshot),
+                            amount_paid=_money(
+                                int(line["amount_paid"] or 0), version.currency_snapshot
+                            ),
+                            cycles=line["cycle_count"],
+                            due=due_text,
+                        )
+                    ),
+                    styles["body_spaced"],
+                )
+            )
+    payment_story.append(
+        _details(
             [
-                Spacer(1, 4 * mm),
-                Paragraph(escape(labels["payment"]), styles["section"]),
-                Paragraph(labels["one_time"], styles["body_spaced"]),
-                _details(
-                    [
-                        (labels["bank"], payment["bank_name"]),
-                        (labels["account_number"], payment["account_number"]),
-                        (labels["account_name"], payment["account_name"]),
-                        (
-                            labels["amount"],
-                            _money(contract.amount_snapshot, contract.currency_snapshot),
-                        ),
-                        (labels["transfer_content"], payment.get("transfer_content")),
-                    ],
-                    styles,
+                (labels["bank"], payment["bank_name"]),
+                (labels["account_number"], payment["account_number"]),
+                (labels["account_name"], payment["account_name"]),
+                (
+                    labels["amount"],
+                    _money(
+                        int(version.payment_schedule_snapshot[0]["amount_due"])
+                        if version is not None and version.payment_type == "installment"
+                        else contract.amount_snapshot,
+                        contract.currency_snapshot,
+                    ),
                 ),
-            ]
+                (labels["transfer_content"], payment.get("transfer_content")),
+            ],
+            styles,
         )
     )
+    story.extend(payment_story)
 
     story.extend(_section(labels["terms"], styles))
     story.append(Paragraph(labels["accepted_all"], styles["body_spaced"]))

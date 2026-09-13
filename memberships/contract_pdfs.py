@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import re
 import secrets
@@ -28,7 +29,7 @@ from memberships.contract_provider import (
     InvalidCSAContractProvider,
     get_contract_provider,
 )
-from memberships.models import CSAContract, CSAContractStatus
+from memberships.models import CSAContract, CSAContractStatus, CSAContractVersion
 from memberships.terms import canonical_csa_terms_hash
 
 SUPPORTED_CONTRACT_PDF_LOCALES = ("vi", "en")
@@ -197,9 +198,35 @@ def _deterministic_canvas(*args, **kwargs):
     return canvas.Canvas(*args, **kwargs)
 
 
-def render_contract_pdf(contract: CSAContract, locale: str, *, pdf_version: int) -> bytes:
+def render_contract_pdf(
+    contract: CSAContract,
+    locale: str,
+    *,
+    pdf_version: int,
+    version: CSAContractVersion | None = None,
+) -> bytes:
     if locale not in SUPPORTED_CONTRACT_PDF_LOCALES:
         raise CSAContractPDFError("Unsupported CSA contract PDF locale")
+    if version is not None:
+        if version.contract_id != contract.pk or pdf_version != version.version_number:
+            raise CSAContractPDFStateError("Contract version does not belong to this PDF")
+        contract = copy.copy(contract)
+        for field in (
+            "status",
+            "issued_at",
+            "start_date",
+            "end_date",
+            "revoked_at",
+            "revocation_reason",
+            "revoked_by_name_snapshot",
+            "package_name_snapshot",
+            "price_option_name_snapshot",
+            "duration_months_snapshot",
+            "amount_snapshot",
+            "currency_snapshot",
+        ):
+            source = "contract_status" if field == "status" else field
+            setattr(contract, field, getattr(version, source))
     providers, terms_by_locale, payment = _validate_contract_snapshot(contract)
     regular_font, bold_font = _font_names()
     styles = build_pdf_styles(regular_font=regular_font, bold_font=bold_font)
@@ -224,6 +251,7 @@ def render_contract_pdf(contract: CSAContract, locale: str, *, pdf_version: int)
         terms=terms,
         terms_hash=canonical_csa_terms_hash(terms),
         styles=styles,
+        version=version,
     )
     decorate = _page_decorator(
         contract=contract,

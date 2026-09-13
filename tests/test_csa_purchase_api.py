@@ -127,6 +127,43 @@ def test_terms_validation_rejects_a_noncanonical_hash():
 
 
 @pytest.mark.django_db
+def test_current_terms_describe_installments_without_changing_v1():
+    from memberships.terms import CSA_TERMS_V1, CSA_TERMS_V2, get_csa_terms
+
+    for locale in ("vi", "en"):
+        old = get_csa_terms(version=CSA_TERMS_V1, locale=locale)
+        current = get_csa_terms(version=CSA_TERMS_V2, locale=locale)
+        old_payment = " ".join(old["content"]["sections"][1]["paragraphs"])
+        new_payment = " ".join(current["content"]["sections"][1]["paragraphs"])
+        assert old["hash"] != current["hash"]
+        assert len(current["content"]["sections"][1]["paragraphs"]) == 3
+        assert ("trả góp" if locale == "vi" else "installments") in new_payment
+        assert ("không cung cấp" if locale == "vi" else "does not offer") in old_payment
+
+
+@pytest.mark.django_db
+def test_v1_purchase_terms_remain_valid_after_v2_becomes_current(
+    valid_payload, payment_settings, monkeypatch
+):
+    import memberships.terms as terms_module
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(terms_module, "CURRENT_CSA_TERMS_VERSION", "CSA_TERMS_V1")
+        response = APIClient().post(CREATE_URL, valid_payload, format="json")
+    assert response.status_code == 201
+    item = CSAPurchaseRequest.objects.get(pk=response.json()["data"]["id"])
+    assert item.terms_version == "CSA_TERMS_V1"
+    assert terms_module.CURRENT_CSA_TERMS_VERSION == "CSA_TERMS_V2"
+    validate_csa_terms_snapshot(
+        version=item.terms_version,
+        locale=item.terms_locale,
+        content=item.terms_snapshot,
+        content_hash=item.terms_hash,
+    )
+    item.full_clean()
+
+
+@pytest.mark.django_db
 def test_guest_creates_request_and_receives_one_time_confirmation_token(
     valid_payload, payment_settings
 ):
@@ -140,7 +177,7 @@ def test_guest_creates_request_and_receives_one_time_confirmation_token(
     assert purchase.phone_e164 == "+84912345678"
     assert purchase.guest_token_hash != token
     assert check_password(token, purchase.guest_token_hash)
-    assert purchase.terms_version == "CSA_TERMS_V1"
+    assert purchase.terms_version == "CSA_TERMS_V2"
     assert purchase.terms_locale == "vi"
     assert purchase.terms_accepted_at is not None
     assert purchase.terms_acceptance_method == "online"
@@ -290,16 +327,16 @@ def test_purchase_terms_snapshot_does_not_follow_a_new_current_version(
     purchase = CSAPurchaseRequest.objects.get(pk=created.json()["data"]["id"])
     original_content = purchase.terms_snapshot
     original_hash = purchase.terms_hash
-    version_two_content = {
-        "vi": {"title": "Điều khoản V2", "sections": []},
-        "en": {"title": "Terms V2", "sections": []},
+    version_three_content = {
+        "vi": {"title": "Điều khoản V3", "sections": []},
+        "en": {"title": "Terms V3", "sections": []},
     }
-    monkeypatch.setitem(terms_module._CSA_TERMS_CONTENT, "CSA_TERMS_V2", version_two_content)
-    monkeypatch.setattr(terms_module, "CURRENT_CSA_TERMS_VERSION", "CSA_TERMS_V2")
+    monkeypatch.setitem(terms_module._CSA_TERMS_CONTENT, "CSA_TERMS_V3", version_three_content)
+    monkeypatch.setattr(terms_module, "CURRENT_CSA_TERMS_VERSION", "CSA_TERMS_V3")
 
-    assert get_current_csa_terms("vi")["version"] == "CSA_TERMS_V2"
+    assert get_current_csa_terms("vi")["version"] == "CSA_TERMS_V3"
     purchase.refresh_from_db()
-    assert purchase.terms_version == "CSA_TERMS_V1"
+    assert purchase.terms_version == "CSA_TERMS_V2"
     assert purchase.terms_snapshot == original_content
     assert purchase.terms_hash == original_hash
 

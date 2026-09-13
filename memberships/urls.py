@@ -23,6 +23,26 @@ router.register(
 
 urlpatterns = [
     path(
+        "admin/membership-price-options/<uuid:option_id>/payment-plans",
+        views.AdminPaymentPlanListView.as_view(),
+    ),
+    path(
+        "admin/membership-price-options/<uuid:option_id>/payment-plans/<uuid:plan_id>",
+        views.AdminPaymentPlanDetailView.as_view(),
+    ),
+    path(
+        "admin/membership-price-options/<uuid:option_id>/payment-plans/<uuid:plan_id>/<str:action>",
+        views.AdminPaymentPlanActivationView.as_view(),
+    ),
+    path(
+        "admin/csa-purchase-requests/<uuid:request_id>/payments/<int:sequence>/confirm",
+        views.AdminCSAPaymentConfirmView.as_view(),
+    ),
+    path(
+        "admin/csa-purchase-requests/<uuid:request_id>/payments/<int:sequence>/reject",
+        views.AdminCSAPaymentRejectView.as_view(),
+    ),
+    path(
         "admin/membership-payment-settings",
         views.AdminMembershipPaymentSettingsView.as_view(),
     ),

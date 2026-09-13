@@ -5,16 +5,15 @@ from decimal import Decimal
 import pytest
 from django.contrib.auth.models import Group
 from django.core.cache import cache
-from django.core.files.storage import FileSystemStorage
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 from rest_framework.test import APIClient
 
 from identity.models import AuditLog
-from memberships.contract_pdfs import generate_revoked_contract_documents
+from memberships.expiry import expire_csa_purchase_request_if_due
 from memberships.models import (
     CSAContract,
-    CSAContractStatus,
+    CSAContractVersion,
     CSAPurchaseRefundStatus,
     CSAPurchaseRequest,
     CSAPurchaseRequestStatus,
@@ -32,6 +31,7 @@ from memberships.purchases import (
     create_public_csa_purchase_request,
     reject_csa_purchase_request,
 )
+from memberships.services import revoke_membership
 from memberships.tracker import TRACKER_COOKIE_NAME
 
 LOOKUP_URL = "/api/v1/public/csa-contract-tracker/lookup"
@@ -163,6 +163,7 @@ def test_lookup_normalizes_phone_and_creates_private_short_lived_cookie(
     assert data["status"] == CSAPurchaseRequestStatus.PENDING
     assert data["contract"] is None
     assert data["pdf_available"] is False
+    assert "versions" not in data
     assert "membership" not in str(data)
     cookie = response.cookies[TRACKER_COOKIE_NAME]
     assert cookie["httponly"] is True
@@ -210,6 +211,7 @@ def test_payment_confirmed_lookup_has_no_contract_or_pdf(request_factory):
     assert data["payment_confirmed_at"] is not None
     assert data["contract"] is None
     assert data["pdf_available"] is False
+    assert "versions" not in data
 
 
 @pytest.mark.django_db
@@ -231,6 +233,7 @@ def test_approved_lookup_returns_contract_membership_snapshot(request_factory, a
         "status": contract.status,
     }
     assert data["available_pdf_locales"] == ["vi", "en"]
+    assert [version["version_number"] for version in data["versions"]] == [1]
     assert data["pdf_available"] is True
     serialized = str(data)
     assert "storage_key" not in serialized
@@ -283,6 +286,8 @@ def test_guest_session_reads_contract_and_streams_current_pdf(request_factory, a
     assert detail.json()["data"]["reference_code"] == item.request_code
     assert "customer_id" not in str(detail.json())
     assert "storage_key" not in str(detail.json())
+    assert [version["version_number"] for version in detail.json()["data"]["versions"]] == [1]
+    assert detail.json()["data"]["current_version"]["paid_cycles"] >= 0
     assert pdf.status_code == 200
     assert pdf["Content-Type"] == "application/pdf"
     assert pdf["Cache-Control"] == "private, no-store"
@@ -308,6 +313,31 @@ def test_open_request_cannot_read_contract_or_pdf(request_factory, status):
     assert detail.json()["errors"] == [{"code": "csa_tracker_contract_unavailable"}]
     assert pdf.status_code == 404
     assert pdf.json()["errors"] == [{"code": "csa_tracker_contract_unavailable"}]
+
+
+@pytest.mark.parametrize("terminal", ["rejected", "expired"])
+@pytest.mark.django_db
+def test_terminal_request_never_exposes_contract_versions(request_factory, terminal):
+    item = request_factory()
+    if terminal == "rejected":
+        reject_csa_purchase_request(request_id=item.pk, reason="Cancelled", actor=None)
+    else:
+        CSAPurchaseRequest.objects.filter(pk=item.pk).update(
+            expires_at=timezone.now() - timedelta(seconds=1)
+        )
+        assert expire_csa_purchase_request_if_due(request_id=item.pk)
+    item.refresh_from_db()
+    client = APIClient()
+    lookup_response = lookup(client, item)
+    assert lookup_response.status_code == 200
+    data = lookup_response.json()["data"]
+    assert data["contract"] is None
+    assert "versions" not in data
+    assert client.get(CONTRACT_URL).status_code == 404
+    assert (
+        client.get(PDF_URL, {"version_id": "00000000-0000-0000-0000-000000000000"}).status_code
+        == 404
+    )
 
 
 @pytest.mark.django_db
@@ -344,33 +374,67 @@ def test_guest_cannot_select_original_pdf(request_factory, active_user, settings
     item = approve_request(request_factory(), active_user)
     contract = CSAContract.objects.get(purchase_request=item)
     original_hash = contract.original_pdf_vi_sha256
-    contract.status = CSAContractStatus.REVOKED
-    contract.revoked_at = timezone.now()
-    contract.revoked_by = active_user
-    contract.revoked_by_name_snapshot = active_user.name
-    contract.revocation_reason = "Cancelled"
-    contract.save(
-        update_fields=[
-            "status",
-            "revoked_at",
-            "revoked_by",
-            "revoked_by_name_snapshot",
-            "revocation_reason",
-            "updated_at",
-        ]
-    )
-    storage = FileSystemStorage(location=settings.CSA_CONTRACT_PRIVATE_STORAGE_ROOT, base_url=None)
-    generate_revoked_contract_documents(contract, storage=storage)
+    revoke_membership(membership_id=contract.membership_id, reason="Cancelled", actor=active_user)
     contract.refresh_from_db()
     client = APIClient()
     lookup(client, item)
 
     response = client.get(f"{PDF_URL}?locale=vi&original=true")
-    downloaded = content(response)
-
-    assert response.status_code == 200
+    assert response.status_code == 404
+    assert response.json()["errors"] == [{"code": "csa_contract_pdf_unavailable"}]
+    downloaded = content(client.get(f"{PDF_URL}?locale=vi"))
     assert hashlib.sha256(downloaded).hexdigest() == contract.pdf_vi_sha256
     assert hashlib.sha256(downloaded).hexdigest() != original_hash
+
+
+@pytest.mark.parametrize("locale", ["vi", "en"])
+@pytest.mark.django_db
+def test_guest_can_download_historical_version_but_not_other_request(
+    request_factory, active_user, locale
+):
+    first = approve_request(request_factory(), active_user)
+    first_contract = CSAContract.objects.get(purchase_request=first)
+    first_version = first_contract.current_version
+    revoke_membership(
+        membership_id=first_contract.membership_id,
+        reason="Cancelled",
+        actor=active_user,
+    )
+    first_contract.refresh_from_db()
+    second = approve_request(request_factory(phone="0987654321"), active_user)
+    second_version_id = CSAContract.objects.get(purchase_request=second).current_version_id
+    client = APIClient()
+    assert lookup(client, first).status_code == 200
+
+    detail = client.get(CONTRACT_URL).json()["data"]
+    assert [version["version_number"] for version in detail["versions"]] == [1, 2]
+    assert detail["versions"][1]["contract_status"] == "revoked"
+    assert "storage_key" not in str(detail)
+    assert "sha256" not in str(detail)
+    old_pdf = client.get(PDF_URL, {"locale": locale, "version_id": str(first_version.pk)})
+    assert old_pdf.status_code == 200
+    assert hashlib.sha256(content(old_pdf)).hexdigest() == getattr(
+        first_version, f"pdf_{locale}_sha256"
+    )
+    before = (
+        CSAContract.objects.count(),
+        CSAContractVersion.objects.count(),
+        CSATrackerSession.objects.count(),
+    )
+    denied = client.get(PDF_URL, {"locale": locale, "version_id": str(second_version_id)})
+    assert denied.status_code == 404
+    assert denied.json()["errors"] == [{"code": "csa_contract_pdf_unavailable"}]
+    for params in (
+        {"locale": "vi", "version_id": "bad"},
+        {"locale": "vi", "original": "true"},
+        {"locale": "vi", "version_id": "00000000-0000-0000-0000-000000000000"},
+    ):
+        assert client.get(PDF_URL, params).status_code == 404
+    assert (
+        CSAContract.objects.count(),
+        CSAContractVersion.objects.count(),
+        CSATrackerSession.objects.count(),
+    ) == before
 
 
 @pytest.mark.django_db
@@ -410,6 +474,7 @@ def test_reject_confirmed_request_tracks_refund_and_mark_refunded_is_idempotent(
     assert tracked["status"] == CSAPurchaseRequestStatus.REJECTED
     assert tracked["refund_status"] == CSAPurchaseRefundStatus.PENDING
     assert tracked["contract"] is None and tracked["pdf_available"] is False
+    assert "versions" not in tracked
     assert tracker_client.get(PDF_URL, {"locale": "vi"}).status_code == 404
 
     url = f"/api/v1/admin/csa-purchase-requests/{item.pk}/mark-refunded"

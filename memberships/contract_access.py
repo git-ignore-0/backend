@@ -2,10 +2,16 @@ import hashlib
 import logging
 import re
 import secrets
+import uuid
 from pathlib import PurePosixPath
 
 from memberships.contract_pdfs import get_contract_pdf_storage
-from memberships.models import CSAContract
+from memberships.models import CSAContract, CSAContractVersion
+from memberships.payment_plans import (
+    initial_payment_amount_snapshot,
+    payment_plan_snapshot_payload,
+)
+from memberships.payments import public_csa_payment_schedule_payload
 
 logger = logging.getLogger(__name__)
 CONTRACT_LOCALES = ("vi", "en")
@@ -25,7 +31,43 @@ class CSAContractPDFUnavailable(CSAContractAccessError):
 
 
 def contract_queryset():
-    return CSAContract.objects.select_related("membership__customer", "purchase_request")
+    return CSAContract.objects.select_related(
+        "membership__customer", "purchase_request", "current_version"
+    ).prefetch_related("versions", "purchase_request__payments")
+
+
+def contract_version_summary(version: CSAContractVersion, *, current=False) -> dict:
+    value = {
+        "id": str(version.pk),
+        "version_number": version.version_number,
+        "version_reason": version.version_reason,
+        "contract_status": version.contract_status,
+        "created_at": version.created_at.isoformat(),
+        "available_locales": [
+            locale
+            for locale in CONTRACT_LOCALES
+            if getattr(version, f"pdf_{locale}_storage_key")
+            and getattr(version, f"pdf_{locale}_sha256")
+        ],
+    }
+    if current:
+        value.update(
+            paid_amount=format(version.paid_amount, "f"),
+            remaining_amount=format(version.remaining_amount, "f"),
+            confirmed_installment_count=version.confirmed_installment_count,
+            installment_count=version.installment_count,
+            paid_cycles=version.paid_cycles,
+            total_cycles=version.total_cycles,
+        )
+    return value
+
+
+def contract_versions_payload(contract: CSAContract) -> list[dict]:
+    current_id = contract.current_version_id
+    return [
+        contract_version_summary(version, current=version.pk == current_id)
+        for version in contract.versions.all()
+    ]
 
 
 def validated_contract_locale(value) -> str:
@@ -46,6 +88,9 @@ def contract_summary(contract: CSAContract | None):
 
 
 def contract_payload(contract: CSAContract, *, admin: bool) -> dict:
+    current_version = contract.current_version if contract.current_version_id else None
+    pdf_source = current_version or contract
+
     data = {
         "id": str(contract.pk),
         "reference_code": contract.reference_code,
@@ -56,6 +101,21 @@ def contract_payload(contract: CSAContract, *, admin: bool) -> dict:
         "package_name_snapshot": contract.package_name_snapshot,
         "price_option_name_snapshot": contract.price_option_name_snapshot,
         "amount_snapshot": str(contract.amount_snapshot),
+        "payment_plan": (
+            payment_plan_snapshot_payload(contract.purchase_request)
+            if contract.purchase_request_id
+            else None
+        ),
+        "initial_payment_amount": (
+            initial_payment_amount_snapshot(contract.purchase_request)
+            if contract.purchase_request_id
+            else str(contract.amount_snapshot)
+        ),
+        **(
+            public_csa_payment_schedule_payload(contract.purchase_request)
+            if contract.purchase_request_id
+            else {"payment_summary": None, "payments": []}
+        ),
         "currency_snapshot": contract.currency_snapshot,
         "duration_months_snapshot": contract.duration_months_snapshot,
         "start_date": contract.start_date.isoformat(),
@@ -64,11 +124,11 @@ def contract_payload(contract: CSAContract, *, admin: bool) -> dict:
         "available_locales": [
             locale
             for locale in CONTRACT_LOCALES
-            if getattr(contract, f"pdf_{locale}_storage_key")
-            and getattr(contract, f"pdf_{locale}_sha256")
+            if getattr(pdf_source, f"pdf_{locale}_storage_key")
+            and getattr(pdf_source, f"pdf_{locale}_sha256")
         ],
         "pdf_generated_at": (
-            contract.pdf_generated_at.isoformat() if contract.pdf_generated_at else None
+            pdf_source.pdf_generated_at.isoformat() if pdf_source.pdf_generated_at else None
         ),
         "revoked_at": contract.revoked_at.isoformat() if contract.revoked_at else None,
         "revocation_reason": contract.revocation_reason,
@@ -76,6 +136,10 @@ def contract_payload(contract: CSAContract, *, admin: bool) -> dict:
         "terms_locale": contract.terms_locale,
         "terms_accepted_at": contract.terms_accepted_at.isoformat(),
         "terms_acceptance_method": contract.terms_acceptance_method,
+        "current_version": contract_version_summary(current_version, current=True)
+        if current_version
+        else None,
+        "versions": contract_versions_payload(contract),
     }
     if admin:
         data.update(
@@ -83,7 +147,9 @@ def contract_payload(contract: CSAContract, *, admin: bool) -> dict:
                 "purchase_request_id": (
                     str(contract.purchase_request_id) if contract.purchase_request_id else None
                 ),
-                "pdf_version": contract.pdf_version,
+                "pdf_version": current_version.version_number
+                if current_version
+                else contract.pdf_version,
                 "revoked_by_name_snapshot": contract.revoked_by_name_snapshot,
             }
         )
@@ -94,15 +160,46 @@ def _safe_reference_code(reference_code: str) -> str:
     return re.sub(r"[^A-Z0-9-]", "-", reference_code.upper())
 
 
-def _current_pdf_metadata(contract: CSAContract, locale: str) -> tuple[str, str]:
-    key = getattr(contract, f"pdf_{locale}_storage_key")
-    expected_hash = getattr(contract, f"pdf_{locale}_sha256")
+def validated_contract_pdf_query(params) -> tuple[str, uuid.UUID | None]:
+    if set(params.keys()) - {"locale", "version_id"} or any(
+        len(params.getlist(key)) != 1 for key in params.keys()
+    ):
+        raise CSAContractPDFUnavailable("Contract PDF query is invalid")
+    locale = validated_contract_locale(params.get("locale", "vi"))
+    raw_version = params.get("version_id")
+    if raw_version is None:
+        return locale, None
+    try:
+        return locale, uuid.UUID(raw_version)
+    except (ValueError, TypeError, AttributeError):
+        raise CSAContractPDFUnavailable("Contract version is unavailable") from None
+
+
+def selected_contract_version(contract: CSAContract, version_id: uuid.UUID | None):
+    if version_id is None:
+        return contract.current_version if contract.current_version_id else None
+    version = next(
+        (version for version in contract.versions.all() if version.pk == version_id),
+        None,
+    )
+    if version is None:
+        raise CSAContractPDFUnavailable("Contract version is unavailable")
+    return version
+
+
+def _pdf_metadata(
+    contract: CSAContract, locale: str, version: CSAContractVersion | None
+) -> tuple[str, str]:
+    source = version or contract
+    if version is not None and version.contract_id != contract.pk:
+        raise CSAContractPDFUnavailable("Contract version is invalid")
+    key = getattr(source, f"pdf_{locale}_storage_key")
+    expected_hash = getattr(source, f"pdf_{locale}_sha256")
     if not key or not re.fullmatch(r"[0-9a-f]{64}", str(expected_hash or "")):
         raise CSAContractPDFUnavailable("Contract PDF metadata is unavailable")
     path = PurePosixPath(key)
-    expected_name = (
-        f"{_safe_reference_code(contract.reference_code)}.v{contract.pdf_version}.{locale}.pdf"
-    )
+    number = version.version_number if version is not None else contract.pdf_version
+    expected_name = f"{_safe_reference_code(contract.reference_code)}.v{number}.{locale}.pdf"
     if (
         path.is_absolute()
         or len(path.parts) != 2
@@ -113,9 +210,13 @@ def _current_pdf_metadata(contract: CSAContract, locale: str) -> tuple[str, str]
     return key, expected_hash
 
 
-def open_verified_current_contract_pdf(contract: CSAContract, *, locale: str):
+def open_verified_contract_pdf(
+    contract: CSAContract, *, locale: str, version: CSAContractVersion | None = None
+):
     locale = validated_contract_locale(locale)
-    key, expected_hash = _current_pdf_metadata(contract, locale)
+    if version is None and contract.current_version_id:
+        version = contract.current_version
+    key, expected_hash = _pdf_metadata(contract, locale, version)
     storage = get_contract_pdf_storage()
     opened = None
     try:
@@ -147,5 +248,10 @@ def open_verified_current_contract_pdf(contract: CSAContract, *, locale: str):
         raise CSAContractPDFUnavailable("Contract PDF is unavailable") from None
 
 
-def contract_download_filename(contract: CSAContract, locale: str) -> str:
-    return f"{_safe_reference_code(contract.reference_code)}.{locale}.pdf"
+def contract_download_filename(
+    contract: CSAContract, locale: str, *, version: CSAContractVersion | None = None
+) -> str:
+    reference = _safe_reference_code(contract.reference_code)
+    if version is not None:
+        return f"{reference}.v{version.version_number}.{locale}.pdf"
+    return f"{reference}.{locale}.pdf"
