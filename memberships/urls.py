@@ -49,12 +49,20 @@ urlpatterns = [
     path("admin/membership-banks", views.AdminMembershipBanksView.as_view()),
     path("public/membership-packages", views.PublicPackageListView.as_view()),
     path(
+        "public/csa-payment-quotes",
+        views.PublicCSAPaymentQuoteView.as_view(),
+    ),
+    path(
         "public/csa-purchase-requests",
         views.PublicCSAPurchaseRequestCreateView.as_view(),
     ),
     path(
         "public/csa-purchase-requests/<uuid:request_id>/confirm-payment",
         views.PublicCSAPurchasePaymentConfirmView.as_view(),
+    ),
+    path(
+        "public/csa-purchase-requests/confirm-transfer",
+        views.PublicCSAPaymentQuoteConfirmView.as_view(),
     ),
     path(
         "public/csa-contract-tracker/lookup",

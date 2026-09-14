@@ -8,7 +8,7 @@ from django.utils.translation import gettext as _
 from django.views.decorators.http import require_GET, require_http_methods, require_POST
 from django.views.i18n import set_language as django_set_language
 
-from identity.navigation import safe_public_return_to
+from identity.navigation import PUBLIC_RETURN_TO_SESSION_KEY, safe_public_return_to
 from identity.oauth import access_token_from_request, has_me_scopes
 from members.forms import MemberProfileForm
 from members.models import MemberProfile
@@ -90,6 +90,9 @@ def account(request):
     if request.method == "POST" and form.is_valid():
         update_member_profile(user=request.user, data=form.cleaned_data)
         messages.success(request, _("Profile updated."))
+        return_to = safe_public_return_to(request.session.pop(PUBLIC_RETURN_TO_SESSION_KEY, None))
+        if return_to:
+            return redirect(return_to)
         return redirect("account")
     return render(request, "account/dashboard.html", {"profile_form": form})
 

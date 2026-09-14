@@ -442,6 +442,9 @@ class CSAPurchaseRequest(models.Model):
     account_number_snapshot = models.CharField(max_length=19)
     account_name_snapshot = models.CharField(max_length=160)
     transfer_content = models.CharField(max_length=80, unique=True, editable=False)
+    quote_nonce = models.CharField(
+        max_length=64, unique=True, null=True, blank=True, editable=False
+    )
     guest_token_hash = models.CharField(max_length=128, blank=True, editable=False)
     payment_config_version = models.PositiveIntegerField()
     terms_version = models.CharField(max_length=64, null=True, blank=True, editable=False)
@@ -552,6 +555,7 @@ class CSAPurchaseRequest(models.Model):
         "account_number_snapshot",
         "account_name_snapshot",
         "transfer_content",
+        "quote_nonce",
         "guest_token_hash",
         "payment_config_version",
         "terms_version",
@@ -706,7 +710,11 @@ class CSAPurchaseRequest(models.Model):
             option = self.price_option
             if option.package_id != self.package_id:
                 errors["price_option"] = "Price option does not belong to the selected package."
-            if self._state.adding and (not self.package.is_active or not option.is_active):
+            if (
+                self._state.adding
+                and not self.quote_nonce
+                and (not self.package.is_active or not option.is_active)
+            ):
                 errors["price_option"] = "Package and price option must be active."
         terms_core = (
             self.terms_version,

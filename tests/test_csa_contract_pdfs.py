@@ -3,6 +3,7 @@ import uuid
 from datetime import date, timedelta
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from django.conf import settings
@@ -16,6 +17,9 @@ import memberships.terms as terms_catalog
 from identity.models import AccountStatus, User
 from memberships.contract_pdf_templates import contract_verification_url
 from memberships.contract_pdfs import (
+    CONTRACT_PDF_MARGIN_BOTTOM,
+    CONTRACT_PDF_MARGIN_HORIZONTAL,
+    CONTRACT_PDF_MARGIN_TOP,
     CSAContractPDFError,
     CSAContractPDFSnapshotIncomplete,
     CSAContractPDFStorageError,
@@ -136,8 +140,19 @@ def test_renders_valid_vietnamese_and_english_pdfs_from_contract_snapshot(contra
     assert vi.startswith(b"%PDF-") and en.startswith(b"%PDF-")
     assert vi_pages > 0 and en_pages > 0
     assert vi != en
-    assert "PHIẾU ĐĂNG KÝ VÀ THỎA THUẬN CSA" in vi_text
-    assert "CSA SIGN-UP AND AGREEMENT" in en_text
+    assert "Natural Farming Vietnam" in vi_text
+    assert "Phiếu Đăng Ký" in vi_text
+    assert "CSA Sign-Up & Agreement" in en_text
+    assert "1. Hai bên" in vi_text
+    assert "2. Chọn gói của bạn" in vi_text
+    assert "3. Thanh toán" in vi_text
+    assert "4. Chương trình hoạt động thế nào" in vi_text
+    assert "5. Xác nhận & chữ ký" in vi_text
+    assert "1. The two parties" in en_text
+    assert "2. Choose your plan" in en_text
+    assert "3. Payment" in en_text
+    assert "4. How the program works" in en_text
+    assert "5. Confirmation & signatures" in en_text
     assert contract.reference_code in vi_text and contract.reference_code in en_text
     assert "Gói Rau Mùa Việt" in vi_text
     assert "Gói 3 tháng" in vi_text
@@ -148,11 +163,97 @@ def test_renders_valid_vietnamese_and_english_pdfs_from_contract_snapshot(contra
     assert "Vietcombank" in vi_text
     assert "123456789" in vi_text
     assert "CSA THANH TOAN 123" in vi_text
-    assert "Điều khoản tham gia chương trình CSA" in vi_text
-    assert "CSA Program Participation Terms" in en_text
+    assert "Thông tin các bên" in vi_text
+    assert "Party information" in en_text
+    assert "Khách hàng xác nhận đã đọc, hiểu và đồng ý" in vi_text
+    assert "The member confirms that they have read, understood" in en_text
     assert "Thanh toán một lần" in vi_text
-    assert "trả góp" in vi_text
+    assert "Thanh toán một lần" in vi_text
+    assert '{"' not in vi_text
+    assert "Mã hash điều khoản" not in vi_text
+    assert "☐" not in vi_text
     assert "ĐÃ THU HỒI" not in vi_text
+
+
+@pytest.mark.django_db
+def test_quota_snapshot_uses_a_localized_three_column_table(contract):
+    text, _pages = _pdf_text(render_contract_pdf(contract, "vi", pdf_version=1))
+
+    assert "Nhóm sản phẩm" in text
+    assert "Hạn mức" in text
+    assert "Đơn vị" in text
+    assert "Rau củ" in text
+    assert "2" in text
+
+
+@pytest.mark.django_db
+def test_contract_pdf_uses_a4_template_geometry_and_never_exposes_snapshot_metadata(contract):
+    content = render_contract_pdf(contract, "vi", pdf_version=1)
+    reader = PdfReader(BytesIO(content))
+    page = reader.pages[0]
+    text = "\n".join(item.extract_text() for item in reader.pages)
+
+    assert float(page.mediabox.width) == pytest.approx(595.2756)
+    assert float(page.mediabox.height) == pytest.approx(841.8898)
+    assert CONTRACT_PDF_MARGIN_TOP == pytest.approx(14 * 72 / 25.4)
+    assert CONTRACT_PDF_MARGIN_BOTTOM == pytest.approx(14 * 72 / 25.4)
+    assert CONTRACT_PDF_MARGIN_HORIZONTAL == pytest.approx(15 * 72 / 25.4)
+    assert "quota_snapshot" not in text
+    assert "payment_snapshot" not in text
+    assert "terms_hash" not in text
+
+
+@pytest.mark.django_db
+def test_installment_version_renders_snapshot_payment_summary_and_schedule(contract):
+    version = SimpleNamespace(
+        contract_id=contract.pk,
+        version_number=2,
+        contract_status=CSAContractStatus.ACTIVE,
+        issued_at=contract.issued_at,
+        start_date=contract.start_date,
+        end_date=contract.end_date,
+        revoked_at=None,
+        revocation_reason="",
+        revoked_by_name_snapshot="",
+        package_name_snapshot=contract.package_name_snapshot,
+        price_option_name_snapshot=contract.price_option_name_snapshot,
+        duration_months_snapshot=contract.duration_months_snapshot,
+        amount_snapshot=contract.amount_snapshot,
+        currency_snapshot=contract.currency_snapshot,
+        payment_type="installment",
+        installment_count=2,
+        total_payment_amount=1_500_000,
+        paid_amount=750_000,
+        remaining_amount=750_000,
+        paid_cycles=1,
+        total_cycles=3,
+        payment_schedule_snapshot=[
+            {
+                "sequence": 2,
+                "amount_due": "750000",
+                "amount_paid": None,
+                "cycle_count": 2,
+                "due_at": "2026-10-10T00:00:00+00:00",
+                "status": "pending",
+            },
+            {
+                "sequence": 1,
+                "amount_due": "750000",
+                "amount_paid": "750000",
+                "cycle_count": 1,
+                "due_at": "2026-09-10T00:00:00+00:00",
+                "status": "confirmed",
+            },
+        ],
+    )
+
+    text, _pages = _pdf_text(render_contract_pdf(contract, "vi", pdf_version=2, version=version))
+
+    assert "Trả góp 2 lần" in text
+    assert "1.500.000 VND" in text
+    assert "750.000 VND" in text
+    assert "Lịch thanh toán" in text
+    assert text.index("10/09/2026") < text.index("10/10/2026")
 
 
 @pytest.mark.django_db
@@ -368,7 +469,7 @@ def test_revoked_pdf_preserves_original_and_updates_current(contract, private_st
     with private_storage.open(contract.pdf_vi_storage_key, "rb") as stored:
         revoked_content = stored.read()
     revoked_text, _pages = _pdf_text(revoked_content)
-    assert "HỢP ĐỒNG ĐÃ BỊ THU HỒI" in revoked_text
+    assert "Hợp đồng này đã bị thu hồi." in revoked_text
     assert "ĐÃ THU HỒI" in revoked_text
     assert "Khách hàng yêu cầu thu hồi" in revoked_text
     assert "Quản trị viên CSA" in revoked_text
@@ -464,7 +565,7 @@ def test_revoked_generation_repairs_current_pdf_when_persisted_snapshot_changes(
         current_text, _pages = _pdf_text(stored.read())
     assert "Lý do thu hồi hiện tại" in current_text
     assert "Admin hiện tại" in current_text
-    assert timezone.localtime(changed_at).strftime("%d/%m/%Y %H:%M:%S") in current_text
+    assert timezone.localtime(changed_at).strftime("%d/%m/%Y %H:%M") in current_text
     assert "Lý do ban đầu" not in current_text
 
 

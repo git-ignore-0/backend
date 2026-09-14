@@ -1,11 +1,18 @@
+import hashlib
+import hmac
+import json
 import secrets
-from datetime import date
+from datetime import date, timedelta
+from decimal import Decimal, InvalidOperation
 
+from django.conf import settings
 from django.contrib.auth.hashers import check_password, make_password
+from django.core import signing
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
 from django.db.models import Q
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 
 from identity.models import AuditLog, User
 from members.administrative_units import province_exists, ward_choices
@@ -62,7 +69,7 @@ from memberships.services import (
     link_csa_customer_to_user,
     update_csa_customer,
 )
-from memberships.terms import get_current_csa_terms
+from memberships.terms import InvalidCSATerms, get_csa_terms, get_current_csa_terms
 
 
 class CSAPurchaseError(ValueError):
@@ -113,6 +120,18 @@ class PurchaseRequestExpired(CSAPurchaseError):
     code = "csa_purchase_request_expired"
 
 
+class PaymentQuoteUnavailable(CSAPurchaseError):
+    code = "csa_payment_quote_unavailable"
+
+
+class PaymentQuoteExpired(CSAPurchaseError):
+    code = "csa_payment_quote_expired"
+
+
+class PaymentQuoteIdentityMismatch(CSAPurchaseError):
+    code = "csa_payment_quote_identity_mismatch"
+
+
 class PurchaseAdminNotFound(CSAPurchaseError):
     code = "csa_purchase_request_not_found"
 
@@ -147,6 +166,8 @@ class PurchaseRefundConflict(CSAPurchaseError):
 
 DUMMY_GUEST_TOKEN_HASH = make_password(secrets.token_urlsafe(32))
 CUSTOMER_RESOLUTIONS = {"keep_existing", "use_request_data", "reject_conflict"}
+PAYMENT_QUOTE_TTL = timedelta(minutes=5)
+PAYMENT_QUOTE_SALT = "memberships.csa-payment-quote.v1"
 
 
 def _required_snapshot(value, label: str) -> str:
@@ -421,6 +442,466 @@ def create_public_csa_purchase_request(**kwargs) -> tuple[CSAPurchaseRequest, st
     if user is None:
         raw_token, guest_token_hash = _guest_confirmation_credentials()
     item = _create_csa_purchase_request(**kwargs, guest_token_hash=guest_token_hash)
+    return item, raw_token
+
+
+def _guest_identity(*, identity) -> dict:
+    try:
+        phone = normalize_vietnam_phone(str(identity.get("phone") or ""))
+    except (AttributeError, InvalidPhoneNumber) as error:
+        raise PurchaseAddressInvalid("Guest identity is invalid") from error
+    province_code, ward_code, address = _validated_address(
+        province_code=identity.get("province_code"),
+        ward_code=identity.get("ward_code"),
+        address=identity.get("address"),
+    )
+    return {
+        "name": _required_snapshot(identity.get("name"), "Name"),
+        "phone": phone,
+        "province_code": province_code,
+        "ward_code": ward_code,
+        "address": address,
+        "email": None,
+        "user": None,
+    }
+
+
+def _guest_identity_fingerprint(identity: dict) -> str:
+    canonical = json.dumps(
+        {
+            "address": identity["address"],
+            "name": identity["name"],
+            "phone": identity["phone"],
+            "province_code": identity["province_code"],
+            "ward_code": identity["ward_code"],
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hmac.new(settings.SECRET_KEY.encode("utf-8"), canonical, hashlib.sha256).hexdigest()
+
+
+def _quote_plan_snapshot(*, option, payment_plan_id):
+    plan = None
+    rows = []
+    if payment_plan_id is not None:
+        try:
+            plan = MembershipPaymentPlan.objects.select_for_update().get(pk=payment_plan_id)
+        except MembershipPaymentPlan.DoesNotExist as error:
+            raise PurchasePaymentPlanUnavailable("Payment plan is unavailable") from error
+        if plan.price_option_id != option.pk or not plan.is_active:
+            raise PurchasePaymentPlanUnavailable("Payment plan is unavailable")
+        rows = list(
+            MembershipPaymentPlanInstallment.objects.select_for_update()
+            .filter(payment_plan=plan)
+            .order_by("sequence", "id")
+        )
+        try:
+            validate_payment_plan_configuration(plan, rows)
+        except PaymentPlanValidationError as error:
+            raise PurchasePaymentPlanUnavailable("Payment plan is unavailable") from error
+    elif MembershipPaymentPlan.objects.filter(price_option=option, is_active=True).exists():
+        raise PurchasePaymentPlanRequired("Select a payment plan for this price option")
+
+    if plan is None:
+        total_amount = str(option.total_price_vnd)
+        installments = [
+            {
+                "sequence": 1,
+                "amount": total_amount,
+                "cycle_count": option.duration_months,
+            }
+        ]
+        return {
+            "id": None,
+            "name": None,
+            "payment_type": "full",
+            "total_amount": total_amount,
+            "initial_payment_amount": total_amount,
+            "installment_count": 1,
+            "installments": installments,
+        }
+    installments = [
+        {
+            "sequence": row.sequence,
+            "amount": format(row.amount, "f"),
+            "cycle_count": row.cycle_count,
+        }
+        for row in rows
+    ]
+    return {
+        "id": str(plan.pk),
+        "name": plan.name,
+        "payment_type": plan.payment_type,
+        "total_amount": format(plan.total_amount, "f"),
+        "initial_payment_amount": installments[0]["amount"],
+        "installment_count": plan.installment_count,
+        "installments": installments,
+    }
+
+
+def _quote_token(payload: dict) -> str:
+    return signing.dumps(payload, salt=PAYMENT_QUOTE_SALT, compress=True)
+
+
+def _quote_positive_amount(value) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        return Decimal(value) > 0 and Decimal(value) == Decimal(value).to_integral_value()
+    except (InvalidOperation, ValueError):
+        return False
+
+
+def _validate_payment_quote(quote: dict, *, now) -> dict:
+    """Validate every signed quote field before it is used to create a request."""
+    if quote.get("v") != 1 or not isinstance(quote.get("nonce"), str) or len(quote["nonce"]) < 32:
+        raise PaymentQuoteUnavailable("Payment quote is unavailable")
+    if not isinstance(quote.get("request_code"), str) or not quote["request_code"].startswith(
+        "CSA-"
+    ):
+        raise PaymentQuoteUnavailable("Payment quote is unavailable")
+    expires_at = parse_datetime(str(quote.get("expires_at") or ""))
+    if expires_at is None or timezone.is_naive(expires_at) or now >= expires_at:
+        raise PaymentQuoteExpired("Payment quote has expired")
+    subject = quote.get("subject")
+    selection = quote.get("selection")
+    payment = quote.get("payment")
+    terms = quote.get("terms")
+    if not all(isinstance(value, dict) for value in (subject, selection, payment, terms)):
+        raise PaymentQuoteUnavailable("Payment quote is unavailable")
+    if subject.get("kind") == "user":
+        valid_subject = isinstance(subject.get("user_id"), str) and bool(subject["user_id"])
+    elif subject.get("kind") == "guest":
+        valid_subject = (
+            isinstance(subject.get("fingerprint"), str) and len(subject["fingerprint"]) == 64
+        )
+    else:
+        valid_subject = False
+    if not valid_subject:
+        raise PaymentQuoteUnavailable("Payment quote is unavailable")
+    plan = selection.get("plan")
+    if (
+        not isinstance(plan, dict)
+        or not isinstance(selection.get("package_id"), str)
+        or not isinstance(selection.get("price_option_id"), str)
+        or not isinstance(selection.get("package_name"), str)
+        or not isinstance(selection.get("price_option_name"), str)
+        or not isinstance(selection.get("duration_months"), int)
+        or selection["duration_months"] < 1
+        or not _quote_positive_amount(selection.get("monthly_price"))
+    ):
+        raise PaymentQuoteUnavailable("Payment quote is unavailable")
+    if plan.get("payment_type") not in {"full", "installment"} or not _quote_positive_amount(
+        plan.get("total_amount")
+    ):
+        raise PaymentQuoteUnavailable("Payment quote is unavailable")
+    rows = plan.get("installments")
+    if not isinstance(rows, list) or not rows or plan.get("installment_count") != len(rows):
+        raise PaymentQuoteUnavailable("Payment quote is unavailable")
+    sequences = []
+    total_amount = Decimal("0")
+    total_cycles = 0
+    for row in rows:
+        if (
+            not isinstance(row, dict)
+            or not isinstance(row.get("sequence"), int)
+            or row["sequence"] < 1
+            or not _quote_positive_amount(row.get("amount"))
+            or not isinstance(row.get("cycle_count"), int)
+            or row["cycle_count"] < 1
+        ):
+            raise PaymentQuoteUnavailable("Payment quote is unavailable")
+        sequences.append(row["sequence"])
+        total_amount += Decimal(row["amount"])
+        total_cycles += row["cycle_count"]
+    if (
+        sorted(sequences) != list(range(1, len(rows) + 1))
+        or total_amount != Decimal(plan["total_amount"])
+        or total_cycles != selection["duration_months"]
+    ):
+        raise PaymentQuoteUnavailable("Payment quote is unavailable")
+    if plan["payment_type"] == "full" and len(rows) != 1:
+        raise PaymentQuoteUnavailable("Payment quote is unavailable")
+    if plan["payment_type"] == "installment" and len(rows) < 2:
+        raise PaymentQuoteUnavailable("Payment quote is unavailable")
+    if plan.get("initial_payment_amount") != rows[0]["amount"]:
+        raise PaymentQuoteUnavailable("Payment quote is unavailable")
+    required_payment = (
+        "bank_bin",
+        "bank_name",
+        "account_number",
+        "account_name",
+        "transfer_content",
+        "payment_config_version",
+    )
+    if any(
+        not isinstance(payment.get(key), str) or not payment[key].strip()
+        for key in required_payment[:-1]
+    ) or not isinstance(payment.get("payment_config_version"), int):
+        raise PaymentQuoteUnavailable("Payment quote is unavailable")
+    if not all(
+        isinstance(terms.get(key), str) and terms[key] for key in ("version", "locale", "hash")
+    ):
+        raise PaymentQuoteUnavailable("Payment quote is unavailable")
+    return quote
+
+
+def _load_payment_quote(*, quote_token: str, now) -> dict:
+    try:
+        quote = signing.loads(
+            quote_token,
+            salt=PAYMENT_QUOTE_SALT,
+            max_age=PAYMENT_QUOTE_TTL,
+        )
+    except signing.SignatureExpired as error:
+        raise PaymentQuoteExpired("Payment quote has expired") from error
+    except (signing.BadSignature, TypeError, ValueError) as error:
+        raise PaymentQuoteUnavailable("Payment quote is unavailable") from error
+    if not isinstance(quote, dict):
+        raise PaymentQuoteUnavailable("Payment quote is unavailable")
+    try:
+        return _validate_payment_quote(quote, now=now)
+    except PaymentQuoteExpired:
+        raise
+    except (AttributeError, KeyError, TypeError, ValueError, InvalidOperation) as error:
+        raise PaymentQuoteUnavailable("Payment quote is unavailable") from error
+
+
+@transaction.atomic
+def create_csa_payment_quote(
+    *,
+    package_id,
+    price_option_id,
+    payment_plan_id=None,
+    terms_locale="vi",
+    user=None,
+    guest_identity=None,
+    now=None,
+) -> tuple[str, dict]:
+    if user is not None:
+        identity = _locked_authenticated_identity(user)
+        subject = {"kind": "user", "user_id": str(identity["user"].pk)}
+    else:
+        identity = _guest_identity(identity=guest_identity or {})
+        subject = {"kind": "guest", "fingerprint": _guest_identity_fingerprint(identity)}
+    try:
+        package = MembershipPackage.objects.select_for_update().get(pk=package_id, is_active=True)
+        option = MembershipPackagePriceOption.objects.select_for_update().get(
+            pk=price_option_id, package=package, is_active=True
+        )
+    except (MembershipPackage.DoesNotExist, MembershipPackagePriceOption.DoesNotExist) as error:
+        raise PurchasePackageUnavailable("Package or price option is unavailable") from error
+    plan = _quote_plan_snapshot(option=option, payment_plan_id=payment_plan_id)
+    payment = _locked_payment_settings()
+    terms = get_current_csa_terms(terms_locale)
+    now = now or timezone.now()
+    expires_at = now + PAYMENT_QUOTE_TTL
+    request_code = generate_csa_purchase_request_code()
+    quote = {
+        "v": 1,
+        "nonce": secrets.token_hex(32),
+        "created_at": now.isoformat(),
+        "expires_at": expires_at.isoformat(),
+        "subject": subject,
+        "request_code": request_code,
+        "selection": {
+            "package_id": str(package.pk),
+            "package_name": package.name,
+            "price_option_id": str(option.pk),
+            "price_option_name": f"{option.duration_months} months",
+            "duration_months": option.duration_months,
+            "monthly_price": str(option.monthly_price_vnd),
+            "plan": plan,
+        },
+        "payment": {
+            "bank_bin": payment.bank_bin,
+            "bank_name": payment.bank_name,
+            "account_number": payment.account_number,
+            "account_name": payment.account_name,
+            "transfer_content": request_code,
+            "payment_config_version": payment.version,
+        },
+        "terms": {
+            "version": terms["version"],
+            "locale": terms["locale"],
+            "hash": terms["hash"],
+        },
+    }
+    return _quote_token(quote), quote
+
+
+def csa_payment_quote_payload(quote_token: str, quote: dict) -> dict:
+    plan = quote["selection"]["plan"]
+    payment = quote["payment"]
+    initial_amount = plan["initial_payment_amount"]
+    return {
+        "quote_token": quote_token,
+        "expires_at": quote["expires_at"],
+        "request_code": quote["request_code"],
+        "payment": {
+            "amount": initial_amount,
+            "bank_code": payment["bank_bin"],
+            "bank_name": payment["bank_name"],
+            "account_number": payment["account_number"],
+            "account_name": payment["account_name"],
+            "transfer_content": payment["transfer_content"],
+        },
+        "payment_summary": {
+            "payment_type": plan["payment_type"],
+            "total_amount": plan["total_amount"],
+            "initial_payment_amount": initial_amount,
+            "installment_count": plan["installment_count"],
+            "installments": plan["installments"],
+        },
+        "terms": quote["terms"],
+        "qr_payload": {
+            "acqId": payment["bank_bin"],
+            "accountNo": payment["account_number"],
+            "accountName": payment["account_name"],
+            "amount": initial_amount,
+            "addInfo": payment["transfer_content"],
+            "format": "text",
+            "template": "compact2",
+        },
+    }
+
+
+@transaction.atomic
+def confirm_csa_payment_quote(*, quote_token, user=None, guest_identity=None, now=None):
+    now = now or timezone.now()
+    quote = _load_payment_quote(quote_token=quote_token, now=now)
+    subject = quote["subject"]
+    if subject.get("kind") == "user":
+        if user is None or str(user.pk) != str(subject.get("user_id")):
+            raise PaymentQuoteIdentityMismatch("Payment quote is unavailable")
+        identity = _locked_authenticated_identity(user)
+    elif subject.get("kind") == "guest":
+        if user is not None:
+            raise PaymentQuoteIdentityMismatch("Payment quote is unavailable")
+        identity = _guest_identity(identity=guest_identity or {})
+        if not hmac.compare_digest(
+            str(subject.get("fingerprint") or ""), _guest_identity_fingerprint(identity)
+        ):
+            raise PaymentQuoteIdentityMismatch("Payment quote is unavailable")
+    else:
+        raise PaymentQuoteUnavailable("Payment quote is unavailable")
+
+    existing = (
+        CSAPurchaseRequest.objects.select_for_update().filter(quote_nonce=quote["nonce"]).first()
+    )
+    if existing is not None:
+        return existing, None
+
+    selection = quote["selection"]
+    plan_data = selection.get("plan")
+    payment = quote["payment"]
+    terms_data = quote["terms"]
+    if not isinstance(selection, dict) or not isinstance(plan_data, dict):
+        raise PaymentQuoteUnavailable("Payment quote is unavailable")
+    try:
+        package = MembershipPackage.objects.select_for_update().get(pk=selection["package_id"])
+        option = MembershipPackagePriceOption.objects.select_for_update().get(
+            pk=selection["price_option_id"], package=package
+        )
+        plan = (
+            MembershipPaymentPlan.objects.select_for_update().get(pk=plan_data["id"])
+            if plan_data.get("id")
+            else None
+        )
+    except (
+        KeyError,
+        MembershipPackage.DoesNotExist,
+        MembershipPackagePriceOption.DoesNotExist,
+        MembershipPaymentPlan.DoesNotExist,
+    ) as error:
+        raise PaymentQuoteUnavailable("Payment quote is unavailable") from error
+    if plan is not None and plan.price_option_id != option.pk:
+        raise PaymentQuoteUnavailable("Payment quote is unavailable")
+    try:
+        terms = get_csa_terms(version=terms_data["version"], locale=terms_data["locale"])
+    except (KeyError, InvalidCSATerms) as error:
+        raise PaymentQuoteUnavailable("Payment quote is unavailable") from error
+    if not hmac.compare_digest(str(terms_data.get("hash") or ""), terms["hash"]):
+        raise PaymentQuoteUnavailable("Payment quote is unavailable")
+
+    expire_open_csa_purchase_request_for_phone(phone_e164=identity["phone"], now=now)
+    if CSAPurchaseRequest.objects.filter(phone_e164=identity["phone"], open_slot=True).exists():
+        raise PurchaseRequestConflict("Phone already has an open CSA purchase request")
+    raw_token = None
+    guest_token_hash = ""
+    if identity["user"] is None:
+        raw_token, guest_token_hash = _guest_confirmation_credentials()
+    installments = plan_data.get("installments")
+    if not isinstance(installments, list) or not installments:
+        raise PaymentQuoteUnavailable("Payment quote is unavailable")
+    item = CSAPurchaseRequest(
+        user=identity["user"],
+        request_code=quote["request_code"],
+        quote_nonce=quote["nonce"],
+        phone_e164=identity["phone"],
+        name_snapshot=identity["name"],
+        email_snapshot=identity["email"],
+        province_code_snapshot=identity["province_code"],
+        ward_code_snapshot=identity["ward_code"],
+        address_snapshot=identity["address"],
+        package=package,
+        price_option=option,
+        payment_plan=plan,
+        package_name_snapshot=selection["package_name"],
+        price_option_name_snapshot=selection["price_option_name"],
+        duration_months_snapshot=selection["duration_months"],
+        amount_snapshot=int(plan_data["total_amount"]),
+        price_option_monthly_amount_snapshot=selection["monthly_price"],
+        payment_plan_name_snapshot=plan_data["name"] if plan is not None else None,
+        payment_type_snapshot=plan_data["payment_type"] if plan is not None else None,
+        total_payment_amount_snapshot=plan_data["total_amount"] if plan is not None else None,
+        installment_count_snapshot=plan_data["installment_count"] if plan is not None else None,
+        payment_installments_snapshot=installments if plan is not None else None,
+        currency_snapshot="VND",
+        bank_bin_snapshot=payment["bank_bin"],
+        bank_name_snapshot=payment["bank_name"],
+        account_number_snapshot=payment["account_number"],
+        account_name_snapshot=payment["account_name"],
+        transfer_content=payment["transfer_content"],
+        guest_token_hash=guest_token_hash,
+        payment_config_version=payment["payment_config_version"],
+        terms_version=terms["version"],
+        terms_locale=terms["locale"],
+        terms_snapshot=terms["content"],
+        terms_hash=terms["hash"],
+        terms_accepted_at=now,
+        terms_acceptance_method="online",
+        status=CSAPurchaseRequestStatus.PAYMENT_CONFIRMED,
+        payment_confirmed_at=now,
+        expires_at=purchase_request_expires_at(now=now),
+    )
+    try:
+        with transaction.atomic():
+            item.save(force_insert=True)
+    except (IntegrityError, ValidationError) as error:
+        existing = (
+            CSAPurchaseRequest.objects.select_for_update()
+            .filter(quote_nonce=quote["nonce"])
+            .first()
+        )
+        if existing is not None:
+            return existing, None
+        if CSAPurchaseRequest.objects.filter(phone_e164=identity["phone"], open_slot=True).exists():
+            raise PurchaseRequestConflict(
+                "Phone already has an open CSA purchase request"
+            ) from error
+        raise PaymentQuoteUnavailable("Payment quote is unavailable") from error
+    try:
+        ensure_csa_payment_schedule(request_id=item.pk)
+        first = CSAPurchasePayment.objects.select_for_update().get(
+            purchase_request=item, installment_sequence=1
+        )
+        first.status = CSAPurchasePaymentStatus.REPORTED
+        first.save(update_fields=["status", "updated_at"])
+    except CSAPaymentError as error:
+        raise CSAPurchaseError("Purchase payment schedule is invalid") from error
     return item, raw_token
 
 

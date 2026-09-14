@@ -83,6 +83,66 @@ class TermsAcceptedField(serializers.Field):
         return bool(value)
 
 
+class CSAGuestIdentitySerializer(StrictSerializer):
+    name = serializers.CharField(max_length=150, trim_whitespace=True)
+    phone = serializers.CharField(max_length=32, trim_whitespace=True)
+    province_code = serializers.CharField(max_length=2, trim_whitespace=True)
+    ward_code = serializers.CharField(max_length=5, trim_whitespace=True)
+    address = serializers.CharField(max_length=500, trim_whitespace=True)
+
+    def validate_phone(self, value):
+        try:
+            return normalize_vietnam_phone(value)
+        except InvalidPhoneNumber as error:
+            raise serializers.ValidationError(str(error)) from error
+
+    def validate(self, attrs):
+        province_code = attrs["province_code"]
+        ward_code = attrs["ward_code"]
+        if not province_exists(province_code):
+            raise serializers.ValidationError({"province_code": "Province code is invalid."})
+        valid_wards = {code for code, _name in ward_choices(province_code, "vi")}
+        if ward_code not in valid_wards:
+            raise serializers.ValidationError(
+                {"ward_code": "Ward code does not belong to province."}
+            )
+        return attrs
+
+
+class CSAPaymentQuoteCreateSerializer(StrictSerializer):
+    package_id = serializers.UUIDField()
+    price_option_id = serializers.UUIDField()
+    payment_plan_id = serializers.UUIDField(required=False)
+    terms_accepted = TermsAcceptedField()
+    terms_locale = serializers.ChoiceField(
+        choices=MembershipContentLocale.choices,
+        default=MembershipContentLocale.VI,
+    )
+    guest_identity = CSAGuestIdentitySerializer(required=True)
+
+
+class AuthenticatedCSAPaymentQuoteCreateSerializer(StrictSerializer):
+    package_id = serializers.UUIDField()
+    price_option_id = serializers.UUIDField()
+    payment_plan_id = serializers.UUIDField(required=False)
+    terms_accepted = TermsAcceptedField()
+    terms_locale = serializers.ChoiceField(
+        choices=MembershipContentLocale.choices,
+        default=MembershipContentLocale.VI,
+    )
+    guest_identity = serializers.JSONField(required=False, write_only=True)
+
+
+class CSAPaymentQuoteConfirmSerializer(StrictSerializer):
+    quote_token = serializers.CharField(max_length=20000, trim_whitespace=True)
+    guest_identity = CSAGuestIdentitySerializer(required=True)
+
+
+class AuthenticatedCSAPaymentQuoteConfirmSerializer(StrictSerializer):
+    quote_token = serializers.CharField(max_length=20000, trim_whitespace=True)
+    guest_identity = serializers.JSONField(required=False, write_only=True)
+
+
 class CSAPurchaseRequestCreateSerializer(StrictSerializer):
     package_id = serializers.UUIDField()
     price_option_id = serializers.UUIDField()

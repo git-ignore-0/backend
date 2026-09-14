@@ -34,6 +34,9 @@ from memberships.terms import canonical_csa_terms_hash
 
 SUPPORTED_CONTRACT_PDF_LOCALES = ("vi", "en")
 _FONT_REGISTRATION_LOCK = threading.Lock()
+CONTRACT_PDF_MARGIN_TOP = 14 * mm
+CONTRACT_PDF_MARGIN_BOTTOM = 14 * mm
+CONTRACT_PDF_MARGIN_HORIZONTAL = 15 * mm
 
 
 class CSAContractPDFError(ValueError):
@@ -174,18 +177,23 @@ def _page_decorator(*, contract, locale, pdf_version, regular_font, bold_font):
             page_canvas.rotate(-38)
             page_canvas.translate(-A4[0] / 2, -A4[1] / 2)
         page_canvas.setStrokeColor(colors.HexColor("#D1D5DB"))
-        page_canvas.line(15 * mm, 14 * mm, A4[0] - 15 * mm, 14 * mm)
+        page_canvas.line(
+            CONTRACT_PDF_MARGIN_HORIZONTAL,
+            12 * mm,
+            A4[0] - CONTRACT_PDF_MARGIN_HORIZONTAL,
+            12 * mm,
+        )
         page_canvas.setFont(regular_font, 7.5)
         page_canvas.setFillColor(colors.HexColor("#4B5563"))
-        page_canvas.drawString(15 * mm, 9 * mm, contract.reference_code)
+        page_canvas.drawString(CONTRACT_PDF_MARGIN_HORIZONTAL, 7 * mm, contract.reference_code)
         page_canvas.drawCentredString(
             A4[0] / 2,
-            9 * mm,
+            7 * mm,
             f"{labels['pdf_version']} {pdf_version}",
         )
         page_canvas.drawRightString(
-            A4[0] - 15 * mm,
-            9 * mm,
+            A4[0] - CONTRACT_PDF_MARGIN_HORIZONTAL,
+            7 * mm,
             f"{labels['page']} {document.page}",
         )
         page_canvas.restoreState()
@@ -234,10 +242,10 @@ def render_contract_pdf(
     document = SimpleDocTemplate(
         output,
         pagesize=A4,
-        leftMargin=15 * mm,
-        rightMargin=15 * mm,
-        topMargin=14 * mm,
-        bottomMargin=20 * mm,
+        leftMargin=CONTRACT_PDF_MARGIN_HORIZONTAL,
+        rightMargin=CONTRACT_PDF_MARGIN_HORIZONTAL,
+        topMargin=CONTRACT_PDF_MARGIN_TOP,
+        bottomMargin=CONTRACT_PDF_MARGIN_BOTTOM,
         title=contract.reference_code,
         author="Natural Farming Vietnam",
         subject="CSA Contract",

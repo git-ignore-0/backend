@@ -190,6 +190,56 @@ def test_account_page_updates_shared_identity_and_member_profile(client, active_
     assert profile.address == "Số 12, ngõ 5"
 
 
+@override_settings(PUBLIC_SITE_ORIGINS=("http://localhost:3000",))
+@pytest.mark.django_db
+def test_account_update_returns_to_validated_public_csa_purchase(client, active_user):
+    client.force_login(active_user, backend="identity.backends.CoreAuthenticationBackend")
+
+    response = client.get(
+        "/account",
+        {"return_to": "http://localhost:3000/csa/purchase/vi"},
+    )
+    assert response.status_code == 200
+
+    response = client.post(
+        "/account",
+        {
+            "name": "Nông Dân Mới",
+            "phone_number": "+84 912 345 678",
+            "date_of_birth": "1990-06-15",
+            "province_code": "66",
+            "ward_code": "22015",
+            "address": "Số 12, ngõ 5",
+        },
+    )
+
+    assert response.status_code == 302
+    assert response.url == "http://localhost:3000/csa/purchase/vi"
+    assert "nfv_public_return_to" not in client.session
+
+
+@override_settings(PUBLIC_SITE_ORIGINS=("http://localhost:3000",))
+@pytest.mark.django_db
+def test_account_update_ignores_unvalidated_public_return(client, active_user):
+    client.force_login(active_user, backend="identity.backends.CoreAuthenticationBackend")
+
+    client.get("/account", {"return_to": "https://attacker.example/csa/purchase/vi"})
+    response = client.post(
+        "/account",
+        {
+            "name": "Nông Dân Mới",
+            "phone_number": "+84 912 345 678",
+            "date_of_birth": "1990-06-15",
+            "province_code": "66",
+            "ward_code": "22015",
+            "address": "Số 12, ngõ 5",
+        },
+    )
+
+    assert response.status_code == 302
+    assert response.url == "/account"
+
+
 @pytest.mark.django_db
 def test_account_page_rejects_invalid_profile_fields(client, active_user):
     client.force_login(active_user, backend="identity.backends.CoreAuthenticationBackend")

@@ -17,6 +17,16 @@ class CSAPurchaseConfirmThrottle(UserRateThrottle):
     rate = "20/minute"
 
 
+class CSAPaymentQuoteCreateThrottle(UserRateThrottle):
+    scope = "csa_payment_quote_create"
+    rate = "10/minute"
+
+
+class CSAPaymentQuoteConfirmThrottle(UserRateThrottle):
+    scope = "csa_payment_quote_confirm"
+    rate = "20/minute"
+
+
 class CSATrackerIPThrottle(SimpleRateThrottle):
     scope = "csa_tracker_ip"
     rate = "20/minute"

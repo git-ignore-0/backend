@@ -76,6 +76,9 @@ from memberships.payments import (
 from memberships.permissions import HasMembershipSelfScopes
 from memberships.purchases import (
     CSAPurchaseError,
+    PaymentQuoteExpired,
+    PaymentQuoteIdentityMismatch,
+    PaymentQuoteUnavailable,
     PaymentSettingsUnavailable,
     PurchaseAdminNotFound,
     PurchaseAdminWorkflowConflict,
@@ -92,8 +95,11 @@ from memberships.purchases import (
     PurchaseStartDateInvalid,
     PurchaseTransitionConflict,
     approve_csa_purchase_request,
+    confirm_csa_payment_quote,
     confirm_csa_purchase_payment,
+    create_csa_payment_quote,
     create_public_csa_purchase_request,
+    csa_payment_quote_payload,
     mark_csa_purchase_request_refunded,
     reject_csa_purchase_request,
     update_membership_payment_settings,
@@ -105,12 +111,16 @@ from memberships.serializers import (
     AdminPackageQuerySerializer,
     AdminPaymentPlanWriteSerializer,
     AdminProductQuerySerializer,
+    AuthenticatedCSAPaymentQuoteConfirmSerializer,
+    AuthenticatedCSAPaymentQuoteCreateSerializer,
     AuthenticatedCSAPurchaseRequestCreateSerializer,
     CSAContractVerificationSerializer,
     CSACustomerCreateSerializer,
     CSACustomerLinkUserSerializer,
     CSACustomerUpdateSerializer,
     CSAPaymentConfirmSerializer,
+    CSAPaymentQuoteConfirmSerializer,
+    CSAPaymentQuoteCreateSerializer,
     CSAPaymentRejectSerializer,
     CSAPurchasePaymentConfirmSerializer,
     CSAPurchaseRequestApproveSerializer,
@@ -149,6 +159,8 @@ from memberships.services import (
 )
 from memberships.throttles import (
     CSAContractVerificationThrottle,
+    CSAPaymentQuoteConfirmThrottle,
+    CSAPaymentQuoteCreateThrottle,
     CSAPurchaseConfirmThrottle,
     CSAPurchaseCreateThrottle,
     CSATrackerCredentialThrottle,
@@ -222,7 +234,14 @@ def csa_purchase_error(error):
     if isinstance(error, PaymentSettingsUnavailable):
         http_status = status.HTTP_503_SERVICE_UNAVAILABLE
     elif isinstance(
-        error, (PurchaseConfirmationDenied, PurchaseAdminNotFound, CSAPaymentUnavailable)
+        error,
+        (
+            PurchaseConfirmationDenied,
+            PurchaseAdminNotFound,
+            PaymentQuoteUnavailable,
+            PaymentQuoteIdentityMismatch,
+            CSAPaymentUnavailable,
+        ),
     ):
         http_status = status.HTTP_404_NOT_FOUND
     elif isinstance(
@@ -233,6 +252,7 @@ def csa_purchase_error(error):
             PurchaseCustomerResolutionRequired,
             PurchaseRequestConflict,
             PurchaseRequestExpired,
+            PaymentQuoteExpired,
             PurchasePackageUnavailable,
             PurchasePaymentPlanRequired,
             PurchasePaymentPlanUnavailable,
@@ -1034,6 +1054,75 @@ class PublicPackageListView(APIView):
         )
         response["Cache-Control"] = "public, max-age=60, stale-while-revalidate=300"
         return response
+
+
+class PublicCSAPaymentQuoteView(APIView):
+    permission_classes = [AllowAny]
+    throttle_classes = [CSAPaymentQuoteCreateThrottle]
+
+    def post(self, request):
+        user = request.user if request.user and request.user.is_authenticated else None
+        serializer_class = (
+            AuthenticatedCSAPaymentQuoteCreateSerializer
+            if user is not None
+            else CSAPaymentQuoteCreateSerializer
+        )
+        serializer = serializer_class(data=request.data)
+        if not serializer.is_valid():
+            return csa_purchase_validation_error(
+                code=(
+                    "csa_purchase_terms_required"
+                    if "terms_accepted" in serializer.errors
+                    else "invalid_csa_purchase_request"
+                ),
+                fields=serializer.errors,
+            )
+        data = serializer.validated_data
+        try:
+            quote_token, quote = create_csa_payment_quote(
+                package_id=data["package_id"],
+                price_option_id=data["price_option_id"],
+                payment_plan_id=data.get("payment_plan_id"),
+                terms_locale=data["terms_locale"],
+                user=user,
+                guest_identity=data.get("guest_identity"),
+            )
+        except CSAPurchaseError as error:
+            return csa_purchase_error(error)
+        return no_store(Response({"data": csa_payment_quote_payload(quote_token, quote)}))
+
+
+class PublicCSAPaymentQuoteConfirmView(APIView):
+    permission_classes = [AllowAny]
+    throttle_classes = [CSAPaymentQuoteConfirmThrottle]
+
+    def post(self, request):
+        user = request.user if request.user and request.user.is_authenticated else None
+        serializer_class = (
+            AuthenticatedCSAPaymentQuoteConfirmSerializer
+            if user is not None
+            else CSAPaymentQuoteConfirmSerializer
+        )
+        serializer = serializer_class(data=request.data)
+        if not serializer.is_valid():
+            return csa_purchase_validation_error(
+                code="invalid_csa_purchase_confirmation",
+                fields=serializer.errors,
+            )
+        try:
+            item, guest_token = confirm_csa_payment_quote(
+                quote_token=serializer.validated_data["quote_token"],
+                user=user,
+                guest_identity=serializer.validated_data.get("guest_identity"),
+            )
+        except CSAPurchaseError as error:
+            return csa_purchase_error(error)
+        return no_store(
+            Response(
+                {"data": csa_purchase_payload(item, guest_confirmation_token=guest_token)},
+                status=status.HTTP_201_CREATED if guest_token is not None else status.HTTP_200_OK,
+            )
+        )
 
 
 class PublicCSAPurchaseRequestCreateView(APIView):

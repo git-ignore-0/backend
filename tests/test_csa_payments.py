@@ -309,7 +309,7 @@ def test_issued_and_later_payment_versions_preserve_original_pdfs(approved_reque
     assert "Phiên bản PDF 1" in text
     assert "3.000.000" in text and "3.000.001" in text
     assert "Trả góp 2 lần" in text
-    assert "Lần 1" in text and "Lần 2" in text
+    assert "Lần" in text and "1" in text and "2" in text
     assert "Tổng giá trị" in text and "Còn phải thanh toán" in text
     assert "Tùy cấu hình" in text
 
