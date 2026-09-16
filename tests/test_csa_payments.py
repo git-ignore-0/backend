@@ -311,7 +311,7 @@ def test_issued_and_later_payment_versions_preserve_original_pdfs(approved_reque
     assert "Trả góp 2 lần" in text
     assert "Lần" in text and "1" in text and "2" in text
     assert "Tổng giá trị" in text and "Còn phải thanh toán" in text
-    assert "Tùy cấu hình" in text
+    assert "Canh tác tự nhiên" in text
 
     confirm_csa_payment(
         request_id=item.pk,

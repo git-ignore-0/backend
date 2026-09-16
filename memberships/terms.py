@@ -1,3 +1,5 @@
+# ruff: noqa: E501
+# The document-mandated CSA clauses below must remain byte-for-byte readable.
 import copy
 import hashlib
 import json
@@ -263,10 +265,10 @@ _CSA_TERMS_CONTENT = {
     }
 }
 
-# Keep V1 byte-for-byte stable: existing requests and Contracts verify their
-# accepted content against its original canonical hash.
-_CSA_TERMS_CONTENT[CSA_TERMS_V2] = copy.deepcopy(_CSA_TERMS_CONTENT[CSA_TERMS_V1])
-_CSA_TERMS_CONTENT[CSA_TERMS_V2][MembershipContentLocale.VI]["sections"][1] = {
+# Keep historical V2 snapshots valid without changing their stored content or
+# hash. New V2 requests use the document-aligned content defined below.
+_CSA_TERMS_LEGACY_CONTENT = {CSA_TERMS_V2: copy.deepcopy(_CSA_TERMS_CONTENT[CSA_TERMS_V1])}
+_CSA_TERMS_LEGACY_CONTENT[CSA_TERMS_V2][MembershipContentLocale.VI]["sections"][1] = {
     "key": "payment",
     "heading": "Thanh toán",
     "paragraphs": [
@@ -287,7 +289,7 @@ _CSA_TERMS_CONTENT[CSA_TERMS_V2][MembershipContentLocale.VI]["sections"][1] = {
         ),
     ],
 }
-_CSA_TERMS_CONTENT[CSA_TERMS_V2][MembershipContentLocale.EN]["sections"][1] = {
+_CSA_TERMS_LEGACY_CONTENT[CSA_TERMS_V2][MembershipContentLocale.EN]["sections"][1] = {
     "key": "payment",
     "heading": "Payment",
     "paragraphs": [
@@ -307,6 +309,173 @@ _CSA_TERMS_CONTENT[CSA_TERMS_V2][MembershipContentLocale.EN]["sections"][1] = {
             "Membership may be revoked under the applicable rules."
         ),
     ],
+}
+
+_CSA_TERMS_CONTENT[CSA_TERMS_V2] = {
+    MembershipContentLocale.VI: {
+        "title": "Chương trình hoạt động thế nào",
+        "sections": [
+            {
+                "key": "natural_farming",
+                "heading": "",
+                "paragraphs": [
+                    "Canh tác tự nhiên — không dùng thuốc trừ sâu, thuốc diệt cỏ hay thuốc diệt nấm; bón phân từ sản phẩm lên men hữu cơ; kiểm soát sâu bệnh bằng côn trùng có ích, luân canh và quản lý đất hợp lý."
+                ],
+            },
+            {
+                "key": "weekly_selection",
+                "heading": "",
+                "paragraphs": [
+                    "Mỗi tuần tôi chọn từ danh sách CSA của tuần đó (sản phẩm có ký hiệu “|C”). Danh sách chỉ hiển thị những gì đã sẵn sàng, nên món tôi chọn không bao giờ hết hàng."
+                ],
+            },
+            {
+                "key": "group_quota",
+                "heading": "",
+                "paragraphs": [
+                    "Tôi có thể phối hợp cả ba nhóm — rau ăn lá; rau thơm; và củ, quả & rau — trong hạn mức mỗi nhóm theo gói (1 người: 10 · 2–3 người: 20 · 4–7 người: 30 món mỗi nhóm, mỗi tuần)."
+                ],
+            },
+            {
+                "key": "seasonal_availability",
+                "heading": "",
+                "paragraphs": [
+                    "Các loại thực phẩm thay đổi theo tuần, tùy mùa vụ, thời tiết và thu hoạch."
+                ],
+            },
+            {
+                "key": "substitution",
+                "heading": "",
+                "paragraphs": [
+                    "Nếu một món sắp hết, nông trại có thể thay bằng món tươi tương đương và sẽ báo cho tôi trước."
+                ],
+            },
+            {
+                "key": "delivery",
+                "heading": "",
+                "paragraphs": [
+                    "Phần của tôi được giao miễn phí đến địa chỉ đã đăng ký vào mỗi thứ Sáu, trong vòng 24 giờ sau thu hoạch, khoảng 8:00–18:00. Tôi sẽ giữ liên lạc trong ngày giao; nếu không liên lạc được, việc giao và chất lượng sản phẩm ngày hôm sau thuộc trách nhiệm của tôi. Nông trại không chịu trách nhiệm về sự cố từ đơn vị vận chuyển bên thứ ba nhưng sẽ hỗ trợ giải quyết."
+                ],
+            },
+            {
+                "key": "pause_or_skip",
+                "heading": "",
+                "paragraphs": [
+                    "Tôi có thể tạm dừng hoặc bỏ qua một tuần (ví dụ khi đi xa) bằng cách báo trước cho nông trại."
+                ],
+            },
+            {
+                "key": "communication",
+                "heading": "",
+                "paragraphs": [
+                    "Nông trại liên hệ với tôi chủ yếu qua Zalo/WhatsApp, và cập nhật các loại rau có sẵn mỗi tuần trên trang web. Tôi sẽ báo mọi thay đổi về địa chỉ hoặc thông tin liên hệ, và có thể gửi nhận xét bất cứ lúc nào."
+                ],
+            },
+            {
+                "key": "group_chat",
+                "heading": "",
+                "paragraphs": [
+                    "Tôi đồng ý được thêm vào nhóm trò chuyện chung của tất cả thành viên trên Zalo và/hoặc WhatsApp."
+                ],
+            },
+            {
+                "key": "program_changes",
+                "heading": "",
+                "paragraphs": [
+                    "Nông trại có thể điều chỉnh một số phần của thỏa thuận này (cách trồng và giao hàng) theo thời gian, và sẽ thông báo cho tôi trước khi thay đổi."
+                ],
+            },
+            {
+                "key": "liability",
+                "heading": "",
+                "paragraphs": [
+                    "Trong phạm vi pháp luật cho phép, tôi miễn trừ trách nhiệm cho Natural Farming Vietnam, chủ sở hữu, đại lý và nhân viên đối với các khiếu nại hay thiệt hại liên quan đến tài sản nông trại, việc giao/nhận hàng, hoặc tư cách thành viên của tôi."
+                ],
+            },
+        ],
+    },
+    MembershipContentLocale.EN: {
+        "title": "How the program works",
+        "sections": [
+            {
+                "key": "natural_farming",
+                "heading": "",
+                "paragraphs": [
+                    "Naturally farmed — grown with no pesticides, herbicides, or fungicides; fertilized with fermented organic inputs; pests managed with beneficial insects, crop rotation, and healthy soil."
+                ],
+            },
+            {
+                "key": "weekly_selection",
+                "heading": "",
+                "paragraphs": [
+                    "Each week I choose from that week's CSA list (items marked “|C”). The list shows only what's ready, so nothing I pick is out of stock."
+                ],
+            },
+            {
+                "key": "group_quota",
+                "heading": "",
+                "paragraphs": [
+                    "I can mix any of the three groups — leafy greens; herbs; and roots, fruits & vegetables — up to my plan's limit per group (1 person: 10 · 2–3 people: 20 · 4–7 people: 30 items per group, each week)."
+                ],
+            },
+            {
+                "key": "seasonal_availability",
+                "heading": "",
+                "paragraphs": [
+                    "What's offered changes each week with the season, weather, and harvest."
+                ],
+            },
+            {
+                "key": "substitution",
+                "heading": "",
+                "paragraphs": [
+                    "If something runs low, the farm may substitute an equally fresh item and will let me know first."
+                ],
+            },
+            {
+                "key": "delivery",
+                "heading": "",
+                "paragraphs": [
+                    "My share is delivered free to my registered address every Friday, within 24 hours of harvest, roughly 8:00–18:00. I will stay reachable on delivery day; if I cannot be reached, next-day delivery and product quality are my responsibility. The farm is not liable for third-party courier problems but will help resolve them."
+                ],
+            },
+            {
+                "key": "pause_or_skip",
+                "heading": "",
+                "paragraphs": [
+                    "I can skip or pause a week (for example, when traveling) by telling the farm in advance."
+                ],
+            },
+            {
+                "key": "communication",
+                "heading": "",
+                "paragraphs": [
+                    "The farm contacts me mainly by Zalo/WhatsApp, and posts each week's available crops on the website. I will report any change to my address or contact details, and I am welcome to send feedback anytime."
+                ],
+            },
+            {
+                "key": "group_chat",
+                "heading": "",
+                "paragraphs": [
+                    "I agree to be added to a group chat of all members on Zalo and/or WhatsApp."
+                ],
+            },
+            {
+                "key": "program_changes",
+                "heading": "",
+                "paragraphs": [
+                    "The farm may adjust parts of this agreement (how it grows and delivers) over time, and will notify me before any change."
+                ],
+            },
+            {
+                "key": "liability",
+                "heading": "",
+                "paragraphs": [
+                    "To the extent permitted by law, I release Natural Farming Vietnam, its owner, agents, and employees from liability for claims or damages relating to farm property, delivery/pickup, or my membership."
+                ],
+            },
+        ],
+    },
 }
 
 
@@ -344,7 +513,17 @@ def get_current_csa_terms(locale: str) -> dict:
 
 def validate_csa_terms_snapshot(*, version: str, locale: str, content, content_hash: str):
     expected = get_csa_terms(version=version, locale=locale)
-    if content != expected["content"] or not secrets.compare_digest(
+    if content == expected["content"] and secrets.compare_digest(
         str(content_hash), expected["hash"]
     ):
-        raise InvalidCSATerms("CSA terms snapshot or hash is invalid")
+        return
+
+    legacy_content = _CSA_TERMS_LEGACY_CONTENT.get(version, {}).get(locale)
+    if (
+        legacy_content is not None
+        and content == legacy_content
+        and secrets.compare_digest(str(content_hash), canonical_csa_terms_hash(legacy_content))
+    ):
+        return
+
+    raise InvalidCSATerms("CSA terms snapshot or hash is invalid")

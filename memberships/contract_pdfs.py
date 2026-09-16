@@ -82,18 +82,35 @@ def get_contract_pdf_storage():
 def _font_names():
     regular_path = Path(settings.CSA_CONTRACT_PDF_FONT_PATH)
     bold_path = Path(settings.CSA_CONTRACT_PDF_BOLD_FONT_PATH)
-    if not regular_path.is_file() or not bold_path.is_file():
+    italic_path = Path(settings.CSA_CONTRACT_PDF_ITALIC_FONT_PATH)
+    bold_italic_path = Path(settings.CSA_CONTRACT_PDF_BOLD_ITALIC_FONT_PATH)
+    if not all(path.is_file() for path in (regular_path, bold_path, italic_path, bold_italic_path)):
         raise CSAContractPDFError("CSA contract PDF Unicode font is unavailable")
-    digest = hashlib.sha256(f"{regular_path}|{bold_path}".encode()).hexdigest()[:12]
+    digest = hashlib.sha256(
+        f"{regular_path}|{bold_path}|{italic_path}|{bold_italic_path}".encode()
+    ).hexdigest()[:12]
     regular_name = f"NFVContractRegular{digest}"
     bold_name = f"NFVContractBold{digest}"
+    italic_name = f"NFVContractItalic{digest}"
+    bold_italic_name = f"NFVContractBoldItalic{digest}"
     with _FONT_REGISTRATION_LOCK:
         registered = set(pdfmetrics.getRegisteredFontNames())
         if regular_name not in registered:
             pdfmetrics.registerFont(TTFont(regular_name, regular_path))
         if bold_name not in registered:
             pdfmetrics.registerFont(TTFont(bold_name, bold_path))
-    return regular_name, bold_name
+        if italic_name not in registered:
+            pdfmetrics.registerFont(TTFont(italic_name, italic_path))
+        if bold_italic_name not in registered:
+            pdfmetrics.registerFont(TTFont(bold_italic_name, bold_italic_path))
+        pdfmetrics.registerFontFamily(
+            regular_name,
+            normal=regular_name,
+            bold=bold_name,
+            italic=italic_name,
+            boldItalic=bold_italic_name,
+        )
+    return regular_name, bold_name, italic_name, bold_italic_name
 
 
 def _validated_terms(contract, locale):
@@ -236,8 +253,13 @@ def render_contract_pdf(
             source = "contract_status" if field == "status" else field
             setattr(contract, field, getattr(version, source))
     providers, terms_by_locale, payment = _validate_contract_snapshot(contract)
-    regular_font, bold_font = _font_names()
-    styles = build_pdf_styles(regular_font=regular_font, bold_font=bold_font)
+    regular_font, bold_font, italic_font, bold_italic_font = _font_names()
+    styles = build_pdf_styles(
+        regular_font=regular_font,
+        bold_font=bold_font,
+        italic_font=italic_font,
+        bold_italic_font=bold_italic_font,
+    )
     output = BytesIO()
     document = SimpleDocTemplate(
         output,

@@ -1,5 +1,6 @@
 import hashlib
 import uuid
+from copy import copy
 from datetime import date, timedelta
 from io import BytesIO
 from pathlib import Path
@@ -11,11 +12,13 @@ from django.core.exceptions import ValidationError
 from django.core.files.storage import FileSystemStorage
 from django.utils import timezone
 from pypdf import PdfReader
-from reportlab.graphics.barcode.qr import QrCodeWidget as ReportLabQRCodeWidget
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER
+from reportlab.pdfbase import pdfmetrics
 
 import memberships.terms as terms_catalog
 from identity.models import AccountStatus, User
-from memberships.contract_pdf_templates import contract_verification_url
+from memberships.contract_pdf_templates import _CheckedBox, _terms_story, build_pdf_styles
 from memberships.contract_pdfs import (
     CONTRACT_PDF_MARGIN_BOTTOM,
     CONTRACT_PDF_MARGIN_HORIZONTAL,
@@ -23,6 +26,7 @@ from memberships.contract_pdfs import (
     CSAContractPDFError,
     CSAContractPDFSnapshotIncomplete,
     CSAContractPDFStorageError,
+    _font_names,
     generate_contract_documents,
     generate_revoked_contract_documents,
     get_contract_pdf_storage,
@@ -41,12 +45,67 @@ from memberships.models import (
     QuotaPolicy,
 )
 from memberships.phones import normalize_vietnam_phone
-from memberships.terms import CSA_TERMS_V1, get_csa_terms
+from memberships.terms import CSA_TERMS_V1, CSA_TERMS_V2, get_csa_terms
 
 
 def _pdf_text(content):
     reader = PdfReader(BytesIO(content))
     return "\n".join(page.extract_text() for page in reader.pages), len(reader.pages)
+
+
+def _normalized_pdf_text(content):
+    return " ".join(_pdf_text(content)[0].split())
+
+
+def _document_terms_contract(contract):
+    document_contract = copy(contract)
+    document_contract.terms_version = CSA_TERMS_V2
+    document_contract.terms_snapshot_vi = get_csa_terms(version=CSA_TERMS_V2, locale="vi")[
+        "content"
+    ]
+    document_contract.terms_snapshot_en = get_csa_terms(version=CSA_TERMS_V2, locale="en")[
+        "content"
+    ]
+    document_contract.terms_snapshot = document_contract.terms_snapshot_vi
+    return document_contract
+
+
+def test_pdf_uses_the_bundled_carlito_family_and_docx_typography():
+    assert settings.CSA_CONTRACT_PDF_FONT_PATH.name == "Carlito-Regular.ttf"
+    assert settings.CSA_CONTRACT_PDF_BOLD_FONT_PATH.name == "Carlito-Bold.ttf"
+    assert settings.CSA_CONTRACT_PDF_ITALIC_FONT_PATH.name == "Carlito-Italic.ttf"
+    assert settings.CSA_CONTRACT_PDF_BOLD_ITALIC_FONT_PATH.name == "Carlito-BoldItalic.ttf"
+
+    regular, bold, italic, bold_italic = _font_names()
+    assert {regular, bold, italic, bold_italic}.issubset(pdfmetrics.getRegisteredFontNames())
+
+    styles = build_pdf_styles(
+        regular_font=regular,
+        bold_font=bold,
+        italic_font=italic,
+        bold_italic_font=bold_italic,
+    )
+    assert styles["title"].fontName == bold
+    assert styles["title"].fontSize == 19
+    assert styles["title"].leading == 23
+    assert styles["title"].alignment == TA_CENTER
+    assert styles["title"].textColor == colors.HexColor("#1B5E20")
+    assert styles["subtitle"].fontName == italic
+    assert styles["subtitle"].fontSize == 10.5
+    assert styles["subtitle"].leading == pytest.approx(13.8)
+    assert styles["subtitle"].alignment == TA_CENTER
+    assert styles["subtitle"].textColor == colors.HexColor("#555555")
+    assert styles["section"].fontName == bold
+    assert styles["section"].fontSize == 13
+    assert styles["section"].spaceBefore == 8
+    assert styles["section"].spaceAfter == 4
+    assert styles["body"].fontName == regular
+    assert styles["body"].fontSize == 10.5
+    assert styles["table_header"].fontName == bold
+    assert styles["table_header"].fontSize == 8.5
+    assert styles["table_header"].alignment == TA_CENTER
+    assert styles["table_body"].fontSize == 9.5
+    assert styles["confirmation_heading"].fontSize == 10.5
 
 
 @pytest.fixture
@@ -138,7 +197,7 @@ def test_renders_valid_vietnamese_and_english_pdfs_from_contract_snapshot(contra
     en_text, en_pages = _pdf_text(en)
 
     assert vi.startswith(b"%PDF-") and en.startswith(b"%PDF-")
-    assert vi_pages > 0 and en_pages > 0
+    assert vi_pages == 2 and en_pages == 2
     assert vi != en
     assert "Natural Farming Vietnam" in vi_text
     assert "Phiếu Đăng Ký" in vi_text
@@ -176,6 +235,48 @@ def test_renders_valid_vietnamese_and_english_pdfs_from_contract_snapshot(contra
 
 
 @pytest.mark.django_db
+def test_v2_pdfs_render_the_document_clauses_with_checked_boxes(contract):
+    document_contract = _document_terms_contract(contract)
+    vi = render_contract_pdf(document_contract, "vi", pdf_version=1)
+    en = render_contract_pdf(document_contract, "en", pdf_version=1)
+    vi_text, vi_pages = _pdf_text(vi)
+    en_text, en_pages = _pdf_text(en)
+    vi_text = " ".join(vi_text.split())
+    en_text = " ".join(en_text.split())
+
+    assert vi_pages == 2 and en_pages == 2
+
+    assert (
+        "4. Chương trình hoạt động thế nào — tôi hiểu và đồng ý (vui lòng đánh dấu từng ô)"
+        in vi_text
+    )
+    assert "4. How the program works — I understand and agree (please tick each box)" in en_text
+    for locale, text in (("vi", vi_text), ("en", en_text)):
+        clauses = [
+            section["paragraphs"][0]
+            for section in get_csa_terms(version=CSA_TERMS_V2, locale=locale)["content"]["sections"]
+        ]
+        assert len(clauses) == 11
+        assert all(clause in text for clause in clauses)
+        assert all(f"{index}. {clause}" not in text for index, clause in enumerate(clauses, 1))
+        assert "/csa/verify" not in text
+    assert "Điều khoản tham gia chương trình CSA" not in vi_text
+    assert "CSA Program Participation Terms" not in en_text
+
+    styles = build_pdf_styles(
+        regular_font="Helvetica",
+        bold_font="Helvetica-Bold",
+        italic_font="Helvetica-Oblique",
+        bold_italic_font="Helvetica-BoldOblique",
+    )
+    story = _terms_story(document_contract.terms_snapshot_vi, styles, checked_items=True)
+    assert len(story) == 1
+    table = story[0]
+    assert len(table._cellvalues) == 11
+    assert all(isinstance(row[0], _CheckedBox) for row in table._cellvalues)
+
+
+@pytest.mark.django_db
 def test_quota_snapshot_uses_a_localized_three_column_table(contract):
     text, _pages = _pdf_text(render_contract_pdf(contract, "vi", pdf_version=1))
 
@@ -205,21 +306,22 @@ def test_contract_pdf_uses_a4_template_geometry_and_never_exposes_snapshot_metad
 
 @pytest.mark.django_db
 def test_installment_version_renders_snapshot_payment_summary_and_schedule(contract):
+    document_contract = _document_terms_contract(contract)
     version = SimpleNamespace(
-        contract_id=contract.pk,
+        contract_id=document_contract.pk,
         version_number=2,
         contract_status=CSAContractStatus.ACTIVE,
-        issued_at=contract.issued_at,
-        start_date=contract.start_date,
-        end_date=contract.end_date,
+        issued_at=document_contract.issued_at,
+        start_date=document_contract.start_date,
+        end_date=document_contract.end_date,
         revoked_at=None,
         revocation_reason="",
         revoked_by_name_snapshot="",
-        package_name_snapshot=contract.package_name_snapshot,
-        price_option_name_snapshot=contract.price_option_name_snapshot,
-        duration_months_snapshot=contract.duration_months_snapshot,
-        amount_snapshot=contract.amount_snapshot,
-        currency_snapshot=contract.currency_snapshot,
+        package_name_snapshot=document_contract.package_name_snapshot,
+        price_option_name_snapshot=document_contract.price_option_name_snapshot,
+        duration_months_snapshot=document_contract.duration_months_snapshot,
+        amount_snapshot=document_contract.amount_snapshot,
+        currency_snapshot=document_contract.currency_snapshot,
         payment_type="installment",
         installment_count=2,
         total_payment_amount=1_500_000,
@@ -247,51 +349,27 @@ def test_installment_version_renders_snapshot_payment_summary_and_schedule(contr
         ],
     )
 
-    text, _pages = _pdf_text(render_contract_pdf(contract, "vi", pdf_version=2, version=version))
+    text, _pages = _pdf_text(
+        render_contract_pdf(document_contract, "vi", pdf_version=2, version=version)
+    )
 
     assert "Trả góp 2 lần" in text
     assert "1.500.000 VND" in text
     assert "750.000 VND" in text
     assert "Lịch thanh toán" in text
+    assert "tôi hiểu và đồng ý (vui lòng đánh dấu" in text
     assert text.index("10/09/2026") < text.index("10/10/2026")
 
 
 @pytest.mark.django_db
-def test_bilingual_pdfs_embed_only_the_public_contract_verification_url(
-    contract, monkeypatch, settings
-):
-    settings.PUBLIC_SITE_ORIGINS = ("https://nongnghiepthiennhien.com",)
-    qr_values = []
-
-    class CapturingQRCodeWidget(ReportLabQRCodeWidget):
-        def __init__(self, value, *args, **kwargs):
-            qr_values.append(value)
-            super().__init__(value, *args, **kwargs)
-
-    monkeypatch.setattr(
-        "memberships.contract_pdf_templates.QrCodeWidget",
-        CapturingQRCodeWidget,
-    )
-    expected_url = (
-        f"https://nongnghiepthiennhien.com/csa/verify?reference={contract.reference_code}"
-    )
-
+def test_bilingual_pdfs_do_not_embed_contract_verification_qr_or_url(contract):
     vi_text, _pages = _pdf_text(render_contract_pdf(contract, "vi", pdf_version=1))
     en_text, _pages = _pdf_text(render_contract_pdf(contract, "en", pdf_version=1))
 
-    assert contract_verification_url(contract.reference_code) == expected_url
-    assert qr_values == [expected_url, expected_url]
-    assert "Quét để xác minh trạng thái hợp đồng" in vi_text
-    assert "Scan to verify contract status" in en_text
-    assert expected_url in vi_text and expected_url in en_text
-    for sensitive in (
-        contract.phone_e164_snapshot,
-        contract.member_name_snapshot,
-        contract.pdf_vi_storage_key,
-        "guest_token",
-        "private/contracts",
-    ):
-        assert not sensitive or sensitive not in "".join(qr_values)
+    for text in (vi_text, en_text):
+        assert "/csa/verify" not in text
+        assert "Scan to verify contract status" not in text
+        assert "Quét để xác minh trạng thái hợp đồng" not in text
 
 
 @pytest.mark.django_db
@@ -473,8 +551,17 @@ def test_revoked_pdf_preserves_original_and_updates_current(contract, private_st
     assert "ĐÃ THU HỒI" in revoked_text
     assert "Khách hàng yêu cầu thu hồi" in revoked_text
     assert "Quản trị viên CSA" in revoked_text
-    assert "Quét để xác minh trạng thái hợp đồng" in revoked_text
-    assert contract_verification_url(contract.reference_code) in revoked_text
+    assert "Quét để xác minh trạng thái hợp đồng" not in revoked_text
+    assert "/csa/verify" not in revoked_text
+    revoked_v2_contract = _document_terms_contract(contract)
+    revoked_v2_contract.status = CSAContractStatus.REVOKED
+    revoked_v2_contract.revoked_at = contract.revoked_at
+    revoked_v2_contract.revocation_reason = contract.revocation_reason
+    revoked_v2_contract.revoked_by_name_snapshot = contract.revoked_by_name_snapshot
+    revoked_v2_text = _normalized_pdf_text(
+        render_contract_pdf(revoked_v2_contract, "vi", pdf_version=2)
+    )
+    assert "tôi hiểu và đồng ý (vui lòng đánh dấu từng ô)" in revoked_v2_text
     with private_storage.open(contract.original_pdf_vi_storage_key, "rb") as stored:
         original_text, _pages = _pdf_text(stored.read())
     assert "HỢP ĐỒNG ĐÃ BỊ THU HỒI" not in original_text

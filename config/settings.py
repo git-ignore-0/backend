@@ -209,11 +209,19 @@ CSA_CONTRACT_PRIVATE_STORAGE_ROOT = Path(
 )
 CSA_CONTRACT_PDF_FONT_PATH = Path(
     os.getenv("CSA_CONTRACT_PDF_FONT_PATH", "").strip()
-    or BASE_DIR / "assets" / "fonts" / "NotoSans-Regular.ttf"
+    or BASE_DIR / "assets" / "fonts" / "Carlito-Regular.ttf"
 )
 CSA_CONTRACT_PDF_BOLD_FONT_PATH = Path(
     os.getenv("CSA_CONTRACT_PDF_BOLD_FONT_PATH", "").strip()
-    or BASE_DIR / "assets" / "fonts" / "NotoSans-Bold.ttf"
+    or BASE_DIR / "assets" / "fonts" / "Carlito-Bold.ttf"
+)
+CSA_CONTRACT_PDF_ITALIC_FONT_PATH = Path(
+    os.getenv("CSA_CONTRACT_PDF_ITALIC_FONT_PATH", "").strip()
+    or BASE_DIR / "assets" / "fonts" / "Carlito-Italic.ttf"
+)
+CSA_CONTRACT_PDF_BOLD_ITALIC_FONT_PATH = Path(
+    os.getenv("CSA_CONTRACT_PDF_BOLD_ITALIC_FONT_PATH", "").strip()
+    or BASE_DIR / "assets" / "fonts" / "Carlito-BoldItalic.ttf"
 )
 CSA_PURCHASE_REQUEST_EXPIRY_SECONDS = env_int(
     "CSA_PURCHASE_REQUEST_EXPIRY_SECONDS",

@@ -2,18 +2,14 @@
 
 from datetime import datetime, timedelta
 from html import escape
-from urllib.parse import urlencode
 
-from django.conf import settings
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
-from reportlab.graphics.barcode.qr import QrCodeWidget
-from reportlab.graphics.shapes import Drawing
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import mm
-from reportlab.platypus import KeepTogether, Paragraph, Spacer, Table, TableStyle
+from reportlab.platypus import Flowable, Paragraph, Spacer, Table, TableStyle
 
 _LABELS = {
     "vi": {
@@ -72,7 +68,10 @@ _LABELS = {
         "account_number": "Số tài khoản",
         "account_name": "Tên tài khoản",
         "transfer_content": "Nội dung chuyển khoản",
-        "terms": "4. Chương trình hoạt động thế nào",
+        "terms": (
+            "4. Chương trình hoạt động thế nào — tôi hiểu và đồng ý (vui lòng đánh dấu từng ô)"
+        ),
+        "legacy_terms": "4. Chương trình hoạt động thế nào",
         "accepted": (
             "Khách hàng xác nhận đã đọc, hiểu và đồng ý với các điều khoản áp dụng cho gói CSA này."
         ),
@@ -89,7 +88,6 @@ _LABELS = {
         "in_store": "Tại cửa hàng",
         "accepted_at": "Thời gian xác nhận",
         "terms_version": "Phiên bản điều khoản",
-        "verification": "Quét để xác minh trạng thái hợp đồng",
         "page": "Trang",
         "pdf_version": "Phiên bản PDF",
     },
@@ -149,7 +147,8 @@ _LABELS = {
         "account_number": "Account number",
         "account_name": "Account name",
         "transfer_content": "Transfer content",
-        "terms": "4. How the program works",
+        "terms": "4. How the program works — I understand and agree (please tick each box)",
+        "legacy_terms": "4. How the program works",
         "accepted": (
             "The member confirms that they have read, understood, and agreed to the terms "
             "applicable to this CSA package."
@@ -167,7 +166,6 @@ _LABELS = {
         "in_store": "In store",
         "accepted_at": "Confirmed at",
         "terms_version": "Terms version",
-        "verification": "Scan to verify contract status",
         "page": "Page",
         "pdf_version": "PDF version",
     },
@@ -203,7 +201,7 @@ def _money(value: int | str | None, currency: str) -> str:
 
 
 def _section(title, styles):
-    return [Spacer(1, 3.5 * mm), Paragraph(escape(title), styles["section"])]
+    return [Paragraph(escape(title), styles["section"])]
 
 
 def _plain_rows(rows, styles):
@@ -229,7 +227,7 @@ def _table(rows, widths, styles, *, compact=False):
             [
                 ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2E7D32")),
                 ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("GRID", (0, 0), (-1, -1), 0.45, colors.HexColor("#7A7A7A")),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
                 ("LEFTPADDING", (0, 0), (-1, -1), padding),
                 ("RIGHTPADDING", (0, 0), (-1, -1), padding),
@@ -383,40 +381,63 @@ def _payment_story(contract, payment, version, labels, styles):
     return story
 
 
-def _terms_story(terms, styles):
+class _CheckedBox(Flowable):
+    """A font-independent checked checkbox used for accepted V2 clauses."""
+
+    def __init__(self):
+        super().__init__()
+        self.width = 4.4 * mm
+        self.height = 4.4 * mm
+
+    def draw(self):
+        canvas = self.canv
+        canvas.setStrokeColor(colors.HexColor("#1B5E20"))
+        canvas.setLineWidth(0.75)
+        canvas.rect(0.3 * mm, 0.3 * mm, 3.7 * mm, 3.7 * mm, stroke=1, fill=0)
+        canvas.setLineWidth(1.1)
+        path = canvas.beginPath()
+        path.moveTo(0.9 * mm, 2.05 * mm)
+        path.lineTo(1.7 * mm, 1.15 * mm)
+        path.lineTo(3.4 * mm, 3.25 * mm)
+        canvas.drawPath(path, stroke=1, fill=0)
+
+
+def _is_document_terms(terms):
+    return len(terms["sections"]) == 11 and all(
+        not section.get("heading") and len(section["paragraphs"]) == 1
+        for section in terms["sections"]
+    )
+
+
+def _terms_story(terms, styles, *, checked_items=False):
+    if checked_items:
+        rows = [
+            [_CheckedBox(), Paragraph(escape(section["paragraphs"][0]), styles["terms_body"])]
+            for section in terms["sections"]
+        ]
+        table = Table(rows, colWidths=[6 * mm, 174 * mm], hAlign="LEFT")
+        table.setStyle(
+            TableStyle(
+                [
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                    ("TOPPADDING", (0, 0), (-1, -1), 0),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+                ]
+            )
+        )
+        return [table]
+
     story = []
     for section in terms["sections"]:
-        story.append(Paragraph(escape(str(section["heading"])), styles["terms_heading"]))
+        if section["heading"]:
+            story.append(Paragraph(escape(str(section["heading"])), styles["terms_heading"]))
         story.extend(
             Paragraph(escape(str(paragraph)), styles["terms_body"])
             for paragraph in section["paragraphs"]
         )
     return story
-
-
-def contract_verification_url(reference_code: str) -> str:
-    origin = settings.PUBLIC_SITE_ORIGINS[0].rstrip("/")
-    return f"{origin}/csa/verify?{urlencode({'reference': reference_code})}"
-
-
-def _verification_story(*, reference_code: str, label: str, styles):
-    url = contract_verification_url(reference_code)
-    qr = QrCodeWidget(url)
-    x1, y1, x2, y2 = qr.getBounds()
-    # The verification feature remains available without forcing a separate
-    # trailing page after the DOCX-style confirmation table.
-    size = 11 * mm
-    scale = size / max(x2 - x1, y2 - y1)
-    drawing = Drawing(size, size, transform=[scale, 0, 0, scale, -x1 * scale, -y1 * scale])
-    drawing.hAlign = "CENTER"
-    drawing.add(qr)
-    return KeepTogether(
-        [
-            Paragraph(escape(label), styles["verification"]),
-            drawing,
-            Paragraph(escape(url), styles["verification_url"]),
-        ]
-    )
 
 
 def _confirmation_table(contract, provider, labels, styles):
@@ -425,36 +446,37 @@ def _confirmation_table(contract, provider, labels, styles):
     )
     member_rows = [
         Paragraph(escape(labels["member_confirmation"]), styles["confirmation_heading"]),
-        Paragraph(_value(contract.member_name_snapshot), styles["table_body"]),
-        Paragraph(escape(labels["electronic_confirmation"]), styles["table_body"]),
+        Paragraph(_value(contract.member_name_snapshot), styles["confirmation_body"]),
+        Paragraph(escape(labels["electronic_confirmation"]), styles["confirmation_body"]),
         Paragraph(
             f"<b>{escape(labels['confirmation_method'])}:</b> {escape(method)}",
-            styles["table_body"],
+            styles["confirmation_body"],
         ),
         Paragraph(
             f"<b>{escape(labels['accepted_at'])}:</b> {_datetime(contract.terms_accepted_at)}",
-            styles["table_body"],
+            styles["confirmation_body"],
         ),
     ]
     farm_rows = [
         Paragraph(escape(labels["farm_confirmation"]), styles["confirmation_heading"]),
-        Paragraph(_value(provider["representative"]), styles["table_body"]),
-        Paragraph(escape(labels["electronic_confirmation"]), styles["table_body"]),
+        Paragraph(_value(provider["representative"]), styles["confirmation_body"]),
+        Paragraph(escape(labels["electronic_confirmation"]), styles["confirmation_body"]),
         Paragraph(
             f"<b>{escape(labels['terms_version'])}:</b> {_value(contract.terms_version)}",
-            styles["table_body"],
+            styles["confirmation_body"],
         ),
     ]
     table = Table([[member_rows, farm_rows]], colWidths=[83.5 * mm, 83.5 * mm], hAlign="LEFT")
     table.setStyle(
         TableStyle(
             [
-                ("GRID", (0, 0), (-1, -1), 0.45, colors.HexColor("#7A7A7A")),
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("LEFTPADDING", (0, 0), (-1, -1), 5),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 5),
-                ("TOPPADDING", (0, 0), (-1, -1), 5),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+                ("LEFTPADDING", (0, 0), (0, -1), 0),
+                ("RIGHTPADDING", (0, 0), (0, -1), 8),
+                ("LEFTPADDING", (1, 0), (1, -1), 8),
+                ("RIGHTPADDING", (1, 0), (1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
             ]
         )
     )
@@ -467,7 +489,6 @@ def build_contract_story(*, contract, locale, provider, payment, terms, styles, 
     story = [
         Paragraph(escape(labels["title"]), styles["title"]),
         Paragraph(escape(labels["subtitle"]), styles["subtitle"]),
-        Spacer(1, 2.5 * mm),
         Paragraph(
             " · ".join(
                 (
@@ -483,7 +504,7 @@ def build_contract_story(*, contract, locale, provider, payment, terms, styles, 
     if contract.status == "revoked":
         story.extend(
             [
-                Spacer(1, 2.5 * mm),
+                Spacer(1, 8),
                 Paragraph(escape(labels["revoked_notice"]), styles["revoked_notice"]),
                 *_plain_rows(
                     [
@@ -529,107 +550,121 @@ def build_contract_story(*, contract, locale, provider, payment, terms, styles, 
     story.append(_selected_plan_table(contract, labels, styles))
     story.extend(_quota_story(contract.quota_snapshot, labels, locale, styles))
     story.extend(_payment_story(contract, payment, version, labels, styles))
-    story.extend(_section(labels["terms"], styles))
-    story.append(Paragraph(escape(labels["accepted"]), styles["note"]))
-    story.extend(_terms_story(terms, styles))
+    document_terms = _is_document_terms(terms)
+    story.extend(_section(labels["terms" if document_terms else "legacy_terms"], styles))
+    if not document_terms:
+        story.append(Paragraph(escape(labels["accepted"]), styles["note"]))
+    story.extend(_terms_story(terms, styles, checked_items=document_terms))
     story.extend(_section(labels["confirmation"], styles))
     story.append(Paragraph(escape(labels["confirmation_text"]), styles["body"]))
     story.append(Spacer(1, 2 * mm))
     story.append(_confirmation_table(contract, provider, labels, styles))
-    # Preserved from the contract-verification phase; QR encodes only public URL/reference.
-    story.append(
-        _verification_story(
-            reference_code=contract.reference_code, label=labels["verification"], styles=styles
-        )
-    )
     return story
 
 
-def build_pdf_styles(*, regular_font: str, bold_font: str):
+def build_pdf_styles(*, regular_font: str, bold_font: str, italic_font: str, bold_italic_font: str):
     return {
         "title": ParagraphStyle(
             "ContractTitle",
             fontName=bold_font,
-            # Noto Sans is intentionally used from the configured Unicode font
-            # bundle. At 16pt it matches the single-line DOCX heading within
-            # the A4 template's 15mm side margins without losing Vietnamese glyphs.
-            fontSize=16,
-            leading=20,
+            fontSize=19,
+            leading=23,
             alignment=TA_CENTER,
             textColor=colors.HexColor("#1B5E20"),
             spaceAfter=2,
         ),
         "subtitle": ParagraphStyle(
             "ContractSubtitle",
-            fontName=regular_font,
+            fontName=italic_font,
             fontSize=10.5,
-            leading=14,
+            leading=13.8,
             alignment=TA_CENTER,
             textColor=colors.HexColor("#555555"),
-            spaceAfter=4,
+            spaceAfter=8,
         ),
         "metadata": ParagraphStyle(
             "ContractMetadata",
             fontName=regular_font,
             fontSize=10.5,
-            leading=14,
-            alignment=TA_CENTER,
+            leading=13.8,
             textColor=colors.HexColor("#222222"),
+            spaceAfter=8,
         ),
         "section": ParagraphStyle(
             "ContractSection",
             fontName=bold_font,
             fontSize=13,
-            leading=17,
+            leading=16.5,
             textColor=colors.HexColor("#1B5E20"),
-            spaceAfter=2,
+            spaceBefore=8,
+            spaceAfter=4,
+            keepWithNext=True,
         ),
         "subsection": ParagraphStyle(
             "ContractSubsection",
             fontName=bold_font,
             fontSize=10.5,
-            leading=14,
+            leading=13.8,
             textColor=colors.HexColor("#222222"),
-            spaceBefore=2,
+            spaceBefore=0,
             spaceAfter=1,
         ),
-        "body": ParagraphStyle("ContractBody", fontName=regular_font, fontSize=10.5, leading=14),
+        "body": ParagraphStyle(
+            "ContractBody",
+            fontName=regular_font,
+            fontSize=10.5,
+            leading=13.8,
+            textColor=colors.HexColor("#222222"),
+            spaceAfter=1,
+        ),
         "terms_heading": ParagraphStyle(
             "ContractTermsHeading",
             fontName=bold_font,
             fontSize=10.5,
-            leading=14,
+            leading=13.8,
             spaceBefore=2,
             spaceAfter=1,
         ),
         "terms_body": ParagraphStyle(
-            "ContractTermsBody", fontName=regular_font, fontSize=10.5, leading=14, spaceAfter=2
+            "ContractTermsBody",
+            fontName=regular_font,
+            fontSize=10.5,
+            leading=13.8,
+            textColor=colors.HexColor("#222222"),
         ),
         "note": ParagraphStyle(
             "ContractNote",
-            fontName=regular_font,
+            fontName=italic_font,
             fontSize=8.5,
-            leading=11,
+            leading=10.5,
             textColor=colors.HexColor("#555555"),
-            spaceAfter=2,
+            spaceAfter=8,
         ),
         "table_header": ParagraphStyle(
             "ContractTableHeader",
             fontName=bold_font,
             fontSize=8.5,
             leading=10.5,
+            alignment=TA_CENTER,
             textColor=colors.white,
         ),
         "table_body": ParagraphStyle(
-            "ContractTableBody", fontName=regular_font, fontSize=9, leading=11.5
+            "ContractTableBody", fontName=regular_font, fontSize=9.5, leading=11.5
         ),
         "confirmation_heading": ParagraphStyle(
             "ContractConfirmationHeading",
             fontName=bold_font,
-            fontSize=9.5,
-            leading=12,
+            fontSize=10.5,
+            leading=13.8,
             textColor=colors.HexColor("#1B5E20"),
-            spaceAfter=1,
+            spaceAfter=2,
+        ),
+        "confirmation_body": ParagraphStyle(
+            "ContractConfirmationBody",
+            fontName=regular_font,
+            fontSize=10.5,
+            leading=13.8,
+            textColor=colors.HexColor("#222222"),
         ),
         "revoked_notice": ParagraphStyle(
             "ContractRevokedNotice",
@@ -637,22 +672,6 @@ def build_pdf_styles(*, regular_font: str, bold_font: str):
             fontSize=10.5,
             leading=14,
             textColor=colors.HexColor("#B42318"),
-        ),
-        "verification": ParagraphStyle(
-            "ContractVerification",
-            fontName=bold_font,
-            fontSize=8.5,
-            leading=11,
-            alignment=TA_CENTER,
-            textColor=colors.HexColor("#1B5E20"),
-        ),
-        "verification_url": ParagraphStyle(
-            "ContractVerificationUrl",
-            fontName=regular_font,
-            fontSize=7,
-            leading=9,
-            alignment=TA_CENTER,
-            textColor=colors.HexColor("#555555"),
         ),
     }
 
