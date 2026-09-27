@@ -1,7 +1,7 @@
 from django.conf import settings
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import IntegrityError, transaction
-from django.db.models import Prefetch, Q, Sum
+from django.db.models import F, Prefetch, Q, Sum
 from django.db.models.deletion import ProtectedError
 from django.http import FileResponse
 from django.shortcuts import get_object_or_404
@@ -15,6 +15,13 @@ from rest_framework.views import APIView
 
 from content.permissions import IsWebsiteAdmin
 from identity.models import User
+from memberships.admin_coupons import (
+    coupon_payload,
+    coupon_payloads,
+    save_admin_coupon,
+    set_admin_coupon_active,
+    validate_coupon_configuration,
+)
 from memberships.banks import BankDirectoryUnavailable, get_transfer_banks
 from memberships.contract_access import (
     CSAContractAccessError,
@@ -34,8 +41,15 @@ from memberships.contract_verification import (
     verify_csa_contract,
 )
 from memberships.contracts import CSAContractError
+from memberships.coupons import (
+    CouponError,
+    coupon_quote_snapshot,
+    discounted_plan,
+    normalize_coupon_code,
+)
 from memberships.models import (
     CSAContract,
+    CSACoupon,
     CSACustomer,
     CSAPurchasePayment,
     CSAPurchaseRequest,
@@ -94,6 +108,7 @@ from memberships.purchases import (
     PurchaseRequestExpired,
     PurchaseStartDateInvalid,
     PurchaseTransitionConflict,
+    _quote_plan_snapshot,
     approve_csa_purchase_request,
     confirm_csa_payment_quote,
     confirm_csa_purchase_payment,
@@ -105,6 +120,9 @@ from memberships.purchases import (
     update_membership_payment_settings,
 )
 from memberships.serializers import (
+    AdminCouponPreviewSerializer,
+    AdminCouponQuerySerializer,
+    AdminCouponWriteSerializer,
     AdminCSACustomerQuerySerializer,
     AdminCSAPurchaseRequestQuerySerializer,
     AdminMembershipQuerySerializer,
@@ -478,6 +496,15 @@ def csa_purchase_payload(item: CSAPurchaseRequest, *, guest_confirmation_token=N
             "template": "compact2",
         },
     }
+    if item.coupon_snapshot:
+        coupon = item.coupon_snapshot
+        data["coupon"] = {
+            "code": coupon["coupon_code"],
+            "discount_type": coupon["discount_type"],
+            "discount_amount": coupon["discount_amount"],
+        }
+        data["customer_payable_total"] = coupon["customer_payable_total"]
+        data["contract_total_before_discount"] = coupon["contract_total_before_discount"]
     if guest_confirmation_token is not None:
         data["guest_confirmation_token"] = guest_confirmation_token
     return data
@@ -1083,11 +1110,12 @@ class PublicCSAPaymentQuoteView(APIView):
                 package_id=data["package_id"],
                 price_option_id=data["price_option_id"],
                 payment_plan_id=data.get("payment_plan_id"),
+                coupon_code=data.get("coupon_code"),
                 terms_locale=data["terms_locale"],
                 user=user,
                 guest_identity=data.get("guest_identity"),
             )
-        except CSAPurchaseError as error:
+        except (CSAPurchaseError, CouponError) as error:
             return csa_purchase_error(error)
         return no_store(Response({"data": csa_payment_quote_payload(quote_token, quote)}))
 
@@ -1115,7 +1143,7 @@ class PublicCSAPaymentQuoteConfirmView(APIView):
                 user=user,
                 guest_identity=serializer.validated_data.get("guest_identity"),
             )
-        except CSAPurchaseError as error:
+        except (CSAPurchaseError, CouponError) as error:
             return csa_purchase_error(error)
         return no_store(
             Response(
@@ -1610,6 +1638,223 @@ def _payment_plan_error(code, *, fields=None, http_status=status.HTTP_400_BAD_RE
     if fields is not None:
         item["fields"] = fields
     return no_store(Response({"errors": [item]}, status=http_status))
+
+
+def _coupon_error(code, *, http_status=400):
+    return no_store(Response({"errors": [{"code": code}]}, status=http_status))
+
+
+def _coupon_input_error(errors):
+    field = next(iter(errors), None)
+    code = {
+        "code": "coupon_invalid",
+        "discount_type": "coupon_invalid_type",
+        "discount_value": "coupon_invalid_value",
+        "usage_limit": "coupon_invalid_usage_limit",
+        "starts_at": "coupon_invalid_date_range",
+        "expires_at": "coupon_invalid_date_range",
+        "minimum_amount": "coupon_invalid_value",
+        "maximum_discount_amount": "coupon_invalid_value",
+    }.get(field, "coupon_not_applicable")
+    return _coupon_error(code)
+
+
+class AdminCouponListView(APIView):
+    permission_classes = [IsWebsiteAdmin]
+
+    def get(self, request):
+        query = AdminCouponQuerySerializer(data=request.query_params)
+        if not query.is_valid() or any(
+            len(request.query_params.getlist(key)) != 1 for key in request.query_params
+        ):
+            return _coupon_error("coupon_invalid")
+        now = timezone.now()
+        queryset = CSACoupon.objects.all()
+        if discount_type := query.validated_data.get("discount_type"):
+            queryset = queryset.filter(discount_type=discount_type)
+        status_filter = query.validated_data.get("status")
+        if status_filter == "inactive":
+            queryset = queryset.filter(is_active=False)
+        elif status_filter == "scheduled":
+            queryset = queryset.filter(is_active=True, starts_at__gt=now)
+        elif status_filter == "expired":
+            queryset = queryset.filter(is_active=True, starts_at__lte=now, expires_at__lte=now)
+        elif status_filter == "exhausted":
+            queryset = queryset.filter(
+                is_active=True,
+                starts_at__lte=now,
+                expires_at__gt=now,
+                used_count__gte=F("usage_limit"),
+            )
+        elif status_filter == "active":
+            queryset = queryset.filter(
+                is_active=True,
+                starts_at__lte=now,
+                expires_at__gt=now,
+                used_count__lt=F("usage_limit"),
+            )
+        items, meta = paginate(queryset, query.validated_data["page"])
+        return no_store(Response({"data": coupon_payloads(items), "meta": meta}))
+
+    def post(self, request):
+        serializer = AdminCouponWriteSerializer(data=request.data)
+        if not serializer.is_valid():
+            return _coupon_input_error(serializer.errors)
+        try:
+            coupon = save_admin_coupon(data=serializer.validated_data)
+        except CouponError as error:
+            return _coupon_error(
+                error.code, http_status=409 if error.code == "coupon_duplicate_code" else 400
+            )
+        return no_store(Response({"data": coupon_payload(coupon)}, status=201))
+
+
+class AdminCouponDetailView(APIView):
+    permission_classes = [IsWebsiteAdmin]
+
+    def get(self, request, coupon_id):
+        coupon = CSACoupon.objects.filter(pk=coupon_id).first()
+        if coupon is None:
+            return _coupon_error("coupon_not_found", http_status=404)
+        return no_store(Response({"data": coupon_payload(coupon)}))
+
+    def patch(self, request, coupon_id):
+        serializer = AdminCouponWriteSerializer(data=request.data, partial=True)
+        if not serializer.is_valid():
+            return _coupon_input_error(serializer.errors)
+        try:
+            coupon = save_admin_coupon(data=serializer.validated_data, coupon_id=coupon_id)
+        except CouponError as error:
+            code = error.code
+            return _coupon_error(
+                code,
+                http_status=404
+                if code == "coupon_not_found"
+                else 409
+                if code in {"coupon_duplicate_code", "coupon_cannot_edit_used"}
+                else 400,
+            )
+        return no_store(Response({"data": coupon_payload(coupon)}))
+
+
+class AdminCouponActivationView(APIView):
+    permission_classes = [IsWebsiteAdmin]
+
+    def post(self, request, coupon_id, action):
+        if action not in {"activate", "deactivate"}:
+            return _coupon_error("coupon_not_found", http_status=404)
+        if request.data:
+            return _coupon_error("coupon_invalid")
+        try:
+            coupon = set_admin_coupon_active(coupon_id=coupon_id, active=action == "activate")
+        except CouponError as error:
+            return _coupon_error(
+                error.code, http_status=404 if error.code == "coupon_not_found" else 409
+            )
+        return no_store(Response({"data": coupon_payload(coupon)}))
+
+
+class AdminCouponPreviewView(APIView):
+    permission_classes = [IsWebsiteAdmin]
+
+    @transaction.atomic
+    def post(self, request):
+        serializer = AdminCouponPreviewSerializer(data=request.data)
+        if not serializer.is_valid():
+            return _coupon_input_error(serializer.errors)
+        data = dict(serializer.validated_data)
+        plan_id = data.pop("payment_plan_id")
+        data["package_ids"] = [str(value) for value in data.get("package_ids", [])]
+        data["price_option_ids"] = [str(value) for value in data.get("price_option_ids", [])]
+        coupon = CSACoupon(**data)
+        try:
+            coupon.code = normalize_coupon_code(coupon.code)
+            validate_coupon_configuration(coupon)
+            plan = MembershipPaymentPlan.objects.select_related("price_option__package").get(
+                pk=plan_id
+            )
+            option = plan.price_option
+            if not plan.is_active or not option.is_active or not option.package.is_active:
+                raise CouponError("coupon_not_applicable")
+            plan_data = _quote_plan_snapshot(option=option, payment_plan_id=plan.pk)
+            snapshot = coupon_quote_snapshot(
+                coupon=coupon,
+                package_id=option.package_id,
+                price_option_id=option.pk,
+                plan={**plan_data, "contract_total": str(option.total_price_vnd)},
+                now=timezone.now(),
+                check_availability=False,
+            )
+        except (
+            CouponError,
+            PurchasePaymentPlanUnavailable,
+            MembershipPaymentPlan.DoesNotExist,
+        ) as error:
+            code = error.code if isinstance(error, CouponError) else "coupon_not_applicable"
+            if code not in {"coupon_invalid_value", "coupon_not_applicable"}:
+                code = "coupon_not_applicable"
+            return _coupon_error(code)
+        return no_store(
+            Response(
+                {
+                    "data": {
+                        **snapshot,
+                        "payment_type": plan.payment_type,
+                        "installments": discounted_plan(plan_data, snapshot),
+                    }
+                }
+            )
+        )
+
+
+class AdminCouponOptionsView(APIView):
+    permission_classes = [IsWebsiteAdmin]
+
+    def get(self, request):
+        packages = MembershipPackage.objects.filter(is_active=True).prefetch_related(
+            Prefetch(
+                "price_options",
+                queryset=MembershipPackagePriceOption.objects.filter(
+                    is_active=True
+                ).prefetch_related(
+                    Prefetch(
+                        "payment_plans",
+                        queryset=MembershipPaymentPlan.objects.filter(
+                            is_active=True
+                        ).prefetch_related("installments"),
+                    )
+                ),
+            )
+        )
+        return no_store(
+            Response(
+                {
+                    "data": [
+                        {
+                            "id": str(package.pk),
+                            "name": package.name,
+                            "price_options": [
+                                {
+                                    "id": str(option.pk),
+                                    "duration_months": option.duration_months,
+                                    "payment_plans": [
+                                        {
+                                            "id": str(plan.pk),
+                                            "name": plan.name,
+                                            "payment_type": plan.payment_type,
+                                            "installment_count": plan.installment_count,
+                                        }
+                                        for plan in option.payment_plans.all()
+                                    ],
+                                }
+                                for option in package.price_options.all()
+                            ],
+                        }
+                        for package in packages
+                    ]
+                }
+            )
+        )
 
 
 class AdminPaymentPlanListView(APIView):

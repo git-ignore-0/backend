@@ -205,9 +205,7 @@ def test_farm_delete_cleans_exclusive_gallery_assets_and_files(
     assert all(default_storage.exists(file_name) for file_name in file_names)
 
     with django_capture_on_commit_callbacks(execute=True):
-        response = tracker_admin_api.delete(
-            f"/api/v1/admin/tracker-farms/{created['id']}"
-        )
+        response = tracker_admin_api.delete(f"/api/v1/admin/tracker-farms/{created['id']}")
 
     assert response.status_code == 204
     assert not TrackerFarm.objects.filter(pk=created["id"]).exists()
@@ -247,9 +245,7 @@ def test_farm_delete_preserves_shared_gallery_asset_until_last_reference_is_remo
     ).json()["data"]
 
     with django_capture_on_commit_callbacks(execute=True):
-        first_delete = tracker_admin_api.delete(
-            f"/api/v1/admin/tracker-farms/{first['id']}"
-        )
+        first_delete = tracker_admin_api.delete(f"/api/v1/admin/tracker-farms/{first['id']}")
 
     assert first_delete.status_code == 204
     assert MediaAsset.objects.filter(pk=asset.pk).exists()
@@ -260,17 +256,18 @@ def test_farm_delete_preserves_shared_gallery_asset_until_last_reference_is_remo
     ).exists()
 
     with django_capture_on_commit_callbacks(execute=True):
-        second_delete = tracker_admin_api.delete(
-            f"/api/v1/admin/tracker-farms/{second['id']}"
-        )
+        second_delete = tracker_admin_api.delete(f"/api/v1/admin/tracker-farms/{second['id']}")
 
     assert second_delete.status_code == 204
     assert not MediaAsset.objects.filter(pk=asset.pk).exists()
     assert all(not default_storage.exists(file_name) for file_name in file_names)
-    assert ContentAuditLog.objects.filter(
-        action="tracker_farm.media.orphan_cleanup",
-        entity_id=str(asset.pk),
-    ).count() == 1
+    assert (
+        ContentAuditLog.objects.filter(
+            action="tracker_farm.media.orphan_cleanup",
+            entity_id=str(asset.pk),
+        ).count()
+        == 1
+    )
 
 
 @pytest.mark.django_db
@@ -294,9 +291,7 @@ def test_farm_delete_preserves_assets_referenced_by_testimonials_and_rewards(
     ).json()["data"]
 
     with django_capture_on_commit_callbacks(execute=True):
-        response = tracker_admin_api.delete(
-            f"/api/v1/admin/tracker-farms/{created['id']}"
-        )
+        response = tracker_admin_api.delete(f"/api/v1/admin/tracker-farms/{created['id']}")
 
     assert response.status_code == 204
     assert MediaAsset.objects.filter(pk=testimonial_asset.pk).exists()
@@ -732,9 +727,7 @@ def test_gallery_update_retains_asset_shared_with_another_farm(
     assert response.status_code == 200, response.json()
     assert MediaAsset.objects.filter(pk=shared_asset.pk).exists()
     assert all(default_storage.exists(file_name) for file_name in shared_files)
-    assert TrackerFarmPhoto.objects.filter(
-        farm_id=second["id"], image_id=shared_asset.pk
-    ).exists()
+    assert TrackerFarmPhoto.objects.filter(farm_id=second["id"], image_id=shared_asset.pk).exists()
     assert not ContentAuditLog.objects.filter(
         action="tracker_farm.media.orphan_cleanup",
         entity_id=str(shared_asset.pk),
@@ -773,16 +766,16 @@ def test_unchanged_photo_ids_do_not_replace_relations_or_run_cleanup(
         )
 
     assert response.status_code == 200, response.json()
-    assert list(
-        TrackerFarmPhoto.objects.filter(farm_id=created["id"])
-        .order_by("sort_order")
-        .values_list("pk", flat=True)
-    ) == relation_ids
-    assert MediaAsset.objects.filter(pk__in=[first.pk, second.pk]).count() == 2
-    assert all(
-        default_storage.exists(file_name)
-        for file_name in first_files | second_files
+    assert (
+        list(
+            TrackerFarmPhoto.objects.filter(farm_id=created["id"])
+            .order_by("sort_order")
+            .values_list("pk", flat=True)
+        )
+        == relation_ids
     )
+    assert MediaAsset.objects.filter(pk__in=[first.pk, second.pk]).count() == 2
+    assert all(default_storage.exists(file_name) for file_name in first_files | second_files)
     assert not ContentAuditLog.objects.filter(
         action="tracker_farm.media.orphan_cleanup",
         context__farm_id=created["id"],
@@ -933,9 +926,7 @@ def test_temporary_tracker_farm_media_cleanup_deletes_unreferenced_asset_and_fil
     asset, file_names = create_stored_media_asset("temporary-cleanup")
 
     with django_capture_on_commit_callbacks(execute=True):
-        response = tracker_admin_api.delete(
-            f"/api/v1/admin/tracker-farms/media/{asset.pk}"
-        )
+        response = tracker_admin_api.delete(f"/api/v1/admin/tracker-farms/media/{asset.pk}")
 
     assert response.status_code == 204
     assert not MediaAsset.objects.filter(pk=asset.pk).exists()
@@ -960,9 +951,7 @@ def test_temporary_tracker_farm_media_cleanup_retains_referenced_asset(
     TrackerFarmPhoto.objects.create(farm=farm, image=asset, sort_order=0)
 
     with django_capture_on_commit_callbacks(execute=True):
-        response = tracker_admin_api.delete(
-            f"/api/v1/admin/tracker-farms/media/{asset.pk}"
-        )
+        response = tracker_admin_api.delete(f"/api/v1/admin/tracker-farms/media/{asset.pk}")
 
     assert response.status_code == 409
     assert response.json() == {"errors": [{"code": "media_asset_referenced"}]}
@@ -986,9 +975,7 @@ def test_temporary_tracker_farm_media_cleanup_rejects_non_farm_asset(
     asset, file_names = create_stored_media_asset("not-a-farm", "rewards")
 
     with django_capture_on_commit_callbacks(execute=True):
-        response = tracker_admin_api.delete(
-            f"/api/v1/admin/tracker-farms/media/{asset.pk}"
-        )
+        response = tracker_admin_api.delete(f"/api/v1/admin/tracker-farms/media/{asset.pk}")
 
     assert response.status_code == 400
     assert "media" in response.json()

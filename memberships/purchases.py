@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import secrets
+import uuid
 from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 
@@ -24,6 +25,7 @@ from memberships.contract_pdfs import (
 )
 from memberships.contract_versions import issue_contract_version
 from memberships.contracts import build_online_contract_snapshot, create_online_contract
+from memberships.coupons import CouponError, coupon_for_code, coupon_quote_snapshot, discounted_plan
 from memberships.expiry import (
     expire_csa_purchase_request_if_due,
     expire_open_csa_purchase_request_for_phone,
@@ -32,6 +34,7 @@ from memberships.expiry import (
 from memberships.models import (
     CSAContract,
     CSAContractVersionReason,
+    CSACoupon,
     CSACustomer,
     CSAPurchasePayment,
     CSAPurchasePaymentStatus,
@@ -593,6 +596,17 @@ def _validate_payment_quote(quote: dict, *, now) -> dict:
         or not _quote_positive_amount(selection.get("monthly_price"))
     ):
         raise PaymentQuoteUnavailable("Payment quote is unavailable")
+    for identifier in (
+        selection["package_id"],
+        selection["price_option_id"],
+        plan.get("id"),
+        quote.get("coupon_id"),
+    ):
+        if identifier is not None:
+            try:
+                uuid.UUID(identifier)
+            except (ValueError, TypeError, AttributeError) as error:
+                raise PaymentQuoteUnavailable("Payment quote is unavailable") from error
     if plan.get("payment_type") not in {"full", "installment"} or not _quote_positive_amount(
         plan.get("total_amount")
     ):
@@ -628,6 +642,35 @@ def _validate_payment_quote(quote: dict, *, now) -> dict:
         raise PaymentQuoteUnavailable("Payment quote is unavailable")
     if plan.get("initial_payment_amount") != rows[0]["amount"]:
         raise PaymentQuoteUnavailable("Payment quote is unavailable")
+    coupon = quote.get("coupon")
+    if coupon is not None:
+        if not isinstance(coupon, dict) or not isinstance(quote.get("coupon_id"), str):
+            raise PaymentQuoteUnavailable("Payment quote is unavailable")
+        required = (
+            "coupon_code",
+            "discount_type",
+            "discount_value",
+            "discount_amount",
+            "contract_total_before_discount",
+            "payment_plan_total_before_discount",
+            "customer_payable_total",
+            "initial_payment_before_discount",
+            "initial_payment_after_discount",
+        )
+        if any(not isinstance(coupon.get(key), str) for key in required):
+            raise PaymentQuoteUnavailable("Payment quote is unavailable")
+        discount = Decimal(coupon["discount_amount"])
+        first = Decimal(rows[0]["amount"])
+        if (
+            coupon["discount_type"] not in {"percent", "fixed"}
+            or discount < 0
+            or discount > first
+            or Decimal(coupon["payment_plan_total_before_discount"]) != total_amount
+            or Decimal(coupon["initial_payment_before_discount"]) != first
+            or Decimal(coupon["initial_payment_after_discount"]) != first - discount
+            or Decimal(coupon["customer_payable_total"]) != total_amount - discount
+        ):
+            raise PaymentQuoteUnavailable("Payment quote is unavailable")
     required_payment = (
         "bank_bin",
         "bank_name",
@@ -675,6 +718,7 @@ def create_csa_payment_quote(
     package_id,
     price_option_id,
     payment_plan_id=None,
+    coupon_code=None,
     terms_locale="vi",
     user=None,
     guest_identity=None,
@@ -697,6 +741,18 @@ def create_csa_payment_quote(
     payment = _locked_payment_settings()
     terms = get_current_csa_terms(terms_locale)
     now = now or timezone.now()
+    coupon = coupon_for_code(coupon_code) if coupon_code is not None else None
+    coupon_snapshot = None
+    if coupon is not None:
+        if CSAPurchaseRequest.objects.filter(coupon=coupon, phone_e164=identity["phone"]).exists():
+            raise CouponError("coupon_already_used")
+        coupon_snapshot = coupon_quote_snapshot(
+            coupon=coupon,
+            package_id=package.pk,
+            price_option_id=option.pk,
+            plan={**plan, "contract_total": str(option.total_price_vnd)},
+            now=now,
+        )
     expires_at = now + PAYMENT_QUOTE_TTL
     request_code = generate_csa_purchase_request_code()
     quote = {
@@ -729,14 +785,20 @@ def create_csa_payment_quote(
             "hash": terms["hash"],
         },
     }
+    if coupon_snapshot is not None:
+        quote["coupon_id"] = str(coupon.pk)
+        quote["coupon"] = coupon_snapshot
     return _quote_token(quote), quote
 
 
 def csa_payment_quote_payload(quote_token: str, quote: dict) -> dict:
     plan = quote["selection"]["plan"]
     payment = quote["payment"]
-    initial_amount = plan["initial_payment_amount"]
-    return {
+    coupon = quote.get("coupon")
+    initial_amount = (
+        coupon["initial_payment_after_discount"] if coupon else plan["initial_payment_amount"]
+    )
+    result = {
         "quote_token": quote_token,
         "expires_at": quote["expires_at"],
         "request_code": quote["request_code"],
@@ -766,6 +828,26 @@ def csa_payment_quote_payload(quote_token: str, quote: dict) -> dict:
             "template": "compact2",
         },
     }
+    if coupon:
+        result["coupon"] = {
+            "code": coupon["coupon_code"],
+            "discount_type": coupon["discount_type"],
+            "discount_value": coupon["discount_value"],
+            "maximum_discount_amount": coupon["maximum_discount_amount"],
+            "discount_amount": coupon["discount_amount"],
+        }
+        result["payment_summary"].update(
+            {
+                "contract_total_before_discount": coupon["contract_total_before_discount"],
+                "payment_plan_total_before_discount": coupon["payment_plan_total_before_discount"],
+                "discount_amount": coupon["discount_amount"],
+                "customer_payable_total": coupon["customer_payable_total"],
+                "initial_payment_before_discount": coupon["initial_payment_before_discount"],
+                "initial_payment_amount": initial_amount,
+                "installments": discounted_plan(plan, coupon),
+            }
+        )
+    return result
 
 
 @transaction.atomic
@@ -793,6 +875,21 @@ def confirm_csa_payment_quote(*, quote_token, user=None, guest_identity=None, no
     )
     if existing is not None:
         return existing, None
+
+    coupon = None
+    coupon_snapshot = quote.get("coupon")
+    if coupon_snapshot is not None:
+        try:
+            coupon = CSACoupon.objects.select_for_update().get(pk=quote["coupon_id"])
+        except CSACoupon.DoesNotExist as error:
+            raise CouponError("coupon_invalid") from error
+        existing = CSAPurchaseRequest.objects.filter(quote_nonce=quote["nonce"]).first()
+        if existing is not None:
+            return existing, None
+        if coupon.used_count >= coupon.usage_limit:
+            raise CouponError("coupon_usage_exhausted")
+        if CSAPurchaseRequest.objects.filter(coupon=coupon, phone_e164=identity["phone"]).exists():
+            raise CouponError("coupon_already_used")
 
     selection = quote["selection"]
     plan_data = selection.get("plan")
@@ -858,7 +955,18 @@ def confirm_csa_payment_quote(*, quote_token, user=None, guest_identity=None, no
         payment_type_snapshot=plan_data["payment_type"] if plan is not None else None,
         total_payment_amount_snapshot=plan_data["total_amount"] if plan is not None else None,
         installment_count_snapshot=plan_data["installment_count"] if plan is not None else None,
-        payment_installments_snapshot=installments if plan is not None else None,
+        payment_installments_snapshot=(
+            discounted_plan(plan_data, coupon_snapshot)
+            if coupon_snapshot and plan is not None
+            else installments
+            if plan is not None
+            else None
+        ),
+        coupon=coupon,
+        coupon_snapshot=coupon_snapshot,
+        customer_payable_total_snapshot=(
+            coupon_snapshot["customer_payable_total"] if coupon_snapshot else None
+        ),
         currency_snapshot="VND",
         bank_bin_snapshot=payment["bank_bin"],
         bank_name_snapshot=payment["bank_name"],
@@ -902,6 +1010,9 @@ def confirm_csa_payment_quote(*, quote_token, user=None, guest_identity=None, no
         first.save(update_fields=["status", "updated_at"])
     except CSAPaymentError as error:
         raise CSAPurchaseError("Purchase payment schedule is invalid") from error
+    if coupon is not None:
+        coupon.used_count += 1
+        coupon.save(update_fields=["used_count", "updated_at"])
     return item, raw_token
 
 

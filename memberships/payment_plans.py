@@ -210,7 +210,7 @@ def payment_plan_snapshot_payload(purchase_request) -> dict | None:
 
     if purchase_request.payment_plan_id is None:
         return None
-    return {
+    payload = {
         "id": str(purchase_request.payment_plan_id),
         "name": purchase_request.payment_plan_name_snapshot,
         "payment_type": purchase_request.payment_type_snapshot,
@@ -219,12 +219,20 @@ def payment_plan_snapshot_payload(purchase_request) -> dict | None:
         "initial_payment_amount": initial_payment_amount_snapshot(purchase_request),
         "installments": purchase_request.payment_installments_snapshot,
     }
+    if purchase_request.coupon_snapshot:
+        payload["customer_payable_total"] = purchase_request.coupon_snapshot[
+            "customer_payable_total"
+        ]
+        payload["discount_amount"] = purchase_request.coupon_snapshot["discount_amount"]
+    return payload
 
 
 def initial_payment_amount_snapshot(purchase_request) -> str | None:
     """Amount due now, derived only from the immutable request snapshot."""
 
     if purchase_request.payment_plan_id is None:
+        if purchase_request.coupon_snapshot:
+            return purchase_request.coupon_snapshot["initial_payment_after_discount"]
         return str(purchase_request.amount_snapshot)
     from memberships.payments import CSAPaymentError, _snapshot_rows
 

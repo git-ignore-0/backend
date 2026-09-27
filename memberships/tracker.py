@@ -156,6 +156,14 @@ def tracker_request_payload(item: CSAPurchaseRequest) -> dict:
         "contract": None,
         "pdf_available": False,
     }
+    if item.coupon_snapshot:
+        coupon = item.coupon_snapshot
+        data["coupon"] = {
+            "code": coupon["coupon_code"],
+            "discount_type": coupon["discount_type"],
+            "discount_amount": coupon["discount_amount"],
+        }
+        data["customer_payable_total"] = coupon["customer_payable_total"]
     if item.status == CSAPurchaseRequestStatus.APPROVED:
         contract = item.csa_contract
         locales = _available_pdf_locales(contract)
@@ -198,7 +206,7 @@ def tracker_contract(item: CSAPurchaseRequest) -> CSAContract:
 def tracker_contract_payload(contract: CSAContract) -> dict:
     locales = _available_pdf_locales(contract)
     versions = contract_versions_payload(contract)
-    return {
+    data = {
         "id": str(contract.pk),
         "reference_code": contract.reference_code,
         "source": contract.source,
@@ -241,3 +249,12 @@ def tracker_contract_payload(contract: CSAContract) -> dict:
         "pdf_available": bool(locales),
         "pdf_action": "/api/v1/public/csa-contract-tracker/contract/pdf",
     }
+    if contract.purchase_request_id and contract.purchase_request.coupon_snapshot:
+        coupon = contract.purchase_request.coupon_snapshot
+        data["coupon"] = {
+            "code": coupon["coupon_code"],
+            "discount_type": coupon["discount_type"],
+            "discount_amount": coupon["discount_amount"],
+        }
+        data["customer_payable_total"] = coupon["customer_payable_total"]
+    return data

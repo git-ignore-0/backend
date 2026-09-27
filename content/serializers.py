@@ -332,11 +332,7 @@ class TrackerFarmWriteSerializer(TestimonialStrictSerializer):
         attrs = super().validate(attrs)
         if "image_id" in attrs and "photo_ids" in attrs:
             raise serializers.ValidationError(
-                {
-                    "photo_ids": (
-                        "Do not submit photo_ids and image_id in the same request."
-                    )
-                }
+                {"photo_ids": ("Do not submit photo_ids and image_id in the same request.")}
             )
         return attrs
 

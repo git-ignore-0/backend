@@ -1,10 +1,12 @@
 # ruff: noqa: DJ008
 import uuid
+from decimal import Decimal, InvalidOperation
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.db.models import Q
+from django.db.models.functions import Trim, Upper
 
 from memberships.phones import InvalidPhoneNumber, normalize_vietnam_phone
 from memberships.pricing import calculate_total_price_vnd
@@ -377,6 +379,122 @@ class MembershipPaymentSettings(models.Model):
             raise ValidationError({"bank_name": "Bank name does not match the selected BIN."})
 
 
+class CSACoupon(models.Model):
+    class DiscountType(models.TextChoices):
+        PERCENT = "percent", "Percent"
+        FIXED = "fixed", "Fixed VND"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    code = models.CharField(max_length=64)
+    discount_type = models.CharField(max_length=7, choices=DiscountType.choices)
+    discount_value = models.DecimalField(max_digits=19, decimal_places=2)
+    is_active = models.BooleanField(default=True)
+    starts_at = models.DateTimeField()
+    expires_at = models.DateTimeField()
+    usage_limit = models.PositiveIntegerField(default=1)
+    used_count = models.PositiveIntegerField(default=0, editable=False)
+    package = models.ForeignKey(MembershipPackage, null=True, blank=True, on_delete=models.PROTECT)
+    price_option = models.ForeignKey(
+        MembershipPackagePriceOption, null=True, blank=True, on_delete=models.PROTECT
+    )
+    payment_type = models.CharField(
+        max_length=12, choices=MembershipPaymentType.choices, null=True, blank=True
+    )
+    installment_count = models.PositiveSmallIntegerField(null=True, blank=True)
+    minimum_amount = models.DecimalField(max_digits=19, decimal_places=0, null=True, blank=True)
+    maximum_discount_amount = models.DecimalField(
+        max_digits=19, decimal_places=0, null=True, blank=True
+    )
+    package_ids = models.JSONField(default=list, blank=True)
+    price_option_ids = models.JSONField(default=list, blank=True)
+    payment_types = models.JSONField(default=list, blank=True)
+    installment_counts = models.JSONField(default=list, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at", "id"]
+        constraints = [
+            models.UniqueConstraint(Upper(Trim("code")), name="memberships_coupon_code_ci_unique"),
+            models.CheckConstraint(condition=Q(usage_limit__gt=0), name="coupon_limit_positive"),
+            models.CheckConstraint(
+                condition=Q(used_count__lte=models.F("usage_limit")),
+                name="coupon_usage_within_limit",
+            ),
+            models.CheckConstraint(
+                condition=Q(expires_at__gt=models.F("starts_at")), name="coupon_dates_ordered"
+            ),
+            models.CheckConstraint(condition=Q(discount_value__gt=0), name="coupon_value_positive"),
+            models.CheckConstraint(
+                condition=Q(discount_type__in=["percent", "fixed"]), name="coupon_type_valid"
+            ),
+            models.CheckConstraint(
+                condition=Q(minimum_amount__isnull=True) | Q(minimum_amount__gt=0),
+                name="coupon_minimum_positive",
+            ),
+            models.CheckConstraint(
+                condition=Q(maximum_discount_amount__isnull=True)
+                | Q(discount_type="percent", maximum_discount_amount__gt=0),
+                name="coupon_max_discount_valid",
+            ),
+            models.CheckConstraint(
+                condition=Q(installment_count__isnull=True) | Q(installment_count__gt=0),
+                name="coupon_count_positive",
+            ),
+        ]
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        return super().save(*args, **kwargs)
+
+    def clean(self):
+        super().clean()
+        from memberships.coupons import CouponError, normalize_coupon_code
+
+        try:
+            self.code = normalize_coupon_code(self.code)
+        except CouponError as error:
+            raise ValidationError({"code": error.code}) from error
+        errors = {}
+        try:
+            value = (
+                Decimal(str(self.discount_value))
+                if not isinstance(self.discount_value, float)
+                else None
+            )
+        except (InvalidOperation, TypeError, ValueError):
+            value = None
+        if value is None or not value.is_finite():
+            errors["discount_value"] = "coupon_invalid_value"
+        elif self.discount_type == self.DiscountType.PERCENT and value > 100:
+            errors["discount_value"] = "coupon_invalid_value"
+        if self.maximum_discount_amount is not None and (
+            self.maximum_discount_amount <= 0 or self.discount_type != self.DiscountType.PERCENT
+        ):
+            errors["maximum_discount_amount"] = "coupon_invalid_value"
+        if (
+            self.discount_type == self.DiscountType.FIXED
+            and value is not None
+            and value.is_finite()
+            and value != value.to_integral_value()
+        ):
+            errors["discount_value"] = "coupon_invalid_value"
+        if (
+            self.price_option_id
+            and self.package_id
+            and self.price_option.package_id != self.package_id
+        ):
+            errors["price_option"] = "coupon_not_applicable"
+        if (
+            self.installment_count
+            and self.payment_type == MembershipPaymentType.FULL
+            and self.installment_count != 1
+        ):
+            errors["installment_count"] = "coupon_not_applicable"
+        if errors:
+            raise ValidationError(errors)
+
+
 class CSAPurchaseRequest(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     user = models.ForeignKey(
@@ -436,6 +554,13 @@ class CSAPurchaseRequest(models.Model):
         null=True, blank=True, editable=False
     )
     payment_installments_snapshot = models.JSONField(null=True, blank=True, editable=False)
+    coupon = models.ForeignKey(
+        CSACoupon, null=True, blank=True, on_delete=models.PROTECT, editable=False
+    )
+    coupon_snapshot = models.JSONField(null=True, blank=True, editable=False)
+    customer_payable_total_snapshot = models.DecimalField(
+        max_digits=19, decimal_places=0, null=True, blank=True, editable=False
+    )
     currency_snapshot = models.CharField(max_length=3, default="VND")
     bank_bin_snapshot = models.CharField(max_length=6)
     bank_name_snapshot = models.CharField(max_length=160)
@@ -549,6 +674,9 @@ class CSAPurchaseRequest(models.Model):
         "total_payment_amount_snapshot",
         "installment_count_snapshot",
         "payment_installments_snapshot",
+        "coupon_id",
+        "coupon_snapshot",
+        "customer_payable_total_snapshot",
         "currency_snapshot",
         "bank_bin_snapshot",
         "bank_name_snapshot",
@@ -572,6 +700,21 @@ class CSAPurchaseRequest(models.Model):
     class Meta:
         ordering = ["-created_at", "-id"]
         constraints = [
+            models.CheckConstraint(
+                condition=(
+                    Q(
+                        coupon__isnull=True,
+                        coupon_snapshot__isnull=True,
+                        customer_payable_total_snapshot__isnull=True,
+                    )
+                    | Q(
+                        coupon__isnull=False,
+                        coupon_snapshot__isnull=False,
+                        customer_payable_total_snapshot__gte=0,
+                    )
+                ),
+                name="memberships_csa_coupon_snapshot_complete",
+            ),
             models.UniqueConstraint(
                 fields=["phone_e164", "open_slot"],
                 name="memberships_csa_purchase_one_open_phone",
@@ -783,6 +926,7 @@ class CSAPurchasePayment(models.Model):
     )
     installment_sequence = models.PositiveSmallIntegerField()
     amount_due = models.DecimalField(max_digits=19, decimal_places=0)
+    coupon_zero_amount = models.BooleanField(default=False, editable=False)
     amount_paid = models.DecimalField(max_digits=19, decimal_places=0, null=True, blank=True)
     cycle_count = models.PositiveSmallIntegerField()
     currency = models.CharField(max_length=3, default="VND")
@@ -819,6 +963,7 @@ class CSAPurchasePayment(models.Model):
         "membership_id",
         "installment_sequence",
         "amount_due",
+        "coupon_zero_amount",
         "cycle_count",
         "currency",
     )
@@ -846,10 +991,15 @@ class CSAPurchasePayment(models.Model):
                 name="memberships_payment_sequence_positive",
             ),
             models.CheckConstraint(
-                condition=Q(amount_due__gt=0), name="memberships_payment_due_positive"
+                condition=Q(amount_due__gt=0) | Q(amount_due=0, coupon_zero_amount=True),
+                name="memberships_payment_due_positive",
             ),
             models.CheckConstraint(
-                condition=Q(amount_paid__isnull=True) | Q(amount_paid__gt=0),
+                condition=(
+                    Q(amount_paid__isnull=True)
+                    | Q(amount_paid__gt=0)
+                    | Q(amount_paid=0, amount_due=0, coupon_zero_amount=True)
+                ),
                 name="memberships_payment_paid_positive",
             ),
             models.CheckConstraint(

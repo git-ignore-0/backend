@@ -71,6 +71,42 @@ class AdminPaymentPlanWriteSerializer(StrictSerializer):
     installments = PaymentPlanInstallmentWriteSerializer(many=True, allow_empty=False)
 
 
+class AdminCouponQuerySerializer(PageQuerySerializer):
+    status = serializers.ChoiceField(
+        choices=("active", "inactive", "scheduled", "expired", "exhausted"), required=False
+    )
+    discount_type = serializers.ChoiceField(choices=("percent", "fixed"), required=False)
+
+
+class AdminCouponWriteSerializer(StrictSerializer):
+    code = serializers.CharField(max_length=128, trim_whitespace=True, allow_blank=True)
+    discount_type = serializers.CharField(max_length=20)
+    discount_value = serializers.DecimalField(max_digits=19, decimal_places=2)
+    usage_limit = serializers.IntegerField(required=False, default=1)
+    starts_at = serializers.DateTimeField()
+    expires_at = serializers.DateTimeField()
+    package_ids = serializers.ListField(child=serializers.UUIDField(), required=False, default=list)
+    price_option_ids = serializers.ListField(
+        child=serializers.UUIDField(), required=False, default=list
+    )
+    payment_types = serializers.ListField(
+        child=serializers.CharField(max_length=20), required=False, default=list
+    )
+    installment_counts = serializers.ListField(
+        child=serializers.IntegerField(), required=False, default=list
+    )
+    minimum_amount = serializers.DecimalField(
+        max_digits=19, decimal_places=0, required=False, allow_null=True, default=None
+    )
+    maximum_discount_amount = serializers.DecimalField(
+        max_digits=19, decimal_places=0, required=False, allow_null=True, default=None
+    )
+
+
+class AdminCouponPreviewSerializer(AdminCouponWriteSerializer):
+    payment_plan_id = serializers.UUIDField()
+
+
 class TermsAcceptedField(serializers.Field):
     default_error_messages = {"required": "CSA terms must be accepted."}
 
@@ -113,6 +149,9 @@ class CSAPaymentQuoteCreateSerializer(StrictSerializer):
     package_id = serializers.UUIDField()
     price_option_id = serializers.UUIDField()
     payment_plan_id = serializers.UUIDField(required=False)
+    coupon_code = serializers.CharField(
+        required=False, max_length=128, trim_whitespace=True, allow_blank=True
+    )
     terms_accepted = TermsAcceptedField()
     terms_locale = serializers.ChoiceField(
         choices=MembershipContentLocale.choices,
@@ -125,6 +164,9 @@ class AuthenticatedCSAPaymentQuoteCreateSerializer(StrictSerializer):
     package_id = serializers.UUIDField()
     price_option_id = serializers.UUIDField()
     payment_plan_id = serializers.UUIDField(required=False)
+    coupon_code = serializers.CharField(
+        required=False, max_length=128, trim_whitespace=True, allow_blank=True
+    )
     terms_accepted = TermsAcceptedField()
     terms_locale = serializers.ChoiceField(
         choices=MembershipContentLocale.choices,
@@ -268,7 +310,7 @@ class CSAPurchaseRequestRefundSerializer(StrictSerializer):
 
 
 class CSAPaymentConfirmSerializer(StrictSerializer):
-    amount_paid = serializers.DecimalField(max_digits=19, decimal_places=0, min_value=Decimal(1))
+    amount_paid = serializers.DecimalField(max_digits=19, decimal_places=0, min_value=Decimal(0))
     note = serializers.CharField(max_length=1000, allow_blank=True, required=False, default="")
 
 

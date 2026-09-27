@@ -40,7 +40,7 @@ class CSAPaymentScheduleInvalid(CSAPaymentError):
     code = "csa_payment_schedule_invalid"
 
 
-def _whole_vnd(value) -> Decimal:
+def _whole_vnd(value, *, allow_zero=False) -> Decimal:
     if isinstance(value, (float, bool)):
         raise CSAPaymentAmountMismatch("Payment amount must be whole VND")
     try:
@@ -49,7 +49,7 @@ def _whole_vnd(value) -> Decimal:
         raise CSAPaymentAmountMismatch("Payment amount must be whole VND") from error
     if (
         not amount.is_finite()
-        or amount <= 0
+        or (amount < 0 if allow_zero else amount <= 0)
         or amount != amount.to_integral_value()
         or amount > MAX_POSITIVE_BIG_INTEGER
     ):
@@ -59,13 +59,34 @@ def _whole_vnd(value) -> Decimal:
 
 def _snapshot_rows(item: CSAPurchaseRequest) -> list[tuple[int, Decimal, int]]:
     if item.payment_plan_id is None:
-        return [(1, _whole_vnd(item.amount_snapshot), item.duration_months_snapshot)]
+        amount = (
+            item.coupon_snapshot["initial_payment_after_discount"]
+            if item.coupon_snapshot
+            else item.amount_snapshot
+        )
+        return [
+            (
+                1,
+                _whole_vnd(amount, allow_zero=bool(item.coupon_snapshot)),
+                item.duration_months_snapshot,
+            )
+        ]
     snapshot = item.payment_installments_snapshot
     if not isinstance(snapshot, list) or len(snapshot) != item.installment_count_snapshot:
         raise CSAPaymentScheduleInvalid("Purchase payment snapshot is incomplete")
     rows = []
     for expected_sequence, entry in enumerate(snapshot, start=1):
-        if not isinstance(entry, dict) or set(entry) != {"sequence", "amount", "cycle_count"}:
+        expected_keys = {"sequence", "amount", "cycle_count"}
+        coupon_keys = {
+            "amount_before_discount",
+            "discount_amount",
+            "amount_after_discount",
+            "months_covered",
+        }
+        if not isinstance(entry, dict) or set(entry) not in (
+            expected_keys,
+            expected_keys | coupon_keys,
+        ):
             raise CSAPaymentScheduleInvalid("Purchase payment snapshot is invalid")
         sequence, cycles = entry["sequence"], entry["cycle_count"]
         if (
@@ -79,12 +100,17 @@ def _snapshot_rows(item: CSAPurchaseRequest) -> list[tuple[int, Decimal, int]]:
         ):
             raise CSAPaymentScheduleInvalid("Purchase payment snapshot is invalid")
         try:
-            amount = _whole_vnd(entry["amount"])
+            amount = _whole_vnd(entry["amount"], allow_zero=bool(item.coupon_snapshot))
         except CSAPaymentAmountMismatch as error:
             raise CSAPaymentScheduleInvalid("Purchase payment snapshot is invalid") from error
         rows.append((sequence, amount, cycles))
     if (
-        sum((row[1] for row in rows), Decimal(0)) != Decimal(item.amount_snapshot)
+        sum((row[1] for row in rows), Decimal(0))
+        != Decimal(
+            item.customer_payable_total_snapshot
+            if item.customer_payable_total_snapshot is not None
+            else item.amount_snapshot
+        )
         or sum(row[2] for row in rows) != item.duration_months_snapshot
     ):
         raise CSAPaymentScheduleInvalid("Purchase payment snapshot totals do not match")
@@ -116,6 +142,7 @@ def ensure_csa_payment_schedule(*, request_id) -> list[CSAPurchasePayment]:
                 purchase_request=item,
                 installment_sequence=sequence,
                 amount_due=amount,
+                coupon_zero_amount=bool(item.coupon_snapshot) and amount == 0,
                 cycle_count=cycles,
             )
             for sequence, amount, cycles in expected
@@ -155,7 +182,7 @@ def set_csa_payment_due_dates(*, request_id, start_date) -> None:
 def confirm_locked_csa_payment(*, payment, amount_paid, actor, note="") -> CSAPurchasePayment:
     if actor is None:
         raise CSAPaymentStateConflict("A confirming admin is required")
-    amount = _whole_vnd(amount_paid)
+    amount = _whole_vnd(amount_paid, allow_zero=payment.amount_due == 0)
     if amount != payment.amount_due:
         raise CSAPaymentAmountMismatch("Payment amount must equal the installment amount due")
     if payment.status == CSAPurchasePaymentStatus.CONFIRMED:
@@ -217,7 +244,10 @@ def confirm_csa_payment(*, request_id, installment_sequence, amount_paid, actor,
             ):
                 raise CSAPaymentStateConflict("Earlier installments must be confirmed first")
             if payment.status == CSAPurchasePaymentStatus.CONFIRMED:
-                if _whole_vnd(amount_paid) != payment.amount_due:
+                if (
+                    _whole_vnd(amount_paid, allow_zero=payment.amount_due == 0)
+                    != payment.amount_due
+                ):
                     raise CSAPaymentAmountMismatch(
                         "Payment amount must equal the installment amount due"
                     )
@@ -310,7 +340,9 @@ def csa_payment_schedule_payload(item: CSAPurchaseRequest) -> dict:
                 "id": str(payment.pk),
                 "installment_sequence": payment.installment_sequence,
                 "amount_due": format(payment.amount_due, "f"),
-                "amount_paid": format(payment.amount_paid, "f") if payment.amount_paid else None,
+                "amount_paid": (
+                    format(payment.amount_paid, "f") if payment.amount_paid is not None else None
+                ),
                 "cycle_count": payment.cycle_count,
                 "status": payment.status,
                 "due_at": payment.due_at.isoformat() if payment.due_at else None,

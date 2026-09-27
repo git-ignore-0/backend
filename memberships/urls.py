@@ -22,6 +22,14 @@ router.register(
 )
 
 urlpatterns = [
+    path("admin/csa-coupons", views.AdminCouponListView.as_view()),
+    path("admin/csa-coupons/options", views.AdminCouponOptionsView.as_view()),
+    path("admin/csa-coupons/preview", views.AdminCouponPreviewView.as_view()),
+    path("admin/csa-coupons/<uuid:coupon_id>", views.AdminCouponDetailView.as_view()),
+    path(
+        "admin/csa-coupons/<uuid:coupon_id>/<str:action>",
+        views.AdminCouponActivationView.as_view(),
+    ),
     path(
         "admin/membership-price-options/<uuid:option_id>/payment-plans",
         views.AdminPaymentPlanListView.as_view(),

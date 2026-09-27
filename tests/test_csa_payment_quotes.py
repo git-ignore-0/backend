@@ -1,15 +1,20 @@
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from decimal import Decimal
 
 import pytest
 from django.core.cache import cache
+from django.core.exceptions import ValidationError
+from django.db import close_old_connections, connection
 from django.utils import timezone
 from rest_framework.test import APIClient
 
 from identity.models import AccountStatus, User
 from members.models import MemberProfile
+from memberships.coupons import CouponError, normalize_coupon_code
 from memberships.models import (
     CSAContract,
+    CSACoupon,
     CSACustomer,
     CSAPurchasePayment,
     CSAPurchasePaymentStatus,
@@ -31,8 +36,11 @@ from memberships.purchases import (
     _quote_token,
     confirm_csa_payment_quote,
     create_csa_payment_quote,
+    csa_payment_quote_payload,
     update_membership_payment_settings,
 )
+from memberships.tracker import tracker_request_payload
+from memberships.views import admin_csa_purchase_payload
 
 QUOTE_URL = "/api/v1/public/csa-payment-quotes"
 CONFIRM_URL = "/api/v1/public/csa-purchase-requests/confirm-transfer"
@@ -376,3 +384,360 @@ def test_quote_snapshot_survives_catalog_and_payment_setting_changes_before_conf
     assert item.amount_snapshot == 1_300_000
     assert item.account_number_snapshot == quote["payment"]["account_number"]
     assert item.status == CSAPurchaseRequestStatus.PAYMENT_CONFIRMED
+
+
+def make_coupon(*, code="TETTRUNGTHU2026", discount_type="fixed", value="600000", **kwargs):
+    now = timezone.now()
+    return CSACoupon.objects.create(
+        code=code,
+        discount_type=discount_type,
+        discount_value=Decimal(value),
+        starts_at=kwargs.pop("starts_at", now - timedelta(days=1)),
+        expires_at=kwargs.pop("expires_at", now + timedelta(days=1)),
+        **kwargs,
+    )
+
+
+@pytest.mark.django_db
+def test_coupon_code_normalizes_and_rejects_case_insensitive_duplicate():
+    assert normalize_coupon_code(" tettrungthu2026 ") == "TETTRUNGTHU2026"
+    coupon = make_coupon(code=" TetTrungThu2026 ")
+    coupon.refresh_from_db()
+    assert coupon.code == "TETTRUNGTHU2026"
+    with pytest.raises(ValidationError):
+        make_coupon(code="tettrungthu2026")
+    with pytest.raises(CouponError) as error:
+        normalize_coupon_code("  ")
+    assert error.value.code == "coupon_invalid"
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    (
+        "payment_type",
+        "discount_type",
+        "value",
+        "expected_discount",
+        "expected_first",
+        "expected_total",
+    ),
+    [
+        ("full", "percent", "10", "110000", "990000", "990000"),
+        ("full", "percent", "100", "1100000", "0", "0"),
+        ("full", "fixed", "1100000", "1100000", "0", "0"),
+        ("installment", "percent", "10", "50000", "450000", "1250000"),
+        ("installment", "fixed", "500000", "500000", "0", "800000"),
+    ],
+)
+def test_coupon_quote_confirm_snapshot_and_replay(
+    catalog,
+    payment_settings,
+    guest_identity,
+    payment_type,
+    discount_type,
+    value,
+    expected_discount,
+    expected_first,
+    expected_total,
+):
+    package, option = catalog
+    plan = make_plan(option, payment_type=payment_type)
+    coupon = make_coupon(discount_type=discount_type, value=value)
+    payload = {
+        **quote_payload(package, option, plan, guest_identity),
+        "coupon_code": " tettrungthu2026 ",
+    }
+    quoted = APIClient().post(QUOTE_URL, payload, format="json")
+    assert quoted.status_code == 200, quoted.json()
+    data = quoted.json()["data"]
+    assert not CSAPurchaseRequest.objects.exists()
+    assert data["coupon"]["code"] == coupon.code
+    assert data["coupon"]["discount_amount"] == expected_discount
+    assert data["payment_summary"]["customer_payable_total"] == expected_total
+    assert data["qr_payload"]["amount"] == expected_first
+    assert data["payment_summary"]["installments"][0]["amount_after_discount"] == expected_first
+    if payment_type == "installment":
+        assert data["payment_summary"]["installments"][1]["amount"] == "800000"
+    confirmed = APIClient().post(
+        CONFIRM_URL,
+        {"quote_token": data["quote_token"], "guest_identity": guest_identity},
+        format="json",
+    )
+    assert confirmed.status_code == 201, confirmed.json()
+    item = CSAPurchaseRequest.objects.get(pk=confirmed.json()["data"]["id"])
+    assert item.coupon_snapshot["customer_payable_total"] == expected_total
+    assert str(item.customer_payable_total_snapshot) == expected_total
+    assert item.amount_snapshot == int(plan.total_amount)
+    assert item.payments.get(installment_sequence=1).amount_due == Decimal(expected_first)
+    assert confirmed.json()["data"]["qr_payload"]["amount"] == expected_first
+    assert admin_csa_purchase_payload(item)["coupon"]["code"] == coupon.code
+    assert tracker_request_payload(item)["customer_payable_total"] == expected_total
+    coupon.refresh_from_db()
+    assert coupon.used_count == 1
+    replay = APIClient().post(
+        CONFIRM_URL,
+        {"quote_token": data["quote_token"], "guest_identity": guest_identity},
+        format="json",
+    )
+    assert replay.status_code == 200
+    coupon.refresh_from_db()
+    assert coupon.used_count == 1
+    assert CSAPurchaseRequest.objects.count() == 1
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("payment_type", "maximum_discount", "expected_discount", "expected_initial"),
+    [
+        ("full", "100000", "100000", "1000000"),
+        ("full", "600000", "550000", "550000"),
+        ("installment", "40000", "40000", "460000"),
+    ],
+)
+def test_percent_coupon_cap_is_applied_and_snapshotted(
+    catalog,
+    payment_settings,
+    guest_identity,
+    payment_type,
+    maximum_discount,
+    expected_discount,
+    expected_initial,
+):
+    package, option = catalog
+    plan = make_plan(option, payment_type=payment_type)
+    coupon = make_coupon(
+        discount_type="percent",
+        value="50",
+        maximum_discount_amount=Decimal(maximum_discount),
+    )
+    token, quote = create_csa_payment_quote(
+        package_id=package.pk,
+        price_option_id=option.pk,
+        payment_plan_id=plan.pk,
+        coupon_code=coupon.code,
+        guest_identity=guest_identity,
+    )
+
+    assert quote["coupon"]["maximum_discount_amount"] == maximum_discount
+    assert quote["coupon"]["discount_amount"] == expected_discount
+    assert quote["coupon"]["initial_payment_after_discount"] == expected_initial
+    response_payload = csa_payment_quote_payload(token, quote)
+    assert response_payload["coupon"]["maximum_discount_amount"] == maximum_discount
+    assert response_payload["qr_payload"]["amount"] == expected_initial
+
+    CSACoupon.objects.filter(pk=coupon.pk).update(
+        maximum_discount_amount=Decimal("1"), is_active=False
+    )
+    request, _ = confirm_csa_payment_quote(quote_token=token, guest_identity=guest_identity)
+    assert request.coupon_snapshot == quote["coupon"]
+    assert request.payments.get(installment_sequence=1).amount_due == Decimal(expected_initial)
+
+
+@pytest.mark.django_db
+def test_coupon_fixed_above_first_payment_is_rejected(catalog, payment_settings, guest_identity):
+    package, option = catalog
+    plan = make_plan(option, payment_type="installment")
+    make_coupon(value="500001")
+    response = APIClient().post(
+        QUOTE_URL,
+        {**quote_payload(package, option, plan, guest_identity), "coupon_code": "tettrungthu2026"},
+        format="json",
+    )
+    assert response.status_code == 400
+    assert response.json()["errors"] == [{"code": "coupon_invalid_value"}]
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("changes", "error_code"),
+    [
+        ({"is_active": False}, "coupon_inactive"),
+        ({"starts_at": timezone.now() + timedelta(hours=1)}, "coupon_not_started"),
+        ({"expires_at": timezone.now() - timedelta(seconds=1)}, "coupon_expired"),
+        ({"used_count": 1}, "coupon_usage_exhausted"),
+        ({"package_id": "other"}, "coupon_not_applicable"),
+        ({"price_option_id": "other"}, "coupon_not_applicable"),
+        ({"payment_type": "installment"}, "coupon_not_applicable"),
+        ({"installment_count": 2}, "coupon_not_applicable"),
+        ({"minimum_amount": Decimal("1200000")}, "coupon_minimum_amount_not_met"),
+    ],
+)
+def test_coupon_eligibility_errors(catalog, payment_settings, guest_identity, changes, error_code):
+    package, option = catalog
+    plan = make_plan(option, payment_type="full")
+    coupon = make_coupon()
+    if "package_id" in changes or "price_option_id" in changes:
+        other_package = MembershipPackage.objects.create(
+            name="Other package", quota_policy=QuotaPolicy.ROLLOVER
+        )
+        other_option = MembershipPackagePriceOption.objects.create(
+            package=other_package, duration_months=3, monthly_price_vnd=400_000
+        )
+        changes = {
+            key: (other_package.pk if key == "package_id" else other_option.pk)
+            if value == "other"
+            else value
+            for key, value in changes.items()
+        }
+    CSACoupon.objects.filter(pk=coupon.pk).update(**changes)
+    response = APIClient().post(
+        QUOTE_URL,
+        {**quote_payload(package, option, plan, guest_identity), "coupon_code": coupon.code},
+        format="json",
+    )
+    assert response.status_code in (400, 409)
+    assert response.json()["errors"] == [{"code": error_code}]
+
+
+@pytest.mark.django_db
+def test_coupon_quote_retains_discount_after_live_coupon_change(
+    catalog, payment_settings, guest_identity
+):
+    package, option = catalog
+    plan = make_plan(option, payment_type="installment")
+    coupon = make_coupon(value="100000")
+    token, quote = create_csa_payment_quote(
+        package_id=package.pk,
+        price_option_id=option.pk,
+        payment_plan_id=plan.pk,
+        coupon_code=coupon.code,
+        guest_identity=guest_identity,
+    )
+    CSACoupon.objects.filter(pk=coupon.pk).update(discount_value=Decimal("200000"), is_active=False)
+    item, _ = confirm_csa_payment_quote(quote_token=token, guest_identity=guest_identity)
+    assert item.coupon_snapshot == quote["coupon"]
+    assert item.payments.get(installment_sequence=1).amount_due == Decimal("400000")
+
+
+@pytest.mark.django_db
+def test_malformed_signed_coupon_id_returns_stable_quote_error(
+    catalog, payment_settings, guest_identity
+):
+    package, option = catalog
+    plan = make_plan(option, payment_type="full")
+    coupon = make_coupon(value="100000")
+    _token, quote = create_csa_payment_quote(
+        package_id=package.pk,
+        price_option_id=option.pk,
+        payment_plan_id=plan.pk,
+        coupon_code=coupon.code,
+        guest_identity=guest_identity,
+    )
+    quote["coupon_id"] = "not-a-uuid"
+    with pytest.raises(PaymentQuoteUnavailable):
+        _load_payment_quote(quote_token=_quote_token(quote), now=timezone.now())
+
+
+@pytest.mark.django_db
+def test_coupon_usage_checked_again_at_confirm_and_expired_quote_does_not_consume(
+    catalog, payment_settings, guest_identity
+):
+    package, option = catalog
+    plan = make_plan(option, payment_type="full")
+    coupon = make_coupon(value="100000")
+    now = timezone.now()
+    token, _ = create_csa_payment_quote(
+        package_id=package.pk,
+        price_option_id=option.pk,
+        payment_plan_id=plan.pk,
+        coupon_code=coupon.code,
+        guest_identity=guest_identity,
+        now=now,
+    )
+    with pytest.raises(PaymentQuoteExpired):
+        confirm_csa_payment_quote(
+            quote_token=token, guest_identity=guest_identity, now=now + timedelta(minutes=5)
+        )
+    assert not CSAPurchaseRequest.objects.exists()
+    coupon.refresh_from_db()
+    assert coupon.used_count == 0
+    CSACoupon.objects.filter(pk=coupon.pk).update(used_count=1)
+    with pytest.raises(CouponError) as error:
+        confirm_csa_payment_quote(quote_token=token, guest_identity=guest_identity, now=now)
+    assert error.value.code == "coupon_usage_exhausted"
+    assert not CSAPurchaseRequest.objects.exists()
+
+
+@pytest.mark.django_db
+def test_coupon_cannot_be_used_twice_by_same_phone(catalog, payment_settings, guest_identity):
+    package, option = catalog
+    plan = make_plan(option, payment_type="full")
+    coupon = make_coupon(value="100000", usage_limit=2)
+    token, _ = create_csa_payment_quote(
+        package_id=package.pk,
+        price_option_id=option.pk,
+        payment_plan_id=plan.pk,
+        coupon_code=coupon.code,
+        guest_identity=guest_identity,
+    )
+    confirm_csa_payment_quote(quote_token=token, guest_identity=guest_identity)
+    with pytest.raises(CouponError) as error:
+        create_csa_payment_quote(
+            package_id=package.pk,
+            price_option_id=option.pk,
+            payment_plan_id=plan.pk,
+            coupon_code=coupon.code,
+            guest_identity=guest_identity,
+        )
+    assert error.value.code == "coupon_already_used"
+
+
+@pytest.mark.django_db
+def test_coupon_without_catalog_payment_plan_uses_discounted_qr(
+    catalog, payment_settings, guest_identity
+):
+    package, option = catalog
+    coupon = make_coupon(value="100000")
+    token, quote = create_csa_payment_quote(
+        package_id=package.pk,
+        price_option_id=option.pk,
+        coupon_code=coupon.code,
+        guest_identity=guest_identity,
+    )
+    assert quote["selection"]["plan"]["total_amount"] == "1200000"
+    assert csa_payment_quote_payload(token, quote)["qr_payload"]["amount"] == "1100000"
+    item, _ = confirm_csa_payment_quote(quote_token=token, guest_identity=guest_identity)
+    assert item.amount_snapshot == 1200000
+    assert item.payments.get().amount_due == Decimal("1100000")
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.skipif(
+    connection.vendor != "postgresql", reason="Row-lock concurrency requires PostgreSQL"
+)
+def test_concurrent_coupon_confirms_do_not_exceed_usage_limit(
+    catalog, payment_settings, guest_identity
+):
+    package, option = catalog
+    plan = make_plan(option, payment_type="full")
+    coupon = make_coupon(value="100000", usage_limit=1)
+    second_identity = {**guest_identity, "phone": "0987654321"}
+    tokens = [
+        create_csa_payment_quote(
+            package_id=package.pk,
+            price_option_id=option.pk,
+            payment_plan_id=plan.pk,
+            coupon_code=coupon.code,
+            guest_identity=identity,
+        )[0]
+        for identity in (guest_identity, second_identity)
+    ]
+
+    def confirm(args):
+        close_old_connections()
+        try:
+            confirm_csa_payment_quote(quote_token=args[0], guest_identity=args[1])
+            return "ok"
+        except CouponError as error:
+            return error.code
+        finally:
+            close_old_connections()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(
+            pool.map(confirm, zip(tokens, (guest_identity, second_identity), strict=True))
+        )
+    assert sorted(outcomes) == ["coupon_usage_exhausted", "ok"]
+    coupon.refresh_from_db()
+    assert coupon.used_count == 1
+    assert CSAPurchaseRequest.objects.count() == 1
