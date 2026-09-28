@@ -6,6 +6,7 @@ from rest_framework import serializers
 
 from content.models import (
     TRACKER_FARM_MAX_PHOTOS,
+    TRACKER_SIGNUP_COUNT_MAX,
     ExternalLink,
     MediaAsset,
     TestimonialStatus,
@@ -299,7 +300,18 @@ class TrackerFarmWriteSerializer(TestimonialStrictSerializer):
         required=False,
         max_length=TRACKER_FARM_MAX_PHOTOS,
     )
-    signup_count = serializers.IntegerField(min_value=0, required=False, default=0)
+    signup_count = serializers.IntegerField(
+        min_value=0,
+        max_value=TRACKER_SIGNUP_COUNT_MAX,
+        required=False,
+        default=0,
+    )
+    one_month_signup_count = serializers.IntegerField(
+        min_value=0,
+        max_value=TRACKER_SIGNUP_COUNT_MAX,
+        required=False,
+        default=0,
+    )
     is_visible = serializers.BooleanField(required=False, default=True)
     sort_order = serializers.IntegerField(min_value=0, required=False)
 
@@ -399,6 +411,7 @@ def public_tracker_farm_payload(farm: TrackerFarm, locale: str, request):
         "image": images[0] if images else None,
         "images": images,
         "signup_count": farm.signup_count,
+        "one_month_signup_count": farm.one_month_signup_count,
         "sort_order": farm.sort_order,
     }
 
@@ -418,6 +431,7 @@ def admin_tracker_farm_payload(farm: TrackerFarm, request):
         "image": media_payload(farm.image, request) if farm.image else None,
         "photos": photos,
         "signup_count": farm.signup_count,
+        "one_month_signup_count": farm.one_month_signup_count,
         "is_visible": farm.is_visible,
         "sort_order": farm.sort_order,
         "version": farm.version,

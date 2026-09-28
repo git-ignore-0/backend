@@ -9,6 +9,7 @@ from django.utils import timezone
 
 SUPPORTED_LOCALES = {"en", "vi"}
 TRACKER_FARM_MAX_PHOTOS = 12
+TRACKER_SIGNUP_COUNT_MAX = 4_294_967_295
 
 
 class SiteSettings(models.Model):
@@ -340,6 +341,7 @@ class TrackerFarm(models.Model):
         on_delete=models.PROTECT,
     )
     signup_count = models.PositiveIntegerField(default=0)
+    one_month_signup_count = models.PositiveIntegerField(default=0)
     is_visible = models.BooleanField(default=True)
     sort_order = models.PositiveIntegerField(default=0)
     version = models.PositiveIntegerField(default=1)
@@ -358,6 +360,10 @@ class TrackerFarm(models.Model):
             models.CheckConstraint(
                 condition=Q(signup_count__gte=0),
                 name="content_tracker_signup_nonnegative",
+            ),
+            models.CheckConstraint(
+                condition=Q(one_month_signup_count__gte=0),
+                name="content_tracker_month_signup_nonneg",
             ),
             models.CheckConstraint(
                 condition=Q(sort_order__gte=0),

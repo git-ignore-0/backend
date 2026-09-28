@@ -15,6 +15,7 @@ from rest_framework.test import APIClient
 
 from content import models as content_models
 from content.models import (
+    TRACKER_SIGNUP_COUNT_MAX,
     ContentAuditLog,
     MediaAsset,
     TrackerFarm,
@@ -31,6 +32,7 @@ def farm_payload(**overrides):
         "location_en": "Da Lat, Vietnam",
         "location_vi": "Đà Lạt, Việt Nam",
         "signup_count": 14,
+        "one_month_signup_count": 4,
         "is_visible": True,
     }
     payload.update(overrides)
@@ -96,6 +98,7 @@ def test_tracker_farm_model_defaults_and_database_constraints():
     )
 
     assert farm.signup_count == 0
+    assert farm.one_month_signup_count == 0
     assert farm.is_visible is True
     assert farm.sort_order == 0
     assert farm.version == 1
@@ -107,6 +110,8 @@ def test_tracker_farm_model_defaults_and_database_constraints():
 
     with pytest.raises(IntegrityError), transaction.atomic():
         TrackerFarm.objects.filter(pk=farm.pk).update(signup_count=-1)
+    with pytest.raises(IntegrityError), transaction.atomic():
+        TrackerFarm.objects.filter(pk=farm.pk).update(one_month_signup_count=-1)
     with pytest.raises(IntegrityError), transaction.atomic():
         TrackerFarm.objects.filter(pk=farm.pk).update(sort_order=-1)
 
@@ -156,6 +161,8 @@ def test_admin_create_update_and_permanent_delete(tracker_admin_api):
     assert first_data["description_vi"] == "Nông trại gia đình"
     assert first_data["image"]["id"] == str(image.pk)
     assert [item["id"] for item in first_data["photos"]] == [str(image.pk)]
+    assert first_data["signup_count"] == 14
+    assert first_data["one_month_signup_count"] == 4
     assert first_data["sort_order"] == 0
     assert second_data["sort_order"] == 1
 
@@ -164,6 +171,7 @@ def test_admin_create_update_and_permanent_delete(tracker_admin_api):
         {
             "version": first_data["version"],
             "signup_count": 27,
+            "one_month_signup_count": 8,
             "is_visible": False,
             "name_vi": "  Nông trại đầu tiên  ",
             "description_en": None,
@@ -174,6 +182,7 @@ def test_admin_create_update_and_permanent_delete(tracker_admin_api):
     )
     assert updated.status_code == 200, updated.json()
     assert updated.json()["data"]["signup_count"] == 27
+    assert updated.json()["data"]["one_month_signup_count"] == 8
     assert updated.json()["data"]["is_visible"] is False
     assert updated.json()["data"]["name_vi"] == "Nông trại đầu tiên"
     assert updated.json()["data"]["description_en"] == ""
@@ -316,6 +325,48 @@ def test_signup_count_rejects_negative_and_invalid_values(tracker_admin_api, sig
 
 
 @pytest.mark.django_db
+@pytest.mark.parametrize("one_month_signup_count", [-1, "not-an-integer", 1.5])
+def test_one_month_signup_count_rejects_negative_and_invalid_values(
+    tracker_admin_api, one_month_signup_count
+):
+    response = tracker_admin_api.post(
+        "/api/v1/admin/tracker-farms",
+        farm_payload(one_month_signup_count=one_month_signup_count),
+        format="json",
+    )
+
+    assert response.status_code == 400
+    assert TrackerFarm.objects.count() == 0
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("field", ["signup_count", "one_month_signup_count"])
+@pytest.mark.parametrize("value", [0, TRACKER_SIGNUP_COUNT_MAX])
+def test_signup_counts_accept_mysql_unsigned_integer_boundaries(tracker_admin_api, field, value):
+    response = tracker_admin_api.post(
+        "/api/v1/admin/tracker-farms",
+        farm_payload(**{field: value}),
+        format="json",
+    )
+
+    assert response.status_code == 201, response.json()
+    assert response.json()["data"][field] == value
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("field", ["signup_count", "one_month_signup_count"])
+def test_signup_counts_reject_values_above_mysql_unsigned_integer_limit(tracker_admin_api, field):
+    response = tracker_admin_api.post(
+        "/api/v1/admin/tracker-farms",
+        farm_payload(**{field: TRACKER_SIGNUP_COUNT_MAX + 1}),
+        format="json",
+    )
+
+    assert response.status_code == 400
+    assert TrackerFarm.objects.count() == 0
+
+
+@pytest.mark.django_db
 @pytest.mark.parametrize("field", ["name_en", "name_vi", "location_en", "location_vi"])
 @pytest.mark.parametrize("value", [None, "   "])
 def test_required_bilingual_fields_are_trimmed_and_required(tracker_admin_api, field, value):
@@ -337,6 +388,7 @@ def test_public_tracker_farms_localize_en_and_vi_and_hide_internal_fields(client
     farm = create_farm(
         sort_order=4,
         signup_count=14,
+        one_month_signup_count=4,
         image=image,
         description_en="English description",
         description_vi="Mô tả tiếng Việt",
@@ -371,6 +423,7 @@ def test_public_tracker_farms_localize_en_and_vi_and_hide_internal_fields(client
                 }
             ],
             "signup_count": 14,
+            "one_month_signup_count": 4,
             "sort_order": 4,
         }
     ]
@@ -399,6 +452,7 @@ def test_public_tracker_farms_localize_en_and_vi_and_hide_internal_fields(client
             }
         ],
         "signup_count": 14,
+        "one_month_signup_count": 4,
         "sort_order": 4,
     }
     assert "is_visible" not in english.json()["data"][0]
