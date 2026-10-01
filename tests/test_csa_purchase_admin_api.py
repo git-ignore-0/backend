@@ -19,6 +19,8 @@ from memberships.models import (
     CSAContract,
     CSAContractSource,
     CSAContractTermsAcceptanceMethod,
+    CSAContractVersion,
+    CSACoupon,
     CSACustomer,
     CSAPurchasePayment,
     CSAPurchasePaymentStatus,
@@ -27,12 +29,17 @@ from memberships.models import (
     MembershipPackage,
     MembershipPackageItem,
     MembershipPackagePriceOption,
+    MembershipPaymentPlan,
+    MembershipPaymentPlanInstallment,
+    MembershipPaymentType,
     Product,
     QuotaPolicy,
 )
 from memberships.purchases import (
     PurchaseAdminWorkflowConflict,
     approve_csa_purchase_request,
+    confirm_csa_payment_quote,
+    create_csa_payment_quote,
     create_public_csa_purchase_request,
     reject_csa_purchase_request,
     update_membership_payment_settings,
@@ -145,6 +152,49 @@ def request_factory(package_and_option, payment_settings):
 def request_url(item, action=None):
     url = f"{LIST_URL}/{item.pk}"
     return f"{url}/{action}" if action else url
+
+
+def confirmed_coupon_request(
+    *,
+    package,
+    option,
+    discount_type,
+    discount_value,
+    code="SNAPSHOTCOUPON",
+    maximum_discount_amount=None,
+    payment_plan=None,
+):
+    now = timezone.now()
+    coupon = CSACoupon.objects.create(
+        code=code,
+        discount_type=discount_type,
+        discount_value=Decimal(discount_value),
+        maximum_discount_amount=(
+            Decimal(maximum_discount_amount) if maximum_discount_amount is not None else None
+        ),
+        starts_at=now - timedelta(days=1),
+        expires_at=now + timedelta(days=30),
+        usage_limit=5,
+    )
+    identity = {
+        "name": "Khách coupon snapshot",
+        "phone": "0912345678",
+        "province_code": "66",
+        "ward_code": "22015",
+        "address": "Địa chỉ snapshot",
+    }
+    quote_token, _quote = create_csa_payment_quote(
+        package_id=package.pk,
+        price_option_id=option.pk,
+        payment_plan_id=payment_plan.pk if payment_plan is not None else None,
+        coupon_code=coupon.code,
+        guest_identity=identity,
+    )
+    item, _guest_token = confirm_csa_payment_quote(
+        quote_token=quote_token,
+        guest_identity=identity,
+    )
+    return item, coupon
 
 
 def customer_from_request(item, *, user=None, **overrides):
@@ -414,6 +464,7 @@ def test_approve_creates_customer_and_one_membership_from_purchase_snapshot(
             page.extract_text() for page in PdfReader(BytesIO(pdf_file.read())).pages
         )
     assert (contract.end_date - timedelta(days=1)).strftime("%d/%m/%Y") in pdf_text
+    assert "Mã giảm giá" not in pdf_text
     log = AuditLog.objects.get(action="csa_purchase_request.approved")
     assert log.user == active_user
     assert log.created_at is not None
@@ -431,6 +482,487 @@ def test_approve_creates_customer_and_one_membership_from_purchase_snapshot(
     assert Membership.objects.count() == 1
     assert CSAContract.objects.count() == 1
     assert AuditLog.objects.filter(action="csa_purchase_request.approved").count() == 1
+
+
+@pytest.mark.django_db
+def test_existing_full_payment_coupon_request_approves_from_immutable_snapshot(
+    admin_api, package_and_option, payment_settings
+):
+    package, _option = package_and_option
+    option = MembershipPackagePriceOption.objects.create(
+        package=package,
+        duration_months=1,
+        monthly_price_vnd=1_635_000,
+    )
+    now = timezone.now()
+    coupon = CSACoupon.objects.create(
+        code="PRODUCTION10",
+        discount_type="percent",
+        discount_value=Decimal("10"),
+        starts_at=now - timedelta(days=1),
+        expires_at=now + timedelta(days=30),
+        usage_limit=5,
+    )
+    identity = {
+        "name": "Khách coupon cũ",
+        "phone": "0912345678",
+        "province_code": "66",
+        "ward_code": "22015",
+        "address": "Địa chỉ snapshot",
+    }
+    quote_token, _quote = create_csa_payment_quote(
+        package_id=package.pk,
+        price_option_id=option.pk,
+        coupon_code=coupon.code,
+        guest_identity=identity,
+    )
+    item, _guest_token = confirm_csa_payment_quote(
+        quote_token=quote_token,
+        guest_identity=identity,
+    )
+    identity_snapshot = (
+        item.guest_token_hash,
+        item.name_snapshot,
+        item.phone_e164,
+        item.address_snapshot,
+    )
+    assert item.status == CSAPurchaseRequestStatus.PAYMENT_CONFIRMED
+    assert item.payment_plan_id is None
+    assert item.payment_installments_snapshot is None
+    assert item.amount_snapshot == 1_635_000
+    assert item.customer_payable_total_snapshot == Decimal("1471500")
+    assert item.payments.get().amount_due == Decimal("1471500")
+    coupon.refresh_from_db()
+    assert coupon.used_count == 1
+
+    CSACoupon.objects.filter(pk=coupon.pk).update(
+        is_active=False,
+        discount_value=Decimal("99"),
+    )
+    response = admin_api.post(
+        request_url(item, "approve"),
+        {"start_date": str(timezone.localdate())},
+        format="json",
+    )
+
+    assert response.status_code == 200, response.json()
+    item.refresh_from_db()
+    coupon.refresh_from_db()
+    payment = item.payments.get()
+    contract = CSAContract.objects.get(purchase_request=item)
+    version = contract.current_version
+    assert payment.status == CSAPurchasePaymentStatus.CONFIRMED
+    assert payment.amount_paid == Decimal("1471500")
+    assert item.membership.duration_months_snapshot == 1
+    assert contract.amount_snapshot == 1_635_000
+    assert version.amount_snapshot == Decimal("1635000")
+    assert version.total_payment_amount == Decimal("1471500")
+    assert version.paid_amount == Decimal("1471500")
+    assert version.remaining_amount == 0
+    assert version.pricing_snapshot == {
+        "original_total": "1635000",
+        "discount_amount": "163500",
+        "customer_payable_total": "1471500",
+        "initial_payment_before_discount": "1635000",
+        "initial_payment_after_discount": "1471500",
+        "coupon": {
+            "code": "PRODUCTION10",
+            "discount_type": "percent",
+            "discount_value": "10.00",
+            "maximum_discount_amount": None,
+        },
+    }
+    assert identity_snapshot == (
+        item.guest_token_hash,
+        item.name_snapshot,
+        item.phone_e164,
+        item.address_snapshot,
+    )
+    assert coupon.used_count == 1
+    for key, expected in (
+        (
+            version.pdf_vi_storage_key,
+            (
+                "Mã giảm giá",
+                "PRODUCTION10",
+                "1.635.000",
+                "163.500",
+                "1.471.500",
+                "Đã thanh toán",
+                "Còn phải thanh toán",
+            ),
+        ),
+        (
+            version.pdf_en_storage_key,
+            (
+                "Coupon code",
+                "PRODUCTION10",
+                "1.635.000",
+                "163.500",
+                "1.471.500",
+                "Paid",
+                "Remaining",
+            ),
+        ),
+    ):
+        with open(settings.CSA_CONTRACT_PRIVATE_STORAGE_ROOT / key, "rb") as source:
+            text = "\n".join(
+                page.extract_text() for page in PdfReader(BytesIO(source.read())).pages
+            )
+        assert all(value in text for value in expected)
+
+    replay = admin_api.post(
+        request_url(item, "approve"),
+        {"start_date": str(timezone.localdate())},
+        format="json",
+    )
+    assert replay.status_code == 200
+    coupon.refresh_from_db()
+    assert coupon.used_count == 1
+    assert Membership.objects.count() == 1
+    assert CSAContract.objects.count() == 1
+    assert CSAContractVersion.objects.count() == 1
+    assert CSAPurchasePayment.objects.count() == 1
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("discount_type", "discount_value"),
+    [("percent", "100"), ("fixed", "1200000")],
+)
+def test_zero_payable_coupon_approves_versions_pdfs_and_replays(
+    admin_api,
+    package_and_option,
+    payment_settings,
+    discount_type,
+    discount_value,
+):
+    package, option = package_and_option
+    item, coupon = confirmed_coupon_request(
+        package=package,
+        option=option,
+        discount_type=discount_type,
+        discount_value=discount_value,
+        code=f"ZERO{discount_type.upper()}",
+    )
+    payment = item.payments.get()
+    assert item.amount_snapshot == 1_200_000
+    assert item.customer_payable_total_snapshot == 0
+    assert payment.amount_due == 0
+    assert payment.coupon_zero_amount is True
+
+    response = admin_api.post(
+        request_url(item, "approve"),
+        {"start_date": str(timezone.localdate())},
+        format="json",
+    )
+
+    assert response.status_code == 200, response.json()
+    item.refresh_from_db()
+    coupon.refresh_from_db()
+    payment.refresh_from_db()
+    contract = CSAContract.objects.get(purchase_request=item)
+    version = contract.current_version
+    assert payment.status == CSAPurchasePaymentStatus.CONFIRMED
+    assert payment.amount_paid == 0
+    assert version.amount_snapshot == Decimal("1200000")
+    assert version.total_payment_amount == 0
+    assert version.paid_amount == 0
+    assert version.remaining_amount == 0
+    assert version.pricing_snapshot["original_total"] == "1200000"
+    assert version.pricing_snapshot["discount_amount"] == "1200000"
+    assert version.pricing_snapshot["customer_payable_total"] == "0"
+    assert version.pricing_snapshot["coupon"]["code"] == coupon.code
+    assert coupon.used_count == 1
+
+    for key, expected in (
+        (
+            version.pdf_vi_storage_key,
+            (
+                "Giá gốc trước mã giảm giá",
+                "Số tiền giảm",
+                "Tổng phải thanh toán sau giảm",
+                "Đã thanh toán",
+                "Còn phải thanh toán",
+                "1.200.000",
+                "0 VND",
+            ),
+        ),
+        (
+            version.pdf_en_storage_key,
+            (
+                "Original total before coupon",
+                "Discount amount",
+                "Customer payable total",
+                "Paid",
+                "Remaining",
+                "1.200.000",
+                "0 VND",
+            ),
+        ),
+    ):
+        with open(settings.CSA_CONTRACT_PRIVATE_STORAGE_ROOT / key, "rb") as source:
+            text = "\n".join(
+                page.extract_text() for page in PdfReader(BytesIO(source.read())).pages
+            )
+        assert coupon.code in text
+        assert all(value in text for value in expected)
+
+    replay = admin_api.post(
+        request_url(item, "approve"),
+        {"start_date": str(timezone.localdate())},
+        format="json",
+    )
+    assert replay.status_code == 200
+    coupon.refresh_from_db()
+    assert coupon.used_count == 1
+    assert Membership.objects.count() == 1
+    assert CSAContract.objects.count() == 1
+    assert CSAContractVersion.objects.count() == 1
+    assert CSAPurchasePayment.objects.count() == 1
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("discount_type", "discount_value", "maximum_discount"),
+    [("fixed", "100000", None), ("percent", "50", "100000")],
+)
+def test_nonzero_full_coupon_variants_approve_with_valid_initial_snapshot(
+    admin_api,
+    package_and_option,
+    payment_settings,
+    discount_type,
+    discount_value,
+    maximum_discount,
+):
+    package, option = package_and_option
+    item, _coupon = confirmed_coupon_request(
+        package=package,
+        option=option,
+        discount_type=discount_type,
+        discount_value=discount_value,
+        maximum_discount_amount=maximum_discount,
+    )
+
+    response = admin_api.post(
+        request_url(item, "approve"),
+        {"start_date": str(timezone.localdate())},
+        format="json",
+    )
+
+    assert response.status_code == 200, response.json()
+    version = CSAContract.objects.get(purchase_request=item).current_version
+    assert version.amount_snapshot == Decimal("1200000")
+    assert version.total_payment_amount == Decimal("1100000")
+    assert version.paid_amount == Decimal("1100000")
+    assert version.remaining_amount == 0
+    assert version.pricing_snapshot["discount_amount"] == "100000"
+    assert version.pricing_snapshot["customer_payable_total"] == "1100000"
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "missing_field",
+    [
+        "amount_before_discount",
+        "discount_amount",
+        "amount_after_discount",
+        "months_covered",
+        "legacy_keyset",
+        "extra_field",
+        "wrong_month_type",
+        "invalid_amount",
+    ],
+)
+def test_installment_coupon_missing_metadata_returns_stable_schedule_error(
+    admin_api,
+    package_and_option,
+    payment_settings,
+    missing_field,
+):
+    package, option = package_and_option
+    plan = MembershipPaymentPlan.objects.create(
+        price_option=option,
+        name="Two installments",
+        payment_type=MembershipPaymentType.INSTALLMENT,
+        total_amount=Decimal("1200000"),
+        installment_count=2,
+        is_active=True,
+    )
+    MembershipPaymentPlanInstallment.objects.create(
+        payment_plan=plan,
+        sequence=1,
+        amount=Decimal("600000"),
+        cycle_count=1,
+    )
+    MembershipPaymentPlanInstallment.objects.create(
+        payment_plan=plan,
+        sequence=2,
+        amount=Decimal("600000"),
+        cycle_count=2,
+    )
+    item, _coupon = confirmed_coupon_request(
+        package=package,
+        option=option,
+        payment_plan=plan,
+        discount_type="fixed",
+        discount_value="100000",
+    )
+    broken = [dict(row) for row in item.payment_installments_snapshot]
+    coupon_fields = {
+        "amount_before_discount",
+        "discount_amount",
+        "amount_after_discount",
+        "months_covered",
+    }
+    if missing_field == "legacy_keyset":
+        for row in broken:
+            for field in coupon_fields:
+                row.pop(field)
+    elif missing_field == "extra_field":
+        broken[0]["unexpected"] = "value"
+    elif missing_field == "wrong_month_type":
+        broken[0]["months_covered"] = "1"
+    elif missing_field == "invalid_amount":
+        broken[0]["amount_before_discount"] = "NaN"
+    else:
+        broken[0].pop(missing_field)
+    type(item).objects.filter(pk=item.pk).update(payment_installments_snapshot=broken)
+
+    response = admin_api.post(
+        request_url(item, "approve"),
+        {"start_date": str(timezone.localdate())},
+        format="json",
+    )
+
+    assert response.status_code == 400
+    assert response.json()["errors"] == [{"code": "csa_payment_schedule_invalid"}]
+    item.refresh_from_db()
+    assert item.status == CSAPurchaseRequestStatus.PAYMENT_CONFIRMED
+    assert item.membership_id is None
+    assert not Membership.objects.exists()
+    assert not CSAContract.objects.exists()
+    assert not CSAContractVersion.objects.exists()
+    assert not AuditLog.objects.filter(action="csa_purchase_request.approved").exists()
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("discount_type", "discount_value", "maximum_discount", "snapshot_changes"),
+    [
+        (
+            "fixed",
+            "100000",
+            None,
+            {
+                "initial_payment_before_discount": "1000000",
+                "initial_payment_after_discount": "900000",
+            },
+        ),
+        (
+            "fixed",
+            "100000",
+            None,
+            {"initial_payment_after_discount": "1000001"},
+        ),
+        (
+            "percent",
+            "50",
+            "100000",
+            {
+                "initial_payment_before_discount": "1000000",
+                "initial_payment_after_discount": "900000",
+            },
+        ),
+        ("fixed", "100000", None, {"coupon_code": " SNAPSHOTCOUPON"}),
+        ("fixed", "100000", None, {"coupon_code": "snapshotcoupon"}),
+        ("fixed", "100000", None, {"coupon_code": "BAD CODE"}),
+    ],
+)
+def test_full_coupon_malformed_initial_amount_or_code_is_rejected(
+    admin_api,
+    package_and_option,
+    payment_settings,
+    discount_type,
+    discount_value,
+    maximum_discount,
+    snapshot_changes,
+):
+    package, option = package_and_option
+    item, _coupon = confirmed_coupon_request(
+        package=package,
+        option=option,
+        discount_type=discount_type,
+        discount_value=discount_value,
+        maximum_discount_amount=maximum_discount,
+    )
+    broken = {**item.coupon_snapshot, **snapshot_changes}
+    type(item).objects.filter(pk=item.pk).update(coupon_snapshot=broken)
+
+    response = admin_api.post(
+        request_url(item, "approve"),
+        {"start_date": str(timezone.localdate())},
+        format="json",
+    )
+
+    assert response.status_code == 400
+    assert response.json()["errors"] == [{"code": "csa_payment_schedule_invalid"}]
+    item.refresh_from_db()
+    assert item.status == CSAPurchaseRequestStatus.PAYMENT_CONFIRMED
+    assert item.membership_id is None
+    assert not Membership.objects.exists()
+    assert not CSAContract.objects.exists()
+    assert not CSAContractVersion.objects.exists()
+    assert not AuditLog.objects.filter(action="csa_purchase_request.approved").exists()
+
+
+@pytest.mark.django_db
+def test_coupon_snapshot_mismatch_is_rejected_without_partial_approval(
+    admin_api, package_and_option, payment_settings
+):
+    package, option = package_and_option
+    now = timezone.now()
+    coupon = CSACoupon.objects.create(
+        code="BROKEN10",
+        discount_type="percent",
+        discount_value=Decimal("10"),
+        starts_at=now - timedelta(days=1),
+        expires_at=now + timedelta(days=30),
+    )
+    identity = {
+        "name": "Khách snapshot lỗi",
+        "phone": "0912345678",
+        "province_code": "66",
+        "ward_code": "22015",
+        "address": "Địa chỉ snapshot",
+    }
+    quote_token, _quote = create_csa_payment_quote(
+        package_id=package.pk,
+        price_option_id=option.pk,
+        coupon_code=coupon.code,
+        guest_identity=identity,
+    )
+    item, _guest_token = confirm_csa_payment_quote(
+        quote_token=quote_token,
+        guest_identity=identity,
+    )
+    broken = {**item.coupon_snapshot, "discount_amount": "1"}
+    type(item).objects.filter(pk=item.pk).update(coupon_snapshot=broken)
+
+    response = admin_api.post(
+        request_url(item, "approve"),
+        {"start_date": str(timezone.localdate())},
+        format="json",
+    )
+
+    assert response.status_code == 400
+    assert response.json()["errors"] == [{"code": "csa_payment_schedule_invalid"}]
+    item.refresh_from_db()
+    assert item.status == CSAPurchaseRequestStatus.PAYMENT_CONFIRMED
+    assert item.membership_id is None
+    assert not Membership.objects.exists()
+    assert not CSAContract.objects.exists()
+    assert not AuditLog.objects.filter(action="csa_purchase_request.approved").exists()
 
 
 @pytest.mark.django_db

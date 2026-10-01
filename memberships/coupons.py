@@ -4,6 +4,7 @@ import re
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from memberships.models import CSACoupon
+from memberships.pricing import parse_whole_vnd
 
 
 class CouponError(ValueError):
@@ -32,12 +33,42 @@ def coupon_for_code(value, *, lock=False):
 
 def _whole_vnd(value):
     try:
-        amount = Decimal(str(value))
+        return parse_whole_vnd(value)
+    except ValueError as error:
+        raise CouponError("coupon_invalid_value") from error
+
+
+def calculate_coupon_discount(
+    *, discount_type, discount_value, maximum_discount_amount, initial_payment_amount
+):
+    """Return canonical coupon arithmetic without reading a live coupon record."""
+
+    first = _whole_vnd(initial_payment_amount)
+    try:
+        value = Decimal(str(discount_value))
     except (InvalidOperation, TypeError, ValueError) as error:
         raise CouponError("coupon_invalid_value") from error
-    if not amount.is_finite() or amount != amount.to_integral_value() or amount < 0:
+    if not value.is_finite() or value <= 0:
         raise CouponError("coupon_invalid_value")
-    return amount
+    maximum_discount = None
+    if discount_type == CSACoupon.DiscountType.PERCENT:
+        if value > 100:
+            raise CouponError("coupon_invalid_value")
+        discount = (first * value / Decimal(100)).quantize(Decimal(1), rounding=ROUND_HALF_UP)
+        if maximum_discount_amount is not None:
+            maximum_discount = _whole_vnd(maximum_discount_amount)
+            if maximum_discount <= 0:
+                raise CouponError("coupon_invalid_value")
+            discount = min(discount, maximum_discount)
+    elif discount_type == CSACoupon.DiscountType.FIXED:
+        if value != value.to_integral_value() or maximum_discount_amount is not None:
+            raise CouponError("coupon_invalid_value")
+        discount = value
+    else:
+        raise CouponError("coupon_invalid_value")
+    if discount > first:
+        raise CouponError("coupon_invalid_value")
+    return first, value, maximum_discount, discount.quantize(Decimal(1))
 
 
 def coupon_quote_snapshot(
@@ -83,39 +114,18 @@ def coupon_quote_snapshot(
     total = _whole_vnd(plan["total_amount"])
     if coupon.minimum_amount is not None and total < coupon.minimum_amount:
         raise CouponError("coupon_minimum_amount_not_met")
-    first = _whole_vnd(plan["initial_payment_amount"])
-    try:
-        value = Decimal(str(coupon.discount_value))
-    except (InvalidOperation, TypeError, ValueError) as error:
-        raise CouponError("coupon_invalid_value") from error
-    if not value.is_finite() or value <= 0:
-        raise CouponError("coupon_invalid_value")
-    if coupon.discount_type == CSACoupon.DiscountType.PERCENT:
-        if value > 100:
-            raise CouponError("coupon_invalid_value")
-        discount = (first * value / Decimal(100)).quantize(Decimal(1), rounding=ROUND_HALF_UP)
-        if coupon.maximum_discount_amount is not None:
-            maximum_discount = _whole_vnd(coupon.maximum_discount_amount)
-            if maximum_discount <= 0:
-                raise CouponError("coupon_invalid_value")
-            discount = min(discount, maximum_discount)
-    elif coupon.discount_type == CSACoupon.DiscountType.FIXED:
-        if value != value.to_integral_value() or coupon.maximum_discount_amount is not None:
-            raise CouponError("coupon_invalid_value")
-        discount = value
-    else:
-        raise CouponError("coupon_invalid_value")
-    if discount > first:
-        raise CouponError("coupon_invalid_value")
-    discount = discount.quantize(Decimal(1))
+    first, value, maximum_discount, discount = calculate_coupon_discount(
+        discount_type=coupon.discount_type,
+        discount_value=coupon.discount_value,
+        maximum_discount_amount=coupon.maximum_discount_amount,
+        initial_payment_amount=plan["initial_payment_amount"],
+    )
     return {
         "coupon_code": coupon.code,
         "discount_type": coupon.discount_type,
         "discount_value": format(value, "f"),
         "maximum_discount_amount": (
-            format(coupon.maximum_discount_amount, "f")
-            if coupon.maximum_discount_amount is not None
-            else None
+            format(maximum_discount, "f") if maximum_discount is not None else None
         ),
         "discount_amount": format(discount, "f"),
         "contract_total_before_discount": str(_whole_vnd(plan["contract_total"])),

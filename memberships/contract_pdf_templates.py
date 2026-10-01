@@ -1,6 +1,7 @@
 """Immutable CSA contract PDF presentation helpers."""
 
 from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from html import escape
 
 from django.utils import timezone
@@ -49,6 +50,13 @@ _LABELS = {
         "payment_method": "Phương thức",
         "payment_full": "Thanh toán toàn bộ khi đăng ký",
         "payment_installment": "Trả góp {count} lần",
+        "original_total": "Giá gốc trước mã giảm giá",
+        "coupon_code": "Mã giảm giá",
+        "coupon_discount": "Loại và giá trị giảm",
+        "discount_percent": "Phần trăm",
+        "discount_fixed": "Số tiền cố định",
+        "discount_amount": "Số tiền giảm",
+        "payable_total": "Tổng phải thanh toán sau giảm",
         "paid": "Đã thanh toán",
         "remaining": "Còn phải thanh toán",
         "opened_months": "Số tháng đã mở",
@@ -128,6 +136,13 @@ _LABELS = {
         "payment_method": "Method",
         "payment_full": "Pay the full amount at sign-up",
         "payment_installment": "Pay in {count} installments",
+        "original_total": "Original total before coupon",
+        "coupon_code": "Coupon code",
+        "coupon_discount": "Discount type and value",
+        "discount_percent": "Percent",
+        "discount_fixed": "Fixed amount",
+        "discount_amount": "Discount amount",
+        "payable_total": "Customer payable total",
         "paid": "Paid",
         "remaining": "Remaining",
         "opened_months": "Months opened",
@@ -198,6 +213,16 @@ def _money(value: int | str | None, currency: str) -> str:
         return f"{int(value):,.0f} {currency}".replace(",", ".")
     except (TypeError, ValueError):
         return "—"
+
+
+def _decimal_text(value) -> str:
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return "—"
+    if not parsed.is_finite():
+        return "—"
+    return format(parsed.normalize(), "f")
 
 
 def _section(title, styles):
@@ -350,18 +375,46 @@ def _payment_story(contract, payment, version, labels, styles):
         )
         opened_months = f"{version.paid_cycles}/{version.total_cycles}"
     story = _section(labels["payment"], styles)
-    story.extend(
-        _plain_rows(
-            [
-                (labels["payment_method"], method),
-                (labels["total_value"], _money(total, contract.currency_snapshot)),
-                (labels["paid"], _money(paid, contract.currency_snapshot)),
-                (labels["remaining"], _money(remaining, contract.currency_snapshot)),
-                (labels["opened_months"], opened_months),
-            ],
-            styles,
+    pricing = getattr(version, "pricing_snapshot", None) if version is not None else None
+    coupon = pricing.get("coupon") if isinstance(pricing, dict) else None
+    pricing_rows = []
+    if isinstance(coupon, dict):
+        discount_type = coupon.get("discount_type")
+        discount_value = coupon.get("discount_value")
+        discount_description = (
+            f"{labels['discount_percent']} · {_decimal_text(discount_value)}%"
+            if discount_type == "percent"
+            else (
+                f"{labels['discount_fixed']} · {_money(discount_value, contract.currency_snapshot)}"
+            )
         )
+        pricing_rows = [
+            (
+                labels["original_total"],
+                _money(pricing.get("original_total"), contract.currency_snapshot),
+            ),
+            (labels["coupon_code"], coupon.get("code")),
+            (labels["coupon_discount"], discount_description),
+            (
+                labels["discount_amount"],
+                _money(pricing.get("discount_amount"), contract.currency_snapshot),
+            ),
+            (
+                labels["payable_total"],
+                _money(pricing.get("customer_payable_total"), contract.currency_snapshot),
+            ),
+        ]
+    summary_rows = [(labels["payment_method"], method), *pricing_rows]
+    if not pricing_rows:
+        summary_rows.append((labels["total_value"], _money(total, contract.currency_snapshot)))
+    summary_rows.extend(
+        [
+            (labels["paid"], _money(paid, contract.currency_snapshot)),
+            (labels["remaining"], _money(remaining, contract.currency_snapshot)),
+            (labels["opened_months"], opened_months),
+        ]
     )
+    story.extend(_plain_rows(summary_rows, styles))
     story.extend(_payment_schedule(version, labels, styles))
     story.extend(
         [

@@ -12,13 +12,15 @@ dependencies = [
     "cryptography>=50.0.0,<51",
     "django-allauth>=65,<66",
     "django-oauth-toolkit>=3.0,<4",
-    "djangorestframework>=3.16,<4",
+    "djangorestframework>=3.17.2,<3.18",
     "gunicorn>=23,<24",
+    "oauthlib>=4.0.0,<5",
     "Pillow>=12.3,<13",
     "python-dotenv>=1.1,<2",
     "reportlab>=4.4,<5",
     "requests>=2.32,<3",
     "sqlparse>=0.6.0,<0.7",
+    "urllib3>=2.8.0,<3",
     "whitenoise>=6.8,<7",
 ]
 

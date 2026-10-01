@@ -1623,6 +1623,7 @@ class CSAContractVersion(models.Model):
     amount_snapshot = models.DecimalField(max_digits=19, decimal_places=0)
     currency_snapshot = models.CharField(max_length=3, default="VND")
     payment_type = models.CharField(max_length=12, choices=MembershipPaymentType.choices)
+    pricing_snapshot = models.JSONField(null=True, blank=True, editable=False)
     total_payment_amount = models.DecimalField(max_digits=19, decimal_places=0)
     paid_amount = models.DecimalField(max_digits=19, decimal_places=0)
     remaining_amount = models.DecimalField(max_digits=19, decimal_places=0)
@@ -1663,7 +1664,7 @@ class CSAContractVersion(models.Model):
             ),
             models.CheckConstraint(
                 condition=Q(amount_snapshot__gt=0)
-                & Q(total_payment_amount__gt=0)
+                & Q(total_payment_amount__gte=0)
                 & Q(paid_amount__gte=0)
                 & Q(remaining_amount__gte=0)
                 & Q(total_payment_amount=models.F("paid_amount") + models.F("remaining_amount")),

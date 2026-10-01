@@ -23,6 +23,7 @@ from memberships.models import (
     CSAContract,
     CSAContractVersion,
     CSAContractVersionReason,
+    CSACoupon,
     CSACustomer,
     CSAPurchasePayment,
     CSAPurchasePaymentStatus,
@@ -39,6 +40,7 @@ from memberships.models import (
 )
 from memberships.payments import (
     CSAPaymentAmountMismatch,
+    CSAPaymentScheduleInvalid,
     CSAPaymentStateConflict,
     confirm_csa_payment,
     ensure_csa_payment_schedule,
@@ -48,7 +50,9 @@ from memberships.payments import (
 )
 from memberships.purchases import (
     approve_csa_purchase_request,
+    confirm_csa_payment_quote,
     confirm_csa_purchase_payment,
+    create_csa_payment_quote,
     create_public_csa_purchase_request,
     update_membership_payment_settings,
 )
@@ -255,6 +259,196 @@ def test_approval_confirms_first_payment_and_caps_quota(approved_request, active
     assert item.payments.count() == 2
     assert Membership.objects.count() == 1
     assert AuditLog.objects.filter(action="csa_payment.confirmed").count() == 1
+
+
+@pytest.mark.django_db
+def test_existing_installment_coupon_request_approves_and_versions_snapshot(catalog, active_user):
+    package, option, plan = catalog
+    now = timezone.now()
+    coupon = CSACoupon.objects.create(
+        code="INSTALLMENT600",
+        discount_type="fixed",
+        discount_value=Decimal("600000"),
+        starts_at=now - timedelta(days=1),
+        expires_at=now + timedelta(days=30),
+        usage_limit=5,
+    )
+    identity = {
+        "name": "Installment buyer",
+        "phone": "0912345678",
+        "province_code": "66",
+        "ward_code": "22015",
+        "address": "12 Main Street",
+    }
+    quote_token, _quote = create_csa_payment_quote(
+        package_id=package.pk,
+        price_option_id=option.pk,
+        payment_plan_id=plan.pk,
+        coupon_code=coupon.code,
+        guest_identity=identity,
+    )
+    item, _guest_token = confirm_csa_payment_quote(
+        quote_token=quote_token,
+        guest_identity=identity,
+    )
+    assert item.status == CSAPurchaseRequestStatus.PAYMENT_CONFIRMED
+    assert [(payment.amount_due, payment.cycle_count) for payment in item.payments.all()] == [
+        (Decimal("2400000"), 3),
+        (Decimal("3000001"), 3),
+    ]
+    assert item.customer_payable_total_snapshot == Decimal("5400001")
+    coupon.refresh_from_db()
+    assert coupon.used_count == 1
+    CSACoupon.objects.filter(pk=coupon.pk).update(
+        is_active=False,
+        discount_value=Decimal("1"),
+    )
+
+    approved, membership = approve_csa_purchase_request(
+        request_id=item.pk,
+        start_date=timezone.localdate(),
+        actor=active_user,
+    )
+
+    contract = CSAContract.objects.get(membership=membership)
+    first = contract.current_version
+    assert approved.payments.get(installment_sequence=1).amount_paid == Decimal("2400000")
+    assert approved.payments.get(installment_sequence=2).amount_due == Decimal("3000001")
+    assert first.amount_snapshot == Decimal("6000001")
+    assert first.total_payment_amount == Decimal("5400001")
+    assert first.paid_amount == Decimal("2400000")
+    assert first.remaining_amount == Decimal("3000001")
+    assert first.pricing_snapshot["coupon"] == {
+        "code": "INSTALLMENT600",
+        "discount_type": "fixed",
+        "discount_value": "600000.00",
+        "maximum_discount_amount": None,
+    }
+    assert [row["amount_due"] for row in first.payment_schedule_snapshot] == [
+        "2400000",
+        "3000001",
+    ]
+    storage = get_contract_pdf_storage()
+    with storage.open(first.pdf_vi_storage_key, "rb") as source:
+        pdf_text = "\n".join(
+            page.extract_text() for page in PdfReader(BytesIO(source.read())).pages
+        )
+    assert "INSTALLMENT600" in pdf_text
+    assert "600.000" in pdf_text
+    assert "5.400.001" in pdf_text
+    assert "2.400.000" in pdf_text and "3.000.001" in pdf_text
+    assert "Lịch thanh toán" in pdf_text
+    coupon.refresh_from_db()
+    assert coupon.used_count == 1
+
+    confirm_csa_payment(
+        request_id=item.pk,
+        installment_sequence=2,
+        amount_paid=Decimal("3000001"),
+        actor=active_user,
+    )
+    contract.refresh_from_db()
+    second = contract.current_version
+    assert second.version_number == 2
+    assert second.pricing_snapshot == first.pricing_snapshot
+    assert second.total_payment_amount == Decimal("5400001")
+    assert second.paid_amount == Decimal("5400001")
+    assert second.remaining_amount == 0
+    coupon.refresh_from_db()
+    assert coupon.used_count == 1
+
+    revoke_membership(
+        membership_id=membership.pk,
+        reason="Coupon membership revoked",
+        actor=active_user,
+    )
+    contract.refresh_from_db()
+    revoked = contract.current_version
+    assert revoked.version_number == 3
+    assert revoked.version_reason == CSAContractVersionReason.MEMBERSHIP_REVOKED
+    assert revoked.pricing_snapshot == first.pricing_snapshot
+    assert revoked.total_payment_amount == Decimal("5400001")
+    assert revoked.paid_amount == Decimal("5400001")
+    assert revoked.remaining_amount == 0
+    with get_contract_pdf_storage().open(revoked.pdf_vi_storage_key, "rb") as source:
+        revoked_text = "\n".join(
+            page.extract_text() for page in PdfReader(BytesIO(source.read())).pages
+        )
+    assert "INSTALLMENT600" in revoked_text
+    assert "5.400.001" in revoked_text
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("mismatch", ["total", "cycles"])
+def test_installment_coupon_snapshot_total_or_cycles_mismatch_blocks_approval(
+    catalog, active_user, mismatch
+):
+    package, option, plan = catalog
+    now = timezone.now()
+    coupon = CSACoupon.objects.create(
+        code="INVALIDSCHEDULE",
+        discount_type="percent",
+        discount_value=Decimal("10"),
+        starts_at=now - timedelta(days=1),
+        expires_at=now + timedelta(days=30),
+    )
+    identity = {
+        "name": "Invalid snapshot buyer",
+        "phone": "0912345678",
+        "province_code": "66",
+        "ward_code": "22015",
+        "address": "12 Main Street",
+    }
+    quote_token, _quote = create_csa_payment_quote(
+        package_id=package.pk,
+        price_option_id=option.pk,
+        payment_plan_id=plan.pk,
+        coupon_code=coupon.code,
+        guest_identity=identity,
+    )
+    item, _guest_token = confirm_csa_payment_quote(
+        quote_token=quote_token,
+        guest_identity=identity,
+    )
+    broken = copy.deepcopy(item.payment_installments_snapshot)
+    if mismatch == "total":
+        broken[1]["amount"] = "3000002"
+        broken[1]["amount_before_discount"] = "3000002"
+        broken[1]["amount_after_discount"] = "3000002"
+    else:
+        broken[1]["cycle_count"] = 2
+        broken[1]["months_covered"] = 2
+    type(item).objects.filter(pk=item.pk).update(payment_installments_snapshot=broken)
+
+    with pytest.raises(CSAPaymentScheduleInvalid):
+        approve_csa_purchase_request(
+            request_id=item.pk,
+            start_date=timezone.localdate(),
+            actor=active_user,
+        )
+
+    item.refresh_from_db()
+    assert item.status == CSAPurchaseRequestStatus.PAYMENT_CONFIRMED
+    assert item.membership_id is None
+    assert not Membership.objects.exists()
+    assert not CSAContract.objects.exists()
+
+
+@pytest.mark.django_db
+def test_no_coupon_installment_rejects_coupon_metadata_keyset(request_and_token):
+    item, _token = request_and_token
+    broken = copy.deepcopy(item.payment_installments_snapshot)
+    for row in broken:
+        row.update(
+            amount_before_discount=row["amount"],
+            discount_amount="0",
+            amount_after_discount=row["amount"],
+            months_covered=row["cycle_count"],
+        )
+    type(item).objects.filter(pk=item.pk).update(payment_installments_snapshot=broken)
+
+    with pytest.raises(CSAPaymentScheduleInvalid):
+        ensure_csa_payment_schedule(request_id=item.pk)
 
 
 @pytest.mark.django_db
@@ -522,7 +716,9 @@ def test_published_version_cannot_be_updated_or_deleted(approved_request):
 
 
 @pytest.mark.django_db
-def test_contract_version_database_rejects_duplicate_and_nonpositive_number(approved_request):
+def test_contract_version_database_rejects_duplicate_invalid_number_and_negative_amounts(
+    approved_request,
+):
     _item, membership = approved_request
     published = CSAContract.objects.get(membership=membership).current_version
     for number in (1, 0):
@@ -531,6 +727,15 @@ def test_contract_version_database_rejects_duplicate_and_nonpositive_number(appr
         duplicate.version_number = number
         with pytest.raises(IntegrityError), transaction.atomic():
             CSAContractVersion.objects.bulk_create([duplicate])
+
+    negative = copy.copy(published)
+    negative.pk = uuid.uuid4()
+    negative.version_number = 2
+    negative.total_payment_amount = Decimal("-1")
+    negative.paid_amount = Decimal("0")
+    negative.remaining_amount = Decimal("-1")
+    with pytest.raises(IntegrityError), transaction.atomic():
+        CSAContractVersion.objects.bulk_create([negative])
 
 
 @pytest.mark.django_db(transaction=True)

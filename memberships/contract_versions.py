@@ -1,6 +1,7 @@
 """Immutable CSA agreement revisions and private, per-version PDF publication."""
 
 import hashlib
+from decimal import Decimal
 
 from django.core.files.base import ContentFile
 from django.db import transaction
@@ -25,6 +26,11 @@ from memberships.models import (
     CSAPurchasePaymentStatus,
     MembershipPaymentType,
 )
+from memberships.payments import (
+    CSAPaymentError,
+    _snapshot_rows,
+    purchase_pricing_snapshot,
+)
 
 
 def build_contract_version_snapshot(*, contract, reason, actor) -> dict:
@@ -45,20 +51,30 @@ def build_contract_version_snapshot(*, contract, reason, actor) -> dict:
         range(1, len(payments) + 1)
     ):
         raise CSAContractPDFSnapshotIncomplete("Contract payment schedule is incomplete")
-    if contract.purchase_request_id and contract.purchase_request.payment_plan_id:
-        expected = contract.purchase_request.payment_installments_snapshot
-        actual = [
-            {
-                "sequence": p.installment_sequence,
-                "amount": format(p.amount_due, "f"),
-                "cycle_count": p.cycle_count,
-            }
-            for p in payments
-        ]
+    if contract.purchase_request_id:
+        try:
+            pricing_snapshot = purchase_pricing_snapshot(contract.purchase_request)
+            expected = _snapshot_rows(contract.purchase_request)
+        except CSAPaymentError as error:
+            raise CSAContractPDFSnapshotIncomplete(
+                "Contract purchase pricing snapshot is invalid"
+            ) from error
+        actual = [(p.installment_sequence, p.amount_due, p.cycle_count) for p in payments]
         if actual != expected:
             raise CSAContractPDFSnapshotIncomplete(
                 "Contract payment schedule differs from purchase snapshot"
             )
+        expected_total = Decimal(pricing_snapshot["customer_payable_total"])
+    else:
+        expected_total = contract.amount_snapshot
+        pricing_snapshot = {
+            "original_total": format(contract.amount_snapshot, "f"),
+            "discount_amount": "0",
+            "customer_payable_total": format(contract.amount_snapshot, "f"),
+            "initial_payment_before_discount": format(payments[0].amount_due, "f"),
+            "initial_payment_after_discount": format(payments[0].amount_due, "f"),
+            "coupon": None,
+        }
     total = sum((p.amount_due for p in payments), 0)
     paid = sum(
         (p.amount_paid for p in payments if p.status == CSAPurchasePaymentStatus.CONFIRMED),
@@ -68,7 +84,7 @@ def build_contract_version_snapshot(*, contract, reason, actor) -> dict:
     paid_cycles = sum(
         p.cycle_count for p in payments if p.status == CSAPurchasePaymentStatus.CONFIRMED
     )
-    if total != contract.amount_snapshot or cycles != contract.duration_months_snapshot:
+    if total != expected_total or cycles != contract.duration_months_snapshot:
         raise CSAContractPDFSnapshotIncomplete("Contract payment totals do not match snapshot")
     if any(
         p.status == CSAPurchasePaymentStatus.CONFIRMED and p.amount_paid != p.amount_due
@@ -105,6 +121,7 @@ def build_contract_version_snapshot(*, contract, reason, actor) -> dict:
         "amount_snapshot": contract.amount_snapshot,
         "currency_snapshot": contract.currency_snapshot,
         "payment_type": payment_type,
+        "pricing_snapshot": pricing_snapshot,
         "total_payment_amount": total,
         "paid_amount": paid,
         "remaining_amount": total - paid,

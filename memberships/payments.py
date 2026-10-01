@@ -1,13 +1,14 @@
 """Immutable CSA payment schedule and manual bank-confirmation services."""
 
 from datetime import datetime, time
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 
 from django.db import transaction
 from django.db.models import Sum
 from django.utils import timezone
 
 from identity.models import AuditLog
+from memberships.coupons import CouponError, calculate_coupon_discount, normalize_coupon_code
 from memberships.models import (
     CSAContract,
     CSAContractVersionReason,
@@ -17,7 +18,7 @@ from memberships.models import (
     CSAPurchaseRequestStatus,
     MembershipStatus,
 )
-from memberships.pricing import MAX_POSITIVE_BIG_INTEGER
+from memberships.pricing import parse_whole_vnd
 
 
 class CSAPaymentError(ValueError):
@@ -41,33 +42,111 @@ class CSAPaymentScheduleInvalid(CSAPaymentError):
 
 
 def _whole_vnd(value, *, allow_zero=False) -> Decimal:
-    if isinstance(value, (float, bool)):
-        raise CSAPaymentAmountMismatch("Payment amount must be whole VND")
     try:
-        amount = Decimal(str(value))
-    except (InvalidOperation, TypeError, ValueError) as error:
+        return parse_whole_vnd(value, allow_zero=allow_zero)
+    except ValueError as error:
         raise CSAPaymentAmountMismatch("Payment amount must be whole VND") from error
+
+
+def _coupon_pricing_snapshot(item: CSAPurchaseRequest) -> dict | None:
+    snapshot = item.coupon_snapshot
+    if snapshot is None:
+        if item.customer_payable_total_snapshot is not None:
+            raise CSAPaymentScheduleInvalid("Coupon pricing snapshot is inconsistent")
+        return None
+    required = {
+        "coupon_code",
+        "discount_type",
+        "discount_value",
+        "maximum_discount_amount",
+        "discount_amount",
+        "contract_total_before_discount",
+        "payment_plan_total_before_discount",
+        "customer_payable_total",
+        "initial_payment_before_discount",
+        "initial_payment_after_discount",
+    }
+    coupon_code = snapshot.get("coupon_code") if isinstance(snapshot, dict) else None
     if (
-        not amount.is_finite()
-        or (amount < 0 if allow_zero else amount <= 0)
-        or amount != amount.to_integral_value()
-        or amount > MAX_POSITIVE_BIG_INTEGER
+        not isinstance(snapshot, dict)
+        or not required.issubset(snapshot)
+        or not isinstance(coupon_code, str)
+        or item.customer_payable_total_snapshot is None
     ):
-        raise CSAPaymentAmountMismatch("Payment amount must be whole VND")
-    return amount
+        raise CSAPaymentScheduleInvalid("Coupon pricing snapshot is incomplete")
+    try:
+        canonical_coupon_code = normalize_coupon_code(coupon_code)
+    except CouponError as error:
+        raise CSAPaymentScheduleInvalid("Coupon pricing snapshot is invalid") from error
+    if coupon_code != canonical_coupon_code:
+        raise CSAPaymentScheduleInvalid("Coupon pricing snapshot is invalid")
+    try:
+        original_total = _whole_vnd(item.amount_snapshot)
+        contract_total = _whole_vnd(snapshot["contract_total_before_discount"])
+        plan_total = _whole_vnd(snapshot["payment_plan_total_before_discount"])
+        expected_contract_total = _whole_vnd(
+            Decimal(item.price_option_monthly_amount_snapshot) * item.duration_months_snapshot
+        )
+        payable_total = _whole_vnd(snapshot["customer_payable_total"], allow_zero=True)
+        persisted_payable = _whole_vnd(item.customer_payable_total_snapshot, allow_zero=True)
+        discount = _whole_vnd(snapshot["discount_amount"], allow_zero=True)
+        initial_before = _whole_vnd(snapshot["initial_payment_before_discount"])
+        initial_after = _whole_vnd(snapshot["initial_payment_after_discount"], allow_zero=True)
+    except (CSAPaymentAmountMismatch, TypeError, ValueError) as error:
+        raise CSAPaymentScheduleInvalid("Coupon pricing snapshot is invalid") from error
+    try:
+        _, discount_value, maximum_discount, expected_discount = calculate_coupon_discount(
+            discount_type=snapshot["discount_type"],
+            discount_value=snapshot["discount_value"],
+            maximum_discount_amount=snapshot["maximum_discount_amount"],
+            initial_payment_amount=initial_before,
+        )
+    except CouponError as error:
+        raise CSAPaymentScheduleInvalid("Coupon pricing snapshot is invalid") from error
+    discount_type = snapshot["discount_type"]
+    if (
+        contract_total != expected_contract_total
+        or original_total != plan_total
+        or payable_total != persisted_payable
+        or payable_total != plan_total - discount
+        or initial_after != initial_before - discount
+        or discount != expected_discount
+        or discount > initial_before
+        or (
+            item.payment_plan_id is None
+            and (
+                initial_before != original_total
+                or initial_before != contract_total
+                or initial_after != payable_total
+            )
+        )
+    ):
+        raise CSAPaymentScheduleInvalid("Coupon pricing snapshot totals do not match")
+    return {
+        "original_total": format(original_total, "f"),
+        "discount_amount": format(discount, "f"),
+        "customer_payable_total": format(payable_total, "f"),
+        "initial_payment_before_discount": format(initial_before, "f"),
+        "initial_payment_after_discount": format(initial_after, "f"),
+        "coupon": {
+            "code": canonical_coupon_code,
+            "discount_type": discount_type,
+            "discount_value": format(discount_value, "f"),
+            "maximum_discount_amount": (
+                format(maximum_discount, "f") if maximum_discount is not None else None
+            ),
+        },
+    }
 
 
 def _snapshot_rows(item: CSAPurchaseRequest) -> list[tuple[int, Decimal, int]]:
+    pricing = _coupon_pricing_snapshot(item)
     if item.payment_plan_id is None:
-        amount = (
-            item.coupon_snapshot["initial_payment_after_discount"]
-            if item.coupon_snapshot
-            else item.amount_snapshot
-        )
+        amount = pricing["customer_payable_total"] if pricing else item.amount_snapshot
         return [
             (
                 1,
-                _whole_vnd(amount, allow_zero=bool(item.coupon_snapshot)),
+                _whole_vnd(amount, allow_zero=pricing is not None),
                 item.duration_months_snapshot,
             )
         ]
@@ -83,10 +162,8 @@ def _snapshot_rows(item: CSAPurchaseRequest) -> list[tuple[int, Decimal, int]]:
             "amount_after_discount",
             "months_covered",
         }
-        if not isinstance(entry, dict) or set(entry) not in (
-            expected_keys,
-            expected_keys | coupon_keys,
-        ):
+        required_keys = expected_keys | coupon_keys if pricing is not None else expected_keys
+        if not isinstance(entry, dict) or set(entry) != required_keys:
             raise CSAPaymentScheduleInvalid("Purchase payment snapshot is invalid")
         sequence, cycles = entry["sequence"], entry["cycle_count"]
         if (
@@ -100,10 +177,54 @@ def _snapshot_rows(item: CSAPurchaseRequest) -> list[tuple[int, Decimal, int]]:
         ):
             raise CSAPaymentScheduleInvalid("Purchase payment snapshot is invalid")
         try:
-            amount = _whole_vnd(entry["amount"], allow_zero=bool(item.coupon_snapshot))
+            amount = _whole_vnd(entry["amount"], allow_zero=pricing is not None)
         except CSAPaymentAmountMismatch as error:
             raise CSAPaymentScheduleInvalid("Purchase payment snapshot is invalid") from error
+        if pricing is not None:
+            if (
+                not all(
+                    isinstance(entry[field], str)
+                    for field in (
+                        "amount_before_discount",
+                        "discount_amount",
+                        "amount_after_discount",
+                    )
+                )
+                or not isinstance(entry["months_covered"], int)
+                or isinstance(entry["months_covered"], bool)
+            ):
+                raise CSAPaymentScheduleInvalid("Purchase payment coupon snapshot is invalid")
+            try:
+                before = _whole_vnd(entry["amount_before_discount"])
+                row_discount = _whole_vnd(entry["discount_amount"], allow_zero=True)
+                after = _whole_vnd(entry["amount_after_discount"], allow_zero=True)
+            except CSAPaymentAmountMismatch as error:
+                raise CSAPaymentScheduleInvalid(
+                    "Purchase payment coupon snapshot is invalid"
+                ) from error
+            expected_discount = (
+                Decimal(pricing["discount_amount"]) if expected_sequence == 1 else Decimal(0)
+            )
+            if (
+                entry["months_covered"] != cycles
+                or amount != after
+                or after != before - row_discount
+                or row_discount != expected_discount
+            ):
+                raise CSAPaymentScheduleInvalid("Purchase payment coupon snapshot is invalid")
         rows.append((sequence, amount, cycles))
+    if pricing is not None:
+        before_total = sum(
+            (_whole_vnd(entry["amount_before_discount"]) for entry in snapshot),
+            Decimal(0),
+        )
+        if (
+            before_total != Decimal(pricing["original_total"])
+            or _whole_vnd(snapshot[0]["amount_before_discount"])
+            != Decimal(pricing["initial_payment_before_discount"])
+            or rows[0][1] != Decimal(pricing["initial_payment_after_discount"])
+        ):
+            raise CSAPaymentScheduleInvalid("Purchase payment coupon totals do not match")
     if (
         sum((row[1] for row in rows), Decimal(0))
         != Decimal(
@@ -115,6 +236,24 @@ def _snapshot_rows(item: CSAPurchaseRequest) -> list[tuple[int, Decimal, int]]:
     ):
         raise CSAPaymentScheduleInvalid("Purchase payment snapshot totals do not match")
     return rows
+
+
+def purchase_pricing_snapshot(item: CSAPurchaseRequest) -> dict:
+    """Build validated pricing facts using only immutable request snapshots."""
+
+    rows = _snapshot_rows(item)
+    coupon_pricing = _coupon_pricing_snapshot(item)
+    if coupon_pricing is not None:
+        return coupon_pricing
+    original_total = _whole_vnd(item.amount_snapshot)
+    return {
+        "original_total": format(original_total, "f"),
+        "discount_amount": "0",
+        "customer_payable_total": format(original_total, "f"),
+        "initial_payment_before_discount": format(rows[0][1], "f"),
+        "initial_payment_after_discount": format(rows[0][1], "f"),
+        "coupon": None,
+    }
 
 
 @transaction.atomic
