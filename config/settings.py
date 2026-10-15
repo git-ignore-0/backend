@@ -111,6 +111,7 @@ INSTALLED_APPS = [
     "oauth2_provider",
     "rest_framework",
     "content.apps.ContentConfig",
+    "commerce.apps.CommerceConfig",
     "identity.apps.IdentityConfig",
     "members.apps.MembersConfig",
     "referrals.apps.ReferralsConfig",

@@ -725,9 +725,10 @@ def package_payload(item, *, public=False, locale=MembershipContentLocale.VI):
                     }
                     if public
                     else {
+                        "product_is_active": package_item.product.is_active,
                         "product_translations": _translation_payloads(
                             package_item.product, "short_description"
-                        )
+                        ),
                     }
                 ),
             }
@@ -1481,6 +1482,21 @@ class AdminProductViewSet(viewsets.ViewSet):
         serializer = ProductWriteSerializer(item, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
+        if data.get("is_active") is False:
+            from commerce.models import Product as StoreProduct
+
+            if (
+                StoreProduct.objects.filter(csa_quota_group=item).exists()
+                or MembershipPackageItem.objects.filter(
+                    product=item, package__is_active=True
+                ).exists()
+            ):
+                return no_store(
+                    Response(
+                        {"errors": [{"code": "csa_quota_group_in_use"}]},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+                )
         translations = data.pop("translations", None)
         for field, value in data.items():
             setattr(item, field, value)
@@ -1514,8 +1530,24 @@ class AdminProductViewSet(viewsets.ViewSet):
         try:
             item.delete()
         except ProtectedError as error:
+            from commerce.models import Product as StoreProduct
+
+            if StoreProduct.objects.filter(csa_quota_group=item).exists():
+                return no_store(
+                    Response(
+                        {"errors": [{"code": "csa_quota_group_in_use"}]},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+                )
             raise ValidationError({"product": "Product is in use."}) from error
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+def _lock_active_package_products(product_ids):
+    ids = set(product_ids)
+    products = list(Product.objects.select_for_update().filter(pk__in=ids).order_by("pk"))
+    if len(products) != len(ids) or any(not product.is_active for product in products):
+        raise ValidationError({"items": "Package items must use active products."})
 
 
 class AdminPackageViewSet(viewsets.ViewSet):
@@ -1545,6 +1577,8 @@ class AdminPackageViewSet(viewsets.ViewSet):
         items = data.pop("items")
         translations = data.pop("translations")
         options = data.pop("price_options")
+        if data.get("is_active", True):
+            _lock_active_package_products(item["product_id"].pk for item in items)
         vi = next(item for item in translations if item["locale"] == MembershipContentLocale.VI)
         package = MembershipPackage.objects.create(
             name=vi["name"], description=vi["description"], **data
@@ -1582,6 +1616,14 @@ class AdminPackageViewSet(viewsets.ViewSet):
         serializer = PackageWriteSerializer(package, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
+        if data.get("is_active", package.is_active):
+            submitted_items = data.get("items")
+            product_ids = (
+                (item["product_id"].pk for item in submitted_items)
+                if submitted_items is not None
+                else package.items.values_list("product_id", flat=True)
+            )
+            _lock_active_package_products(product_ids)
         items = data.pop("items", None)
         translations = data.pop("translations", None)
         options = data.pop("price_options", None)

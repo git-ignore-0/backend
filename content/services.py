@@ -407,6 +407,25 @@ def _media_asset_file_names(asset):
     }
 
 
+@transaction.atomic
+def delete_orphan_media_asset(*, asset_id, storage_prefix):
+    """Delete an unreferenced asset belonging to one media namespace."""
+    asset = MediaAsset.objects.select_for_update().filter(pk=asset_id).first()
+    if asset is None:
+        return False
+    file_names = _media_asset_file_names(asset)
+    prefix = f"{storage_prefix}/"
+    if not asset.file.name.startswith(prefix) or any(
+        not file_name.startswith(prefix) for file_name in file_names
+    ):
+        return False
+    if _media_asset_has_references(asset):
+        return False
+    asset.delete()
+    transaction.on_commit(partial(_delete_media_files, file_names))
+    return True
+
+
 def _cleanup_orphan_tracker_farm_media(
     *,
     actor,
@@ -505,7 +524,7 @@ def reorder_tracker_farms(*, actor, items):
 
 
 def store_media_image(upload, *, actor, storage_prefix: str) -> MediaAsset:
-    if storage_prefix not in {"farms", "rewards", "testimonials", "workshops"}:
+    if storage_prefix not in {"farms", "products", "rewards", "testimonials", "workshops"}:
         raise ValueError("Unsupported media storage prefix.")
     if upload.size > settings.CONTENT_MAX_UPLOAD_BYTES:
         raise ValueError("Image exceeds the upload size limit.")

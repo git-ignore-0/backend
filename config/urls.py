@@ -13,6 +13,7 @@ urlpatterns = [
     path("admin/", admin.site.urls),
     path("api/v1/administrative-units/", include("members.urls")),
     path("api/v1/", include("content.urls")),
+    path("api/v1/", include("commerce.urls")),
     path("api/v1/", include("referrals.urls")),
     path("api/v1/", include("memberships.urls")),
     re_path(r"^register/?$", CoreSignupView.as_view(), name="account_signup_alias"),

@@ -51,4 +51,4 @@ select = ["E", "F", "I", "UP", "B", "DJ"]
 ignore = ["DJ001"]
 
 [tool.setuptools.packages.find]
-include = ["config*", "content*", "identity*", "members*", "referrals*", "memberships*"]
+include = ["config*", "content*", "commerce*", "identity*", "members*", "referrals*", "memberships*"]
