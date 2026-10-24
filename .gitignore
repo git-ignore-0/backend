@@ -5,6 +5,7 @@
 *.key
 *.pem
 .venv/
+.venv-broken
 
 # Python caches and build artifacts
 __pycache__/

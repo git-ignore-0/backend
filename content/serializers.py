@@ -379,10 +379,11 @@ class TrackerFarmReorderSerializer(TestimonialStrictSerializer):
 
 
 def public_tracker_farm_payload(farm: TrackerFarm, locale: str, request):
-    name = getattr(farm, f"name_{locale}")
-    photo_assets = [photo.image for photo in farm.photos.all()]
-    if not photo_assets and farm.image:
-        photo_assets = [farm.image]
+    shared = farm.farm if farm.farm_id else farm
+    name = getattr(shared, f"name_{locale}")
+    photo_assets = [photo.image for photo in shared.photos.all()]
+    if not photo_assets and shared.image:
+        photo_assets = [shared.image]
     images = []
     for photo_asset in photo_assets:
         asset = media_payload(photo_asset, request)
@@ -406,8 +407,8 @@ def public_tracker_farm_payload(farm: TrackerFarm, locale: str, request):
     return {
         "id": str(farm.pk),
         "name": name,
-        "location": getattr(farm, f"location_{locale}"),
-        "description": getattr(farm, f"description_{locale}"),
+        "location": getattr(shared, f"location_{locale}"),
+        "description": getattr(shared, f"description_{locale}"),
         "image": images[0] if images else None,
         "images": images,
         "signup_count": farm.signup_count,
@@ -417,18 +418,19 @@ def public_tracker_farm_payload(farm: TrackerFarm, locale: str, request):
 
 
 def admin_tracker_farm_payload(farm: TrackerFarm, request):
-    photos = [media_payload(photo.image, request) for photo in farm.photos.all()]
-    if not photos and farm.image:
-        photos = [media_payload(farm.image, request)]
+    shared = farm.farm if farm.farm_id else farm
+    photos = [media_payload(photo.image, request) for photo in shared.photos.all()]
+    if not photos and shared.image:
+        photos = [media_payload(shared.image, request)]
     return {
         "id": str(farm.pk),
-        "name_en": farm.name_en,
-        "name_vi": farm.name_vi,
-        "location_en": farm.location_en,
-        "location_vi": farm.location_vi,
-        "description_en": farm.description_en,
-        "description_vi": farm.description_vi,
-        "image": media_payload(farm.image, request) if farm.image else None,
+        "name_en": shared.name_en,
+        "name_vi": shared.name_vi,
+        "location_en": shared.location_en,
+        "location_vi": shared.location_vi,
+        "description_en": shared.description_en,
+        "description_vi": shared.description_vi,
+        "image": media_payload(shared.image, request) if shared.image else None,
         "photos": photos,
         "signup_count": farm.signup_count,
         "one_month_signup_count": farm.one_month_signup_count,

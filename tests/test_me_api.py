@@ -4,12 +4,18 @@ from django.utils import timezone
 from oauth2_provider.models import AccessToken
 
 from identity.models import AccountStatus
+from members.models import MemberProfile
 
 
 @pytest.mark.django_db
 def test_profile_scope_returns_stable_core_identity(client, active_user, access_token):
     group = Group.objects.create(name="member")
     active_user.groups.add(group)
+    MemberProfile.objects.create(
+        user=active_user,
+        phone_number="+84 912 345 678",
+        date_of_birth="1990-06-15",
+    )
 
     response = client.get(
         "/api/v1/me",
@@ -27,8 +33,27 @@ def test_profile_scope_returns_stable_core_identity(client, active_user, access_
             "locale": "vi",
             "status": "active",
             "roles": ["member"],
+            "phone_number": "+84 912 345 678",
+            "date_of_birth": "1990-06-15",
         }
     }
+
+
+@pytest.mark.django_db
+def test_profile_scope_returns_empty_optional_profile_without_creating_row(
+    client, active_user, access_token
+):
+    assert not MemberProfile.objects.filter(user=active_user).exists()
+
+    response = client.get(
+        "/api/v1/me",
+        HTTP_AUTHORIZATION=f"Bearer {access_token.token}",
+    )
+
+    assert response.status_code == 200
+    assert response.json()["data"]["phone_number"] == ""
+    assert response.json()["data"]["date_of_birth"] is None
+    assert not MemberProfile.objects.filter(user=active_user).exists()
 
 
 @pytest.mark.django_db

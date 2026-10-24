@@ -114,6 +114,7 @@ def me(request):
     email_verified = user.email_verified
     if not user.can_access_core(email_verified=email_verified):
         return oauth_error("account_inactive", 403)
+    profile = MemberProfile.objects.filter(user=user).first()
 
     return no_store(
         JsonResponse(
@@ -126,6 +127,12 @@ def me(request):
                     "locale": user.locale,
                     "status": user.status,
                     "roles": list(user.groups.order_by("name").values_list("name", flat=True)),
+                    "phone_number": profile.phone_number if profile else "",
+                    "date_of_birth": (
+                        profile.date_of_birth.isoformat()
+                        if profile and profile.date_of_birth
+                        else None
+                    ),
                 }
             }
         )

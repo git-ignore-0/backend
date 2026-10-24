@@ -327,6 +327,13 @@ class TestimonialTranslation(models.Model):
 
 class TrackerFarm(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    farm = models.OneToOneField(
+        "farms.Farm",
+        related_name="tracker_profile",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+    )
     name_en = models.CharField(max_length=240)
     name_vi = models.CharField(max_length=240)
     location_en = models.CharField(max_length=240)

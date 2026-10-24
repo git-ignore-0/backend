@@ -260,6 +260,16 @@ def create_product(*, actor, payload):
 @transaction.atomic
 def update_product(*, actor, product, payload):
     data = payload.copy()
+    from farms.models import FarmWeeklySupply
+
+    if (
+        any(
+            field in data and data[field] != getattr(product, field)
+            for field in ("unit_size", "unit_label_vi", "unit_label_en")
+        )
+        and FarmWeeklySupply.objects.filter(farm_product__product=product).exists()
+    ):
+        raise CatalogConflict("product_unit_in_use")
     translations = data.pop("translations", None)
     previous_image = product.primary_image
     requested_category_id = data.pop("category_id", product.category_id)

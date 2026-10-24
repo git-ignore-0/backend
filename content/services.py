@@ -34,6 +34,7 @@ from content.models import (
     WorkshopTranslation,
 )
 from content.validators import tiptap_has_content, validate_tiptap_document
+from farms.models import FarmPhoto
 
 logger = logging.getLogger(__name__)
 preview_signer = TimestampSigner(salt="nfv-workshop-preview")
@@ -221,14 +222,14 @@ def request_frontend_revalidation(tags):
 
 def tracker_farm_queryset():
     return (
-        TrackerFarm.objects.select_related("image")
+        TrackerFarm.objects.select_related("image", "farm__image")
         .prefetch_related(
             Prefetch(
-                "photos",
-                queryset=TrackerFarmPhoto.objects.select_related("image").order_by(
+                "farm__photos",
+                queryset=FarmPhoto.objects.select_related("image").order_by(
                     "sort_order", "created_at", "id"
                 ),
-            )
+            ),
         )
         .order_by("sort_order", "created_at", "id")
     )
@@ -247,6 +248,68 @@ def _replace_tracker_farm_photos(farm, assets):
         ]
     )
     farm.image = assets[0] if assets else None
+
+
+def _sync_canonical_farm(profile):
+    """Keep the legacy tracker write endpoint compatible while Farm owns shared data."""
+    from farms.models import Farm, FarmPhoto
+
+    farm = Farm.objects.select_for_update().filter(pk=profile.farm_id or profile.pk).first()
+    created = farm is None
+    if created:
+        farm = Farm(id=profile.pk, legacy_tracker_owned=True)
+    shared_changed = created
+    for field in (
+        "name_en",
+        "name_vi",
+        "location_en",
+        "location_vi",
+        "description_en",
+        "description_vi",
+    ):
+        value = getattr(profile, field)
+        if getattr(farm, field) != value:
+            setattr(farm, field, value)
+            shared_changed = True
+    if farm.image_id != profile.image_id:
+        farm.image_id = profile.image_id
+        shared_changed = True
+    assets = list(profile.photos.order_by("sort_order", "created_at", "id"))
+    if not assets and profile.image_id:
+        assets = [profile.image]
+    new_photo_ids = [asset.image_id if hasattr(asset, "image_id") else asset.pk for asset in assets]
+    existing_photo_ids = (
+        list(
+            FarmPhoto.objects.filter(farm=farm)
+            .order_by("sort_order")
+            .values_list("image_id", flat=True)
+        )
+        if not created
+        else []
+    )
+    gallery_changed = existing_photo_ids != new_photo_ids
+    if shared_changed or gallery_changed:
+        if not created:
+            farm.version += 1
+        farm.save()
+        if created:
+            Farm.objects.filter(pk=farm.pk).update(
+                created_at=profile.created_at, updated_at=profile.updated_at
+            )
+        if gallery_changed:
+            FarmPhoto.objects.filter(farm=farm).delete()
+            FarmPhoto.objects.bulk_create(
+                [
+                    FarmPhoto(farm=farm, image_id=asset_id, sort_order=index)
+                    for index, asset_id in enumerate(new_photo_ids)
+                ]
+            )
+    if profile.farm_id != farm.pk:
+        profile.farm = farm
+        profile.save(update_fields=["farm"])
+    if farm.tracker_profile_revision < profile.version:
+        Farm.objects.filter(pk=farm.pk).update(tracker_profile_revision=profile.version)
+    return farm
 
 
 def _tracker_farm_media_ids(farm):
@@ -285,6 +348,21 @@ def _lock_submitted_tracker_farm_media(values, *, additional_ids=()):
             }
         )
 
+    invalid_ids = [
+        asset_id
+        for asset_id in submitted_ids
+        if asset_id not in additional_ids
+        and (
+            not locked_by_id[asset_id].file.name.startswith("farms/")
+            or any(
+                not str(variant.get("file") or "").startswith("farms/")
+                for variant in locked_by_id[asset_id].variants
+            )
+        )
+    ]
+    if invalid_ids:
+        raise ValidationError({field_name: "Choose Farm images."})
+
     if field_name == "photo_ids":
         values["photo_ids"] = [locked_by_id[asset_id] for asset_id in submitted_ids]
     elif field_name == "image_id":
@@ -309,6 +387,7 @@ def create_tracker_farm(*, actor, data):
     farm = TrackerFarm.objects.create(**values)
     if gallery_assets is not None:
         _replace_tracker_farm_photos(farm, gallery_assets)
+    _sync_canonical_farm(farm)
     audit(actor=actor, action="tracker_farm.create", entity=farm)
     _revalidate_tracker_farms()
     return farm
@@ -316,6 +395,11 @@ def create_tracker_farm(*, actor, data):
 
 @transaction.atomic
 def update_tracker_farm(*, farm_id, actor, expected_version, data):
+    from farms.models import Farm
+
+    canonical_id = TrackerFarm.objects.only("farm_id").get(pk=farm_id).farm_id
+    if canonical_id:
+        Farm.objects.select_for_update().get(pk=canonical_id)
     farm = TrackerFarm.objects.select_for_update().get(pk=farm_id)
     if farm.version != expected_version:
         raise TrackerFarmVersionConflict
@@ -358,6 +442,7 @@ def update_tracker_farm(*, farm_id, actor, expected_version, data):
         _replace_tracker_farm_photos(farm, gallery_assets)
     farm.version += 1
     farm.save()
+    _sync_canonical_farm(farm)
     if gallery_assets is not None:
         retained_ids = {asset.pk for asset in gallery_assets}
         _cleanup_orphan_tracker_farm_media(
@@ -480,11 +565,30 @@ def delete_temporary_tracker_farm_media(*, media_id, actor):
 
 @transaction.atomic
 def delete_tracker_farm(*, farm_id, actor):
+    from farms.models import Farm, FarmPhoto, FarmProduct
+
+    canonical_id = TrackerFarm.objects.only("farm_id").get(pk=farm_id).farm_id
+    if canonical_id:
+        Farm.objects.select_for_update().get(pk=canonical_id)
     farm = TrackerFarm.objects.select_for_update().get(pk=farm_id)
     candidate_ids = _tracker_farm_media_ids(farm)
+    if canonical_id:
+        canonical = Farm.objects.select_for_update().get(pk=canonical_id)
+        canonical.tracker_profile_revision = max(canonical.tracker_profile_revision, farm.version)
+        canonical.save(update_fields=["tracker_profile_revision"])
+        candidate_ids.update(canonical.photos.values_list("image_id", flat=True))
+        if canonical.image_id:
+            candidate_ids.add(canonical.image_id)
     audit(actor=actor, action="tracker_farm.delete", entity=farm)
     farm.photos.all().delete()
     farm.delete()
+    if (
+        canonical_id
+        and canonical.legacy_tracker_owned
+        and not FarmProduct.objects.filter(farm_id=canonical_id).exists()
+    ):
+        FarmPhoto.objects.filter(farm_id=canonical_id).delete()
+        canonical.delete()
     _cleanup_orphan_tracker_farm_media(
         actor=actor,
         candidate_ids=candidate_ids,

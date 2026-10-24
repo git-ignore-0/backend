@@ -252,7 +252,10 @@ class AdminProductViewSet(viewsets.ViewSet):
         product = get_object_or_404(Product.objects.select_for_update(), pk=pk)
         serializer = ProductWriteSerializer(data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
-        update_product(actor=request.user, product=product, payload=serializer.validated_data)
+        try:
+            update_product(actor=request.user, product=product, payload=serializer.validated_data)
+        except CatalogConflict as error:
+            return conflict_response(error)
         return no_store(Response({"data": product_payload(product_queryset().get(pk=pk), request)}))
 
     def destroy(self, request, pk=None):

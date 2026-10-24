@@ -312,7 +312,11 @@ class PublicTrackerFarmListView(APIView):
         query = PublicTrackerFarmQuerySerializer(data=request.query_params)
         query.is_valid(raise_exception=True)
         locale = query.validated_data["locale"]
-        farms = tracker_farm_queryset().filter(is_visible=True)
+        farms = (
+            tracker_farm_queryset()
+            .filter(is_visible=True)
+            .filter(Q(farm__is_active=True) | Q(farm__isnull=True))
+        )
         response = Response(
             {"data": [public_tracker_farm_payload(farm, locale, request) for farm in farms]}
         )

@@ -112,6 +112,7 @@ INSTALLED_APPS = [
     "rest_framework",
     "content.apps.ContentConfig",
     "commerce.apps.CommerceConfig",
+    "farms.apps.FarmsConfig",
     "identity.apps.IdentityConfig",
     "members.apps.MembersConfig",
     "referrals.apps.ReferralsConfig",
