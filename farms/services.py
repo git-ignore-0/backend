@@ -3,6 +3,7 @@ from django.db.models import Max, Prefetch
 from rest_framework.exceptions import ValidationError
 
 from commerce.models import Product
+from commerce.services import schedule_store_revalidation
 from content.models import MediaAsset
 from content.services import audit, delete_orphan_media_asset, request_frontend_revalidation
 from farms.models import Farm, FarmPhoto, FarmProduct, FarmWeeklySupply
@@ -77,6 +78,9 @@ def update_farm(*, farm_id, actor, expected_version, data):
     from content.models import TrackerFarm, TrackerFarmPhoto
 
     farm = Farm.objects.select_for_update().get(pk=farm_id)
+    store_product_slugs = list(
+        Product.objects.filter(farm_offers__farm_id=farm_id).values_list("slug", flat=True)
+    )
     profile = TrackerFarm.objects.select_for_update().filter(farm_id=farm_id).first()
     if farm.version != expected_version:
         raise FarmConflict("version_conflict")
@@ -119,6 +123,8 @@ def update_farm(*, farm_id, actor, expected_version, data):
                 delete_orphan_media_asset(asset_id=asset_id, storage_prefix="farms")
         transaction.on_commit(lambda: request_frontend_revalidation(["tracker-farms"]))
     audit(actor=actor, action="farm.update", entity=farm)
+    if store_product_slugs:
+        schedule_store_revalidation(slugs=store_product_slugs)
     return farm
 
 
@@ -154,6 +160,7 @@ def add_farm_product(*, farm_id, product_id, actor):
     except IntegrityError as error:
         raise FarmConflict("product_already_linked") from error
     audit(actor=actor, action="farm.product.add", entity=row, context={"farm_id": str(farm.pk)})
+    schedule_store_revalidation(slugs=[product.slug])
     return row
 
 
@@ -172,6 +179,7 @@ def update_farm_product(*, farm_id, product_id, is_active, actor):
         audit(
             actor=actor, action="farm.product.update", entity=row, context={"is_active": is_active}
         )
+        schedule_store_revalidation(slugs=[row.product.slug])
     return row
 
 
@@ -188,7 +196,9 @@ def delete_farm_product(*, farm_id, product_id, actor):
     if FarmWeeklySupply.objects.filter(farm_product=row).exists():
         raise FarmConflict("farm_product_has_supply")
     audit(actor=actor, action="farm.product.delete", entity=row, context={"farm_id": str(farm_id)})
+    slug = row.product.slug
     row.delete()
+    schedule_store_revalidation(slugs=[slug])
 
 
 @transaction.atomic

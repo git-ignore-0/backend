@@ -259,6 +259,7 @@ def _sync_canonical_farm(profile):
     if created:
         farm = Farm(id=profile.pk, legacy_tracker_owned=True)
     shared_changed = created
+    store_presentation_changed = False
     for field in (
         "name_en",
         "name_vi",
@@ -271,6 +272,8 @@ def _sync_canonical_farm(profile):
         if getattr(farm, field) != value:
             setattr(farm, field, value)
             shared_changed = True
+            if field in {"name_en", "name_vi", "location_en", "location_vi"}:
+                store_presentation_changed = True
     if farm.image_id != profile.image_id:
         farm.image_id = profile.image_id
         shared_changed = True
@@ -309,6 +312,12 @@ def _sync_canonical_farm(profile):
         profile.save(update_fields=["farm"])
     if farm.tracker_profile_revision < profile.version:
         Farm.objects.filter(pk=farm.pk).update(tracker_profile_revision=profile.version)
+    if store_presentation_changed and not created:
+        from commerce.models import Product
+        from commerce.services import schedule_store_revalidation
+
+        linked_slugs = Product.objects.filter(farm_offers__farm=farm).values_list("slug", flat=True)
+        schedule_store_revalidation(slugs=linked_slugs)
     return farm
 
 

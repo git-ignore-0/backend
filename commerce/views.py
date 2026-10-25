@@ -1,17 +1,26 @@
 from django.db import transaction
-from django.db.models import Count, Exists, OuterRef, Q
+from django.db.models import CharField, Count, Exists, OuterRef, Q, Subquery
+from django.db.models.functions import Coalesce
 from django.shortcuts import get_object_or_404
 from rest_framework import status, viewsets
 from rest_framework.exceptions import NotFound
+from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from commerce.models import Category, Product
+from commerce.models import Category, Product, ProductTranslation
+from commerce.public_catalog import (
+    public_category_payloads,
+    public_product_payload,
+    public_product_queryset,
+)
 from commerce.serializers import (
     CategoryQuerySerializer,
     CategoryWriteSerializer,
     ProductQuerySerializer,
     ProductWriteSerializer,
+    PublicStoreLocaleSerializer,
+    PublicStoreProductQuerySerializer,
 )
 from commerce.services import (
     CatalogConflict,
@@ -33,6 +42,120 @@ def no_store(response):
     response["Cache-Control"] = "private, no-store"
     response["Pragma"] = "no-cache"
     return response
+
+
+def public_cache(response):
+    response["Cache-Control"] = "public, max-age=60, stale-while-revalidate=300"
+    return response
+
+
+class PublicStoreCategoryListView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        query = PublicStoreLocaleSerializer(data=request.query_params.dict())
+        query.is_valid(raise_exception=True)
+        return public_cache(
+            Response({"data": public_category_payloads(query.validated_data["locale"])})
+        )
+
+
+class PublicStoreProductListView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        query = PublicStoreProductQuerySerializer(data=request.query_params.dict())
+        query.is_valid(raise_exception=True)
+        data = query.validated_data
+        rows = public_product_queryset()
+        if search := data["search"]:
+            rows = rows.filter(
+                Q(sku__icontains=search)
+                | Q(slug__icontains=search)
+                | Q(translations__name__icontains=search)
+                | Q(category__translations__name__icontains=search)
+                | Q(
+                    farm_offers__is_active=True,
+                    farm_offers__farm__is_active=True,
+                    farm_offers__farm__name_vi__icontains=search,
+                )
+                | Q(
+                    farm_offers__is_active=True,
+                    farm_offers__farm__is_active=True,
+                    farm_offers__farm__name_en__icontains=search,
+                )
+            ).distinct()
+        if category_id := data.get("category_id"):
+            rows = rows.filter(
+                Q(category_id=category_id)
+                | Q(category__parent_id=category_id)
+                | Q(category__parent__parent_id=category_id)
+            )
+        if "csa_eligible" in data:
+            eligible = Q(
+                csa_quota_group__isnull=False,
+                csa_quota_group__is_active=True,
+                csa_quota_cost__gt=0,
+            )
+            rows = rows.filter(eligible if data["csa_eligible"] else ~eligible)
+        if "price_min" in data:
+            rows = rows.filter(retail_price_vnd__gte=data["price_min"])
+        if "price_max" in data:
+            rows = rows.filter(retail_price_vnd__lte=data["price_max"])
+        ordering = {
+            "default": ("-updated_at", "id"),
+            "price_asc": ("retail_price_vnd", "id"),
+            "price_desc": ("-retail_price_vnd", "id"),
+            "name": ("localized_name", "id"),
+        }[data["sort"]]
+        if data["sort"] == "name":
+            fallback_locale = "vi" if data["locale"] == "en" else "en"
+            requested_name = ProductTranslation.objects.filter(
+                product_id=OuterRef("pk"), locale=data["locale"]
+            ).values("name")[:1]
+            fallback_name = ProductTranslation.objects.filter(
+                product_id=OuterRef("pk"), locale=fallback_locale
+            ).values("name")[:1]
+            rows = rows.annotate(
+                localized_name=Coalesce(
+                    Subquery(requested_name),
+                    Subquery(fallback_name),
+                    output_field=CharField(),
+                )
+            )
+        rows = rows.order_by(*ordering)
+        total = rows.count()
+        page = data["page"]
+        page_size = data["page_size"]
+        items = rows[(page - 1) * page_size : page * page_size]
+        return public_cache(
+            Response(
+                {
+                    "data": [
+                        public_product_payload(item, request, data["locale"]) for item in items
+                    ],
+                    "meta": {"page": page, "page_size": page_size, "total": total},
+                }
+            )
+        )
+
+
+class PublicStoreProductDetailView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, slug):
+        query = PublicStoreLocaleSerializer(data=request.query_params.dict())
+        query.is_valid(raise_exception=True)
+        item = get_object_or_404(public_product_queryset(), slug=slug)
+        return public_cache(
+            Response(
+                {
+                    "data": public_product_payload(
+                        item, request, query.validated_data["locale"], detail=True
+                    )
+                }
+            )
+        )
 
 
 def category_queryset():

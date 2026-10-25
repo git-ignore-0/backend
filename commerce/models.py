@@ -3,6 +3,8 @@ import uuid
 from django.db import models
 from django.db.models import Q
 
+PUBLIC_STORE_MAX_PRICE_VND = 1_000_000_000
+
 
 class CatalogTreeLock(models.Model):
     """The shared row serialized by catalog mutations that depend on the category tree."""

@@ -10,6 +10,12 @@ router.register(
 router.register("admin/store-products", views.AdminProductViewSet, basename="admin-store-product")
 
 urlpatterns = [
+    path("public/store-categories", views.PublicStoreCategoryListView.as_view()),
+    path("public/store-products", views.PublicStoreProductListView.as_view()),
+    path(
+        "public/store-products/<slug:slug>",
+        views.PublicStoreProductDetailView.as_view(),
+    ),
     path("admin/store-products/media", views.AdminProductMediaUploadView.as_view()),
     path(
         "admin/store-products/media/<uuid:media_id>",

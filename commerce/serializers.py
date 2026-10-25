@@ -7,6 +7,13 @@ MAX_POSITIVE_INTEGER = 2_147_483_647
 MAX_POSITIVE_BIG_INTEGER = 9_223_372_036_854_775_807
 
 
+class StrictBooleanField(serializers.BooleanField):
+    def to_internal_value(self, data):
+        if data not in {"true", "false"}:
+            raise serializers.ValidationError("Must be exactly true or false.")
+        return data == "true"
+
+
 class StrictSerializer(serializers.Serializer):
     def to_internal_value(self, data):
         if hasattr(data, "keys"):
@@ -92,3 +99,32 @@ class ProductQuerySerializer(StrictSerializer):
     is_published = serializers.BooleanField(required=False)
     csa_eligible = serializers.BooleanField(required=False)
     page = serializers.IntegerField(min_value=1, max_value=10000, required=False, default=1)
+
+
+class PublicStoreLocaleSerializer(StrictSerializer):
+    locale = serializers.ChoiceField(choices=["vi", "en"])
+
+
+class PublicStoreProductQuerySerializer(PublicStoreLocaleSerializer):
+    search = serializers.CharField(
+        max_length=100, allow_blank=True, trim_whitespace=True, required=False, default=""
+    )
+    category_id = serializers.UUIDField(required=False)
+    csa_eligible = StrictBooleanField(required=False)
+    price_min = serializers.IntegerField(min_value=0, max_value=1_000_000_000, required=False)
+    price_max = serializers.IntegerField(min_value=0, max_value=1_000_000_000, required=False)
+    sort = serializers.ChoiceField(
+        choices=["default", "price_asc", "price_desc", "name"],
+        required=False,
+        default="default",
+    )
+    page = serializers.IntegerField(min_value=1, max_value=10_000, required=False, default=1)
+    page_size = serializers.IntegerField(min_value=1, max_value=48, required=False, default=12)
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        if attrs.get("price_min", 0) > attrs.get("price_max", 1_000_000_000):
+            raise serializers.ValidationError(
+                {"price_max": "Must be greater than or equal to price_min."}
+            )
+        return attrs

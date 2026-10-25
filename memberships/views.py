@@ -1515,6 +1515,14 @@ class AdminProductViewSet(viewsets.ViewSet):
                         "short_description": translation["short_description"],
                     },
                 )
+        from commerce.models import Product as StoreProduct
+        from commerce.services import schedule_store_revalidation
+
+        linked_slugs = list(
+            StoreProduct.objects.filter(csa_quota_group=item).values_list("slug", flat=True)
+        )
+        if linked_slugs:
+            schedule_store_revalidation(slugs=linked_slugs)
         return no_store(
             Response(
                 {

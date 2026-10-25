@@ -4,6 +4,7 @@ from django.utils.text import slugify
 from rest_framework.exceptions import ValidationError
 
 from commerce.models import (
+    PUBLIC_STORE_MAX_PRICE_VND,
     CatalogTreeLock,
     Category,
     CategoryTranslation,
@@ -11,7 +12,7 @@ from commerce.models import (
     ProductTranslation,
 )
 from content.models import MediaAsset
-from content.services import delete_orphan_media_asset
+from content.services import delete_orphan_media_asset, request_frontend_revalidation
 from memberships.models import Product as MembershipProduct
 
 
@@ -19,6 +20,18 @@ class CatalogConflict(Exception):
     def __init__(self, code):
         self.code = code
         super().__init__(code)
+
+
+def schedule_store_revalidation(*, slugs=(), categories=False, all_details=False):
+    tags = {"store-products"}
+    if categories:
+        tags.add("store-categories")
+    slug_tags = {f"store-product:{slug}" for slug in slugs if slug}
+    if all_details or len(tags | slug_tags) > 20:
+        tags.add("store-product-details")
+    else:
+        tags.update(slug_tags)
+    transaction.on_commit(lambda: request_frontend_revalidation(sorted(tags)))
 
 
 def _automatic_slug(model, translations, *, fallback=""):
@@ -119,6 +132,7 @@ def create_category(*, actor, payload):
     except IntegrityError as error:
         raise ValidationError({"slug": "This slug is already in use."}) from error
     _save_translations(CategoryTranslation, "category", category, translations)
+    schedule_store_revalidation(categories=True)
     return category
 
 
@@ -155,6 +169,7 @@ def update_category(*, actor, category, payload):
     except IntegrityError as error:
         raise ValidationError({"slug": "This slug is already in use."}) from error
     _save_translations(CategoryTranslation, "category", category, translations)
+    schedule_store_revalidation(categories=True, all_details=True)
     return category
 
 
@@ -168,6 +183,7 @@ def delete_category(*, actor, category):
         category.delete()
     except ProtectedError as error:
         raise CatalogConflict("category_in_use") from error
+    schedule_store_revalidation(categories=True)
 
 
 def _get_category_for_product(pk):
@@ -213,6 +229,11 @@ def _validate_product(data, *, instance=None, translations=None):
     if published and not active:
         raise ValidationError({"is_active": "Published products must be active."})
     if published:
+        price = data.get("retail_price_vnd", instance.retail_price_vnd if instance else 0)
+        if price > PUBLIC_STORE_MAX_PRICE_VND:
+            raise ValidationError(
+                {"retail_price_vnd": "Published products exceed the public price limit."}
+            )
         locales = set(_translation_map(instance, translations))
         if locales != {"vi", "en"}:
             raise ValidationError({"translations": "Both languages are required to publish."})
@@ -254,12 +275,14 @@ def create_product(*, actor, payload):
     except IntegrityError as error:
         raise ValidationError({"sku": "SKU or slug is already in use."}) from error
     _save_translations(ProductTranslation, "product", product, translations)
+    schedule_store_revalidation(slugs=[product.slug], categories=True)
     return product
 
 
 @transaction.atomic
 def update_product(*, actor, product, payload):
     data = payload.copy()
+    previous_slug = product.slug
     from farms.models import FarmWeeklySupply
 
     if (
@@ -306,15 +329,18 @@ def update_product(*, actor, product, payload):
     _save_translations(ProductTranslation, "product", product, translations)
     if previous_image and previous_image.pk != product.primary_image_id:
         delete_orphan_media_asset(asset_id=previous_image.pk, storage_prefix="products")
+    schedule_store_revalidation(slugs=[previous_slug, product.slug], categories=True)
     return product
 
 
 @transaction.atomic
 def delete_product(*, actor, product):
     image_id = product.primary_image_id
+    slug = product.slug
     try:
         product.delete()
     except ProtectedError as error:
         raise CatalogConflict("product_in_use") from error
     if image_id:
         delete_orphan_media_asset(asset_id=image_id, storage_prefix="products")
+    schedule_store_revalidation(slugs=[slug], categories=True)
