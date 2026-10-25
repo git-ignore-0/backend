@@ -1,5 +1,4 @@
 from django.core.exceptions import ValidationError as DjangoValidationError
-from django.core.signing import BadSignature, SignatureExpired
 from django.db import transaction
 from django.db.models import Q
 from django.shortcuts import get_object_or_404
@@ -54,7 +53,6 @@ from content.services import (
     TrackerFarmMediaStorageMismatch,
     TrackerFarmVersionConflict,
     audit,
-    create_preview_token,
     create_testimonial,
     create_tracker_farm,
     delete_temporary_tracker_farm_media,
@@ -62,7 +60,6 @@ from content.services import (
     hide_testimonial,
     publish_revision,
     publish_testimonial,
-    read_preview_token,
     reorder_tracker_farms,
     request_frontend_revalidation,
     store_media_image,
@@ -256,25 +253,6 @@ class PublicWorkshopDetailView(APIView):
             raise NotFound()
         response = Response({"data": data})
         response["Cache-Control"] = "public, max-age=60, stale-while-revalidate=300"
-        return response
-
-
-class PublicWorkshopPreviewView(APIView):
-    permission_classes = [AllowAny]
-    authentication_classes = []
-
-    def get(self, request, token):
-        try:
-            revision = read_preview_token(token)
-        except (BadSignature, SignatureExpired, WorkshopRevision.DoesNotExist) as error:
-            raise NotFound("Preview is invalid or expired.") from error
-        locale = validated_public_locale(request, revision.default_locale)
-        data = public_workshop_payload(revision, locale)
-        if data is None:
-            raise NotFound()
-        response = Response({"data": data})
-        response["Cache-Control"] = "private, no-store"
-        response["X-Robots-Tag"] = "noindex, nofollow"
         return response
 
 
@@ -647,18 +625,6 @@ class AdminWorkshopViewSet(viewsets.ViewSet):
         if not unpublish_workshop(workshop, actor=request.user):
             raise ValidationError({"publish": "Workshop is not published."})
         return Response({"data": {"unpublished": True}})
-
-    @action(detail=True, methods=["post"], url_path="preview-token")
-    def preview_token(self, request, pk=None):
-        revision = get_object_or_404(WorkshopRevision, workshop_id=pk, is_draft=True)
-        return Response(
-            {
-                "data": {
-                    "token": create_preview_token(revision),
-                    "expires_in": 600,
-                }
-            }
-        )
 
 
 class AdminTestimonialViewSet(viewsets.ViewSet):

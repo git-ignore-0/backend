@@ -7,6 +7,7 @@ from django.apps import apps as django_apps
 from django.contrib.auth.models import Group
 from django.core.exceptions import ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.core.signing import TimestampSigner
 from django.test import override_settings
 from django.utils import timezone
 from PIL import Image
@@ -390,20 +391,50 @@ def test_public_workshop_pagination_rejects_invalid_values(client, query):
 
 
 @pytest.mark.django_db
-def test_public_workshop_detail_and_preview_reject_unsupported_locale(admin_api):
+def test_public_workshop_detail_rejects_unsupported_locale(admin_api):
     created = admin_api.post("/api/v1/admin/workshops/", workshop_payload(), format="json")
     workshop = created.json()["data"]
     assert publish_workshop(admin_api, workshop).status_code == 200
-    draft = admin_api.get(f"/api/v1/admin/workshops/{workshop['id']}/").json()["data"]
-    preview = admin_api.post(f"/api/v1/admin/workshops/{draft['id']}/preview-token/").json()["data"]
 
     detail_response = admin_api.get(f"/api/v1/public/workshops/{workshop['slug']}?locale=fr")
-    preview_response = admin_api.get(
-        f"/api/v1/public/workshops/preview/{preview['token']}?locale=fr"
-    )
 
     assert detail_response.status_code == 400
-    assert preview_response.status_code == 400
+
+
+@pytest.mark.django_db
+def test_workshop_preview_token_and_public_read_are_not_available(admin_api):
+    created = admin_api.post("/api/v1/admin/workshops/", workshop_payload(), format="json")
+    workshop = created.json()["data"]
+    legacy_token = TimestampSigner(salt="nfv-workshop-preview").sign(workshop["revision_id"])
+
+    token_response = admin_api.post(f"/api/v1/admin/workshops/{workshop['id']}/preview-token/")
+    public_response = admin_api.get(f"/api/v1/public/workshops/preview/{legacy_token}?locale=vi")
+
+    assert token_response.status_code == 404
+    assert public_response.status_code == 404
+
+
+@pytest.mark.django_db
+def test_unpublish_hides_workshop_from_public_list_and_detail_but_keeps_draft(admin_api):
+    created = admin_api.post("/api/v1/admin/workshops/", workshop_payload(), format="json")
+    workshop = created.json()["data"]
+    assert publish_workshop(admin_api, workshop).status_code == 200
+
+    response = admin_api.post(f"/api/v1/admin/workshops/{workshop['id']}/unpublish/")
+
+    assert response.status_code == 200
+    assert response.json()["data"] == {"unpublished": True}
+    assert WorkshopRevision.objects.filter(workshop_id=workshop["id"], is_draft=True).count() == 1
+    assert not WorkshopRevision.objects.filter(
+        workshop_id=workshop["id"], is_published=True
+    ).exists()
+
+    public_list = admin_api.get("/api/v1/public/workshops?locale=vi&period=upcoming")
+    public_detail = admin_api.get(f"/api/v1/public/workshops/{workshop['slug']}?locale=vi")
+
+    assert public_list.status_code == 200
+    assert public_list.json()["data"] == []
+    assert public_detail.status_code == 404
 
 
 @pytest.mark.django_db

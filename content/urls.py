@@ -12,7 +12,6 @@ urlpatterns = [
     path("public/tracker-farms", views.PublicTrackerFarmListView.as_view()),
     path("public/workshops", views.PublicWorkshopListView.as_view()),
     path("public/workshops/<slug:slug>", views.PublicWorkshopDetailView.as_view()),
-    path("public/workshops/preview/<str:token>", views.PublicWorkshopPreviewView.as_view()),
     path("public/testimonials", views.PublicTestimonialListView.as_view()),
     path("public/testimonials/featured", views.PublicFeaturedTestimonialView.as_view()),
     path(

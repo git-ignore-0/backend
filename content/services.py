@@ -12,7 +12,6 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.files.base import ContentFile
 from django.core.files.storage import default_storage
-from django.core.signing import TimestampSigner
 from django.db import transaction
 from django.db.models import Prefetch
 from django.utils import timezone
@@ -37,7 +36,6 @@ from content.validators import tiptap_has_content, validate_tiptap_document
 from farms.models import FarmPhoto
 
 logger = logging.getLogger(__name__)
-preview_signer = TimestampSigner(salt="nfv-workshop-preview")
 
 
 class RevisionConflict(Exception):
@@ -179,17 +177,6 @@ def unpublish_workshop(workshop, *, actor):
             lambda: request_frontend_revalidation(["workshops", f"workshop:{workshop.slug}"])
         )
     return bool(updated)
-
-
-def create_preview_token(revision: WorkshopRevision) -> str:
-    return preview_signer.sign(str(revision.pk))
-
-
-def read_preview_token(token: str, max_age=600) -> WorkshopRevision:
-    revision_id = preview_signer.unsign(token, max_age=max_age)
-    return WorkshopRevision.objects.prefetch_related("translations").get(
-        pk=revision_id, is_draft=True
-    )
 
 
 def request_frontend_revalidation(tags):
