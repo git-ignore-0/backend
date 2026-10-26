@@ -17,7 +17,27 @@ from memberships.pricing import MAX_POSITIVE_BIG_INTEGER, calculate_total_price_
 MAX_PAGE = 10_000
 
 
+class StableListErrorSerializer(serializers.ListSerializer):
+    """Keep the established array-shaped validation errors for membership APIs."""
+
+    def to_internal_value(self, data):
+        try:
+            return super().to_internal_value(data)
+        except serializers.ValidationError as error:
+            if (
+                isinstance(data, list)
+                and isinstance(error.detail, dict)
+                and all(isinstance(index, int) for index in error.detail)
+            ):
+                errors = [error.detail.get(index, {}) for index in range(len(data))]
+                raise serializers.ValidationError(errors) from error
+            raise
+
+
 class StrictSerializer(serializers.Serializer):
+    class Meta:
+        list_serializer_class = StableListErrorSerializer
+
     def to_internal_value(self, data):
         if hasattr(data, "keys"):
             unknown = sorted(set(data.keys()) - set(self.fields))
