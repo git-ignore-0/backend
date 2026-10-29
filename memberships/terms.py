@@ -5,7 +5,10 @@ import hashlib
 import json
 import secrets
 
-from memberships.models import MembershipContentLocale
+from django.db import IntegrityError, transaction
+from django.utils import timezone
+
+from memberships.models import CSATermsClause, CSATermsDocument, MembershipContentLocale
 
 CSA_TERMS_V1 = "CSA_TERMS_V1"
 CSA_TERMS_V2 = "CSA_TERMS_V2"
@@ -483,6 +486,12 @@ class InvalidCSATerms(ValueError):
     pass
 
 
+class CSATermsConflict(ValueError):
+    def __init__(self, code):
+        self.code = code
+        super().__init__(code)
+
+
 def canonical_csa_terms_hash(content) -> str:
     serialized = json.dumps(
         content,
@@ -493,22 +502,225 @@ def canonical_csa_terms_hash(content) -> str:
     return hashlib.sha256(serialized).hexdigest()
 
 
+def _document_content(document, locale: str) -> dict:
+    if locale not in MembershipContentLocale.values:
+        raise InvalidCSATerms("Unsupported CSA terms version or locale")
+    sections = []
+    for clause in document.clauses.all():
+        sections.append(
+            {
+                "key": clause.key,
+                "heading": getattr(clause, f"heading_{locale}"),
+                "paragraphs": copy.deepcopy(getattr(clause, f"paragraphs_{locale}")),
+            }
+        )
+    return {"title": getattr(document, f"title_{locale}"), "sections": sections}
+
+
 def get_csa_terms(*, version: str, locale: str) -> dict:
     try:
-        content = _CSA_TERMS_CONTENT[version][locale]
-    except KeyError as error:
+        document = CSATermsDocument.objects.prefetch_related("clauses").get(version=version)
+    except CSATermsDocument.DoesNotExist as error:
         raise InvalidCSATerms("Unsupported CSA terms version or locale") from error
-    content = copy.deepcopy(content)
+    if document.status == CSATermsDocument.Status.DRAFT:
+        raise InvalidCSATerms("Unsupported CSA terms version or locale")
+    content = _document_content(document, locale)
     return {
         "version": version,
         "locale": locale,
         "content": content,
-        "hash": canonical_csa_terms_hash(content),
+        "hash": getattr(document, f"content_hash_{locale}"),
     }
 
 
 def get_current_csa_terms(locale: str) -> dict:
-    return get_csa_terms(version=CURRENT_CSA_TERMS_VERSION, locale=locale)
+    try:
+        document = CSATermsDocument.objects.get(status=CSATermsDocument.Status.PUBLISHED)
+    except CSATermsDocument.DoesNotExist as error:
+        raise InvalidCSATerms("No published CSA terms") from error
+    return get_csa_terms(version=document.version, locale=locale)
+
+
+def _complete_paragraphs(value) -> bool:
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and all(isinstance(paragraph, str) and bool(paragraph.strip()) for paragraph in value)
+    )
+
+
+@transaction.atomic
+def publish_csa_terms(document, *, actor, expected_revision: int):
+    locked = (
+        CSATermsDocument.objects.select_for_update().prefetch_related("clauses").get(pk=document.pk)
+    )
+    if locked.status != CSATermsDocument.Status.DRAFT:
+        raise CSATermsConflict("csa_terms_immutable")
+    if locked.revision != expected_revision:
+        raise CSATermsConflict("csa_terms_revision_conflict")
+    observed_current_id = (
+        CSATermsDocument.objects.filter(status=CSATermsDocument.Status.PUBLISHED)
+        .values_list("pk", flat=True)
+        .first()
+    )
+    locked_current_id = (
+        CSATermsDocument.objects.select_for_update()
+        .filter(status=CSATermsDocument.Status.PUBLISHED)
+        .values_list("pk", flat=True)
+        .first()
+    )
+    if observed_current_id != locked_current_id:
+        raise CSATermsConflict("csa_terms_publish_conflict")
+    clauses = list(locked.clauses.all())
+    if (
+        not locked.title_vi.strip()
+        or not locked.title_en.strip()
+        or not clauses
+        or any(
+            not clause.key
+            or not _complete_paragraphs(clause.paragraphs_vi)
+            or not _complete_paragraphs(clause.paragraphs_en)
+            for clause in clauses
+        )
+    ):
+        raise CSATermsConflict("csa_terms_incomplete")
+
+    content_vi = _document_content(locked, MembershipContentLocale.VI)
+    content_en = _document_content(locked, MembershipContentLocale.EN)
+    now = timezone.now()
+    CSATermsDocument.objects.filter(pk=locked_current_id).update(
+        status=CSATermsDocument.Status.ARCHIVED,
+        published_slot=None,
+        updated_at=now,
+    )
+    try:
+        with transaction.atomic():
+            updated = CSATermsDocument.objects.filter(
+                pk=locked.pk, status=CSATermsDocument.Status.DRAFT
+            ).update(
+                status=CSATermsDocument.Status.PUBLISHED,
+                published_slot=True,
+                content_hash_vi=canonical_csa_terms_hash(content_vi),
+                content_hash_en=canonical_csa_terms_hash(content_en),
+                published_by=actor,
+                published_at=now,
+                revision=locked.revision + 1,
+                updated_at=now,
+            )
+    except IntegrityError as error:
+        raise CSATermsConflict("csa_terms_publish_conflict") from error
+    if updated != 1:
+        raise CSATermsConflict("csa_terms_publish_conflict")
+    return CSATermsDocument.objects.prefetch_related("clauses").get(pk=locked.pk)
+
+
+def csa_terms_document_payload(document) -> dict:
+    return {
+        "id": str(document.pk),
+        "version": document.version,
+        "status": document.status,
+        "title_vi": document.title_vi,
+        "title_en": document.title_en,
+        "content_hash_vi": document.content_hash_vi or None,
+        "content_hash_en": document.content_hash_en or None,
+        "revision": document.revision,
+        "published_at": document.published_at.isoformat() if document.published_at else None,
+        "published_by_id": str(document.published_by_id) if document.published_by_id else None,
+        "created_at": document.created_at.isoformat(),
+        "updated_at": document.updated_at.isoformat(),
+        "clauses": [
+            {
+                "id": str(clause.pk),
+                "key": clause.key,
+                "sort_order": clause.sort_order,
+                "heading_vi": clause.heading_vi,
+                "heading_en": clause.heading_en,
+                "paragraphs_vi": clause.paragraphs_vi,
+                "paragraphs_en": clause.paragraphs_en,
+            }
+            for clause in document.clauses.all()
+        ],
+    }
+
+
+def _replace_clauses(document, clauses):
+    document.clauses.all().delete()
+    CSATermsClause.objects.bulk_create(
+        [CSATermsClause(document=document, **clause) for clause in clauses]
+    )
+
+
+@transaction.atomic
+def create_csa_terms_document(*, data, actor):
+    clauses = data.pop("clauses")
+    try:
+        document = CSATermsDocument.objects.create(**data, created_by=actor)
+        _replace_clauses(document, clauses)
+    except IntegrityError as error:
+        raise CSATermsConflict("csa_terms_version_exists") from error
+    return CSATermsDocument.objects.prefetch_related("clauses").get(pk=document.pk)
+
+
+@transaction.atomic
+def update_csa_terms_document(*, document_id, data):
+    try:
+        document = CSATermsDocument.objects.select_for_update().get(pk=document_id)
+    except CSATermsDocument.DoesNotExist as error:
+        raise CSATermsConflict("csa_terms_not_found") from error
+    if document.status != CSATermsDocument.Status.DRAFT:
+        raise CSATermsConflict("csa_terms_immutable")
+    expected_revision = data.pop("revision", None)
+    if expected_revision is None or expected_revision != document.revision:
+        raise CSATermsConflict("csa_terms_revision_conflict")
+    clauses = data.pop("clauses", None)
+    for field, value in data.items():
+        setattr(document, field, value)
+    document.revision += 1
+    try:
+        document.save()
+        if clauses is not None:
+            _replace_clauses(document, clauses)
+    except IntegrityError as error:
+        raise CSATermsConflict("csa_terms_version_exists") from error
+    return CSATermsDocument.objects.prefetch_related("clauses").get(pk=document.pk)
+
+
+@transaction.atomic
+def clone_csa_terms_document(*, document_id, version, actor):
+    try:
+        source = CSATermsDocument.objects.prefetch_related("clauses").get(pk=document_id)
+    except CSATermsDocument.DoesNotExist as error:
+        raise CSATermsConflict("csa_terms_not_found") from error
+    return create_csa_terms_document(
+        data={
+            "version": version,
+            "title_vi": source.title_vi,
+            "title_en": source.title_en,
+            "clauses": [
+                {
+                    "key": clause.key,
+                    "sort_order": clause.sort_order,
+                    "heading_vi": clause.heading_vi,
+                    "heading_en": clause.heading_en,
+                    "paragraphs_vi": copy.deepcopy(clause.paragraphs_vi),
+                    "paragraphs_en": copy.deepcopy(clause.paragraphs_en),
+                }
+                for clause in source.clauses.all()
+            ],
+        },
+        actor=actor,
+    )
+
+
+@transaction.atomic
+def delete_csa_terms_document(*, document_id):
+    try:
+        document = CSATermsDocument.objects.select_for_update().get(pk=document_id)
+    except CSATermsDocument.DoesNotExist as error:
+        raise CSATermsConflict("csa_terms_not_found") from error
+    if document.status != CSATermsDocument.Status.DRAFT:
+        raise CSATermsConflict("csa_terms_immutable")
+    document.delete()
 
 
 def validate_csa_terms_snapshot(*, version: str, locale: str, content, content_hash: str):

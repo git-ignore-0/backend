@@ -26,6 +26,7 @@ from memberships.models import (
     QuotaPolicy,
 )
 from memberships.purchases import update_membership_payment_settings
+from memberships.terms import get_current_csa_terms
 
 CREATE_URL = "/api/v1/public/csa-purchase-requests"
 CATALOG_URL = "/api/v1/public/membership-packages"
@@ -70,6 +71,7 @@ def payment_settings():
 @pytest.fixture
 def guest_payload(catalog):
     package, option = catalog
+    terms = get_current_csa_terms("vi")
     return {
         "package_id": str(package.pk),
         "price_option_id": str(option.pk),
@@ -79,6 +81,8 @@ def guest_payload(catalog):
         "ward_code": "22015",
         "address": "12 Main Street",
         "terms_accepted": True,
+        "terms_version": terms["version"],
+        "terms_hash": terms["hash"],
     }
 
 
@@ -358,6 +362,8 @@ def test_authenticated_create_accepts_only_selected_plan_and_server_identity(
             "name": "Fake",
             "phone": "0987654321",
             "terms_accepted": True,
+            "terms_version": get_current_csa_terms("vi")["version"],
+            "terms_hash": get_current_csa_terms("vi")["hash"],
         },
         format="json",
     )

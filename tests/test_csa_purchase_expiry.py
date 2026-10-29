@@ -36,6 +36,7 @@ from memberships.purchases import (
     mark_csa_purchase_request_refunded,
     reject_csa_purchase_request,
 )
+from memberships.terms import get_current_csa_terms
 from memberships.views import admin_csa_purchase_payload
 
 CREATE_URL = "/api/v1/public/csa-purchase-requests"
@@ -136,6 +137,7 @@ def test_public_create_rejects_client_expiry_and_returns_server_expiry(
     package_and_option, payment_settings
 ):
     package, option = package_and_option
+    terms = get_current_csa_terms("vi")
     payload = {
         "package_id": str(package.pk),
         "price_option_id": str(option.pk),
@@ -145,6 +147,8 @@ def test_public_create_rejects_client_expiry_and_returns_server_expiry(
         "ward_code": "22015",
         "address": "12 Orchard Road",
         "terms_accepted": True,
+        "terms_version": terms["version"],
+        "terms_hash": terms["hash"],
     }
     rejected = APIClient().post(
         CREATE_URL,

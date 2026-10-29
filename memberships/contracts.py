@@ -19,9 +19,9 @@ from memberships.models import (
     MembershipPaymentSettings,
 )
 from memberships.terms import (
-    CURRENT_CSA_TERMS_VERSION,
     InvalidCSATerms,
     get_csa_terms,
+    get_current_csa_terms,
     validate_csa_terms_snapshot,
 )
 
@@ -113,6 +113,18 @@ def _bilingual_terms(*, version: str) -> tuple[dict, dict]:
     return vi, en
 
 
+def _current_bilingual_terms() -> tuple[str, dict, dict]:
+    try:
+        current_vi = get_current_csa_terms(MembershipContentLocale.VI)
+        version = current_vi["version"]
+        terms_en = get_csa_terms(version=version, locale=MembershipContentLocale.EN)["content"]
+    except InvalidCSATerms as error:
+        raise CSAContractTermsSnapshotIncomplete(
+            "Both localized CSA terms snapshots must be available"
+        ) from error
+    return version, current_vi["content"], terms_en
+
+
 def build_online_contract_snapshot(
     *, purchase_request: CSAPurchaseRequest, membership: Membership
 ) -> CSAContractSnapshot:
@@ -183,7 +195,7 @@ def build_online_contract_snapshot(
 def build_manual_contract_snapshot(
     *, customer, membership: Membership, payment_settings: MembershipPaymentSettings
 ) -> CSAContractSnapshot:
-    terms_vi, terms_en = _bilingual_terms(version=CURRENT_CSA_TERMS_VERSION)
+    terms_version, terms_vi, terms_en = _current_bilingual_terms()
     accepted_at = timezone.now()
     user = customer.user if customer.user_id else None
     return CSAContractSnapshot(
@@ -208,7 +220,7 @@ def build_manual_contract_snapshot(
             "transfer_content": membership.farmbrite_order_reference,
             "payment_config_version": payment_settings.version,
         },
-        terms_version=CURRENT_CSA_TERMS_VERSION,
+        terms_version=terms_version,
         terms_locale=MembershipContentLocale.VI,
         terms=terms_vi,
         terms_vi=terms_vi,

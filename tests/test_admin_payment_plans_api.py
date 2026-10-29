@@ -20,6 +20,7 @@ from memberships.models import (
 )
 from memberships.payment_plans import PaymentPlanValidationError, set_admin_payment_plan_active
 from memberships.purchases import update_membership_payment_settings
+from memberships.terms import get_current_csa_terms
 
 
 @pytest.fixture
@@ -206,6 +207,7 @@ def test_used_plan_cannot_be_edited_or_deleted(
         account_name="NFV",
         direct_transfer_enabled=True,
     )
+    terms = get_current_csa_terms("vi")
     public = APIClient().post(
         "/api/v1/public/csa-purchase-requests",
         {
@@ -218,6 +220,8 @@ def test_used_plan_cannot_be_edited_or_deleted(
             "ward_code": "22015",
             "address": "12 Main Street",
             "terms_accepted": True,
+            "terms_version": terms["version"],
+            "terms_hash": terms["hash"],
         },
         format="json",
     )

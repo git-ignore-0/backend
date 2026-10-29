@@ -127,6 +127,41 @@ class AdminCouponPreviewSerializer(AdminCouponWriteSerializer):
     payment_plan_id = serializers.UUIDField()
 
 
+class AdminCSATermsClauseWriteSerializer(StrictSerializer):
+    key = serializers.SlugField(max_length=80)
+    sort_order = serializers.IntegerField(min_value=0, required=False, default=0)
+    heading_vi = serializers.CharField(max_length=300, trim_whitespace=True, allow_blank=True)
+    heading_en = serializers.CharField(max_length=300, trim_whitespace=True, allow_blank=True)
+    paragraphs_vi = serializers.ListField(
+        child=serializers.CharField(trim_whitespace=True, allow_blank=False), allow_empty=False
+    )
+    paragraphs_en = serializers.ListField(
+        child=serializers.CharField(trim_whitespace=True, allow_blank=False), allow_empty=False
+    )
+
+
+class AdminCSATermsWriteSerializer(StrictSerializer):
+    version = serializers.RegexField(r"^[A-Z0-9_\-]+$", max_length=64)
+    title_vi = serializers.CharField(max_length=300, trim_whitespace=True)
+    title_en = serializers.CharField(max_length=300, trim_whitespace=True)
+    revision = serializers.IntegerField(min_value=1, required=False, write_only=True)
+    clauses = AdminCSATermsClauseWriteSerializer(many=True, allow_empty=False)
+
+    def validate_clauses(self, value):
+        keys = [clause["key"] for clause in value]
+        if len(keys) != len(set(keys)):
+            raise serializers.ValidationError("Clause keys must be unique.")
+        return value
+
+
+class AdminCSATermsCloneSerializer(StrictSerializer):
+    version = serializers.RegexField(r"^[A-Z0-9_\-]+$", max_length=64)
+
+
+class AdminCSATermsPublishSerializer(StrictSerializer):
+    revision = serializers.IntegerField(min_value=1)
+
+
 class TermsAcceptedField(serializers.Field):
     default_error_messages = {"required": "CSA terms must be accepted."}
 
@@ -177,6 +212,8 @@ class CSAPaymentQuoteCreateSerializer(StrictSerializer):
         choices=MembershipContentLocale.choices,
         default=MembershipContentLocale.VI,
     )
+    terms_version = serializers.CharField(max_length=64)
+    terms_hash = serializers.RegexField(r"^[0-9a-f]{64}$")
     guest_identity = CSAGuestIdentitySerializer(required=True)
 
 
@@ -192,6 +229,8 @@ class AuthenticatedCSAPaymentQuoteCreateSerializer(StrictSerializer):
         choices=MembershipContentLocale.choices,
         default=MembershipContentLocale.VI,
     )
+    terms_version = serializers.CharField(max_length=64)
+    terms_hash = serializers.RegexField(r"^[0-9a-f]{64}$")
     guest_identity = serializers.JSONField(required=False, write_only=True)
 
 
@@ -225,6 +264,8 @@ class CSAPurchaseRequestCreateSerializer(StrictSerializer):
         choices=MembershipContentLocale.choices,
         default=MembershipContentLocale.VI,
     )
+    terms_version = serializers.CharField(max_length=64)
+    terms_hash = serializers.RegexField(r"^[0-9a-f]{64}$")
     amount = serializers.JSONField(required=False, write_only=True)
 
     def validate_phone(self, value):
@@ -258,6 +299,8 @@ class AuthenticatedCSAPurchaseRequestCreateSerializer(StrictSerializer):
         choices=MembershipContentLocale.choices,
         default=MembershipContentLocale.VI,
     )
+    terms_version = serializers.CharField(max_length=64)
+    terms_hash = serializers.RegexField(r"^[0-9a-f]{64}$")
     amount = serializers.JSONField(required=False, write_only=True)
     name = serializers.JSONField(required=False, write_only=True)
     phone = serializers.JSONField(required=False, write_only=True)

@@ -139,6 +139,14 @@ class PaymentQuoteIdentityMismatch(CSAPurchaseError):
     code = "csa_payment_quote_identity_mismatch"
 
 
+class PurchaseTermsChanged(CSAPurchaseError):
+    code = "csa_purchase_terms_changed"
+
+
+class PaymentQuoteTermsChanged(PurchaseTermsChanged):
+    pass
+
+
 class PurchaseAdminNotFound(CSAPurchaseError):
     code = "csa_purchase_request_not_found"
 
@@ -304,6 +312,8 @@ def _create_csa_purchase_request(
     email=None,
     zalo_whatsapp=None,
     terms_locale="vi",
+    terms_version=None,
+    terms_hash=None,
     terms_acceptance_ip=None,
     terms_acceptance_user_agent=None,
     user=None,
@@ -332,6 +342,11 @@ def _create_csa_purchase_request(
         email = str(email or "").strip() or None
     zalo_whatsapp = str(zalo_whatsapp or "").strip() or None
     terms = get_current_csa_terms(terms_locale)
+    if terms_version is not None and (
+        not hmac.compare_digest(str(terms_version), terms["version"])
+        or not hmac.compare_digest(str(terms_hash or ""), terms["hash"])
+    ):
+        raise PurchaseTermsChanged("CSA terms changed")
     terms_accepted_at = timezone.now()
     try:
         package = MembershipPackage.objects.select_for_update().get(pk=package_id, is_active=True)
@@ -742,6 +757,8 @@ def create_csa_payment_quote(
     payment_plan_id=None,
     coupon_code=None,
     terms_locale="vi",
+    terms_version=None,
+    terms_hash=None,
     user=None,
     guest_identity=None,
     now=None,
@@ -766,6 +783,11 @@ def create_csa_payment_quote(
     plan = _quote_plan_snapshot(option=option, payment_plan_id=payment_plan_id)
     payment = _locked_payment_settings()
     terms = get_current_csa_terms(terms_locale)
+    if terms_version is not None and (
+        not hmac.compare_digest(str(terms_version), terms["version"])
+        or not hmac.compare_digest(str(terms_hash or ""), terms["hash"])
+    ):
+        raise PaymentQuoteTermsChanged("CSA terms changed")
     now = now or timezone.now()
     coupon = coupon_for_code(coupon_code) if coupon_code is not None else None
     coupon_snapshot = None

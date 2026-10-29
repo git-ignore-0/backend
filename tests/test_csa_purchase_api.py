@@ -18,6 +18,8 @@ from memberships.models import (
     CSACustomer,
     CSAPurchaseRequest,
     CSAPurchaseRequestStatus,
+    CSATermsClause,
+    CSATermsDocument,
     Membership,
     MembershipPackage,
     MembershipPackagePriceOption,
@@ -31,7 +33,9 @@ from memberships.purchases import (
 from memberships.terms import (
     InvalidCSATerms,
     canonical_csa_terms_hash,
+    get_csa_terms,
     get_current_csa_terms,
+    publish_csa_terms,
     validate_csa_terms_snapshot,
 )
 
@@ -103,6 +107,7 @@ def complete_member_profile(active_user):
 @pytest.fixture
 def valid_payload(package_and_option):
     package, option = package_and_option
+    terms = get_current_csa_terms("vi")
     return {
         "package_id": str(package.pk),
         "price_option_id": str(option.pk),
@@ -112,7 +117,28 @@ def valid_payload(package_and_option):
         "ward_code": "22015",
         "address": "Số 12, ngõ 5",
         "terms_accepted": True,
+        "terms_version": terms["version"],
+        "terms_hash": terms["hash"],
     }
+
+
+def terms_acceptance(locale="vi"):
+    terms = get_current_csa_terms(locale)
+    return {"terms_version": terms["version"], "terms_hash": terms["hash"]}
+
+
+@pytest.mark.django_db
+def test_direct_purchase_requires_terms_version_and_hash(valid_payload, payment_settings):
+    payload = {
+        key: value
+        for key, value in valid_payload.items()
+        if key not in {"terms_version", "terms_hash"}
+    }
+
+    response = APIClient().post(CREATE_URL, payload, format="json")
+
+    assert response.status_code == 400
+    assert set(response.json()["errors"][0]["fields"]) == {"terms_hash", "terms_version"}
 
 
 def bearer_client(access_token):
@@ -193,25 +219,14 @@ def test_legacy_v2_terms_snapshot_remains_valid():
 
 
 @pytest.mark.django_db
-def test_v1_purchase_terms_remain_valid_after_v2_becomes_current(
-    valid_payload, payment_settings, monkeypatch
-):
-    import memberships.terms as terms_module
-
-    with monkeypatch.context() as patcher:
-        patcher.setattr(terms_module, "CURRENT_CSA_TERMS_VERSION", "CSA_TERMS_V1")
-        response = APIClient().post(CREATE_URL, valid_payload, format="json")
-    assert response.status_code == 201
-    item = CSAPurchaseRequest.objects.get(pk=response.json()["data"]["id"])
-    assert item.terms_version == "CSA_TERMS_V1"
-    assert terms_module.CURRENT_CSA_TERMS_VERSION == "CSA_TERMS_V2"
+def test_v1_purchase_terms_remain_valid_after_v2_becomes_current(valid_payload, payment_settings):
+    item = get_csa_terms(version="CSA_TERMS_V1", locale="vi")
     validate_csa_terms_snapshot(
-        version=item.terms_version,
-        locale=item.terms_locale,
-        content=item.terms_snapshot,
-        content_hash=item.terms_hash,
+        version=item["version"],
+        locale=item["locale"],
+        content=item["content"],
+        content_hash=item["hash"],
     )
-    item.full_clean()
 
 
 @pytest.mark.django_db
@@ -327,7 +342,7 @@ def test_purchase_snapshots_the_server_terms_for_supported_locale(
 ):
     response = APIClient().post(
         CREATE_URL,
-        {**valid_payload, "terms_locale": locale},
+        {**valid_payload, "terms_locale": locale, **terms_acceptance(locale)},
         format="json",
     )
 
@@ -353,43 +368,77 @@ def test_purchase_rejects_unknown_terms_locale(valid_payload, payment_settings):
     assert "terms_locale" in response.json()["errors"][0]["fields"]
 
 
-@pytest.mark.parametrize("field", ["terms_version", "terms_content", "terms_hash"])
 @pytest.mark.django_db
-def test_purchase_never_trusts_client_terms_snapshot_fields(field, valid_payload, payment_settings):
+def test_purchase_never_trusts_client_terms_content(valid_payload, payment_settings):
     response = APIClient().post(
         CREATE_URL,
-        {**valid_payload, field: "client-controlled"},
+        {**valid_payload, "terms_content": "client-controlled"},
         format="json",
     )
 
     assert response.status_code == 400
     assert response.json()["errors"][0]["code"] == "invalid_csa_purchase_request"
-    assert field in response.json()["errors"][0]["fields"]
+    assert "terms_content" in response.json()["errors"][0]["fields"]
     assert not CSAPurchaseRequest.objects.exists()
 
 
 @pytest.mark.django_db
 def test_purchase_terms_snapshot_does_not_follow_a_new_current_version(
-    valid_payload, payment_settings, monkeypatch
+    valid_payload, payment_settings
 ):
-    import memberships.terms as terms_module
-
     created = APIClient().post(CREATE_URL, valid_payload, format="json")
     purchase = CSAPurchaseRequest.objects.get(pk=created.json()["data"]["id"])
     original_content = purchase.terms_snapshot
     original_hash = purchase.terms_hash
-    version_three_content = {
-        "vi": {"title": "Điều khoản V3", "sections": []},
-        "en": {"title": "Terms V3", "sections": []},
-    }
-    monkeypatch.setitem(terms_module._CSA_TERMS_CONTENT, "CSA_TERMS_V3", version_three_content)
-    monkeypatch.setattr(terms_module, "CURRENT_CSA_TERMS_VERSION", "CSA_TERMS_V3")
+    version_three = CSATermsDocument.objects.create(
+        version="CSA_TERMS_V3", title_vi="Điều khoản V3", title_en="Terms V3"
+    )
+    CSATermsClause.objects.create(
+        document=version_three,
+        key="delivery",
+        heading_vi="Giao hàng",
+        heading_en="Delivery",
+        paragraphs_vi=["Điều khoản mới."],
+        paragraphs_en=["New terms."],
+    )
+    publish_csa_terms(version_three, actor=None, expected_revision=1)
 
     assert get_current_csa_terms("vi")["version"] == "CSA_TERMS_V3"
     purchase.refresh_from_db()
     assert purchase.terms_version == "CSA_TERMS_V2"
     assert purchase.terms_snapshot == original_content
     assert purchase.terms_hash == original_hash
+
+
+@pytest.mark.django_db
+def test_direct_purchase_rejects_terms_that_changed_before_submit(valid_payload, payment_settings):
+    accepted = get_current_csa_terms("vi")
+    next_terms = CSATermsDocument.objects.create(
+        version="CSA_TERMS_NEXT", title_vi="Điều khoản mới", title_en="New terms"
+    )
+    CSATermsClause.objects.create(
+        document=next_terms,
+        key="delivery",
+        heading_vi="Giao hàng",
+        heading_en="Delivery",
+        paragraphs_vi=["Điều khoản mới."],
+        paragraphs_en=["New terms."],
+    )
+    publish_csa_terms(next_terms, actor=None, expected_revision=1)
+
+    response = APIClient().post(
+        CREATE_URL,
+        {
+            **valid_payload,
+            "terms_version": accepted["version"],
+            "terms_hash": accepted["hash"],
+        },
+        format="json",
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"errors": [{"code": "csa_purchase_terms_changed"}]}
+    assert not CSAPurchaseRequest.objects.exists()
 
 
 @pytest.mark.django_db
@@ -407,6 +456,7 @@ def test_authenticated_user_creates_only_their_own_request(
             "package_id": str(package.pk),
             "price_option_id": str(option.pk),
             "terms_accepted": True,
+            **terms_acceptance(),
         },
         format="json",
     )
@@ -449,6 +499,7 @@ def test_authenticated_request_snapshots_without_updating_auth_or_live_data(
             "price_option_id": str(option.pk),
             "terms_accepted": True,
             "zalo_whatsapp": "zalo-member",
+            **terms_acceptance(),
         },
         format="json",
     )
@@ -552,6 +603,7 @@ def test_authenticated_user_with_incomplete_delivery_address_is_rejected(
             "package_id": str(package.pk),
             "price_option_id": str(option.pk),
             "terms_accepted": True,
+            **terms_acceptance(),
         },
         format="json",
     )

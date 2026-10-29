@@ -53,6 +53,7 @@ from memberships.models import (
     CSACustomer,
     CSAPurchasePayment,
     CSAPurchaseRequest,
+    CSATermsDocument,
     Membership,
     MembershipContentLocale,
     MembershipCycleQuota,
@@ -92,6 +93,7 @@ from memberships.purchases import (
     CSAPurchaseError,
     PaymentQuoteExpired,
     PaymentQuoteIdentityMismatch,
+    PaymentQuoteTermsChanged,
     PaymentQuoteUnavailable,
     PaymentSettingsUnavailable,
     PurchaseAdminNotFound,
@@ -107,6 +109,7 @@ from memberships.purchases import (
     PurchaseRequestConflict,
     PurchaseRequestExpired,
     PurchaseStartDateInvalid,
+    PurchaseTermsChanged,
     PurchaseTransitionConflict,
     _quote_plan_snapshot,
     approve_csa_purchase_request,
@@ -125,6 +128,9 @@ from memberships.serializers import (
     AdminCouponWriteSerializer,
     AdminCSACustomerQuerySerializer,
     AdminCSAPurchaseRequestQuerySerializer,
+    AdminCSATermsCloneSerializer,
+    AdminCSATermsPublishSerializer,
+    AdminCSATermsWriteSerializer,
     AdminMembershipQuerySerializer,
     AdminPackageQuerySerializer,
     AdminPaymentPlanWriteSerializer,
@@ -174,6 +180,16 @@ from memberships.services import (
     sync_package_price_options,
     undo_usage_order,
     update_csa_customer,
+)
+from memberships.terms import (
+    CSATermsConflict,
+    clone_csa_terms_document,
+    create_csa_terms_document,
+    csa_terms_document_payload,
+    delete_csa_terms_document,
+    get_current_csa_terms,
+    publish_csa_terms,
+    update_csa_terms_document,
 )
 from memberships.throttles import (
     CSAContractVerificationThrottle,
@@ -271,6 +287,8 @@ def csa_purchase_error(error):
             PurchaseRequestConflict,
             PurchaseRequestExpired,
             PaymentQuoteExpired,
+            PaymentQuoteTermsChanged,
+            PurchaseTermsChanged,
             PurchasePackageUnavailable,
             PurchasePaymentPlanRequired,
             PurchasePaymentPlanUnavailable,
@@ -1084,6 +1102,18 @@ class PublicPackageListView(APIView):
         return response
 
 
+class PublicCSATermsView(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def get(self, request):
+        query = LocaleQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+        response = Response({"data": get_current_csa_terms(query.validated_data["locale"])})
+        response["Cache-Control"] = "public, max-age=60, stale-while-revalidate=300"
+        return response
+
+
 class PublicCSAPaymentQuoteView(APIView):
     permission_classes = [AllowAny]
     throttle_classes = [CSAPaymentQuoteCreateThrottle]
@@ -1113,6 +1143,8 @@ class PublicCSAPaymentQuoteView(APIView):
                 payment_plan_id=data.get("payment_plan_id"),
                 coupon_code=data.get("coupon_code"),
                 terms_locale=data["terms_locale"],
+                terms_version=data.get("terms_version"),
+                terms_hash=data.get("terms_hash"),
                 user=user,
                 guest_identity=data.get("guest_identity"),
             )
@@ -1182,6 +1214,8 @@ class PublicCSAPurchaseRequestCreateView(APIView):
             "payment_plan_id": data.get("payment_plan_id"),
             "zalo_whatsapp": data.get("zalo_whatsapp"),
             "terms_locale": data["terms_locale"],
+            "terms_version": data["terms_version"],
+            "terms_hash": data["terms_hash"],
             "terms_acceptance_ip": request.META.get("REMOTE_ADDR") or None,
             "terms_acceptance_user_agent": request.META.get("HTTP_USER_AGENT") or None,
         }
@@ -1692,6 +1726,120 @@ def _payment_plan_error(code, *, fields=None, http_status=status.HTTP_400_BAD_RE
 
 def _coupon_error(code, *, http_status=400):
     return no_store(Response({"errors": [{"code": code}]}, status=http_status))
+
+
+def _csa_terms_error(error):
+    code = error.code
+    return no_store(
+        Response(
+            {"errors": [{"code": code}]},
+            status=(
+                status.HTTP_404_NOT_FOUND
+                if code == "csa_terms_not_found"
+                else status.HTTP_409_CONFLICT
+                if code
+                in {
+                    "csa_terms_immutable",
+                    "csa_terms_revision_conflict",
+                    "csa_terms_publish_conflict",
+                    "csa_terms_version_exists",
+                }
+                else status.HTTP_400_BAD_REQUEST
+            ),
+        )
+    )
+
+
+class AdminCSATermsListView(APIView):
+    permission_classes = [IsWebsiteAdmin]
+
+    def get(self, request):
+        documents = CSATermsDocument.objects.prefetch_related("clauses").all()
+        return no_store(
+            Response({"data": [csa_terms_document_payload(item) for item in documents]})
+        )
+
+    def post(self, request):
+        serializer = AdminCSATermsWriteSerializer(data=request.data)
+        if not serializer.is_valid():
+            return _csa_terms_error(CSATermsConflict("csa_terms_invalid"))
+        try:
+            document = create_csa_terms_document(
+                data=dict(serializer.validated_data), actor=request.user
+            )
+        except CSATermsConflict as error:
+            return _csa_terms_error(error)
+        return no_store(Response({"data": csa_terms_document_payload(document)}, status=201))
+
+
+class AdminCSATermsDetailView(APIView):
+    permission_classes = [IsWebsiteAdmin]
+
+    def get(self, request, document_id):
+        document = (
+            CSATermsDocument.objects.prefetch_related("clauses").filter(pk=document_id).first()
+        )
+        if document is None:
+            return _csa_terms_error(CSATermsConflict("csa_terms_not_found"))
+        return no_store(Response({"data": csa_terms_document_payload(document)}))
+
+    def patch(self, request, document_id):
+        serializer = AdminCSATermsWriteSerializer(data=request.data, partial=True)
+        if not serializer.is_valid():
+            return _csa_terms_error(CSATermsConflict("csa_terms_invalid"))
+        try:
+            document = update_csa_terms_document(
+                document_id=document_id, data=dict(serializer.validated_data)
+            )
+        except CSATermsConflict as error:
+            return _csa_terms_error(error)
+        return no_store(Response({"data": csa_terms_document_payload(document)}))
+
+    def delete(self, request, document_id):
+        try:
+            delete_csa_terms_document(document_id=document_id)
+        except CSATermsConflict as error:
+            return _csa_terms_error(error)
+        return no_store(Response(status=status.HTTP_204_NO_CONTENT))
+
+
+class AdminCSATermsCloneView(APIView):
+    permission_classes = [IsWebsiteAdmin]
+
+    def post(self, request, document_id):
+        serializer = AdminCSATermsCloneSerializer(data=request.data)
+        if not serializer.is_valid():
+            return _csa_terms_error(CSATermsConflict("csa_terms_invalid"))
+        try:
+            document = clone_csa_terms_document(
+                document_id=document_id,
+                version=serializer.validated_data["version"],
+                actor=request.user,
+            )
+        except CSATermsConflict as error:
+            return _csa_terms_error(error)
+        return no_store(Response({"data": csa_terms_document_payload(document)}, status=201))
+
+
+class AdminCSATermsPublishView(APIView):
+    permission_classes = [IsWebsiteAdmin]
+
+    def post(self, request, document_id):
+        serializer = AdminCSATermsPublishSerializer(data=request.data)
+        if not serializer.is_valid():
+            return _csa_terms_error(CSATermsConflict("csa_terms_invalid"))
+        document = CSATermsDocument.objects.filter(pk=document_id).first()
+        if document is None:
+            return _csa_terms_error(CSATermsConflict("csa_terms_not_found"))
+        try:
+            document = publish_csa_terms(
+                document,
+                actor=request.user,
+                expected_revision=serializer.validated_data["revision"],
+            )
+        except CSATermsConflict as error:
+            return _csa_terms_error(error)
+        return no_store(Response({"data": csa_terms_document_payload(document)}))
 
 
 def _coupon_input_error(errors):

@@ -82,6 +82,112 @@ class CSAContractVersionReason(models.TextChoices):
     MEMBERSHIP_REVOKED = "membership_revoked", "Membership revoked"
 
 
+class CSATermsDocument(models.Model):
+    class Status(models.TextChoices):
+        DRAFT = "draft", "Draft"
+        PUBLISHED = "published", "Published"
+        ARCHIVED = "archived", "Archived"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    version = models.CharField(max_length=64, unique=True)
+    status = models.CharField(max_length=12, choices=Status.choices, default=Status.DRAFT)
+    title_vi = models.CharField(max_length=300)
+    title_en = models.CharField(max_length=300)
+    content_hash_vi = models.CharField(max_length=64, blank=True, editable=False)
+    content_hash_en = models.CharField(max_length=64, blank=True, editable=False)
+    published_slot = models.BooleanField(null=True, default=None, editable=False)
+    revision = models.PositiveIntegerField(default=1, editable=False)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        related_name="csa_terms_documents_created",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+    )
+    published_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        related_name="csa_terms_documents_published",
+        null=True,
+        blank=True,
+        editable=False,
+        on_delete=models.SET_NULL,
+    )
+    published_at = models.DateTimeField(null=True, blank=True, editable=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at", "version"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["published_slot"],
+                name="memberships_one_published_csa_terms",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(status="published", published_slot=True)
+                    | (~Q(status="published") & Q(published_slot__isnull=True))
+                ),
+                name="memberships_csa_terms_published_slot_valid",
+            ),
+        ]
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            previous_status = (
+                type(self).objects.filter(pk=self.pk).values_list("status", flat=True).first()
+            )
+            if previous_status and previous_status != self.Status.DRAFT:
+                raise ValidationError("csa_terms_immutable")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        current_status = (
+            type(self).objects.filter(pk=self.pk).values_list("status", flat=True).first()
+        )
+        if current_status != self.Status.DRAFT:
+            raise ValidationError("csa_terms_immutable")
+        return super().delete(*args, **kwargs)
+
+
+class CSATermsClause(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    document = models.ForeignKey(CSATermsDocument, related_name="clauses", on_delete=models.CASCADE)
+    key = models.SlugField(max_length=80)
+    sort_order = models.PositiveIntegerField(default=0)
+    heading_vi = models.CharField(max_length=300, blank=True)
+    heading_en = models.CharField(max_length=300, blank=True)
+    paragraphs_vi = models.JSONField(default=list)
+    paragraphs_en = models.JSONField(default=list)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["sort_order", "created_at", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["document", "key"], name="memberships_csa_terms_clause_key_unique"
+            )
+        ]
+
+    def save(self, *args, **kwargs):
+        self._ensure_mutable()
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        self._ensure_mutable()
+        return super().delete(*args, **kwargs)
+
+    def _ensure_mutable(self):
+        status = (
+            CSATermsDocument.objects.filter(pk=self.document_id)
+            .values_list("status", flat=True)
+            .first()
+        )
+        if status != CSATermsDocument.Status.DRAFT:
+            raise ValidationError("csa_terms_immutable")
+
+
 OPEN_CSA_PURCHASE_REQUEST_STATUSES = [
     CSAPurchaseRequestStatus.PENDING,
     CSAPurchaseRequestStatus.PAYMENT_CONFIRMED,

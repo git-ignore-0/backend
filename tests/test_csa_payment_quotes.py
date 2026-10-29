@@ -20,6 +20,8 @@ from memberships.models import (
     CSAPurchasePaymentStatus,
     CSAPurchaseRequest,
     CSAPurchaseRequestStatus,
+    CSATermsClause,
+    CSATermsDocument,
     Membership,
     MembershipPackage,
     MembershipPackagePriceOption,
@@ -31,6 +33,7 @@ from memberships.models import (
 from memberships.purchases import (
     PaymentQuoteExpired,
     PaymentQuoteIdentityMismatch,
+    PaymentQuoteTermsChanged,
     PaymentQuoteUnavailable,
     _load_payment_quote,
     _quote_token,
@@ -39,6 +42,7 @@ from memberships.purchases import (
     csa_payment_quote_payload,
     update_membership_payment_settings,
 )
+from memberships.terms import get_current_csa_terms, publish_csa_terms
 from memberships.tracker import tracker_request_payload
 from memberships.views import admin_csa_purchase_payload
 
@@ -122,14 +126,47 @@ def make_plan(option, *, payment_type):
 
 
 def quote_payload(package, option, plan, identity):
+    terms = get_current_csa_terms("vi")
     return {
         "package_id": str(package.pk),
         "price_option_id": str(option.pk),
         "payment_plan_id": str(plan.pk),
         "terms_accepted": True,
         "terms_locale": "vi",
+        "terms_version": terms["version"],
+        "terms_hash": terms["hash"],
         "guest_identity": identity,
     }
+
+
+@pytest.mark.django_db
+def test_quote_rejects_terms_that_are_no_longer_current(catalog, payment_settings, guest_identity):
+    accepted = get_current_csa_terms("vi")
+    draft = CSATermsDocument.objects.create(
+        version="CSA_TERMS_NEXT", title_vi="Điều khoản mới", title_en="New terms"
+    )
+    CSATermsClause.objects.create(
+        document=draft,
+        key="delivery",
+        heading_vi="Giao hàng",
+        heading_en="Delivery",
+        paragraphs_vi=["Điều khoản mới."],
+        paragraphs_en=["New terms."],
+    )
+    publish_csa_terms(draft, actor=None, expected_revision=1)
+    package, option = catalog
+    plan = make_plan(option, payment_type=MembershipPaymentType.FULL)
+
+    with pytest.raises(PaymentQuoteTermsChanged, match="changed"):
+        create_csa_payment_quote(
+            package_id=package.pk,
+            price_option_id=option.pk,
+            payment_plan_id=plan.pk,
+            guest_identity=guest_identity,
+            terms_locale="vi",
+            terms_version=accepted["version"],
+            terms_hash=accepted["hash"],
+        )
 
 
 @pytest.mark.django_db
@@ -157,6 +194,22 @@ def test_quote_is_stateless_and_uses_full_payment_total_for_qr(
     assert "+84912345678" not in data["quote_token"]
     assert "guest_token" not in data
     assert response.headers["Cache-Control"] == "private, no-store"
+
+
+@pytest.mark.django_db
+def test_quote_requires_the_exact_terms_version_and_hash(catalog, payment_settings, guest_identity):
+    package, option = catalog
+    plan = make_plan(option, payment_type=MembershipPaymentType.FULL)
+    payload = quote_payload(package, option, plan, guest_identity)
+    payload.pop("terms_version")
+    payload.pop("terms_hash")
+
+    response = APIClient().post(QUOTE_URL, payload, format="json")
+
+    assert response.status_code == 400
+    error = response.json()["errors"][0]
+    assert error["code"] == "invalid_csa_purchase_request"
+    assert set(error["fields"]) == {"terms_version", "terms_hash"}
 
 
 @pytest.mark.django_db

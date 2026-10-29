@@ -16,6 +16,7 @@ from memberships.contracts import (
     CSAContractPurchaseInvalid,
     CSAContractSnapshot,
     CSAContractSnapshotInvalid,
+    build_manual_contract_snapshot,
     create_manual_contract,
     create_online_contract,
 )
@@ -27,6 +28,8 @@ from memberships.models import (
     CSACustomer,
     CSAPurchaseRequest,
     CSAPurchaseRequestStatus,
+    CSATermsClause,
+    CSATermsDocument,
     Membership,
     MembershipPackage,
     MembershipPackagePriceOption,
@@ -35,6 +38,7 @@ from memberships.models import (
     QuotaPolicy,
 )
 from memberships.phones import normalize_vietnam_phone
+from memberships.terms import publish_csa_terms
 
 
 @pytest.fixture
@@ -298,6 +302,40 @@ def test_manual_contract_allows_no_purchase_request(package_and_option):
         snapshot=snapshot_for(membership),
     )
     assert contract.purchase_request_id is None
+
+
+@pytest.mark.django_db
+def test_manual_contract_uses_the_current_published_terms(package_and_option, actor):
+    membership = create_membership(*package_and_option)
+    draft = CSATermsDocument.objects.create(
+        version="CSA_TERMS_CONTRACT_TEST",
+        title_vi="Điều khoản hợp đồng mới",
+        title_en="New contract terms",
+    )
+    CSATermsClause.objects.create(
+        document=draft,
+        key="delivery",
+        sort_order=10,
+        paragraphs_vi=["Nội dung mới."],
+        paragraphs_en=["New content."],
+    )
+    publish_csa_terms(draft, actor=actor, expected_revision=1)
+    payment_settings = MembershipPaymentSettings(
+        bank_bin="970436",
+        bank_name="Vietcombank",
+        account_number="123456789",
+        account_name="NFV",
+    )
+
+    snapshot = build_manual_contract_snapshot(
+        customer=membership.customer,
+        membership=membership,
+        payment_settings=payment_settings,
+    )
+
+    assert snapshot.terms_version == "CSA_TERMS_CONTRACT_TEST"
+    assert snapshot.terms_vi["title"] == "Điều khoản hợp đồng mới"
+    assert snapshot.terms_en["title"] == "New contract terms"
 
 
 @pytest.mark.django_db
