@@ -1322,8 +1322,18 @@ def _resolve_purchase_customer(*, item, actor, customer_resolution, rejection_re
     if locked_user is not None and user_customer is not None:
         try:
             ensure_csa_customer_complete(user_customer)
-        except CSACustomerError as error:
-            raise PurchaseCustomerIncomplete("Linked CSA customer is incomplete") from error
+        except CSACustomerError:
+            try:
+                user_customer = update_csa_customer(
+                    customer=user_customer,
+                    name=item.name_snapshot,
+                    phone=item.phone_e164,
+                    province_code=item.province_code_snapshot,
+                    ward_code=item.ward_code_snapshot,
+                    address=item.address_snapshot,
+                )
+            except CSACustomerError as error:
+                raise PurchaseCustomerIncomplete("Linked CSA customer is incomplete") from error
         return user_customer, False
 
     if phone_customer is None:

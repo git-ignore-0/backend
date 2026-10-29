@@ -1204,7 +1204,9 @@ def test_request_user_links_matching_unmanaged_phone_customer(admin_api, request
 
 
 @pytest.mark.django_db
-def test_request_user_with_incomplete_customer_cannot_be_approved(admin_api, request_factory):
+def test_request_user_with_incomplete_customer_is_completed_from_purchase_snapshot(
+    admin_api, request_factory
+):
     user = create_purchase_user()
     customer = CSACustomer.objects.create(
         user=user,
@@ -1220,11 +1222,16 @@ def test_request_user_with_incomplete_customer_cannot_be_approved(admin_api, req
         request_url(item, "approve"), {"start_date": str(timezone.localdate())}, format="json"
     )
 
-    assert response.status_code == 400
-    assert response.json()["errors"] == [{"code": "csa_purchase_customer_incomplete"}]
+    assert response.status_code == 200
     customer.refresh_from_db()
-    assert customer.address == ""
-    assert not Membership.objects.exists()
+    item.refresh_from_db()
+    assert customer.name == item.name_snapshot
+    assert customer.phone_e164 == item.phone_e164
+    assert customer.province_code == item.province_code_snapshot
+    assert customer.ward_code == item.ward_code_snapshot
+    assert customer.address == item.address_snapshot
+    assert item.customer == customer
+    assert Membership.objects.get().customer == customer
 
 
 @pytest.mark.django_db
