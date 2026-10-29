@@ -13,6 +13,7 @@ from django.utils import timezone
 from pypdf import PdfReader
 from rest_framework.test import APIClient
 
+from commerce.models import ShippingAddress
 from identity.models import AccountStatus, AuditLog, User
 from members.models import MemberProfile
 from memberships.models import (
@@ -63,7 +64,7 @@ def bearer_client(token):
 
 
 @pytest.fixture(autouse=True)
-def purchase_admin_bank_directory(monkeypatch, settings, tmp_path):
+def purchase_admin_bank_directory(monkeypatch, settings, tmp_path, default_supported_shipping_area):
     cache.clear()
     monkeypatch.setattr("memberships.banks.get_transfer_banks", lambda: [TEST_BANK])
     settings.CSA_CONTRACT_PRIVATE_STORAGE_ROOT = tmp_path / "contracts"
@@ -219,6 +220,14 @@ def create_purchase_user(*, phone="0901234567"):
     )
     MemberProfile.objects.create(
         user=user,
+        phone_number=phone,
+        province_code="66",
+        ward_code="22015",
+        address="Số 12, ngõ 5",
+    )
+    ShippingAddress.objects.create(
+        user=user,
+        recipient_name=user.name,
         phone_number=phone,
         province_code="66",
         ward_code="22015",

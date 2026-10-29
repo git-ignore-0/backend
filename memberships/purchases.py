@@ -15,9 +15,10 @@ from django.db.models import Q
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
+from commerce.models import ShippingAddress
+from commerce.shipping import active_shipping_area
 from identity.models import AuditLog, User
 from members.administrative_units import province_exists, ward_choices
-from members.models import MemberProfile
 from memberships.contract_pdfs import (
     CSAContractPDFStorageError,
     delete_contract_documents,
@@ -103,11 +104,14 @@ class PurchaseAddressInvalid(CSAPurchaseError):
     code = "invalid_csa_purchase_address"
 
 
+class PurchaseShippingAreaUnsupported(CSAPurchaseError):
+    code = "csa_shipping_area_unsupported"
+
+
 class AuthAccountIncomplete(CSAPurchaseError):
     code = "csa_purchase_auth_account_incomplete"
     client_message = (
-        "Please update your name, phone number, province, ward, and address in Auth Account "
-        "before purchasing a CSA package."
+        "Please add a supported delivery address in Account before purchasing a CSA package."
     )
 
 
@@ -180,7 +184,7 @@ def _required_snapshot(value, label: str) -> str:
     return normalized
 
 
-def _validated_address(*, province_code, ward_code, address) -> tuple[str, str, str]:
+def _normalized_address(*, province_code, ward_code, address) -> tuple[str, str, str]:
     province_code = _required_snapshot(province_code, "Province")
     ward_code = _required_snapshot(ward_code, "Ward")
     address = _required_snapshot(address, "Address")
@@ -192,19 +196,31 @@ def _validated_address(*, province_code, ward_code, address) -> tuple[str, str, 
     return province_code, ward_code, address
 
 
+def _validated_address(*, province_code, ward_code, address) -> tuple[str, str, str]:
+    province_code, ward_code, address = _normalized_address(
+        province_code=province_code,
+        ward_code=ward_code,
+        address=address,
+    )
+    area = active_shipping_area(province_code=province_code, ward_code=ward_code)
+    if area is None:
+        raise PurchaseShippingAreaUnsupported("Shipping area is not supported")
+    return province_code, ward_code, address
+
+
 def _locked_authenticated_identity(user) -> dict:
     try:
         locked_user = User.objects.select_for_update().get(pk=user.pk)
-        profile = MemberProfile.objects.select_for_update().get(user=locked_user)
-    except (User.DoesNotExist, MemberProfile.DoesNotExist) as error:
-        raise AuthAccountIncomplete("Auth Account profile is incomplete") from error
+        shipping_address = ShippingAddress.objects.select_for_update().get(user=locked_user)
+    except (User.DoesNotExist, ShippingAddress.DoesNotExist) as error:
+        raise AuthAccountIncomplete("Delivery address is missing") from error
 
     values = {
-        "name": str(locked_user.name or "").strip(),
-        "phone": str(profile.phone_number or "").strip(),
-        "province_code": str(profile.province_code or "").strip(),
-        "ward_code": str(profile.ward_code or "").strip(),
-        "address": str(profile.address or "").strip(),
+        "name": str(shipping_address.recipient_name or "").strip(),
+        "phone": str(shipping_address.phone_number or "").strip(),
+        "province_code": str(shipping_address.province_code or "").strip(),
+        "ward_code": str(shipping_address.ward_code or "").strip(),
+        "address": str(shipping_address.address or "").strip(),
         "email": str(locked_user.email or "").strip(),
     }
     if any(not value for value in values.values()):
@@ -448,12 +464,13 @@ def create_public_csa_purchase_request(**kwargs) -> tuple[CSAPurchaseRequest, st
     return item, raw_token
 
 
-def _guest_identity(*, identity) -> dict:
+def _guest_identity(*, identity, require_supported_area=True) -> dict:
     try:
         phone = normalize_vietnam_phone(str(identity.get("phone") or ""))
     except (AttributeError, InvalidPhoneNumber) as error:
         raise PurchaseAddressInvalid("Guest identity is invalid") from error
-    province_code, ward_code, address = _validated_address(
+    address_validator = _validated_address if require_supported_area else _normalized_address
+    province_code, ward_code, address = address_validator(
         province_code=identity.get("province_code"),
         ward_code=identity.get("ward_code"),
         address=identity.get("address"),
@@ -575,7 +592,12 @@ def _validate_payment_quote(quote: dict, *, now) -> dict:
     if not all(isinstance(value, dict) for value in (subject, selection, payment, terms)):
         raise PaymentQuoteUnavailable("Payment quote is unavailable")
     if subject.get("kind") == "user":
-        valid_subject = isinstance(subject.get("user_id"), str) and bool(subject["user_id"])
+        valid_subject = (
+            isinstance(subject.get("user_id"), str)
+            and bool(subject["user_id"])
+            and isinstance(subject.get("fingerprint"), str)
+            and len(subject["fingerprint"]) == 64
+        )
     elif subject.get("kind") == "guest":
         valid_subject = (
             isinstance(subject.get("fingerprint"), str) and len(subject["fingerprint"]) == 64
@@ -726,7 +748,11 @@ def create_csa_payment_quote(
 ) -> tuple[str, dict]:
     if user is not None:
         identity = _locked_authenticated_identity(user)
-        subject = {"kind": "user", "user_id": str(identity["user"].pk)}
+        subject = {
+            "kind": "user",
+            "user_id": str(identity["user"].pk),
+            "fingerprint": _guest_identity_fingerprint(identity),
+        }
     else:
         identity = _guest_identity(identity=guest_identity or {})
         subject = {"kind": "guest", "fingerprint": _guest_identity_fingerprint(identity)}
@@ -855,26 +881,37 @@ def confirm_csa_payment_quote(*, quote_token, user=None, guest_identity=None, no
     now = now or timezone.now()
     quote = _load_payment_quote(quote_token=quote_token, now=now)
     subject = quote["subject"]
+    existing = (
+        CSAPurchaseRequest.objects.select_for_update().filter(quote_nonce=quote["nonce"]).first()
+    )
     if subject.get("kind") == "user":
         if user is None or str(user.pk) != str(subject.get("user_id")):
             raise PaymentQuoteIdentityMismatch("Payment quote is unavailable")
+        if existing is not None:
+            if existing.user_id != user.pk:
+                raise PaymentQuoteIdentityMismatch("Payment quote is unavailable")
+            return existing, None
         identity = _locked_authenticated_identity(user)
-    elif subject.get("kind") == "guest":
-        if user is not None:
-            raise PaymentQuoteIdentityMismatch("Payment quote is unavailable")
-        identity = _guest_identity(identity=guest_identity or {})
         if not hmac.compare_digest(
             str(subject.get("fingerprint") or ""), _guest_identity_fingerprint(identity)
         ):
             raise PaymentQuoteIdentityMismatch("Payment quote is unavailable")
+    elif subject.get("kind") == "guest":
+        if user is not None:
+            raise PaymentQuoteIdentityMismatch("Payment quote is unavailable")
+        identity = _guest_identity(
+            identity=guest_identity or {}, require_supported_area=existing is None
+        )
+        if not hmac.compare_digest(
+            str(subject.get("fingerprint") or ""), _guest_identity_fingerprint(identity)
+        ):
+            raise PaymentQuoteIdentityMismatch("Payment quote is unavailable")
+        if existing is not None:
+            if existing.user_id is not None:
+                raise PaymentQuoteIdentityMismatch("Payment quote is unavailable")
+            return existing, None
     else:
         raise PaymentQuoteUnavailable("Payment quote is unavailable")
-
-    existing = (
-        CSAPurchaseRequest.objects.select_for_update().filter(quote_nonce=quote["nonce"]).first()
-    )
-    if existing is not None:
-        return existing, None
 
     coupon = None
     coupon_snapshot = quote.get("coupon")

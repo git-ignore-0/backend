@@ -1,5 +1,6 @@
 import uuid
 
+from django.conf import settings
 from django.db import models
 from django.db.models import Q
 
@@ -13,6 +14,59 @@ class CatalogTreeLock(models.Model):
 
     def __str__(self):
         return "commerce-category-tree"
+
+
+class ShippingProvinceRule(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    province_code = models.CharField(max_length=2, unique=True)
+    default_shipping_fee_vnd = models.PositiveBigIntegerField(default=0)
+    is_active = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["province_code", "id"]
+
+    def __str__(self):
+        return self.province_code
+
+
+class ShippingArea(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    province_code = models.CharField(max_length=2)
+    ward_code = models.CharField(max_length=5, unique=True)
+    shipping_fee_vnd = models.PositiveBigIntegerField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["province_code", "ward_code", "id"]
+
+    def __str__(self):
+        return self.ward_code
+
+
+class ShippingAddress(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        related_name="shipping_address",
+        on_delete=models.CASCADE,
+    )
+    recipient_name = models.CharField(max_length=200)
+    phone_number = models.CharField(max_length=32)
+    province_code = models.CharField(max_length=2)
+    ward_code = models.CharField(max_length=5)
+    address = models.CharField(max_length=500)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["user_id"]
+
+    def __str__(self):
+        return f"{self.user_id}: {self.ward_code}"
 
 
 class Category(models.Model):

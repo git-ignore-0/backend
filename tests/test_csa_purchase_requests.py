@@ -30,7 +30,7 @@ TEST_BANK = {
 
 
 @pytest.fixture(autouse=True)
-def vietqr_bank_directory(monkeypatch):
+def vietqr_bank_directory(monkeypatch, default_supported_shipping_area):
     monkeypatch.setattr("memberships.banks.get_transfer_banks", lambda: [TEST_BANK])
 
 

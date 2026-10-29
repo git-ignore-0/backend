@@ -8,7 +8,7 @@ from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from commerce.models import Category, Product, ProductTranslation
+from commerce.models import Category, Product, ProductTranslation, ShippingAddress
 from commerce.public_catalog import (
     public_category_payloads,
     public_product_payload,
@@ -21,6 +21,10 @@ from commerce.serializers import (
     ProductWriteSerializer,
     PublicStoreLocaleSerializer,
     PublicStoreProductQuerySerializer,
+    ShippingAddressSerializer,
+    ShippingLocaleSerializer,
+    ShippingQuoteSerializer,
+    ShippingSettingsSerializer,
 )
 from commerce.services import (
     CatalogConflict,
@@ -31,11 +35,22 @@ from commerce.services import (
     update_category,
     update_product,
 )
+from commerce.shipping import (
+    UnsupportedShippingArea,
+    active_shipping_area,
+    public_shipping_area_payloads,
+    save_shipping_address,
+    save_shipping_settings,
+    shipping_address_payload,
+    shipping_settings_payload,
+)
 from content.models import MediaAsset
 from content.permissions import IsWebsiteAdmin
 from content.serializers import media_payload
 from content.services import delete_orphan_media_asset
 from content.views import AdminMediaUploadView
+from members.administrative_units import province_exists
+from memberships.permissions import HasMembershipSelfScopes
 
 
 def no_store(response):
@@ -156,6 +171,90 @@ class PublicStoreProductDetailView(APIView):
                 }
             )
         )
+
+
+class PublicShippingAreaListView(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def get(self, request):
+        query = ShippingLocaleSerializer(data=request.query_params.dict())
+        query.is_valid(raise_exception=True)
+        return public_cache(
+            Response({"data": public_shipping_area_payloads(query.validated_data["locale"])})
+        )
+
+
+class PublicShippingQuoteView(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        serializer = ShippingQuoteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        area = active_shipping_area(**serializer.validated_data)
+        return no_store(
+            Response(
+                {
+                    "data": {
+                        "supported": area is not None,
+                        "shipping_fee_vnd": str(area.shipping_fee_vnd) if area else None,
+                    }
+                }
+            )
+        )
+
+
+class SelfShippingAddressView(APIView):
+    permission_classes = [HasMembershipSelfScopes]
+
+    def get(self, request):
+        item = ShippingAddress.objects.filter(user=request.user).first()
+        return no_store(Response({"data": shipping_address_payload(item) if item else None}))
+
+    def put(self, request):
+        serializer = ShippingAddressSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            item = save_shipping_address(user=request.user, data=serializer.validated_data)
+        except UnsupportedShippingArea:
+            return no_store(
+                Response(
+                    {
+                        "errors": [
+                            {
+                                "code": "shipping_area_unsupported",
+                                "detail": "The selected shipping area is not supported.",
+                            }
+                        ]
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            )
+        return no_store(Response({"data": shipping_address_payload(item)}))
+
+
+class AdminShippingSettingsView(APIView):
+    permission_classes = [IsWebsiteAdmin]
+
+    def get(self, request, province_code):
+        if not province_exists(province_code):
+            raise NotFound
+        return no_store(Response({"data": shipping_settings_payload(province_code=province_code)}))
+
+    def put(self, request, province_code):
+        if not province_exists(province_code):
+            raise NotFound
+        serializer = ShippingSettingsSerializer(
+            data=request.data,
+            context={"province_code": province_code},
+        )
+        serializer.is_valid(raise_exception=True)
+        payload = save_shipping_settings(
+            province_code=province_code,
+            data=serializer.validated_data,
+        )
+        return no_store(Response({"data": payload}))
 
 
 def category_queryset():

@@ -47,7 +47,7 @@ def bearer_client(token):
 
 
 @pytest.fixture(autouse=True)
-def tracker_environment(monkeypatch, settings, tmp_path):
+def tracker_environment(monkeypatch, settings, tmp_path, default_supported_shipping_area):
     cache.clear()
     monkeypatch.setattr("memberships.banks.get_transfer_banks", lambda: [TEST_BANK])
     settings.CSA_CONTRACT_PRIVATE_STORAGE_ROOT = tmp_path / "contracts"

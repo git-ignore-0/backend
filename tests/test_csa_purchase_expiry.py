@@ -46,7 +46,7 @@ TEST_BANK = {"bin": "970436", "name": "Vietcombank"}
 
 
 @pytest.fixture(autouse=True)
-def expiry_environment(monkeypatch, settings, tmp_path):
+def expiry_environment(monkeypatch, settings, tmp_path, default_supported_shipping_area):
     monkeypatch.setattr("memberships.banks.get_transfer_banks", lambda: [TEST_BANK])
     settings.CSA_CONTRACT_PRIVATE_STORAGE_ROOT = tmp_path / "contracts"
 

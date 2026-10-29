@@ -188,7 +188,9 @@ def test_invalid_stored_plan_cannot_be_activated(option, admin_client):
 
 
 @pytest.mark.django_db
-def test_used_plan_cannot_be_edited_or_deleted(option, admin_client, monkeypatch):
+def test_used_plan_cannot_be_edited_or_deleted(
+    option, admin_client, monkeypatch, default_supported_shipping_area
+):
     base = collection(option)
     plan_id = admin_client.post(base, full_plan(), format="json").json()["data"]["id"]
     admin_client.post(f"{base}/{plan_id}/activate", {}, format="json")

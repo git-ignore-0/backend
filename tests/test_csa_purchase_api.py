@@ -9,6 +9,7 @@ from django.core.cache import cache
 from django.db import close_old_connections, connection
 from rest_framework.test import APIClient
 
+from commerce.models import ShippingAddress
 from identity.models import User
 from members.models import MemberProfile
 from memberships.banks import BankDirectoryUnavailable
@@ -44,7 +45,7 @@ TEST_BANK = {
 
 
 @pytest.fixture(autouse=True)
-def public_purchase_test_isolation(monkeypatch):
+def public_purchase_test_isolation(monkeypatch, default_supported_shipping_area):
     cache.clear()
     monkeypatch.setattr("memberships.banks.get_transfer_banks", lambda: [TEST_BANK])
     yield
@@ -82,12 +83,20 @@ def payment_settings():
 
 @pytest.fixture
 def complete_member_profile(active_user):
-    return MemberProfile.objects.create(
+    MemberProfile.objects.create(
         user=active_user,
         phone_number="0901234567",
         province_code="66",
         ward_code="22015",
         address="Địa chỉ từ Auth Account",
+    )
+    return ShippingAddress.objects.create(
+        user=active_user,
+        recipient_name="Người nhận giao hàng",
+        phone_number="+84901234567",
+        province_code="66",
+        ward_code="22015",
+        address="Địa chỉ giao hàng",
     )
 
 
@@ -406,7 +415,7 @@ def test_authenticated_user_creates_only_their_own_request(
     data = response.json()["data"]
     purchase = CSAPurchaseRequest.objects.get(pk=data["id"])
     assert purchase.user == active_user
-    assert purchase.name_snapshot == active_user.name
+    assert purchase.name_snapshot == complete_member_profile.recipient_name
     assert purchase.phone_e164 == "+84901234567"
     assert purchase.province_code_snapshot == complete_member_profile.province_code
     assert purchase.ward_code_snapshot == complete_member_profile.ward_code
@@ -426,6 +435,7 @@ def test_authenticated_request_snapshots_without_updating_auth_or_live_data(
 ):
     package, option = package_and_option
     original_user_name = active_user.name
+    original_recipient_name = complete_member_profile.recipient_name
     original_profile_values = (
         complete_member_profile.phone_number,
         complete_member_profile.province_code,
@@ -467,7 +477,7 @@ def test_authenticated_request_snapshots_without_updating_auth_or_live_data(
     payment_settings.save(update_fields=["account_number", "updated_at"])
     purchase.refresh_from_db()
 
-    assert purchase.name_snapshot == original_user_name
+    assert purchase.name_snapshot == original_recipient_name
     assert purchase.email_snapshot != active_user.email
     assert purchase.phone_e164 == "+84901234567"
     assert purchase.address_snapshot == original_profile_values[3]
@@ -507,21 +517,21 @@ def test_authenticated_identity_payload_is_ignored_in_favor_of_locked_profile(
 
     assert response.status_code == 201
     purchase = CSAPurchaseRequest.objects.get(pk=response.json()["data"]["id"])
-    assert purchase.name_snapshot == active_user.name
+    assert purchase.name_snapshot == complete_member_profile.recipient_name
     assert purchase.phone_e164 == "+84901234567"
     assert purchase.province_code_snapshot == "66"
     assert purchase.ward_code_snapshot == "22015"
-    assert purchase.address_snapshot == "Địa chỉ từ Auth Account"
+    assert purchase.address_snapshot == "Địa chỉ giao hàng"
     assert purchase.email_snapshot == active_user.email
     assert purchase.zalo_whatsapp_snapshot == "zalo-contact"
 
 
 @pytest.mark.parametrize(
     "missing_field",
-    ["profile", "name", "phone_number", "province_code", "ward_code", "address"],
+    ["address_record", "recipient_name", "phone_number", "province_code", "ward_code", "address"],
 )
 @pytest.mark.django_db
-def test_authenticated_user_with_incomplete_auth_account_is_rejected(
+def test_authenticated_user_with_incomplete_delivery_address_is_rejected(
     missing_field,
     package_and_option,
     payment_settings,
@@ -530,10 +540,8 @@ def test_authenticated_user_with_incomplete_auth_account_is_rejected(
     access_token,
 ):
     package, option = package_and_option
-    if missing_field == "profile":
+    if missing_field == "address_record":
         complete_member_profile.delete()
-    elif missing_field == "name":
-        User.objects.filter(pk=active_user.pk).update(name="")
     else:
         setattr(complete_member_profile, missing_field, "")
         complete_member_profile.save(update_fields=[missing_field, "updated_at"])
@@ -550,7 +558,7 @@ def test_authenticated_user_with_incomplete_auth_account_is_rejected(
 
     assert response.status_code == 400
     assert response.json()["errors"][0]["code"] == "csa_purchase_auth_account_incomplete"
-    assert "Auth Account" in response.json()["errors"][0]["message"]
+    assert "delivery address" in response.json()["errors"][0]["message"].lower()
     assert CSAPurchaseRequest.objects.count() == 0
 
 

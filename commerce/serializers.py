@@ -3,6 +3,9 @@ from decimal import Decimal
 from django.utils.text import slugify
 from rest_framework import serializers
 
+from members.administrative_units import province_exists, ward_choices
+from memberships.phones import InvalidPhoneNumber, normalize_vietnam_phone
+
 MAX_POSITIVE_INTEGER = 2_147_483_647
 MAX_POSITIVE_BIG_INTEGER = 9_223_372_036_854_775_807
 
@@ -23,6 +26,74 @@ class StrictSerializer(serializers.Serializer):
                     {field: "This field is not allowed." for field in unknown}
                 )
         return super().to_internal_value(data)
+
+
+def validate_administrative_codes(*, province_code, ward_code):
+    if not province_exists(province_code):
+        raise serializers.ValidationError({"province_code": "Province code is invalid."})
+    valid_wards = {code for code, _name in ward_choices(province_code, "vi")}
+    if ward_code not in valid_wards:
+        raise serializers.ValidationError({"ward_code": "Ward code does not belong to province."})
+
+
+class ShippingAreaOverrideSerializer(StrictSerializer):
+    ward_code = serializers.CharField(max_length=5, trim_whitespace=True)
+    shipping_fee_vnd = serializers.IntegerField(
+        min_value=0, max_value=MAX_POSITIVE_BIG_INTEGER, allow_null=True
+    )
+    is_active = serializers.BooleanField()
+
+
+class ShippingSettingsSerializer(StrictSerializer):
+    default_shipping_fee_vnd = serializers.IntegerField(
+        min_value=0, max_value=MAX_POSITIVE_BIG_INTEGER
+    )
+    is_active = serializers.BooleanField()
+    overrides = ShippingAreaOverrideSerializer(many=True)
+
+    def validate_overrides(self, value):
+        ward_codes = [item["ward_code"] for item in value]
+        if len(ward_codes) != len(set(ward_codes)):
+            raise serializers.ValidationError("Ward codes must be unique.")
+        valid_wards = {code for code, _name in ward_choices(self.context["province_code"], "vi")}
+        if any(code not in valid_wards for code in ward_codes):
+            raise serializers.ValidationError(
+                "Every ward code must belong to the selected province."
+            )
+        return value
+
+
+class ShippingLocaleSerializer(StrictSerializer):
+    locale = serializers.ChoiceField(choices=["vi", "en"], required=False, default="vi")
+
+
+class ShippingQuoteSerializer(StrictSerializer):
+    province_code = serializers.CharField(max_length=2, trim_whitespace=True)
+    ward_code = serializers.CharField(max_length=5, trim_whitespace=True)
+
+    def validate(self, attrs):
+        validate_administrative_codes(**attrs)
+        return attrs
+
+
+class ShippingAddressSerializer(StrictSerializer):
+    recipient_name = serializers.CharField(max_length=200, trim_whitespace=True)
+    phone_number = serializers.CharField(max_length=32, trim_whitespace=True)
+    province_code = serializers.CharField(max_length=2, trim_whitespace=True)
+    ward_code = serializers.CharField(max_length=5, trim_whitespace=True)
+    address = serializers.CharField(max_length=500, trim_whitespace=True)
+
+    def validate_phone_number(self, value):
+        try:
+            return normalize_vietnam_phone(value)
+        except InvalidPhoneNumber as error:
+            raise serializers.ValidationError("Phone number is invalid.") from error
+
+    def validate(self, attrs):
+        validate_administrative_codes(
+            province_code=attrs["province_code"], ward_code=attrs["ward_code"]
+        )
+        return attrs
 
 
 class TranslationSerializer(StrictSerializer):

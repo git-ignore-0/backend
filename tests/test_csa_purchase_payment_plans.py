@@ -13,7 +13,7 @@ from django.db.models.deletion import ProtectedError
 from django.test.utils import CaptureQueriesContext
 from rest_framework.test import APIClient
 
-from members.models import MemberProfile
+from commerce.models import ShippingAddress, ShippingArea
 from memberships.models import (
     CSAPurchaseRequest,
     MembershipPackage,
@@ -34,9 +34,13 @@ BANK = {"bin": "970436", "name": "Vietcombank"}
 
 
 @pytest.fixture(autouse=True)
-def bank_directory(monkeypatch):
+def bank_directory(monkeypatch, db):
     cache.clear()
     monkeypatch.setattr("memberships.banks.get_transfer_banks", lambda: [BANK])
+    ShippingArea.objects.update_or_create(
+        ward_code="22015",
+        defaults={"province_code": "66", "shipping_fee_vnd": 30_000, "is_active": True},
+    )
     yield
     cache.clear()
 
@@ -335,9 +339,10 @@ def test_authenticated_create_accepts_only_selected_plan_and_server_identity(
 ):
     package, option = catalog
     plan = make_plan(option)
-    MemberProfile.objects.create(
+    ShippingAddress.objects.create(
         user=active_user,
-        phone_number="0901234567",
+        recipient_name="Delivery recipient",
+        phone_number="+84901234567",
         province_code="66",
         ward_code="22015",
         address="Server address",
@@ -359,7 +364,7 @@ def test_authenticated_create_accepts_only_selected_plan_and_server_identity(
     assert response.status_code == 201
     item = CSAPurchaseRequest.objects.get(pk=response.json()["data"]["id"])
     assert item.user_id == active_user.pk
-    assert item.name_snapshot == active_user.name
+    assert item.name_snapshot == "Delivery recipient"
     assert item.phone_e164 == "+84901234567"
     assert item.payment_plan_id == plan.pk
     assert "guest_confirmation_token" not in response.json()["data"]

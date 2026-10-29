@@ -10,6 +10,13 @@ router.register(
 router.register("admin/store-products", views.AdminProductViewSet, basename="admin-store-product")
 
 urlpatterns = [
+    path("public/shipping-areas", views.PublicShippingAreaListView.as_view()),
+    path("public/shipping-quotes", views.PublicShippingQuoteView.as_view()),
+    path("shipping-address", views.SelfShippingAddressView.as_view()),
+    path(
+        "admin/shipping-settings/<str:province_code>",
+        views.AdminShippingSettingsView.as_view(),
+    ),
     path("public/store-categories", views.PublicStoreCategoryListView.as_view()),
     path("public/store-products", views.PublicStoreProductListView.as_view()),
     path(

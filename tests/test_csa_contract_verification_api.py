@@ -32,7 +32,7 @@ TEST_BANK = {"bin": "970436", "name": "Vietcombank"}
 
 
 @pytest.fixture(autouse=True)
-def verification_environment(monkeypatch, settings, tmp_path):
+def verification_environment(monkeypatch, settings, tmp_path, default_supported_shipping_area):
     cache.clear()
     monkeypatch.setattr("memberships.banks.get_transfer_banks", lambda: [TEST_BANK])
     settings.CSA_CONTRACT_PRIVATE_STORAGE_ROOT = tmp_path / "contracts"

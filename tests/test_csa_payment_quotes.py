@@ -9,8 +9,8 @@ from django.db import close_old_connections, connection
 from django.utils import timezone
 from rest_framework.test import APIClient
 
+from commerce.models import ShippingAddress, ShippingArea
 from identity.models import AccountStatus, User
-from members.models import MemberProfile
 from memberships.coupons import CouponError, normalize_coupon_code
 from memberships.models import (
     CSAContract,
@@ -48,9 +48,17 @@ BANK = {"bin": "970436", "name": "Vietcombank"}
 
 
 @pytest.fixture(autouse=True)
-def quote_test_isolation(monkeypatch):
+def quote_test_isolation(monkeypatch, db):
     cache.clear()
     monkeypatch.setattr("memberships.banks.get_transfer_banks", lambda: [BANK])
+    ShippingArea.objects.update_or_create(
+        ward_code="22015",
+        defaults={
+            "province_code": "66",
+            "shipping_fee_vnd": 30_000,
+            "is_active": True,
+        },
+    )
     yield
     cache.clear()
 
@@ -144,10 +152,27 @@ def test_quote_is_stateless_and_uses_full_payment_total_for_qr(
     assert data["qr_payload"]["amount"] == "1100000"
     assert data["payment_summary"]["initial_payment_amount"] == "1100000"
     assert data["payment_summary"]["payment_type"] == "full"
+    assert "shipping_fee_vnd" not in data
     assert "Nguyễn Văn An" not in data["quote_token"]
     assert "+84912345678" not in data["quote_token"]
     assert "guest_token" not in data
     assert response.headers["Cache-Control"] == "private, no-store"
+
+
+@pytest.mark.django_db
+def test_guest_quote_rejects_a_real_ward_that_is_not_enabled_for_shipping(
+    catalog, payment_settings, guest_identity
+):
+    ShippingArea.objects.all().delete()
+    package, option = catalog
+    plan = make_plan(option, payment_type=MembershipPaymentType.FULL)
+
+    response = APIClient().post(
+        QUOTE_URL, quote_payload(package, option, plan, guest_identity), format="json"
+    )
+
+    assert response.status_code == 400
+    assert response.json()["errors"] == [{"code": "csa_shipping_area_unsupported"}]
 
 
 @pytest.mark.django_db
@@ -254,6 +279,7 @@ def test_confirm_quote_creates_one_payment_confirmed_request_and_is_idempotent(
     assert not CSAContract.objects.exists()
     assert data["guest_confirmation_token"]
     assert item.amount_snapshot == 1_300_000
+    assert "shipping_fee_vnd" not in data
     assert item.payment_installments_snapshot == quoted["payment_summary"]["installments"]
     assert list(
         CSAPurchasePayment.objects.filter(purchase_request=item).values_list(
@@ -269,6 +295,36 @@ def test_confirm_quote_creates_one_payment_confirmed_request_and_is_idempotent(
     assert retried.status_code == 200
     assert retried.json()["data"]["id"] == data["id"]
     assert "guest_confirmation_token" not in retried.json()["data"]
+    assert CSAPurchaseRequest.objects.count() == 1
+
+
+@pytest.mark.django_db
+def test_retry_returns_existing_request_after_shipping_area_is_disabled(
+    catalog, payment_settings, guest_identity
+):
+    package, option = catalog
+    plan = make_plan(option, payment_type=MembershipPaymentType.FULL)
+    quoted = (
+        APIClient()
+        .post(QUOTE_URL, quote_payload(package, option, plan, guest_identity), format="json")
+        .json()["data"]
+    )
+    first = APIClient().post(
+        CONFIRM_URL,
+        {"quote_token": quoted["quote_token"], "guest_identity": guest_identity},
+        format="json",
+    )
+    assert first.status_code == 201
+    ShippingArea.objects.filter(ward_code=guest_identity["ward_code"]).update(is_active=False)
+
+    retried = APIClient().post(
+        CONFIRM_URL,
+        {"quote_token": quoted["quote_token"], "guest_identity": guest_identity},
+        format="json",
+    )
+
+    assert retried.status_code == 200
+    assert retried.json()["data"]["id"] == first.json()["data"]["id"]
     assert CSAPurchaseRequest.objects.count() == 1
 
 
@@ -306,12 +362,13 @@ def test_confirm_rejects_expired_or_identity_mismatched_quote_without_creating_r
 def test_authenticated_quote_is_bound_to_the_current_user(catalog, payment_settings, active_user):
     package, option = catalog
     plan = make_plan(option, payment_type=MembershipPaymentType.FULL)
-    MemberProfile.objects.create(
+    ShippingAddress.objects.create(
         user=active_user,
-        phone_number="0901234567",
+        recipient_name="Nguyễn Văn An",
+        phone_number="+84901234567",
         province_code="66",
         ward_code="22015",
-        address="Auth account address",
+        address="Delivery address",
     )
     token, _quote = create_csa_payment_quote(
         package_id=package.pk,
@@ -328,8 +385,19 @@ def test_authenticated_quote_is_bound_to_the_current_user(catalog, payment_setti
 
     with pytest.raises(PaymentQuoteIdentityMismatch):
         confirm_csa_payment_quote(quote_token=token, user=another_user)
+
+    address = ShippingAddress.objects.get(user=active_user)
+    address.address = "Changed after quote"
+    address.save(update_fields=["address", "updated_at"])
+    with pytest.raises(PaymentQuoteIdentityMismatch):
+        confirm_csa_payment_quote(quote_token=token, user=active_user)
+
+    address.address = "Delivery address"
+    address.save(update_fields=["address", "updated_at"])
     item, guest_token = confirm_csa_payment_quote(quote_token=token, user=active_user)
     assert item.user_id == active_user.pk
+    assert item.name_snapshot == "Nguyễn Văn An"
+    assert item.address_snapshot == "Delivery address"
     assert guest_token is None
 
 

@@ -7,6 +7,19 @@ from identity.models import AccountStatus, User
 
 
 @pytest.fixture
+def default_supported_shipping_area(db):
+    """Create the supported ward explicitly for CSA purchase tests that need it."""
+    from commerce.models import ShippingArea
+
+    return ShippingArea.objects.create(
+        ward_code="22015",
+        province_code="66",
+        shipping_fee_vnd=30_000,
+        is_active=True,
+    )
+
+
+@pytest.fixture
 def active_user(db):
     user = User.objects.create_user(
         email="member@example.com",

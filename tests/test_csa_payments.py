@@ -16,6 +16,7 @@ from pypdf import PdfReader
 from rest_framework.test import APIClient
 
 import memberships.contract_versions as contract_versions
+from commerce.models import ShippingArea
 from identity.models import AuditLog
 from memberships.contract_access import contract_payload
 from memberships.contract_pdfs import CSAContractPDFStorageError, get_contract_pdf_storage
@@ -79,6 +80,10 @@ def payment_test_environment(monkeypatch, settings, tmp_path):
         account_number="123456789",
         account_name="NFV",
         direct_transfer_enabled=True,
+    )
+    ShippingArea.objects.update_or_create(
+        ward_code="22015",
+        defaults={"province_code": "66", "shipping_fee_vnd": 30_000, "is_active": True},
     )
     yield
     cache.clear()
