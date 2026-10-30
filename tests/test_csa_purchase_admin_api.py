@@ -13,7 +13,7 @@ from django.utils import timezone
 from pypdf import PdfReader
 from rest_framework.test import APIClient
 
-from commerce.models import ShippingAddress
+from commerce.models import ShippingAddress, ShippingArea
 from identity.models import AccountStatus, AuditLog, User
 from members.models import MemberProfile
 from memberships.models import (
@@ -1201,6 +1201,71 @@ def test_request_user_links_matching_unmanaged_phone_customer(admin_api, request
     assert existing.user == user
     assert item.customer == existing
     assert CSACustomer.objects.count() == 1
+
+
+@pytest.mark.django_db
+def test_request_user_link_reports_unavailable_shipping_address_without_mutating_customer(
+    admin_api, request_factory
+):
+    user = create_purchase_user()
+    item = request_factory(user=user)
+    existing = customer_from_request(item)
+    user.shipping_address.delete()
+
+    response = admin_api.post(
+        request_url(item, "approve"), {"start_date": str(timezone.localdate())}, format="json"
+    )
+
+    assert response.status_code == 400
+    assert response.json()["errors"] == [
+        {"code": "csa_purchase_customer_shipping_address_unavailable"}
+    ]
+    item.refresh_from_db()
+    existing.refresh_from_db()
+    assert item.status == CSAPurchaseRequestStatus.PAYMENT_CONFIRMED
+    assert item.customer_id is None
+    assert existing.user_id is None
+    assert existing.address == item.address_snapshot
+    assert not Membership.objects.exists()
+    assert not AuditLog.objects.exists()
+
+
+@pytest.mark.django_db
+def test_linked_purchase_conflict_audit_uses_final_shipping_address(admin_api, request_factory):
+    ShippingArea.objects.create(
+        province_code="66",
+        ward_code="22045",
+        shipping_fee_vnd=30_000,
+        is_active=True,
+    )
+    user = create_purchase_user()
+    item = request_factory(user=user)
+    existing = customer_from_request(item, name="Tên hiện tại", address="Địa chỉ hiện tại")
+    shipping_address = user.shipping_address
+    shipping_address.ward_code = "22045"
+    shipping_address.address = "Địa chỉ giao hàng mới"
+    shipping_address.save(update_fields=["ward_code", "address", "updated_at"])
+
+    response = admin_api.post(
+        request_url(item, "approve"),
+        {"start_date": str(timezone.localdate()), "customer_resolution": "use_request_data"},
+        format="json",
+    )
+
+    assert response.status_code == 200
+    existing.refresh_from_db()
+    assert existing.user_id == user.pk
+    assert existing.name == item.name_snapshot
+    assert existing.province_code == "66"
+    assert existing.ward_code == "22045"
+    assert existing.address == "Địa chỉ giao hàng mới"
+    log = AuditLog.objects.get(action="csa_purchase_request.conflict_resolved")
+    assert log.context["new_customer_data"] == {
+        "name": item.name_snapshot,
+        "province_code": "66",
+        "ward_code": "22045",
+        "address": "Địa chỉ giao hàng mới",
+    }
 
 
 @pytest.mark.django_db

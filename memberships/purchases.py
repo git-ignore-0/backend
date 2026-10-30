@@ -64,6 +64,7 @@ from memberships.payments import (
 from memberships.phones import InvalidPhoneNumber, normalize_vietnam_phone
 from memberships.services import (
     CSACustomerError,
+    CSACustomerShippingAddressUnavailable,
     MembershipOverlap,
     add_months,
     assign_membership,
@@ -165,6 +166,10 @@ class PurchaseCustomerResolutionRequired(CSAPurchaseError):
 
 class PurchaseCustomerConflict(CSAPurchaseError):
     code = "csa_purchase_customer_conflict"
+
+
+class PurchaseCustomerShippingAddressUnavailable(CSAPurchaseError):
+    code = "csa_purchase_customer_shipping_address_unavailable"
 
 
 class PurchaseCustomerIncomplete(CSAPurchaseError):
@@ -1362,6 +1367,7 @@ def _resolve_purchase_customer(*, item, actor, customer_resolution, rejection_re
     if locked_user is not None and phone_customer.user_id not in {None, locked_user.pk}:
         raise PurchaseCustomerConflict("Phone belongs to another linked CSA customer")
 
+    resolution_audit = None
     details_match = _customer_matches_request(phone_customer, item)
     if not details_match:
         if customer_resolution not in CUSTOMER_RESOLUTIONS:
@@ -1402,22 +1408,29 @@ def _resolve_purchase_customer(*, item, actor, customer_resolution, rejection_re
                 phone_customer = update_csa_customer(customer=phone_customer, **request_data)
             except CSACustomerError as error:
                 raise PurchaseCustomerConflict("CSA customer could not be updated") from error
-        _audit_conflict_resolution(
-            item=item,
-            actor=actor,
-            customer=phone_customer,
-            resolution=customer_resolution,
-            old_data=old_data,
-            new_data=_customer_details(phone_customer),
-        )
+        resolution_audit = (customer_resolution, old_data)
 
     if locked_user is not None and phone_customer.user_id is None:
         try:
             phone_customer = link_csa_customer_to_user(
                 customer=phone_customer, user=locked_user, actor=actor
             )
+        except CSACustomerShippingAddressUnavailable as error:
+            raise PurchaseCustomerShippingAddressUnavailable(
+                "User does not have a supported shipping address"
+            ) from error
         except CSACustomerError as error:
             raise PurchaseCustomerConflict("User is already linked to another customer") from error
+    if resolution_audit is not None:
+        resolution, old_data = resolution_audit
+        _audit_conflict_resolution(
+            item=item,
+            actor=actor,
+            customer=phone_customer,
+            resolution=resolution,
+            old_data=old_data,
+            new_data=_customer_details(phone_customer),
+        )
     try:
         ensure_csa_customer_complete(phone_customer)
     except CSACustomerError as error:

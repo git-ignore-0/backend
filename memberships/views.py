@@ -104,6 +104,7 @@ from memberships.purchases import (
     PurchaseCustomerConflict,
     PurchaseCustomerIncomplete,
     PurchaseCustomerResolutionRequired,
+    PurchaseCustomerShippingAddressUnavailable,
     PurchasePackageUnavailable,
     PurchasePaymentPlanRequired,
     PurchasePaymentPlanUnavailable,
@@ -143,7 +144,6 @@ from memberships.serializers import (
     CSAContractVerificationSerializer,
     CSACustomerCreateSerializer,
     CSACustomerLinkUserSerializer,
-    CSACustomerUpdateSerializer,
     CSAPaymentConfirmSerializer,
     CSAPaymentQuoteConfirmSerializer,
     CSAPaymentQuoteCreateSerializer,
@@ -172,8 +172,7 @@ from memberships.services import (
     PriceOptionConflict,
     PriceOptionTotalInvalid,
     assign_membership_with_contract,
-    create_csa_customer_for_user,
-    create_managed_csa_customer,
+    create_supported_managed_csa_customer,
     create_usage_order,
     ensure_due_cycles,
     link_csa_customer_to_user,
@@ -181,7 +180,6 @@ from memberships.services import (
     revoke_membership,
     sync_package_price_options,
     undo_usage_order,
-    update_csa_customer,
 )
 from memberships.terms import (
     CSATermsConflict,
@@ -258,6 +256,8 @@ def csa_customer_error(error):
             "csa_customer_province_required",
             "csa_customer_ward_required",
             "csa_customer_address_required",
+            "csa_customer_shipping_address_unavailable",
+            "csa_customer_shipping_area_unsupported",
             "csa_customer_incomplete",
             "invalid_csa_customer_address",
         }
@@ -300,7 +300,14 @@ def csa_purchase_error(error):
         ),
     ):
         http_status = status.HTTP_409_CONFLICT
-    elif isinstance(error, (PurchaseCustomerIncomplete, PurchaseStartDateInvalid)):
+    elif isinstance(
+        error,
+        (
+            PurchaseCustomerIncomplete,
+            PurchaseCustomerShippingAddressUnavailable,
+            PurchaseStartDateInvalid,
+        ),
+    ):
         http_status = status.HTTP_400_BAD_REQUEST
     elif isinstance(error, CSAPaymentAmountMismatch):
         http_status = status.HTTP_400_BAD_REQUEST
@@ -2407,26 +2414,13 @@ class AdminCSACustomerViewSet(viewsets.ViewSet):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         try:
-            if user_id := data.get("user_id"):
-                user = User.objects.get(pk=user_id)
-                item = create_csa_customer_for_user(
-                    user=user,
-                    name=data.get("name"),
-                    phone=data.get("phone"),
-                    province_code=data.get("province_code", ""),
-                    ward_code=data.get("ward_code", ""),
-                    address=data.get("address", ""),
-                )
-            else:
-                item = create_managed_csa_customer(
-                    name=data.get("name"),
-                    phone=data.get("phone"),
-                    province_code=data.get("province_code", ""),
-                    ward_code=data.get("ward_code", ""),
-                    address=data.get("address", ""),
-                )
-        except User.DoesNotExist:
-            return Response(status=status.HTTP_404_NOT_FOUND)
+            item = create_supported_managed_csa_customer(
+                name=data.get("name"),
+                phone=data.get("phone"),
+                province_code=data.get("province_code", ""),
+                ward_code=data.get("ward_code", ""),
+                address=data.get("address", ""),
+            )
         except CSACustomerError as error:
             return csa_customer_error(error)
         return no_store(
@@ -2440,24 +2434,6 @@ class AdminCSACustomerViewSet(viewsets.ViewSet):
         refresh_membership_statuses()
         item = get_object_or_404(customer_queryset(), pk=pk)
         return no_store(Response({"data": customer_payload(item, include_memberships=True)}))
-
-    def partial_update(self, request, pk=None):
-        item = get_object_or_404(CSACustomer, pk=pk)
-        serializer = CSACustomerUpdateSerializer(data=request.data, partial=True)
-        serializer.is_valid(raise_exception=True)
-        data = serializer.validated_data
-        try:
-            item = update_csa_customer(
-                customer=item,
-                name=data.get("name", ...),
-                phone=data.get("phone", ...),
-                province_code=data.get("province_code", ...),
-                ward_code=data.get("ward_code", ...),
-                address=data.get("address", ...),
-            )
-        except CSACustomerError as error:
-            return csa_customer_error(error)
-        return no_store(Response({"data": customer_payload(customer_queryset().get(pk=item.pk))}))
 
     @action(detail=True, methods=["post"], url_path="link-user")
     def link_user(self, request, pk=None):

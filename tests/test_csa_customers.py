@@ -9,8 +9,8 @@ from django.db.migrations.executor import MigrationExecutor
 from django.utils import timezone
 from rest_framework.test import APIClient
 
+from commerce.models import ShippingAddress, ShippingArea
 from identity.models import AccountStatus, AuditLog, User
-from members.models import MemberProfile
 from memberships.models import (
     CSACustomer,
     Membership,
@@ -166,79 +166,59 @@ def test_admin_managed_customer_requires_complete_valid_data(admin_api, field, v
 
 
 @pytest.mark.django_db
-@pytest.mark.parametrize(
-    ("field", "code"),
-    [
-        ("name", "csa_customer_name_required"),
-        ("phone", "csa_customer_phone_required"),
-        ("province_code", "csa_customer_province_required"),
-        ("ward_code", "csa_customer_ward_required"),
-        ("address", "csa_customer_address_required"),
-    ],
-)
-def test_admin_linked_customer_does_not_backfill_missing_request_data(admin_api, field, code):
-    user = create_active_user("linked-required@example.com")
-    payload = {
-        "user_id": str(user.pk),
-        "name": user.name,
-        "phone": "0901234567",
-        **VALID_CUSTOMER_FIELDS,
-    }
-    payload.pop(field)
-
-    response = admin_api.post("/api/v1/admin/csa-customers", payload, format="json")
-
-    assert response.status_code == 400
-    assert response.json()["errors"] == [{"code": code}]
-    assert not CSACustomer.objects.filter(user=user).exists()
-
-
-@pytest.mark.django_db
-@pytest.mark.parametrize(
-    ("field", "code"),
-    [
-        ("name", "csa_customer_name_required"),
-        ("phone", "csa_customer_phone_required"),
-        ("province_code", "csa_customer_province_required"),
-        ("ward_code", "csa_customer_ward_required"),
-        ("address", "csa_customer_address_required"),
-    ],
-)
-def test_admin_customer_patch_cannot_remove_required_data(admin_api, field, code):
-    customer = create_complete_managed_customer()
-
-    response = admin_api.patch(
-        f"/api/v1/admin/csa-customers/{customer.pk}",
-        {field: " "},
+def test_admin_managed_customer_requires_supported_shipping_area(admin_api):
+    response = admin_api.post(
+        "/api/v1/admin/csa-customers",
+        {"name": "Managed", "phone": "0901234567", **VALID_CUSTOMER_FIELDS},
         format="json",
     )
 
     assert response.status_code == 400
-    assert response.json()["errors"] == [{"code": code}]
+    assert response.json()["errors"] == [{"code": "csa_customer_shipping_area_unsupported"}]
+    assert not CSACustomer.objects.exists()
+
+
+@pytest.mark.django_db
+def test_admin_customer_create_rejects_user_id(admin_api, active_user):
+    response = admin_api.post(
+        "/api/v1/admin/csa-customers",
+        {
+            "user_id": str(active_user.pk),
+            "name": "Managed",
+            "phone": "0901234567",
+            **VALID_CUSTOMER_FIELDS,
+        },
+        format="json",
+    )
+
+    assert response.status_code == 400
+    assert response.json()["user_id"] == "This field is not allowed."
+    assert not CSACustomer.objects.exists()
+
+
+@pytest.mark.django_db
+def test_admin_customer_patch_is_not_available(admin_api):
+    customer = create_complete_managed_customer()
+
+    response = admin_api.patch(
+        f"/api/v1/admin/csa-customers/{customer.pk}",
+        {"name": "Changed"},
+        format="json",
+    )
+
+    assert response.status_code == 405
     customer.refresh_from_db()
     assert customer.name == "Managed"
-    assert customer.phone_e164 == "+84901234567"
-    assert customer.province_code == "66"
-    assert customer.ward_code == "22015"
-    assert customer.address == "Số 12, ngõ 5"
 
 
 @pytest.mark.django_db
-def test_admin_customer_patch_requires_new_ward_when_province_changes(admin_api):
-    customer = create_complete_managed_customer()
-
-    response = admin_api.patch(
-        f"/api/v1/admin/csa-customers/{customer.pk}",
-        {"province_code": "01"},
-        format="json",
+def test_admin_customer_create_list_and_delete_rejection(admin_api):
+    ShippingArea.objects.create(
+        province_code="66",
+        ward_code="22015",
+        shipping_fee_vnd=30_000,
+        is_active=True,
     )
-
-    assert response.status_code == 400
-    assert response.json()["errors"] == [{"code": "csa_customer_ward_required"}]
-
-
-@pytest.mark.django_db
-def test_admin_customer_crud_filters_and_strict_fields(admin_api):
     managed_response = admin_api.post(
         "/api/v1/admin/csa-customers",
         {
@@ -258,36 +238,6 @@ def test_admin_customer_crud_filters_and_strict_fields(admin_api):
     assert managed["ward_code"] == "22015"
     assert managed["address"] == "Số 12, ngõ 5"
 
-    user = create_active_user("api-linked@example.com", phone=None)
-    MemberProfile.objects.create(
-        user=user,
-        phone_number="0908888888",
-        province_code="66",
-        ward_code="22015",
-        address="Địa chỉ từ hồ sơ",
-    )
-    linked_response = admin_api.post(
-        "/api/v1/admin/csa-customers",
-        {
-            "user_id": str(user.pk),
-            "name": user.name,
-            "phone": "0908888888",
-            "province_code": "66",
-            "ward_code": "22015",
-            "address": "Địa chỉ gửi từ admin",
-        },
-        format="json",
-    )
-    assert linked_response.status_code == 201
-    linked_data = linked_response.json()["data"]
-    assert linked_data["user"]["email"] == user.email
-    assert linked_data["phone"] == "+84908888888"
-    assert linked_data["province_code"] == "66"
-    assert linked_data["ward_code"] == "22015"
-    assert linked_data["address"] == "Địa chỉ gửi từ admin"
-    user.member_profile.refresh_from_db()
-    assert user.member_profile.address == "Địa chỉ từ hồ sơ"
-
     listed = admin_api.get(
         "/api/v1/admin/csa-customers",
         {"linked": "managed", "search": "Khách", "page": 1, "page_size": 10},
@@ -296,49 +246,18 @@ def test_admin_customer_crud_filters_and_strict_fields(admin_api):
     assert [item["id"] for item in listed.json()["data"]] == [managed["id"]]
     assert listed.json()["meta"]["page_size"] == 10
 
-    patched = admin_api.patch(
-        f"/api/v1/admin/csa-customers/{managed['id']}",
-        {"name": "Khách CSA", "phone": "84909999999", "address": "Số 20"},
-        format="json",
-    )
-    assert patched.status_code == 200
-    assert patched.json()["data"]["phone"] == "+84909999999"
-    assert patched.json()["data"]["address"] == "Số 20"
-
-    invalid_address = admin_api.patch(
-        f"/api/v1/admin/csa-customers/{managed['id']}",
-        {"province_code": "01", "ward_code": "22015"},
-        format="json",
-    )
-    assert invalid_address.status_code == 400
-    assert invalid_address.json()["errors"] == [{"code": "invalid_csa_customer_address"}]
-
-    unknown = admin_api.patch(
-        f"/api/v1/admin/csa-customers/{managed['id']}",
-        {"user_id": str(user.pk)},
-        format="json",
-    )
-    assert unknown.status_code == 400
-    assert unknown.json()["user_id"] == "This field is not allowed."
     assert admin_api.delete(f"/api/v1/admin/csa-customers/{managed['id']}").status_code == 405
 
 
 @pytest.mark.django_db
-def test_admin_customer_create_maps_duplicate_user_and_phone_to_stable_conflicts(admin_api):
-    user = create_active_user("duplicate-linked@example.com")
-    create_complete_customer_for_user(user)
-    linked_response = admin_api.post(
-        "/api/v1/admin/csa-customers",
-        {
-            "user_id": str(user.pk),
-            "name": user.name,
-            "phone": "0907777777",
-            **VALID_CUSTOMER_FIELDS,
-        },
-        format="json",
+def test_admin_customer_create_maps_duplicate_phone_to_stable_conflict(admin_api):
+    ShippingArea.objects.create(
+        province_code="66",
+        ward_code="22015",
+        shipping_fee_vnd=30_000,
+        is_active=True,
     )
-    assert linked_response.status_code == 409
-    assert linked_response.json()["errors"] == [{"code": "csa_customer_user_exists"}]
+    create_complete_managed_customer()
 
     phone_response = admin_api.post(
         "/api/v1/admin/csa-customers",
@@ -365,6 +284,20 @@ def test_customer_api_requires_scope_and_group(active_user, access_token):
 @pytest.mark.django_db
 def test_admin_can_link_user_once_with_audit_and_cannot_unlink(admin_api, active_user):
     customer = create_complete_managed_customer()
+    ShippingArea.objects.create(
+        province_code="66",
+        ward_code="22045",
+        shipping_fee_vnd=30_000,
+        is_active=True,
+    )
+    ShippingAddress.objects.create(
+        user=active_user,
+        recipient_name="Người nhận mới",
+        phone_number="0987654321",
+        province_code="66",
+        ward_code="22045",
+        address="Địa chỉ giao hàng mới",
+    )
     response = admin_api.post(
         f"/api/v1/admin/csa-customers/{customer.pk}/link-user",
         {"user_id": str(active_user.pk)},
@@ -372,6 +305,12 @@ def test_admin_can_link_user_once_with_audit_and_cannot_unlink(admin_api, active
     )
     assert response.status_code == 200
     assert response.json()["data"]["user"]["id"] == str(active_user.pk)
+    customer.refresh_from_db()
+    assert customer.name == "Managed"
+    assert customer.phone_e164 == "+84901234567"
+    assert customer.province_code == "66"
+    assert customer.ward_code == "22045"
+    assert customer.address == "Địa chỉ giao hàng mới"
     audit = AuditLog.objects.get(action="csa_customer.link_user")
     assert audit.user_id == active_user.pk
     assert audit.context == {
@@ -392,8 +331,39 @@ def test_admin_can_link_user_once_with_audit_and_cannot_unlink(admin_api, active
             {"user": None},
             format="json",
         ).status_code
-        == 400
+        == 405
     )
+
+
+@pytest.mark.parametrize("has_shipping_address", [False, True])
+@pytest.mark.django_db
+def test_admin_cannot_link_customer_without_supported_shipping_address(
+    admin_api, active_user, has_shipping_address
+):
+    customer = create_complete_managed_customer()
+    if has_shipping_address:
+        ShippingAddress.objects.create(
+            user=active_user,
+            recipient_name="Người nhận mới",
+            phone_number="0987654321",
+            province_code="66",
+            ward_code="22045",
+            address="Địa chỉ chưa được hỗ trợ",
+        )
+
+    response = admin_api.post(
+        f"/api/v1/admin/csa-customers/{customer.pk}/link-user",
+        {"user_id": str(active_user.pk)},
+        format="json",
+    )
+
+    assert response.status_code == 400
+    assert response.json()["errors"] == [{"code": "csa_customer_shipping_address_unavailable"}]
+    customer.refresh_from_db()
+    assert customer.user_id is None
+    assert customer.province_code == "66"
+    assert customer.ward_code == "22015"
+    assert customer.address == "Số 12, ngõ 5"
 
 
 @pytest.mark.django_db

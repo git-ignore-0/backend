@@ -417,19 +417,6 @@ class MembershipPaymentSettingsWriteSerializer(StrictSerializer):
 
 
 class CSACustomerCreateSerializer(StrictSerializer):
-    user_id = serializers.UUIDField(required=False)
-    name = serializers.CharField(
-        max_length=150, trim_whitespace=True, allow_blank=True, required=False
-    )
-    phone = serializers.CharField(
-        max_length=32, trim_whitespace=True, allow_blank=True, allow_null=True, required=False
-    )
-    province_code = serializers.CharField(max_length=2, allow_blank=True, required=False)
-    ward_code = serializers.CharField(max_length=5, allow_blank=True, required=False)
-    address = serializers.CharField(max_length=500, allow_blank=True, required=False)
-
-
-class CSACustomerUpdateSerializer(StrictSerializer):
     name = serializers.CharField(
         max_length=150, trim_whitespace=True, allow_blank=True, required=False
     )
