@@ -97,6 +97,22 @@ def expire_open_csa_purchase_request_for_phone(*, phone_e164, now=None) -> bool:
     return bool(item and _expire_locked_request(item, now=now))
 
 
+@transaction.atomic
+def expire_open_csa_purchase_requests_for_user(*, user_id, now=None) -> int:
+    now = now or timezone.now()
+    items = (
+        CSAPurchaseRequest.objects.select_for_update()
+        .filter(
+            user_id=user_id,
+            status__in=OPEN_CSA_PURCHASE_REQUEST_STATUSES,
+            expires_at__isnull=False,
+            expires_at__lte=now,
+        )
+        .order_by("expires_at", "id")
+    )
+    return sum(int(_expire_locked_request(item, now=now)) for item in items)
+
+
 def expire_csa_purchase_requests(*, now=None, batch_size=DEFAULT_BATCH_SIZE, dry_run=False) -> int:
     now = now or timezone.now()
     batch_size = int(batch_size)

@@ -20,6 +20,8 @@ from memberships.models import (
     CSAContractSource,
     CSAContractTermsAcceptanceMethod,
     CSACustomer,
+    CSAPurchaseRequest,
+    CSAPurchaseRequestStatus,
     Membership,
     MembershipCycle,
     MembershipCycleQuota,
@@ -194,6 +196,33 @@ def assign(
         actor=actor or user,
     )
     return membership, product, option
+
+
+def create_purchase_request(user, package, option, *, status=CSAPurchaseRequestStatus.PENDING):
+    customer = customer_for(user)
+    return CSAPurchaseRequest.objects.create(
+        user=user,
+        phone_e164=customer.phone_e164,
+        name_snapshot=user.name,
+        email_snapshot=user.email,
+        province_code_snapshot="66",
+        ward_code_snapshot="22015",
+        address_snapshot="Số 12, ngõ 5",
+        package=package,
+        price_option=option,
+        package_name_snapshot=package.name,
+        price_option_name_snapshot=f"{option.duration_months} tháng",
+        duration_months_snapshot=option.duration_months,
+        amount_snapshot=option.duration_months * option.monthly_price_vnd,
+        currency_snapshot="VND",
+        bank_bin_snapshot="970436",
+        bank_name_snapshot="Vietcombank",
+        account_number_snapshot="123456789",
+        account_name_snapshot="NATURAL FARMING VIETNAM",
+        transfer_content=f"CSA {uuid.uuid4().hex[:12].upper()}",
+        payment_config_version=1,
+        status=status,
+    )
 
 
 def assign_with_past_start(user, *, policy=QuotaPolicy.EXPIRE, quota=2, months_ago=1):
@@ -861,6 +890,145 @@ def test_self_current_quota_and_usage_use_immutable_snapshot(active_user, access
     assert quota.json()["data"]["products"][0]["remaining_units"] == 1
     assert usage.json()["data"][0]["lines"][0]["product_name"] == "Seasonal basket"
     assert current["Cache-Control"] == "private, no-store"
+
+
+@pytest.mark.django_db
+def test_self_membership_overview_returns_active_and_all_owned_upcoming_items(
+    active_user, access_token
+):
+    active, _product, _option = assign(active_user, reference="FB-ACTIVE")
+    scheduled_package, _product, scheduled_option = create_package(duration=3)
+    scheduled_first, _product, _option = assign(
+        active_user,
+        package=scheduled_package,
+        option=scheduled_option,
+        start_date=active.end_date,
+        reference="FB-SCHEDULED-1",
+    )
+    scheduled_second, _product, _option = assign(
+        active_user,
+        package=scheduled_package,
+        option=scheduled_option,
+        start_date=scheduled_first.end_date,
+        reference="FB-SCHEDULED-2",
+    )
+    approved = create_purchase_request(active_user, scheduled_package, scheduled_option)
+    approved.status = CSAPurchaseRequestStatus.APPROVED
+    approved.customer = customer_for(active_user)
+    approved.membership = scheduled_first
+    approved.approved_at = timezone.now()
+    approved.approved_by = active_user
+    approved.save(
+        update_fields=[
+            "status",
+            "customer",
+            "membership",
+            "approved_at",
+            "approved_by",
+            "updated_at",
+        ]
+    )
+    pending = create_purchase_request(active_user, scheduled_package, scheduled_option)
+
+    other_user = create_active_user("other-overview@example.com")
+    other_active, _product, _option = assign(other_user)
+    assign(
+        other_user,
+        package=scheduled_package,
+        option=scheduled_option,
+        start_date=other_active.end_date,
+    )
+    create_purchase_request(other_user, scheduled_package, scheduled_option)
+
+    response = bearer_client(access_token).get("/api/v1/memberships/overview?locale=en")
+
+    assert response.status_code == 200
+    assert response["Cache-Control"] == "private, no-store"
+    data = response.json()["data"]
+    assert data["active_membership"]["id"] == str(active.pk)
+    assert data["active_membership"]["package_name"] == "CSA package"
+    assert [(item["kind"], item["id"]) for item in data["upcoming"]] == [
+        ("membership", str(scheduled_first.pk)),
+        ("membership", str(scheduled_second.pk)),
+        ("purchase_request", str(pending.pk)),
+    ]
+    assert data["upcoming"][0]["status"] == MembershipStatus.SCHEDULED
+    assert str(approved.pk) not in {item["id"] for item in data["upcoming"]}
+    assert data["upcoming"][2] == {
+        "kind": "purchase_request",
+        "id": str(pending.pk),
+        "request_code": pending.request_code,
+        "status": CSAPurchaseRequestStatus.PENDING,
+        "package_name": pending.package_name_snapshot,
+        "duration_months": pending.duration_months_snapshot,
+        "amount": str(pending.amount_snapshot),
+        "currency": pending.currency_snapshot,
+        "created_at": pending.created_at.isoformat(),
+        "expires_at": None,
+    }
+
+
+@pytest.mark.django_db
+def test_self_membership_overview_returns_empty_shape_without_memberships(
+    active_user, access_token
+):
+    response = bearer_client(access_token).get("/api/v1/memberships/overview?locale=vi")
+
+    assert response.status_code == 200
+    assert response.json() == {"data": {"active_membership": None, "upcoming": []}}
+
+
+@pytest.mark.django_db
+def test_self_membership_overview_includes_payment_confirmed_request(active_user, access_token):
+    package, _product, option = create_package()
+    purchase_request = create_purchase_request(
+        active_user,
+        package,
+        option,
+        status=CSAPurchaseRequestStatus.PAYMENT_CONFIRMED,
+    )
+
+    response = bearer_client(access_token).get("/api/v1/memberships/overview")
+
+    assert response.status_code == 200
+    assert response.json()["data"]["upcoming"] == [
+        {
+            "kind": "purchase_request",
+            "id": str(purchase_request.pk),
+            "request_code": purchase_request.request_code,
+            "status": CSAPurchaseRequestStatus.PAYMENT_CONFIRMED,
+            "package_name": purchase_request.package_name_snapshot,
+            "duration_months": purchase_request.duration_months_snapshot,
+            "amount": str(purchase_request.amount_snapshot),
+            "currency": purchase_request.currency_snapshot,
+            "created_at": purchase_request.created_at.isoformat(),
+            "expires_at": None,
+        }
+    ]
+
+
+@pytest.mark.django_db
+def test_self_membership_overview_expires_due_open_request(active_user, access_token):
+    package, _product, option = create_package()
+    purchase_request = create_purchase_request(active_user, package, option)
+    CSAPurchaseRequest.objects.filter(pk=purchase_request.pk).update(
+        expires_at=timezone.now() - timedelta(seconds=1)
+    )
+
+    response = bearer_client(access_token).get("/api/v1/memberships/overview")
+
+    assert response.status_code == 200
+    assert response.json()["data"]["upcoming"] == []
+    purchase_request.refresh_from_db()
+    assert purchase_request.status == CSAPurchaseRequestStatus.EXPIRED
+    assert purchase_request.expired_at is not None
+
+
+@pytest.mark.django_db
+def test_self_membership_overview_requires_auth_and_strict_locale(access_token):
+    assert APIClient().get("/api/v1/memberships/overview").status_code == 401
+    response = bearer_client(access_token).get("/api/v1/memberships/overview?locale=fr")
+    assert response.status_code == 400
 
 
 @pytest.mark.django_db

@@ -47,12 +47,14 @@ from memberships.coupons import (
     discounted_plan,
     normalize_coupon_code,
 )
+from memberships.expiry import expire_open_csa_purchase_requests_for_user
 from memberships.models import (
     CSAContract,
     CSACoupon,
     CSACustomer,
     CSAPurchasePayment,
     CSAPurchaseRequest,
+    CSAPurchaseRequestStatus,
     CSATermsDocument,
     Membership,
     MembershipContentLocale,
@@ -891,6 +893,21 @@ def membership_payload(
     return data
 
 
+def upcoming_purchase_request_payload(item: CSAPurchaseRequest):
+    return {
+        "kind": "purchase_request",
+        "id": str(item.pk),
+        "request_code": item.request_code,
+        "status": item.status,
+        "package_name": item.package_name_snapshot,
+        "duration_months": item.duration_months_snapshot,
+        "amount": str(item.amount_snapshot),
+        "currency": item.currency_snapshot,
+        "created_at": item.created_at.isoformat(),
+        "expires_at": item.expires_at.isoformat() if item.expires_at else None,
+    }
+
+
 def quota_payload(membership, *, locale=MembershipContentLocale.VI, admin=False):
     balances = {
         str(row["product_snapshot_id"]): row["remaining"] or 0
@@ -1371,6 +1388,51 @@ class SelfMembershipView(APIView):
         if item.status != MembershipStatus.ACTIVE:
             return no_store(Response({"data": None}))
         return no_store(Response({"data": membership_payload(item, locale=locale)}))
+
+
+class SelfMembershipOverviewView(APIView):
+    permission_classes = [HasMembershipSelfScopes]
+
+    @transaction.atomic
+    def get(self, request):
+        locale = requested_locale(request)
+        refresh_membership_statuses()
+        expire_open_csa_purchase_requests_for_user(user_id=request.user.pk)
+        today = timezone.localdate()
+        memberships = membership_queryset().filter(customer__user=request.user)
+        active = memberships.filter(
+            status=MembershipStatus.ACTIVE,
+            start_date__lte=today,
+            end_date__gt=today,
+        ).first()
+        scheduled = memberships.filter(status=MembershipStatus.SCHEDULED).order_by(
+            "start_date", "id"
+        )
+        purchase_requests = CSAPurchaseRequest.objects.filter(
+            user=request.user,
+            membership__isnull=True,
+            status__in=(
+                CSAPurchaseRequestStatus.PENDING,
+                CSAPurchaseRequestStatus.PAYMENT_CONFIRMED,
+            ),
+        ).order_by("created_at", "id")
+
+        upcoming = [
+            {"kind": "membership", **membership_payload(item, locale=locale)} for item in scheduled
+        ]
+        upcoming.extend(upcoming_purchase_request_payload(item) for item in purchase_requests)
+        return no_store(
+            Response(
+                {
+                    "data": {
+                        "active_membership": (
+                            membership_payload(active, locale=locale) if active else None
+                        ),
+                        "upcoming": upcoming,
+                    }
+                }
+            )
+        )
 
 
 class SelfMembershipContractView(APIView):

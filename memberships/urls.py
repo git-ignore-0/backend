@@ -100,6 +100,7 @@ urlpatterns = [
         views.PublicCSAContractTrackerPDFView.as_view(),
     ),
     path("memberships/current", views.SelfMembershipView.as_view()),
+    path("memberships/overview", views.SelfMembershipOverviewView.as_view()),
     path(
         "memberships/<uuid:membership_id>/contract",
         views.SelfMembershipContractView.as_view(),
