@@ -11,6 +11,7 @@ from commerce.services import update_product
 from content.models import MediaAsset
 from farms.models import Farm, FarmProduct
 from memberships.models import Product as MembershipProduct
+from memberships.models import ProductTranslation as MembershipProductTranslation
 
 
 def make_category(slug, *, parent=None, active=True, sort_order=0):
@@ -79,6 +80,29 @@ def make_product(
         ]
     )
     return product
+
+
+def make_quota_group(*, vi_name="Rau", en_name="Vegetables"):
+    group = MembershipProduct.objects.create(
+        name=vi_name,
+        unit_size=Decimal("1.000"),
+        unit_label_vi="kg",
+        unit_label_en="kg",
+        is_active=True,
+    )
+    translations = [
+        MembershipProductTranslation(
+            product=group, locale="vi", name=vi_name, short_description=""
+        )
+    ]
+    if en_name is not None:
+        translations.append(
+            MembershipProductTranslation(
+                product=group, locale="en", name=en_name, short_description=""
+            )
+        )
+    MembershipProductTranslation.objects.bulk_create(translations)
+    return group
 
 
 @pytest.mark.django_db
@@ -154,13 +178,7 @@ def test_public_store_categories_include_only_usable_tree():
 def test_public_store_list_returns_localized_card_contract():
     client = APIClient()
     category = make_category("vegetables")
-    quota_group = MembershipProduct.objects.create(
-        name="Greens",
-        unit_size=Decimal("1.000"),
-        unit_label_vi="kg",
-        unit_label_en="kg",
-        is_active=True,
-    )
+    quota_group = make_quota_group()
     product = make_product("tomato", category, quota_group=quota_group)
     farm = Farm.objects.create(
         name_vi="Nông trại A",
@@ -205,7 +223,11 @@ def test_public_store_list_returns_localized_card_contract():
                 }
             ],
         },
-        "csa_eligible": True,
+        "csa_quota_group": {
+            "id": str(quota_group.pk),
+            "name": "Rau",
+            "cost": 2,
+        },
         "suppliers": [{"id": str(farm.pk), "name": "Nông trại A"}],
         "requested_locale": "vi",
         "content_locale": "vi",
@@ -218,7 +240,8 @@ def test_public_store_list_returns_localized_card_contract():
 def test_public_store_detail_returns_description_and_active_supplier_summaries():
     client = APIClient()
     category = make_category("vegetables")
-    product = make_product("tomato", category)
+    quota_group = make_quota_group()
+    product = make_product("tomato", category, quota_group=quota_group)
     visible = Farm.objects.create(
         name_vi="Nông trại A",
         name_en="Farm A",
@@ -242,9 +265,44 @@ def test_public_store_detail_returns_description_and_active_supplier_summaries()
     row = response.json()["data"]
     assert row["description"] == "Full description"
     assert row["suppliers"] == [{"id": str(visible.pk), "name": "Farm A", "location": "Da Lat"}]
+    assert row["csa_quota_group"] == {
+        "id": str(quota_group.pk),
+        "name": "Vegetables",
+        "cost": 2,
+    }
+    assert "csa_eligible" not in row
     assert "csa_quota_cost" not in row
     assert "is_published" not in row
     assert "weekly_supplies" not in row
+
+
+@pytest.mark.django_db
+def test_public_store_returns_null_csa_group_for_retail_product():
+    category = make_category("vegetables")
+    product = make_product("tomato", category)
+
+    response = APIClient().get(f"/api/v1/public/store-products/{product.slug}?locale=vi")
+
+    assert response.status_code == 200
+    row = response.json()["data"]
+    assert row["csa_quota_group"] is None
+    assert "csa_eligible" not in row
+
+
+@pytest.mark.django_db
+def test_public_store_csa_group_name_falls_back_to_vietnamese():
+    category = make_category("vegetables")
+    quota_group = make_quota_group(vi_name="Củ quả", en_name=None)
+    product = make_product("carrot", category, quota_group=quota_group)
+
+    response = APIClient().get(f"/api/v1/public/store-products/{product.slug}?locale=en")
+
+    assert response.status_code == 200
+    assert response.json()["data"]["csa_quota_group"] == {
+        "id": str(quota_group.pk),
+        "name": "Củ quả",
+        "cost": 2,
+    }
 
 
 @pytest.mark.django_db

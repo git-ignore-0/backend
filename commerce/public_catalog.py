@@ -34,6 +34,7 @@ def public_product_queryset():
         .prefetch_related(
             "translations",
             "category__translations",
+            "csa_quota_group__translations",
             Prefetch("farm_offers", queryset=active_suppliers, to_attr="public_farm_offers"),
         )
     )
@@ -122,6 +123,18 @@ def _public_media_payload(asset, request):
     }
 
 
+def _public_csa_quota_group_payload(product, locale):
+    group = product.csa_quota_group
+    if group is None or not group.is_active or product.csa_quota_cost <= 0:
+        return None
+    translation, _available_locales = _translation(group, locale)
+    return {
+        "id": str(group.pk),
+        "name": translation.name if translation else group.name,
+        "cost": product.csa_quota_cost,
+    }
+
+
 def public_product_payload(product, request, locale, *, detail=False):
     translation, available_locales = _translation(product, locale)
     alternate_locale = "en" if translation.locale == "vi" else "vi"
@@ -159,11 +172,7 @@ def public_product_payload(product, request, locale, *, detail=False):
         "primary_image": (
             _public_media_payload(product.primary_image, request) if product.primary_image else None
         ),
-        "csa_eligible": bool(
-            product.csa_quota_group_id
-            and product.csa_quota_group.is_active
-            and product.csa_quota_cost > 0
-        ),
+        "csa_quota_group": _public_csa_quota_group_payload(product, locale),
         "suppliers": suppliers,
         "requested_locale": locale,
         "content_locale": translation.locale,
