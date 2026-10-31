@@ -1,21 +1,17 @@
-import re
-from datetime import date
-
-from django.db.models import Q
+from django.db.models import Exists, OuterRef, Q
 from django.http import Http404
 from django.shortcuts import get_object_or_404
 from rest_framework import status
-from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from commerce.models import Product
+from commerce.models import Product, ProductTranslation
 from content.models import MediaAsset, TrackerFarm
 from content.permissions import IsWebsiteAdmin
 from content.serializers import admin_tracker_farm_payload, media_payload
 from content.services import delete_orphan_media_asset
 from content.views import AdminMediaUploadView
-from farms.models import Farm, FarmProduct, FarmWeeklySupply
+from farms.models import Farm, FarmProduct, FarmProductStockBatch
 from farms.serializers import (
     FarmProductQuerySerializer,
     FarmProductUpdateSerializer,
@@ -25,23 +21,29 @@ from farms.serializers import (
     FarmWriteSerializer,
     GrowthTrackerUpdateSerializer,
     GrowthTrackerWriteSerializer,
-    WeeklySupplyQuerySerializer,
-    WeeklySupplyWriteSerializer,
+    StockBatchCancelSerializer,
+    StockBatchQuerySerializer,
+    StockBatchUpdateSerializer,
+    StockBatchWriteSerializer,
 )
 from farms.services import (
     FarmConflict,
     add_farm_product,
+    cancel_stock_batch,
     create_farm,
     create_growth_tracker_profile,
+    create_stock_batch,
     delete_farm,
     delete_farm_product,
     delete_growth_tracker_profile,
+    farm_product_queryset,
     farm_queryset,
-    set_weekly_supply,
     update_farm,
     update_farm_product,
     update_growth_tracker_profile,
+    update_stock_batch,
 )
+from farms.stock import stock_batch_status, stock_batch_status_q
 
 
 def no_store(response):
@@ -67,6 +69,8 @@ def farm_payload(farm, request):
         "image": media_payload(farm.image, request) if farm.image else None,
         "photos": photos,
         "is_active": farm.is_active,
+        "in_stock_product_count": farm.in_stock_product_count,
+        "out_of_stock_product_count": farm.out_of_stock_product_count,
         "version": farm.version,
         "created_at": farm.created_at.isoformat(),
         "updated_at": farm.updated_at.isoformat(),
@@ -86,6 +90,25 @@ def farm_product_payload(row):
         "unit_label_vi": row.product.unit_label_vi,
         "unit_label_en": row.product.unit_label_en,
         "is_active": row.is_active,
+        "available_quantity": row.available_quantity,
+        "batch_count": row.batch_count,
+        "active_batch_count": row.active_batch_count,
+        "has_supply_history": row.batch_count > 0 or row.has_legacy_supply_history,
+        "next_expiry_date": row.next_expiry_date.isoformat() if row.next_expiry_date else None,
+    }
+
+
+def stock_batch_payload(batch):
+    return {
+        "id": str(batch.pk),
+        "farm_product_id": str(batch.farm_product_id),
+        "start_date": batch.start_date.isoformat(),
+        "end_date": batch.end_date.isoformat(),
+        "quantity_units": batch.quantity_units,
+        "status": stock_batch_status(batch),
+        "version": batch.version,
+        "created_at": batch.created_at.isoformat(),
+        "updated_at": batch.updated_at.isoformat(),
     }
 
 
@@ -183,18 +206,18 @@ class AdminFarmProductListView(APIView):
         get_object_or_404(Farm, pk=farm_id)
         query = FarmProductQuerySerializer(data=request.query_params.dict())
         query.is_valid(raise_exception=True)
-        rows = FarmProduct.objects.filter(farm_id=farm_id).select_related("product")
+        rows = farm_product_queryset().filter(farm_id=farm_id)
         search = query.validated_data["search"].strip()
         if search:
-            rows = rows.filter(
-                Q(product__sku__icontains=search) | Q(product__translations__name__icontains=search)
-            ).distinct()
+            matching_translation = ProductTranslation.objects.filter(
+                product_id=OuterRef("product_id"),
+                name__icontains=search,
+            )
+            rows = rows.filter(Q(product__sku__icontains=search) | Exists(matching_translation))
         page = query.validated_data["page"]
         page_size = 20
         total = rows.count()
-        rows = rows.prefetch_related("product__translations").order_by("product__sku", "id")[
-            (page - 1) * page_size : page * page_size
-        ]
+        rows = rows.order_by("product__sku", "id")[(page - 1) * page_size : page * page_size]
         return no_store(
             Response(
                 {
@@ -208,20 +231,21 @@ class AdminFarmProductListView(APIView):
         get_object_or_404(Farm, pk=farm_id)
         serializer = FarmProductWriteSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        product_id = serializer.validated_data["product_id"]
+        data = dict(serializer.validated_data)
+        product_id = data.pop("product_id")
         get_object_or_404(Product, pk=product_id)
         try:
-            row = add_farm_product(farm_id=farm_id, product_id=product_id, actor=request.user)
+            row = add_farm_product(
+                farm_id=farm_id,
+                product_id=product_id,
+                actor=request.user,
+                **data,
+            )
         except FarmConflict as error:
             return conflict(error.code)
         except (Farm.DoesNotExist, Product.DoesNotExist) as error:
             raise Http404 from error
-        row = (
-            FarmProduct.objects.select_related("product")
-            .prefetch_related("product__translations")
-            .filter(pk=row.pk)
-            .first()
-        )
+        row = farm_product_queryset().filter(pk=row.pk).first()
         if row is None:
             return conflict("farm_product_changed")
         return no_store(
@@ -274,12 +298,7 @@ class AdminFarmProductDetailView(APIView):
             )
         except FarmConflict as error:
             return conflict(error.code)
-        row = (
-            FarmProduct.objects.select_related("product")
-            .prefetch_related("product__translations")
-            .filter(pk=row.pk)
-            .first()
-        )
+        row = farm_product_queryset().filter(pk=row.pk).first()
         if row is None:
             return conflict("farm_product_changed")
         return no_store(Response({"data": farm_product_payload(row)}))
@@ -293,69 +312,100 @@ class AdminFarmProductDetailView(APIView):
         return no_store(Response(status=status.HTTP_204_NO_CONTENT))
 
 
-class AdminFarmWeeklySupplyView(APIView):
-    permission_classes = [IsWebsiteAdmin]
-
-    def put(self, request, farm_id, product_id, week_start):
-        get_object_or_404(FarmProduct, farm_id=farm_id, product_id=product_id)
-        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", week_start):
-            raise ValidationError({"week_start": "Use YYYY-MM-DD."})
-        try:
-            week = date.fromisoformat(week_start)
-        except ValueError as error:
-            raise ValidationError({"week_start": "Use YYYY-MM-DD."}) from error
-        if week.weekday() != 0:
-            raise ValidationError({"week_start": "Week must start on Monday."})
-        serializer = WeeklySupplyWriteSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        try:
-            row = set_weekly_supply(
-                farm_id=farm_id,
-                product_id=product_id,
-                week_start=week,
-                quantity_units=serializer.validated_data["quantity_units"],
-                actor=request.user,
-            )
-        except FarmConflict as error:
-            return conflict(error.code)
-        return no_store(
-            Response(
-                {
-                    "data": {
-                        "id": str(row.pk),
-                        "week_start": row.week_start.isoformat(),
-                        "quantity_units": row.quantity_units,
-                    }
-                }
-            )
-        )
-
-
-class AdminFarmWeeklySupplyListView(APIView):
+class AdminFarmStockBatchListView(APIView):
     permission_classes = [IsWebsiteAdmin]
 
     def get(self, request, farm_id, product_id):
         relation = get_object_or_404(FarmProduct, farm_id=farm_id, product_id=product_id)
-        serializer = WeeklySupplyQuerySerializer(data=request.query_params.dict())
+        serializer = StockBatchQuerySerializer(data=request.query_params.dict())
         serializer.is_valid(raise_exception=True)
-        start = serializer.validated_data["from_week"]
-        end = serializer.validated_data["to_week"]
-        supplies = FarmWeeklySupply.objects.filter(
-            farm_product=relation, week_start__gte=start, week_start__lte=end
-        ).order_by("week_start")
+        rows = FarmProductStockBatch.objects.filter(farm_product=relation)
+        if requested_status := serializer.validated_data.get("status"):
+            rows = rows.filter(stock_batch_status_q(requested_status))
+        page = serializer.validated_data["page"]
+        page_size = 20
+        total = rows.count()
+        rows = rows.select_related("farm_product").order_by("-start_date", "-created_at", "id")[
+            (page - 1) * page_size : page * page_size
+        ]
         return no_store(
             Response(
                 {
-                    "data": [
-                        {
-                            "week_start": item.week_start.isoformat(),
-                            "quantity_units": item.quantity_units,
-                        }
-                        for item in supplies
-                    ]
+                    "data": [stock_batch_payload(row) for row in rows],
+                    "meta": {"page": page, "page_size": page_size, "total": total},
                 }
             )
         )
+
+    def post(self, request, farm_id, product_id):
+        get_object_or_404(FarmProduct, farm_id=farm_id, product_id=product_id)
+        serializer = StockBatchWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            batch = create_stock_batch(
+                farm_id=farm_id,
+                product_id=product_id,
+                actor=request.user,
+                data=serializer.validated_data,
+            )
+        except FarmConflict as error:
+            return conflict(error.code)
+        return no_store(
+            Response({"data": stock_batch_payload(batch)}, status=status.HTTP_201_CREATED)
+        )
+
+
+class AdminFarmStockBatchDetailView(APIView):
+    permission_classes = [IsWebsiteAdmin]
+
+    def patch(self, request, farm_id, product_id, batch_id):
+        get_object_or_404(
+            FarmProductStockBatch,
+            pk=batch_id,
+            farm_product__farm_id=farm_id,
+            farm_product__product_id=product_id,
+        )
+        serializer = StockBatchUpdateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = dict(serializer.validated_data)
+        version = data.pop("version")
+        try:
+            batch = update_stock_batch(
+                farm_id=farm_id,
+                product_id=product_id,
+                batch_id=batch_id,
+                actor=request.user,
+                expected_version=version,
+                data=data,
+            )
+        except FarmConflict as error:
+            return conflict(error.code)
+        return no_store(Response({"data": stock_batch_payload(batch)}))
+
+
+class AdminFarmStockBatchCancelView(APIView):
+    permission_classes = [IsWebsiteAdmin]
+
+    def post(self, request, farm_id, product_id, batch_id):
+        get_object_or_404(
+            FarmProductStockBatch,
+            pk=batch_id,
+            farm_product__farm_id=farm_id,
+            farm_product__product_id=product_id,
+        )
+        serializer = StockBatchCancelSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            batch = cancel_stock_batch(
+                farm_id=farm_id,
+                product_id=product_id,
+                batch_id=batch_id,
+                actor=request.user,
+                expected_version=serializer.validated_data["version"],
+            )
+        except FarmConflict as error:
+            return conflict(error.code)
+        return no_store(Response({"data": stock_batch_payload(batch)}))
 
 
 class AdminFarmGrowthTrackerView(APIView):

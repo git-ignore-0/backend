@@ -143,7 +143,7 @@ class PublicStoreProductListView(APIView):
         page = data["page"]
         page_size = data["page_size"]
         items = rows[(page - 1) * page_size : page * page_size]
-        return public_cache(
+        return no_store(
             Response(
                 {
                     "data": [
@@ -162,7 +162,7 @@ class PublicStoreProductDetailView(APIView):
         query = PublicStoreLocaleSerializer(data=request.query_params.dict())
         query.is_valid(raise_exception=True)
         item = get_object_or_404(public_product_queryset(), slug=slug)
-        return public_cache(
+        return no_store(
             Response(
                 {
                     "data": public_product_payload(

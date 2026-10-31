@@ -4,11 +4,11 @@ import pytest
 from django.db import IntegrityError, transaction
 
 from commerce.models import Category, Product
-from farms.models import Farm, FarmProduct, FarmWeeklySupply
+from farms.models import Farm, FarmProduct, FarmProductStockBatch
 
 
 @pytest.mark.django_db
-def test_farm_product_is_unique_and_weekly_quantity_uses_sale_units():
+def test_farm_product_is_unique_and_stock_batch_quantity_uses_sale_units():
     farm = Farm.objects.create(
         name_en="Green Farm",
         name_vi="Nông trại Xanh",
@@ -26,22 +26,17 @@ def test_farm_product_is_unique_and_weekly_quantity_uses_sale_units():
         retail_price_vnd=25000,
     )
     farm_product = FarmProduct.objects.create(farm=farm, product=product)
-    supply = FarmWeeklySupply.objects.create(
+    batch = FarmProductStockBatch.objects.create(
         farm_product=farm_product,
-        week_start=date(2026, 10, 19),
+        start_date=date(2026, 10, 19),
+        end_date=date(2026, 10, 25),
         quantity_units=10,
     )
 
-    assert supply.quantity_units == 10
+    assert batch.quantity_units == 10
     assert farm_product.farm_id == farm.pk
     assert farm_product.product_id == product.pk
     with pytest.raises(IntegrityError), transaction.atomic():
         FarmProduct.objects.create(farm=farm, product=product)
     with pytest.raises(IntegrityError), transaction.atomic():
-        FarmWeeklySupply.objects.create(
-            farm_product=farm_product,
-            week_start=date(2026, 10, 19),
-            quantity_units=11,
-        )
-    with pytest.raises(IntegrityError), transaction.atomic():
-        FarmWeeklySupply.objects.filter(pk=supply.pk).update(quantity_units=-1)
+        FarmProductStockBatch.objects.filter(pk=batch.pk).update(quantity_units=-1)

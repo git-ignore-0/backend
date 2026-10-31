@@ -1,8 +1,10 @@
-from django.db.models import Prefetch, Q
+from django.db.models import IntegerField, OuterRef, Prefetch, Q, Subquery, Sum, Value
+from django.db.models.functions import Coalesce
+from django.utils import timezone
 
 from commerce.models import PUBLIC_STORE_MAX_PRICE_VND, Category, Product
 from content.serializers import media_payload
-from farms.models import FarmProduct
+from farms.models import FarmProduct, FarmProductStockBatch
 
 
 def _public_product_filter():
@@ -19,6 +21,20 @@ def _public_product_filter():
 
 
 def public_product_queryset():
+    current_date = timezone.localdate()
+    current_stock = (
+        FarmProductStockBatch.objects.filter(
+            farm_product__product_id=OuterRef("pk"),
+            farm_product__farm__is_active=True,
+            farm_product__is_active=True,
+            cancelled_at__isnull=True,
+            start_date__lte=current_date,
+            end_date__gte=current_date,
+        )
+        .values("farm_product__product_id")
+        .annotate(total=Sum("quantity_units"))
+        .values("total")[:1]
+    )
     active_suppliers = FarmProduct.objects.filter(
         is_active=True, farm__is_active=True
     ).select_related("farm")
@@ -30,6 +46,12 @@ def public_product_queryset():
             "category__parent__parent",
             "primary_image",
             "csa_quota_group",
+        )
+        .annotate(
+            available_quantity=Coalesce(
+                Subquery(current_stock, output_field=IntegerField()),
+                Value(0),
+            )
         )
         .prefetch_related(
             "translations",
@@ -162,6 +184,7 @@ def public_product_payload(product, request, locale, *, detail=False):
         "alternate_name": alternate.name if alternate else None,
         "short_description": translation.short_description,
         "retail_price_vnd": product.retail_price_vnd,
+        "available_quantity": product.available_quantity,
         "unit_size": str(product.unit_size),
         "unit_label": product.unit_label_vi if locale == "vi" else product.unit_label_en,
         "category": {

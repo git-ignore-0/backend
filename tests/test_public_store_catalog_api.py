@@ -1,15 +1,17 @@
+from datetime import timedelta
 from decimal import Decimal
 
 import pytest
 from django.db import connection
 from django.test.utils import CaptureQueriesContext
+from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 from rest_framework.test import APIClient
 
 from commerce.models import Category, CategoryTranslation, Product, ProductTranslation
 from commerce.services import update_product
 from content.models import MediaAsset
-from farms.models import Farm, FarmProduct
+from farms.models import Farm, FarmProduct, FarmProductStockBatch
 from memberships.models import Product as MembershipProduct
 from memberships.models import ProductTranslation as MembershipProductTranslation
 
@@ -192,7 +194,7 @@ def test_public_store_list_returns_localized_card_contract():
     response = client.get("/api/v1/public/store-products?locale=vi")
 
     assert response.status_code == 200
-    assert response["Cache-Control"] == "public, max-age=60, stale-while-revalidate=300"
+    assert response["Cache-Control"] == "private, no-store"
     assert response.json()["meta"] == {"page": 1, "page_size": 12, "total": 1}, response.json()
     row = response.json()["data"][0]
     assert row == {
@@ -203,6 +205,7 @@ def test_public_store_list_returns_localized_card_contract():
         "alternate_name": "EN tomato",
         "short_description": "Mô tả ngắn",
         "retail_price_vnd": 45_000,
+        "available_quantity": 0,
         "unit_size": "1.000",
         "unit_label": "kg",
         "category": {
@@ -234,6 +237,60 @@ def test_public_store_list_returns_localized_card_contract():
         "available_locales": ["en", "vi"],
         "is_fallback": False,
     }
+
+
+@pytest.mark.django_db
+def test_public_store_sums_only_current_stock_from_active_farms_and_links():
+    category = make_category("stocked-vegetables")
+    product = make_product("stocked-tomato", category)
+    today = timezone.localdate()
+
+    def add_batch(
+        name,
+        quantity,
+        *,
+        farm_active=True,
+        link_active=True,
+        start_offset=-1,
+        end_offset=1,
+        cancelled=False,
+    ):
+        farm = Farm.objects.create(
+            name_vi=name,
+            name_en=name,
+            location_vi="Đà Lạt",
+            location_en="Da Lat",
+            is_active=farm_active,
+        )
+        relation = FarmProduct.objects.create(
+            farm=farm, product=product, is_active=link_active
+        )
+        FarmProductStockBatch.objects.create(
+            farm_product=relation,
+            start_date=today + timedelta(days=start_offset),
+            end_date=today + timedelta(days=end_offset),
+            quantity_units=quantity,
+            cancelled_at=timezone.now() if cancelled else None,
+        )
+
+    add_batch("Farm A", 10)
+    add_batch("Farm B", 15, start_offset=0, end_offset=0)
+    add_batch("Inactive farm", 100, farm_active=False)
+    add_batch("Inactive link", 100, link_active=False)
+    add_batch("Upcoming", 100, start_offset=1, end_offset=2)
+    add_batch("Expired", 100, start_offset=-2, end_offset=-1)
+    add_batch("Cancelled", 100, cancelled=True)
+
+    client = APIClient()
+    listed = client.get("/api/v1/public/store-products?locale=vi")
+    detail = client.get(f"/api/v1/public/store-products/{product.slug}?locale=vi")
+
+    assert listed.status_code == 200
+    assert detail.status_code == 200
+    assert listed["Cache-Control"] == "private, no-store"
+    assert detail["Cache-Control"] == "private, no-store"
+    assert listed.json()["data"][0]["available_quantity"] == 25
+    assert detail.json()["data"]["available_quantity"] == 25
 
 
 @pytest.mark.django_db

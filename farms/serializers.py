@@ -1,3 +1,4 @@
+from django.utils import timezone
 from rest_framework import serializers
 
 from commerce.serializers import StrictSerializer
@@ -48,7 +49,23 @@ class FarmQuerySerializer(StrictSerializer):
     page = serializers.IntegerField(min_value=1, max_value=10000, required=False, default=1)
 
 
-class FarmProductWriteSerializer(StrictSerializer):
+class StockBatchWriteSerializer(StrictSerializer):
+    start_date = serializers.DateField()
+    end_date = serializers.DateField()
+    quantity_units = serializers.IntegerField(min_value=1, max_value=2_147_483_647)
+
+    def validate(self, data):
+        data = super().validate(data)
+        if data["end_date"] < data["start_date"]:
+            raise serializers.ValidationError({"end_date": "End date must not precede start date."})
+        if data["end_date"] < timezone.localdate():
+            raise serializers.ValidationError(
+                {"end_date": "An expired stock batch cannot be created."}
+            )
+        return data
+
+
+class FarmProductWriteSerializer(StockBatchWriteSerializer):
     product_id = serializers.UUIDField()
 
 
@@ -61,22 +78,30 @@ class FarmProductUpdateSerializer(StrictSerializer):
     is_active = serializers.BooleanField()
 
 
-class WeeklySupplyWriteSerializer(StrictSerializer):
-    quantity_units = serializers.IntegerField(min_value=0, max_value=2_147_483_647)
-
-
-class WeeklySupplyQuerySerializer(StrictSerializer):
-    from_week = serializers.DateField()
-    to_week = serializers.DateField()
+class StockBatchUpdateSerializer(StrictSerializer):
+    version = serializers.IntegerField(min_value=1)
+    start_date = serializers.DateField(required=False)
+    end_date = serializers.DateField(required=False)
+    quantity_units = serializers.IntegerField(
+        min_value=1, max_value=2_147_483_647, required=False
+    )
 
     def validate(self, data):
         data = super().validate(data)
-        if data["from_week"].weekday() != 0 or data["to_week"].weekday() != 0:
-            raise serializers.ValidationError("Week boundaries must be Mondays.")
-        days = (data["to_week"] - data["from_week"]).days
-        if days < 0 or days > 364:
-            raise serializers.ValidationError("Choose a range of at most 52 weeks.")
+        if not any(field in data for field in ("start_date", "end_date", "quantity_units")):
+            raise serializers.ValidationError("Submit at least one stock batch field.")
         return data
+
+
+class StockBatchCancelSerializer(StrictSerializer):
+    version = serializers.IntegerField(min_value=1)
+
+
+class StockBatchQuerySerializer(StrictSerializer):
+    status = serializers.ChoiceField(
+        choices=("upcoming", "active", "expired", "cancelled"), required=False
+    )
+    page = serializers.IntegerField(min_value=1, max_value=10000, required=False, default=1)
 
 
 class GrowthTrackerWriteSerializer(StrictSerializer):

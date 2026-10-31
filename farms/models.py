@@ -74,7 +74,9 @@ class FarmProduct(models.Model):
         return f"{self.farm_id}:{self.product_id}"
 
 
-class FarmWeeklySupply(models.Model):
+class LegacyFarmWeeklySupply(models.Model):
+    """Read-only archive retained until legacy weekly history is explicitly retired."""
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     farm_product = models.ForeignKey(
         FarmProduct, related_name="weekly_supplies", on_delete=models.PROTECT
@@ -97,3 +99,45 @@ class FarmWeeklySupply(models.Model):
 
     def __str__(self):
         return f"{self.farm_product_id}:{self.week_start}"
+
+
+class FarmProductStockBatch(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    farm_product = models.ForeignKey(
+        FarmProduct, related_name="stock_batches", on_delete=models.PROTECT
+    )
+    start_date = models.DateField()
+    end_date = models.DateField()
+    quantity_units = models.PositiveIntegerField()
+    cancelled_at = models.DateTimeField(null=True, blank=True)
+    cancelled_by = models.ForeignKey(
+        "identity.User",
+        related_name="cancelled_farm_product_stock_batches",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+    )
+    version = models.PositiveIntegerField(default=1)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-start_date", "-created_at", "id"]
+        indexes = [
+            models.Index(
+                fields=["farm_product", "cancelled_at", "start_date", "end_date"],
+                name="farms_batch_availability_idx",
+            )
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(end_date__gte=models.F("start_date")),
+                name="farms_batch_dates_ordered",
+            ),
+            models.CheckConstraint(
+                condition=Q(quantity_units__gt=0), name="farms_batch_quantity_positive"
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.farm_product_id}:{self.start_date}:{self.end_date}"

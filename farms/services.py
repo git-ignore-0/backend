@@ -1,12 +1,33 @@
 from django.db import IntegrityError, transaction
-from django.db.models import Max, Prefetch
+from django.db.models import (
+    Count,
+    Exists,
+    F,
+    IntegerField,
+    Max,
+    Min,
+    OuterRef,
+    Prefetch,
+    Q,
+    Sum,
+    Value,
+)
+from django.db.models.functions import Coalesce
+from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
 from commerce.models import Product
 from commerce.services import schedule_store_revalidation
 from content.models import MediaAsset
 from content.services import audit, delete_orphan_media_asset, request_frontend_revalidation
-from farms.models import Farm, FarmPhoto, FarmProduct, FarmWeeklySupply
+from farms.models import (
+    Farm,
+    FarmPhoto,
+    FarmProduct,
+    FarmProductStockBatch,
+    LegacyFarmWeeklySupply,
+)
+from farms.stock import active_stock_batch_q, stock_batch_status
 
 
 class FarmConflict(ValueError):
@@ -16,9 +37,56 @@ class FarmConflict(ValueError):
 
 
 def farm_queryset():
-    return Farm.objects.select_related("image").prefetch_related(
-        Prefetch(
-            "photos", queryset=FarmPhoto.objects.select_related("image").order_by("sort_order")
+    current_stock = active_stock_batch_q("products__stock_batches") & Q(
+        is_active=True,
+        products__is_active=True,
+    )
+    return (
+        Farm.objects.select_related("image")
+        .prefetch_related(
+            Prefetch(
+                "photos",
+                queryset=FarmPhoto.objects.select_related("image").order_by("sort_order"),
+            )
+        )
+        .annotate(
+            _active_product_count=Count(
+                "products",
+                filter=Q(products__is_active=True),
+                distinct=True,
+            ),
+            in_stock_product_count=Count(
+                "products",
+                filter=current_stock,
+                distinct=True,
+            ),
+        )
+        .annotate(
+            out_of_stock_product_count=F("_active_product_count") - F("in_stock_product_count"),
+        )
+    )
+
+
+def farm_product_queryset(*, today=None):
+    current_date = today or timezone.localdate()
+    active_batches = active_stock_batch_q(today=current_date) & Q(
+        farm__is_active=True, is_active=True
+    )
+    return (
+        FarmProduct.objects.select_related("farm", "product")
+        .prefetch_related("product__translations")
+        .annotate(
+            available_quantity=Coalesce(
+                Sum("stock_batches__quantity_units", filter=active_batches),
+                Value(0),
+                output_field=IntegerField(),
+            ),
+            batch_count=Count("stock_batches", distinct=True),
+            active_batch_count=Count("stock_batches", filter=active_batches, distinct=True),
+            next_expiry_date=Min("stock_batches__end_date", filter=active_batches),
+            has_legacy_supply_history=Exists(
+                LegacyFarmWeeklySupply.objects.filter(farm_product_id=OuterRef("pk"))
+            ),
         )
     )
 
@@ -147,21 +215,152 @@ def delete_farm(*, farm_id, actor):
         delete_orphan_media_asset(asset_id=asset_id, storage_prefix="farms")
 
 
+def _validate_stock_batch_values(*, start_date, end_date, quantity_units, today=None):
+    current_date = today or timezone.localdate()
+    errors = {}
+    if end_date < start_date:
+        errors["end_date"] = "End date must not precede start date."
+    elif end_date < current_date:
+        errors["end_date"] = "An expired stock batch cannot be saved."
+    if quantity_units <= 0:
+        errors["quantity_units"] = "Quantity must be positive."
+    if errors:
+        raise ValidationError(errors)
+
+
 @transaction.atomic
-def add_farm_product(*, farm_id, product_id, actor):
+def add_farm_product(*, farm_id, product_id, start_date, end_date, quantity_units, actor):
     farm = Farm.objects.select_for_update().get(pk=farm_id)
     product = Product.objects.select_for_update().filter(pk=product_id).first()
     if product is None:
         raise Product.DoesNotExist
     if not product.is_active:
         raise FarmConflict("product_inactive")
+    _validate_stock_batch_values(
+        start_date=start_date, end_date=end_date, quantity_units=quantity_units
+    )
     try:
         row = FarmProduct.objects.create(farm=farm, product=product)
     except IntegrityError as error:
         raise FarmConflict("product_already_linked") from error
-    audit(actor=actor, action="farm.product.add", entity=row, context={"farm_id": str(farm.pk)})
+    batch = FarmProductStockBatch.objects.create(
+        farm_product=row,
+        start_date=start_date,
+        end_date=end_date,
+        quantity_units=quantity_units,
+    )
+    audit(
+        actor=actor,
+        action="farm.product.add",
+        entity=row,
+        context={"farm_id": str(farm.pk), "stock_batch_id": str(batch.pk)},
+    )
     schedule_store_revalidation(slugs=[product.slug])
     return row
+
+
+@transaction.atomic
+def create_stock_batch(*, farm_id, product_id, actor, data):
+    product = Product.objects.select_for_update().only("slug").filter(pk=product_id).first()
+    if product is None:
+        raise FarmConflict("farm_product_changed")
+    relation = (
+        FarmProduct.objects.select_for_update()
+        .filter(farm_id=farm_id, product_id=product_id)
+        .first()
+    )
+    if relation is None:
+        raise FarmConflict("farm_product_changed")
+    values = dict(data)
+    _validate_stock_batch_values(**values)
+    batch = FarmProductStockBatch.objects.create(farm_product=relation, **values)
+    audit(
+        actor=actor,
+        action="farm.stock_batch.create",
+        entity=batch,
+        context={"farm_id": str(farm_id), "product_id": str(product_id)},
+    )
+    schedule_store_revalidation(slugs=[product.slug])
+    return batch
+
+
+@transaction.atomic
+def update_stock_batch(*, farm_id, product_id, batch_id, actor, expected_version, data):
+    relation = FarmProduct.objects.filter(farm_id=farm_id, product_id=product_id).first()
+    if relation is None:
+        raise FarmConflict("farm_product_changed")
+    batch = (
+        FarmProductStockBatch.objects.select_for_update()
+        .select_related("farm_product__product")
+        .filter(pk=batch_id, farm_product=relation)
+        .first()
+    )
+    if batch is None:
+        raise FarmConflict("stock_batch_changed")
+    if batch.version != expected_version:
+        raise FarmConflict("version_conflict")
+    status = stock_batch_status(batch)
+    if status == "cancelled":
+        raise FarmConflict("stock_batch_cancelled")
+    if status == "expired":
+        raise FarmConflict("stock_batch_expired")
+    values = dict(data)
+    if status == "active" and "start_date" in values and values["start_date"] != batch.start_date:
+        raise FarmConflict("stock_batch_start_locked")
+    start_date = values.get("start_date", batch.start_date)
+    end_date = values.get("end_date", batch.end_date)
+    quantity_units = values.get("quantity_units", batch.quantity_units)
+    _validate_stock_batch_values(
+        start_date=start_date,
+        end_date=end_date,
+        quantity_units=quantity_units,
+    )
+    before = {
+        "start_date": batch.start_date.isoformat(),
+        "end_date": batch.end_date.isoformat(),
+        "quantity_units": batch.quantity_units,
+    }
+    for field, value in values.items():
+        setattr(batch, field, value)
+    batch.version += 1
+    batch.save()
+    audit(
+        actor=actor,
+        action="farm.stock_batch.update",
+        entity=batch,
+        context={"before": before},
+    )
+    schedule_store_revalidation(slugs=[batch.farm_product.product.slug])
+    return batch
+
+
+@transaction.atomic
+def cancel_stock_batch(*, farm_id, product_id, batch_id, actor, expected_version):
+    relation = FarmProduct.objects.filter(farm_id=farm_id, product_id=product_id).first()
+    if relation is None:
+        raise FarmConflict("farm_product_changed")
+    batch = (
+        FarmProductStockBatch.objects.select_for_update()
+        .select_related("farm_product__product")
+        .filter(pk=batch_id, farm_product=relation)
+        .first()
+    )
+    if batch is None:
+        raise FarmConflict("stock_batch_changed")
+    if batch.version != expected_version:
+        raise FarmConflict("version_conflict")
+    status = stock_batch_status(batch)
+    if status == "cancelled":
+        raise FarmConflict("stock_batch_cancelled")
+    if status == "expired":
+        raise FarmConflict("stock_batch_expired")
+    batch.cancelled_at = timezone.now()
+    batch.cancelled_by = actor
+    batch.version += 1
+    batch.save(update_fields=["cancelled_at", "cancelled_by", "version", "updated_at"])
+    audit(actor=actor, action="farm.stock_batch.cancel", entity=batch)
+    schedule_store_revalidation(slugs=[batch.farm_product.product.slug])
+    return batch
 
 
 @transaction.atomic
@@ -193,50 +392,15 @@ def delete_farm_product(*, farm_id, product_id, actor):
     row = FarmProduct.objects.select_for_update().filter(pk=relation.pk).first()
     if row is None:
         raise FarmConflict("farm_product_changed")
-    if FarmWeeklySupply.objects.filter(farm_product=row).exists():
+    if (
+        FarmProductStockBatch.objects.filter(farm_product=row).exists()
+        or LegacyFarmWeeklySupply.objects.filter(farm_product=row).exists()
+    ):
         raise FarmConflict("farm_product_has_supply")
     audit(actor=actor, action="farm.product.delete", entity=row, context={"farm_id": str(farm_id)})
     slug = row.product.slug
     row.delete()
     schedule_store_revalidation(slugs=[slug])
-
-
-@transaction.atomic
-def set_weekly_supply(*, farm_id, product_id, week_start, quantity_units, actor):
-    relation = FarmProduct.objects.filter(farm_id=farm_id, product_id=product_id).first()
-    if relation is None:
-        raise FarmConflict("farm_product_changed")
-    if not Product.objects.select_for_update().filter(pk=relation.product_id).exists():
-        raise FarmConflict("farm_product_changed")
-    row = FarmProduct.objects.select_for_update().filter(pk=relation.pk).first()
-    if row is None:
-        raise FarmConflict("farm_product_changed")
-    current = (
-        FarmWeeklySupply.objects.select_for_update()
-        .filter(farm_product=row, week_start=week_start)
-        .first()
-    )
-    before = current.quantity_units if current else None
-    if current is None:
-        current = FarmWeeklySupply.objects.create(
-            farm_product=row, week_start=week_start, quantity_units=quantity_units
-        )
-    elif before != quantity_units:
-        current.quantity_units = quantity_units
-        current.save(update_fields=["quantity_units", "updated_at"])
-    if before != quantity_units:
-        audit(
-            actor=actor,
-            action="farm.supply.set",
-            entity=current,
-            context={
-                "farm_id": str(farm_id),
-                "product_id": str(product_id),
-                "before": before,
-                "after": quantity_units,
-            },
-        )
-    return current
 
 
 def _schedule_tracker_revalidation():

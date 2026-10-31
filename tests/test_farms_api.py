@@ -1,13 +1,20 @@
-from datetime import date
+from datetime import timedelta
 from unittest.mock import patch
 
 import pytest
 from django.contrib.auth.models import Group
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from commerce.models import Category, Product, ProductTranslation
 from content.models import MediaAsset, TrackerFarm, TrackerFarmPhoto
-from farms.models import Farm, FarmPhoto, FarmProduct, FarmWeeklySupply
+from farms.models import (
+    Farm,
+    FarmPhoto,
+    FarmProduct,
+    FarmProductStockBatch,
+    LegacyFarmWeeklySupply,
+)
 from farms.services import FarmConflict
 
 
@@ -68,7 +75,7 @@ def test_admin_can_manage_canonical_farm_without_creating_tracker_profile(farm_a
 
 
 @pytest.mark.django_db
-def test_farm_product_and_weekly_supply_are_scoped_to_farm(farm_admin_api):
+def test_farm_product_and_first_stock_batch_are_scoped_to_farm(farm_admin_api):
     farm = Farm.objects.create(**farm_payload())
     other = Farm.objects.create(**farm_payload(name_en="Other Farm"))
     category = Category.objects.create(slug="greens", is_active=True)
@@ -82,41 +89,29 @@ def test_farm_product_and_weekly_supply_are_scoped_to_farm(farm_admin_api):
         retail_price_vnd=25000,
     )
     url = f"/api/v1/admin/farms/{farm.pk}/products"
-    linked = farm_admin_api.post(url, {"product_id": str(product.pk)}, format="json")
+    today = timezone.localdate()
+    payload = {
+        "product_id": str(product.pk),
+        "start_date": today.isoformat(),
+        "end_date": (today + timedelta(days=6)).isoformat(),
+        "quantity_units": 10,
+    }
+    linked = farm_admin_api.post(url, payload, format="json")
     assert linked.status_code == 201, linked.json()
     assert FarmProduct.objects.filter(farm=farm, product=product).exists()
+    assert farm_admin_api.post(url, payload, format="json").status_code == 409
+    assert FarmProductStockBatch.objects.get(farm_product__farm=farm).quantity_units == 10
     assert (
-        farm_admin_api.post(url, {"product_id": str(product.pk)}, format="json").status_code == 409
-    )
-
-    week = date(2026, 10, 19)
-    supply_url = f"{url}/{product.pk}/weeks/{week.isoformat()}"
-    supplied = farm_admin_api.put(supply_url, {"quantity_units": 10}, format="json")
-    assert supplied.status_code == 200, supplied.json()
-    assert supplied.json()["data"]["quantity_units"] == 10
-    assert (
-        FarmWeeklySupply.objects.get(farm_product__farm=farm, week_start=week).quantity_units == 10
-    )
-    assert (
-        farm_admin_api.put(
-            f"/api/v1/admin/farms/{other.pk}/products/{product.pk}/weeks/{week.isoformat()}",
-            {"quantity_units": 10},
+        farm_admin_api.post(
+            f"/api/v1/admin/farms/{other.pk}/products/{product.pk}/batches",
+            {
+                "start_date": today.isoformat(),
+                "end_date": today.isoformat(),
+                "quantity_units": 10,
+            },
             format="json",
         ).status_code
         == 404
-    )
-    assert farm_admin_api.put(supply_url, {"quantity_units": -1}, format="json").status_code == 400
-    assert (
-        farm_admin_api.put(
-            f"{url}/{product.pk}/weeks/20261019", {"quantity_units": 5}, format="json"
-        ).status_code
-        == 400
-    )
-    assert (
-        farm_admin_api.put(
-            f"{url}/{product.pk}/weeks/2026-10-20", {"quantity_units": 5}, format="json"
-        ).status_code
-        == 400
     )
 
 
@@ -141,7 +136,14 @@ def test_farm_cannot_link_product_deactivated_after_catalog_selection(farm_admin
     product.is_active = False
     product.save(update_fields=["is_active"])
     response = farm_admin_api.post(
-        f"{base}/products", {"product_id": str(product.pk)}, format="json"
+        f"{base}/products",
+        {
+            "product_id": str(product.pk),
+            "start_date": timezone.localdate().isoformat(),
+            "end_date": timezone.localdate().isoformat(),
+            "quantity_units": 1,
+        },
+        format="json",
     )
 
     assert response.status_code == 409
@@ -305,7 +307,14 @@ def test_farm_api_handles_records_removed_after_preflight(farm_admin_api):
     base = f"/api/v1/admin/farms/{farm.pk}"
     with patch("farms.views.add_farm_product", side_effect=Product.DoesNotExist):
         response = farm_admin_api.post(
-            f"{base}/products", {"product_id": str(product.pk)}, format="json"
+            f"{base}/products",
+            {
+                "product_id": str(product.pk),
+                "start_date": timezone.localdate().isoformat(),
+                "end_date": timezone.localdate().isoformat(),
+                "quantity_units": 1,
+            },
+            format="json",
         )
     assert response.status_code == 404
     with patch("farms.views.update_farm_product", side_effect=FarmConflict("farm_product_changed")):
@@ -323,7 +332,7 @@ def test_farm_api_handles_records_removed_after_preflight(farm_admin_api):
 
 
 @pytest.mark.django_db
-def test_weekly_write_returns_conflict_if_link_disappears_after_initial_lookup(farm_admin_api):
+def test_batch_write_returns_conflict_if_link_disappears_after_initial_lookup(farm_admin_api):
     farm = Farm.objects.create(**farm_payload())
     category = Category.objects.create(slug="farm-product-race", is_active=True)
     product = Product.objects.create(
@@ -336,11 +345,14 @@ def test_weekly_write_returns_conflict_if_link_disappears_after_initial_lookup(f
         retail_price_vnd=25000,
     )
     FarmProduct.objects.create(farm=farm, product=product)
-    with patch.object(FarmProduct.objects, "select_for_update") as locked:
-        locked.return_value.filter.return_value.first.return_value = None
-        response = farm_admin_api.put(
-            f"/api/v1/admin/farms/{farm.pk}/products/{product.pk}/weeks/2026-10-19",
-            {"quantity_units": 10},
+    with patch("farms.views.create_stock_batch", side_effect=FarmConflict("farm_product_changed")):
+        response = farm_admin_api.post(
+            f"/api/v1/admin/farms/{farm.pk}/products/{product.pk}/batches",
+            {
+                "start_date": timezone.localdate().isoformat(),
+                "end_date": timezone.localdate().isoformat(),
+                "quantity_units": 10,
+            },
             format="json",
         )
     assert response.status_code == 409
@@ -397,7 +409,7 @@ def test_tracker_uses_canonical_farm_and_preserves_public_payload(farm_admin_api
 
 
 @pytest.mark.django_db
-def test_product_sale_unit_cannot_change_after_farm_weekly_supply_exists(farm_admin_api):
+def test_product_sale_unit_cannot_change_after_stock_batch_exists(farm_admin_api):
     farm = Farm.objects.create(**farm_payload())
     category = Category.objects.create(slug="vegetables-2", is_active=True)
     product = Product.objects.create(
@@ -410,8 +422,11 @@ def test_product_sale_unit_cannot_change_after_farm_weekly_supply_exists(farm_ad
         retail_price_vnd=30000,
     )
     row = FarmProduct.objects.create(farm=farm, product=product)
-    FarmWeeklySupply.objects.create(
-        farm_product=row, week_start=date(2026, 10, 19), quantity_units=20
+    FarmProductStockBatch.objects.create(
+        farm_product=row,
+        start_date=timezone.localdate(),
+        end_date=timezone.localdate(),
+        quantity_units=20,
     )
     response = farm_admin_api.patch(
         f"/api/v1/admin/store-products/{product.pk}",
@@ -421,6 +436,36 @@ def test_product_sale_unit_cannot_change_after_farm_weekly_supply_exists(farm_ad
     assert response.status_code == 409
     product.refresh_from_db()
     assert product.unit_size == 1
+
+
+@pytest.mark.django_db
+def test_product_sale_unit_cannot_change_when_archived_weekly_history_exists(farm_admin_api):
+    farm = Farm.objects.create(**farm_payload())
+    category = Category.objects.create(slug="legacy-unit-category", is_active=True)
+    product = Product.objects.create(
+        category=category,
+        sku="LEGACY-UNIT",
+        slug="legacy-unit",
+        unit_size="1.000",
+        unit_label_vi="kg",
+        unit_label_en="kg",
+        retail_price_vnd=30_000,
+    )
+    relation = FarmProduct.objects.create(farm=farm, product=product)
+    LegacyFarmWeeklySupply.objects.create(
+        farm_product=relation,
+        week_start=timezone.localdate(),
+        quantity_units=0,
+    )
+
+    response = farm_admin_api.patch(
+        f"/api/v1/admin/store-products/{product.pk}",
+        {"unit_size": "2.000"},
+        format="json",
+    )
+
+    assert response.status_code == 409
+    assert response.json()["errors"][0]["code"] == "product_unit_in_use"
 
 
 @pytest.mark.django_db
@@ -561,7 +606,7 @@ def test_farm_gallery_is_shared_with_growth_tracker_and_stale_tracker_form_confl
 
 
 @pytest.mark.django_db
-def test_weekly_supply_list_requires_bounded_monday_range(farm_admin_api):
+def test_stock_batch_list_returns_batch_history(farm_admin_api):
     farm = Farm.objects.create(**farm_payload())
     category = Category.objects.create(slug="vegetables-3", is_active=True)
     product = Product.objects.create(
@@ -574,15 +619,17 @@ def test_weekly_supply_list_requires_bounded_monday_range(farm_admin_api):
         retail_price_vnd=25000,
     )
     row = FarmProduct.objects.create(farm=farm, product=product)
-    FarmWeeklySupply.objects.create(
-        farm_product=row, week_start=date(2026, 10, 19), quantity_units=8
+    batch = FarmProductStockBatch.objects.create(
+        farm_product=row,
+        start_date=timezone.localdate(),
+        end_date=timezone.localdate(),
+        quantity_units=8,
     )
-    url = f"/api/v1/admin/farms/{farm.pk}/products/{product.pk}/weeks"
-    good = farm_admin_api.get(f"{url}?from_week=2026-10-19&to_week=2026-10-26")
+    url = f"/api/v1/admin/farms/{farm.pk}/products/{product.pk}/batches"
+    good = farm_admin_api.get(url)
     assert good.status_code == 200, good.json()
-    assert good.json()["data"] == [{"week_start": "2026-10-19", "quantity_units": 8}]
-    assert farm_admin_api.get(f"{url}?from_week=2026-10-20&to_week=2026-10-26").status_code == 400
-    assert farm_admin_api.get(f"{url}?from_week=2026-10-19&to_week=2028-10-23").status_code == 400
+    assert good.json()["data"][0]["id"] == str(batch.pk)
+    assert good.json()["data"][0]["quantity_units"] == 8
 
 
 @pytest.mark.django_db
@@ -628,10 +675,45 @@ def test_unreferenced_farm_and_unsupplied_link_can_be_removed_but_history_is_pro
 
     farm = Farm.objects.create(**farm_payload(name_en="Second Farm"))
     relation = FarmProduct.objects.create(farm=farm, product=product)
-    FarmWeeklySupply.objects.create(
-        farm_product=relation, week_start=date(2026, 10, 19), quantity_units=5
+    FarmProductStockBatch.objects.create(
+        farm_product=relation,
+        start_date=timezone.localdate(),
+        end_date=timezone.localdate(),
+        quantity_units=5,
     )
     assert (
         farm_admin_api.delete(f"/api/v1/admin/farms/{farm.pk}/products/{product.pk}").status_code
         == 409
     )
+
+
+@pytest.mark.django_db
+def test_archived_zero_weekly_history_protects_farm_product_link(farm_admin_api):
+    farm = Farm.objects.create(**farm_payload())
+    category = Category.objects.create(slug="legacy-link-category", is_active=True)
+    product = Product.objects.create(
+        category=category,
+        sku="LEGACY-LINK",
+        slug="legacy-link",
+        unit_size="1.000",
+        unit_label_vi="kg",
+        unit_label_en="kg",
+        retail_price_vnd=10_000,
+    )
+    relation = FarmProduct.objects.create(farm=farm, product=product)
+    LegacyFarmWeeklySupply.objects.create(
+        farm_product=relation,
+        week_start=timezone.localdate(),
+        quantity_units=0,
+    )
+
+    listed = farm_admin_api.get(f"/api/v1/admin/farms/{farm.pk}/products")
+    assert listed.status_code == 200
+    assert listed.json()["data"][0]["has_supply_history"] is True
+
+    response = farm_admin_api.delete(
+        f"/api/v1/admin/farms/{farm.pk}/products/{product.pk}"
+    )
+
+    assert response.status_code == 409
+    assert response.json()["errors"][0]["code"] == "farm_product_has_supply"

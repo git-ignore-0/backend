@@ -283,14 +283,17 @@ def create_product(*, actor, payload):
 def update_product(*, actor, product, payload):
     data = payload.copy()
     previous_slug = product.slug
-    from farms.models import FarmWeeklySupply
+    from farms.models import FarmProductStockBatch, LegacyFarmWeeklySupply
 
     if (
         any(
             field in data and data[field] != getattr(product, field)
             for field in ("unit_size", "unit_label_vi", "unit_label_en")
         )
-        and FarmWeeklySupply.objects.filter(farm_product__product=product).exists()
+        and (
+            FarmProductStockBatch.objects.filter(farm_product__product=product).exists()
+            or LegacyFarmWeeklySupply.objects.filter(farm_product__product=product).exists()
+        )
     ):
         raise CatalogConflict("product_unit_in_use")
     translations = data.pop("translations", None)

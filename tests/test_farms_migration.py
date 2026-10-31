@@ -1,3 +1,4 @@
+from datetime import date, timedelta
 from uuid import uuid4
 
 import pytest
@@ -155,5 +156,75 @@ def test_repair_migration_adds_missing_tracker_revision_without_losing_farm_data
         assert "tracker_profile_revision" in table_columns(RepairedFarm._meta.db_table)
         assert repaired.name_en == "Repair me"
         assert repaired.tracker_profile_revision == 0
+    finally:
+        MigrationExecutor(connection).migrate(latest_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_stock_batch_migration_preserves_weekly_history_and_converts_positive_supply():
+    migrate_from = ("farms", "0002_repair_tracker_profile_revision")
+    migrate_to = ("farms", "0003_replace_weekly_supply_with_stock_batches")
+    executor = MigrationExecutor(connection)
+    latest_nodes = executor.loader.graph.leaf_nodes()
+    try:
+        executor.migrate([migrate_from])
+        old_apps = executor.loader.project_state([migrate_from]).apps
+        Category = old_apps.get_model("commerce", "Category")
+        Product = old_apps.get_model("commerce", "Product")
+        Farm = old_apps.get_model("farms", "Farm")
+        FarmProduct = old_apps.get_model("farms", "FarmProduct")
+        WeeklySupply = old_apps.get_model("farms", "FarmWeeklySupply")
+
+        category = Category.objects.create(slug="migration-vegetables", is_active=True)
+        product = Product.objects.create(
+            category=category,
+            sku="MIGRATION-TOMATO",
+            slug="migration-tomato",
+            unit_size="1.000",
+            unit_label_vi="kg",
+            unit_label_en="kg",
+            retail_price_vnd=25_000,
+        )
+        farm = Farm.objects.create(
+            name_en="Migration Farm",
+            name_vi="Farm migration",
+            location_en="Da Lat",
+            location_vi="Đà Lạt",
+        )
+        relation = FarmProduct.objects.create(farm=farm, product=product)
+        positive_id = uuid4()
+        zero_id = uuid4()
+        week_start = date(2026, 10, 19)
+        positive = WeeklySupply.objects.create(
+            id=positive_id,
+            farm_product=relation,
+            week_start=week_start,
+            quantity_units=12,
+        )
+        WeeklySupply.objects.create(
+            id=zero_id,
+            farm_product=relation,
+            week_start=week_start + timedelta(days=7),
+            quantity_units=0,
+        )
+
+        executor = MigrationExecutor(connection)
+        executor.migrate([migrate_to])
+        migrated_apps = executor.loader.project_state([migrate_to]).apps
+        LegacySupply = migrated_apps.get_model("farms", "LegacyFarmWeeklySupply")
+        StockBatch = migrated_apps.get_model("farms", "FarmProductStockBatch")
+
+        assert set(LegacySupply.objects.values_list("id", flat=True)) == {
+            positive_id,
+            zero_id,
+        }
+        batch = StockBatch.objects.get(pk=positive_id)
+        assert batch.farm_product_id == relation.pk
+        assert batch.start_date == week_start
+        assert batch.end_date == week_start + timedelta(days=6)
+        assert batch.quantity_units == 12
+        assert batch.created_at == positive.created_at
+        assert batch.updated_at == positive.updated_at
+        assert not StockBatch.objects.filter(pk=zero_id).exists()
     finally:
         MigrationExecutor(connection).migrate(latest_nodes)

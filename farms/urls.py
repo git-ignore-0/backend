@@ -14,15 +14,19 @@ urlpatterns = [
     ),
     path("admin/farms/<uuid:farm_id>/products", views.AdminFarmProductListView.as_view()),
     path(
-        "admin/farms/<uuid:farm_id>/products/<uuid:product_id>/weeks",
-        views.AdminFarmWeeklySupplyListView.as_view(),
+        "admin/farms/<uuid:farm_id>/products/<uuid:product_id>/batches",
+        views.AdminFarmStockBatchListView.as_view(),
     ),
     path(
         "admin/farms/<uuid:farm_id>/products/<uuid:product_id>",
         views.AdminFarmProductDetailView.as_view(),
     ),
     path(
-        "admin/farms/<uuid:farm_id>/products/<uuid:product_id>/weeks/<str:week_start>",
-        views.AdminFarmWeeklySupplyView.as_view(),
+        "admin/farms/<uuid:farm_id>/products/<uuid:product_id>/batches/<uuid:batch_id>",
+        views.AdminFarmStockBatchDetailView.as_view(),
+    ),
+    path(
+        "admin/farms/<uuid:farm_id>/products/<uuid:product_id>/batches/<uuid:batch_id>/cancel",
+        views.AdminFarmStockBatchCancelView.as_view(),
     ),
 ]
