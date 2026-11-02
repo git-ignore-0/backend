@@ -1,9 +1,11 @@
 import calendar
 from datetime import date
+from decimal import Decimal, InvalidOperation
 
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
 from django.db.models import Sum
+from django.db.models.functions import Round
 from django.utils import timezone
 
 from commerce.models import ShippingAddress
@@ -49,6 +51,7 @@ from memberships.models import (
 from memberships.payments import confirm_locked_csa_payment, paid_cycle_count, payment_due_at
 from memberships.phones import InvalidPhoneNumber, normalize_vietnam_phone
 from memberships.pricing import calculate_total_price_vnd
+from memberships.quota_points import POINT_INPUT_ERROR, is_allowed_point_input
 
 
 class MembershipError(ValueError):
@@ -941,7 +944,7 @@ def ensure_due_cycles(
                 line__order__expires_at__gt=timezone.now(),
             )
             .values("cycle_quota_id")
-            .annotate(total=Sum("units"))
+            .annotate(total=Round(Sum("units"), precision=2))
         }
         for quota in expiring:
             held = min(quota.remaining_units, held_by_quota.get(quota.pk, 0))
@@ -984,7 +987,9 @@ def quota_availability_rows(
     )
     reserved = {
         row["cycle_quota_id"]: row["total"]
-        for row in reservations.values("cycle_quota_id").annotate(total=Sum("units"))
+        for row in reservations.values("cycle_quota_id").annotate(
+            total=Round(Sum("units"), precision=2)
+        )
     }
     current_reserved = {}
     if current_order_id is not None:
@@ -992,7 +997,7 @@ def quota_availability_rows(
             row["cycle_quota_id"]: row["total"]
             for row in reservations.filter(line__order_id=current_order_id)
             .values("cycle_quota_id")
-            .annotate(total=Sum("units"))
+            .annotate(total=Round(Sum("units"), precision=2))
         }
     return [
         (
@@ -1009,9 +1014,23 @@ def quota_availability_rows(
     ]
 
 
-def _normalized_usage_lines(lines: list[dict]) -> list[tuple[str, int]]:
-    normalized = sorted((str(item["product_id"]), int(item["units"])) for item in lines)
-    if not normalized or any(units <= 0 for _product_id, units in normalized):
+def _normalized_usage_lines(lines: list[dict]) -> list[tuple[str, Decimal]]:
+    normalized = []
+    for item in lines:
+        try:
+            units = Decimal(str(item["units"]))
+        except (InvalidOperation, TypeError, ValueError) as error:
+            raise QuotaError(POINT_INPUT_ERROR) from error
+        if (
+            not units.is_finite()
+            or units <= 0
+            or units > Decimal("999999999999.99")
+            or not is_allowed_point_input(units)
+        ):
+            raise QuotaError(POINT_INPUT_ERROR)
+        normalized.append((str(item["product_id"]), units))
+    normalized.sort()
+    if not normalized:
         raise QuotaError("Usage lines and positive units are required")
     if len({product_id for product_id, _units in normalized}) != len(normalized):
         raise QuotaError("Each product may appear only once")
@@ -1113,7 +1132,7 @@ def create_usage_order(*, membership_id, actor, idempotency_key, lines: list[dic
             line__order__expires_at__gt=timezone.now(),
         )
         .values("cycle_quota_id")
-        .annotate(total=Sum("units"))
+        .annotate(total=Round(Sum("units"), precision=2))
     }
     available_by_quota = {
         quota.pk: max(0, quota.remaining_units - reserved_by_quota.get(quota.pk, 0))

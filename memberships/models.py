@@ -6,7 +6,7 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.db.models import Q
-from django.db.models.functions import Trim, Upper
+from django.db.models.functions import Round, Trim, Upper
 
 from memberships.phones import InvalidPhoneNumber, normalize_vietnam_phone
 from memberships.pricing import calculate_total_price_vnd
@@ -1855,8 +1855,8 @@ class MembershipCycleQuota(models.Model):
         MembershipProductSnapshot, related_name="cycle_quotas", on_delete=models.PROTECT
     )
     granted_units = models.PositiveIntegerField()
-    remaining_units = models.PositiveIntegerField()
-    expired_units = models.PositiveIntegerField(default=0)
+    remaining_units = models.DecimalField(max_digits=14, decimal_places=2)
+    expired_units = models.DecimalField(max_digits=14, decimal_places=2, default=0)
 
     class Meta:
         ordering = ["cycle__sequence", "id"]
@@ -1871,8 +1871,13 @@ class MembershipCycleQuota(models.Model):
                 condition=Q(remaining_units__gte=0), name="memberships_cycle_remaining_nonnegative"
             ),
             models.CheckConstraint(
+                condition=Q(expired_units__gte=0), name="memberships_cycle_expired_nonnegative"
+            ),
+            models.CheckConstraint(
                 condition=Q(
-                    remaining_units__lte=models.F("granted_units") - models.F("expired_units")
+                    granted_units__gte=Round(
+                        models.F("remaining_units") + models.F("expired_units"), precision=2
+                    )
                 ),
                 name="memberships_cycle_quota_totals_valid",
             ),
@@ -1936,7 +1941,7 @@ class MembershipUsageLine(models.Model):
     product_snapshot = models.ForeignKey(
         MembershipProductSnapshot, related_name="usage_lines", on_delete=models.PROTECT
     )
-    units = models.PositiveIntegerField()
+    units = models.DecimalField(max_digits=14, decimal_places=2)
 
     class Meta:
         constraints = [
@@ -1956,7 +1961,7 @@ class MembershipUsageAllocation(models.Model):
     cycle_quota = models.ForeignKey(
         MembershipCycleQuota, related_name="usage_allocations", on_delete=models.PROTECT
     )
-    units = models.PositiveIntegerField()
+    units = models.DecimalField(max_digits=14, decimal_places=2)
 
     class Meta:
         constraints = [

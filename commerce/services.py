@@ -1,3 +1,5 @@
+from decimal import Decimal, InvalidOperation
+
 from django.db import IntegrityError, transaction
 from django.db.models.deletion import ProtectedError
 from django.utils.text import slugify
@@ -14,6 +16,7 @@ from commerce.models import (
 from content.models import MediaAsset
 from content.services import delete_orphan_media_asset, request_frontend_revalidation
 from memberships.models import Product as MembershipProduct
+from memberships.quota_points import POINT_INPUT_ERROR, is_allowed_point_input
 
 
 class CatalogConflict(Exception):
@@ -220,6 +223,12 @@ def _get_product_image(pk):
 def _validate_product(data, *, instance=None, translations=None):
     group = data.get("csa_quota_group", instance.csa_quota_group if instance else None)
     cost = data.get("csa_quota_cost", instance.csa_quota_cost if instance else 0)
+    try:
+        cost = Decimal(str(cost))
+    except (InvalidOperation, TypeError, ValueError) as error:
+        raise ValidationError({"csa_quota_cost": POINT_INPUT_ERROR}) from error
+    if not cost.is_finite() or (cost != 0 and not is_allowed_point_input(cost)):
+        raise ValidationError({"csa_quota_cost": POINT_INPUT_ERROR})
     if (group is None and cost != 0) or (group is not None and cost <= 0):
         raise ValidationError({"csa_quota_cost": "Quota cost must match CSA eligibility."})
     if group is not None and not group.is_active:

@@ -5,6 +5,7 @@ from rest_framework import serializers
 
 from members.administrative_units import province_exists, ward_choices
 from memberships.phones import InvalidPhoneNumber, normalize_vietnam_phone
+from memberships.quota_points import POINT_INPUT_ERROR, is_allowed_point_input
 
 MAX_POSITIVE_INTEGER = 2_147_483_647
 MAX_POSITIVE_BIG_INTEGER = 9_223_372_036_854_775_807
@@ -146,8 +147,12 @@ class ProductWriteSerializer(StrictSerializer):
         min_value=1, max_value=MAX_POSITIVE_BIG_INTEGER, required=False
     )
     csa_quota_group_id = serializers.UUIDField(allow_null=True, required=False)
-    csa_quota_cost = serializers.IntegerField(
-        min_value=0, max_value=MAX_POSITIVE_INTEGER, required=False
+    csa_quota_cost = serializers.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        min_value=Decimal("0"),
+        max_value=Decimal(MAX_POSITIVE_INTEGER),
+        required=False,
     )
     primary_image_id = serializers.UUIDField(allow_null=True, required=False)
     is_active = serializers.BooleanField(required=False)
@@ -157,6 +162,11 @@ class ProductWriteSerializer(StrictSerializer):
     def validate_sku(self, value):
         if not slugify(value.replace("đ", "d").replace("Đ", "D")):
             raise serializers.ValidationError("SKU must contain letters or numbers.")
+        return value
+
+    def validate_csa_quota_cost(self, value):
+        if value != 0 and not is_allowed_point_input(value):
+            raise serializers.ValidationError(POINT_INPUT_ERROR)
         return value
 
     def validate_translations(self, value):

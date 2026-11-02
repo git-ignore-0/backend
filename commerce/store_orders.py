@@ -6,7 +6,8 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta
 
 from django.db import transaction
-from django.db.models import F, Q, Sum
+from django.db.models import Q, Sum
+from django.db.models.functions import Round
 from django.utils import timezone
 from django.utils.crypto import salted_hmac
 
@@ -420,7 +421,7 @@ def create_store_checkout(*, user, payload):
                 )
             needed_per_item = product.csa_quota_cost
             available_units = sum(row[1] for row in quota_by_group[product.csa_quota_group_id])
-            quota_quantity = min(item["quantity"], available_units // needed_per_item)
+            quota_quantity = min(item["quantity"], int(available_units // needed_per_item))
             units_needed = quota_quantity * needed_per_item
             for quota_row in quota_by_group[product.csa_quota_group_id]:
                 quota, available = quota_row
@@ -574,7 +575,7 @@ def _release_reservations(order, reason):
                         line__order__expires_at__gt=now,
                     )
                     .exclude(line__order=order)
-                    .aggregate(total=Sum("units"))["total"]
+                    .aggregate(total=Round(Sum("units"), precision=2))["total"]
                     or 0
                 )
                 kept = min(quota.remaining_units, held_elsewhere)
@@ -839,7 +840,9 @@ def _consume_reserved_quota(order, actor):
         for quota, units in by_quota.values():
             if quota.remaining_units < units:
                 raise StoreOrderError("store_quota_changed")
-            quota.remaining_units = F("remaining_units") - units
+            # The cycle quota is already locked; subtract Decimals in Python so
+            # SQLite numeric affinity cannot leave a tiny nonzero balance.
+            quota.remaining_units -= units
             quota.save(update_fields=["remaining_units"])
             MembershipUsageAllocation.objects.create(line=line, cycle_quota=quota, units=units)
     StoreQuotaReservation.objects.filter(pk__in=[item.pk for item in reservations]).update(

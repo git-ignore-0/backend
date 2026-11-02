@@ -13,6 +13,7 @@ from memberships.models import (
 )
 from memberships.phones import InvalidPhoneNumber, normalize_vietnam_phone
 from memberships.pricing import MAX_POSITIVE_BIG_INTEGER, calculate_total_price_vnd
+from memberships.quota_points import POINT_INPUT_ERROR, is_allowed_point_input
 
 MAX_PAGE = 10_000
 
@@ -585,7 +586,12 @@ class MembershipAssignSerializer(StrictSerializer):
 
 class UsageLineSerializer(StrictSerializer):
     product_id = serializers.UUIDField()
-    units = serializers.IntegerField(min_value=1)
+    units = serializers.DecimalField(max_digits=14, decimal_places=2, min_value=Decimal("0.01"))
+
+    def validate_units(self, value):
+        if not is_allowed_point_input(value):
+            raise serializers.ValidationError(POINT_INPUT_ERROR)
+        return value
 
 
 class UsageCreateSerializer(StrictSerializer):

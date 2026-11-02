@@ -3,6 +3,7 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import IntegrityError, transaction
 from django.db.models import F, Prefetch, Q, Sum
 from django.db.models.deletion import ProtectedError
+from django.db.models.functions import Round
 from django.http import FileResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -928,7 +929,7 @@ def quota_payload(
         str(row["product_snapshot_id"]): row["remaining"] or 0
         for row in MembershipCycleQuota.objects.filter(cycle__membership=membership)
         .values("product_snapshot_id")
-        .annotate(remaining=Sum("remaining_units"))
+        .annotate(remaining=Round(Sum("remaining_units"), precision=2))
     }
     availability = {}
     for (

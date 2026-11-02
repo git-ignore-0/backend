@@ -130,7 +130,7 @@ class Product(models.Model):
     unit_label_vi = models.CharField(max_length=40)
     unit_label_en = models.CharField(max_length=40)
     retail_price_vnd = models.PositiveBigIntegerField()
-    csa_quota_cost = models.PositiveIntegerField(default=0)
+    csa_quota_cost = models.DecimalField(max_digits=14, decimal_places=2, default=0)
     primary_image = models.ForeignKey(
         "content.MediaAsset",
         null=True,
@@ -339,9 +339,9 @@ class StoreOrderLine(models.Model):
         related_name="store_order_lines",
         on_delete=models.PROTECT,
     )
-    quota_cost_snapshot = models.PositiveIntegerField(default=0)
+    quota_cost_snapshot = models.DecimalField(max_digits=14, decimal_places=2, default=0)
     quota_quantity = models.PositiveIntegerField(default=0)
-    quota_units = models.PositiveIntegerField(default=0)
+    quota_units = models.DecimalField(max_digits=14, decimal_places=2, default=0)
     cash_quantity = models.PositiveIntegerField()
     cash_subtotal_vnd = models.PositiveBigIntegerField()
 
@@ -356,6 +356,10 @@ class StoreOrderLine(models.Model):
             ),
             models.CheckConstraint(
                 condition=Q(quantity__gt=0), name="commerce_order_line_qty_positive"
+            ),
+            models.CheckConstraint(
+                condition=Q(quota_cost_snapshot__gte=0, quota_units__gte=0),
+                name="commerce_order_line_quota_nonnegative",
             ),
             models.CheckConstraint(
                 condition=Q(cash_quantity=models.F("quantity") - models.F("quota_quantity")),
@@ -403,7 +407,7 @@ class StoreQuotaReservation(models.Model):
         related_name="store_reservations",
         on_delete=models.PROTECT,
     )
-    units = models.PositiveIntegerField()
+    units = models.DecimalField(max_digits=14, decimal_places=2)
     released_at = models.DateTimeField(null=True, blank=True)
     consumed_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
