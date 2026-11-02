@@ -2,6 +2,7 @@ from django.db import IntegrityError, transaction
 from django.db.models import (
     Count,
     Exists,
+    ExpressionWrapper,
     F,
     IntegerField,
     Max,
@@ -9,14 +10,15 @@ from django.db.models import (
     OuterRef,
     Prefetch,
     Q,
+    Subquery,
     Sum,
     Value,
 )
-from django.db.models.functions import Coalesce
+from django.db.models.functions import Coalesce, Greatest
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
-from commerce.models import Product
+from commerce.models import Product, StoreStockMovement, StoreStockMovementKind
 from commerce.services import schedule_store_revalidation
 from content.models import MediaAsset
 from content.services import audit, delete_orphan_media_asset, request_frontend_revalidation
@@ -36,10 +38,78 @@ class FarmConflict(ValueError):
         super().__init__(code)
 
 
+def _farm_product_inventory_queryset(*, today=None):
+    current_date = today or timezone.localdate()
+    active_batches = FarmProductStockBatch.objects.filter(
+        farm_product_id=OuterRef("pk"),
+        farm_product__farm__is_active=True,
+        farm_product__is_active=True,
+        cancelled_at__isnull=True,
+        start_date__lte=current_date,
+        end_date__gte=current_date,
+    )
+    movement_base = StoreStockMovement.objects.filter(
+        batch__farm_product_id=OuterRef("pk"),
+        batch__farm_product__farm__is_active=True,
+        batch__farm_product__is_active=True,
+        batch__cancelled_at__isnull=True,
+        batch__start_date__lte=current_date,
+        batch__end_date__gte=current_date,
+    )
+    initial = (
+        active_batches.values("farm_product_id")
+        .annotate(total=Sum("quantity_units"))
+        .values("total")[:1]
+    )
+
+    def movement_total(kind):
+        return (
+            movement_base.filter(kind=kind)
+            .values("batch__farm_product_id")
+            .annotate(total=Sum("quantity"))
+            .values("total")[:1]
+        )
+
+    return FarmProduct.objects.annotate(
+        initial_quantity=Coalesce(Subquery(initial, output_field=IntegerField()), Value(0)),
+        sold_quantity=Coalesce(
+            Subquery(movement_total(StoreStockMovementKind.SALE), output_field=IntegerField()),
+            Value(0),
+        ),
+        restocked_quantity=Coalesce(
+            Subquery(movement_total(StoreStockMovementKind.RESTOCK), output_field=IntegerField()),
+            Value(0),
+        ),
+    ).annotate(
+        net_sold_quantity=Greatest(
+            Value(0),
+            ExpressionWrapper(
+                F("sold_quantity") - F("restocked_quantity"), output_field=IntegerField()
+            ),
+        ),
+        available_quantity=Greatest(
+            Value(0),
+            ExpressionWrapper(
+                F("initial_quantity") - F("sold_quantity") + F("restocked_quantity"),
+                output_field=IntegerField(),
+            ),
+        ),
+    )
+
+
 def farm_queryset():
-    current_stock = active_stock_batch_q("products__stock_batches") & Q(
-        is_active=True,
-        products__is_active=True,
+    inventory = _farm_product_inventory_queryset()
+    active_count = (
+        FarmProduct.objects.filter(farm_id=OuterRef("pk"), is_active=True)
+        .values("farm_id")
+        .annotate(total=Count("pk"))
+        .values("total")[:1]
+    )
+    in_stock_count = (
+        inventory.filter(farm_id=OuterRef("pk"), is_active=True, available_quantity__gt=0)
+        .values("farm_id")
+        .annotate(total=Count("pk"))
+        .values("total")[:1]
     )
     return (
         Farm.objects.select_related("image")
@@ -50,15 +120,11 @@ def farm_queryset():
             )
         )
         .annotate(
-            _active_product_count=Count(
-                "products",
-                filter=Q(products__is_active=True),
-                distinct=True,
+            _active_product_count=Coalesce(
+                Subquery(active_count, output_field=IntegerField()), Value(0)
             ),
-            in_stock_product_count=Count(
-                "products",
-                filter=current_stock,
-                distinct=True,
+            in_stock_product_count=Coalesce(
+                Subquery(in_stock_count, output_field=IntegerField()), Value(0)
             ),
         )
         .annotate(
@@ -73,19 +139,54 @@ def farm_product_queryset(*, today=None):
         farm__is_active=True, is_active=True
     )
     return (
-        FarmProduct.objects.select_related("farm", "product")
+        _farm_product_inventory_queryset(today=current_date)
+        .select_related("farm", "product")
         .prefetch_related("product__translations")
         .annotate(
-            available_quantity=Coalesce(
-                Sum("stock_batches__quantity_units", filter=active_batches),
-                Value(0),
-                output_field=IntegerField(),
-            ),
             batch_count=Count("stock_batches", distinct=True),
             active_batch_count=Count("stock_batches", filter=active_batches, distinct=True),
             next_expiry_date=Min("stock_batches__end_date", filter=active_batches),
             has_legacy_supply_history=Exists(
                 LegacyFarmWeeklySupply.objects.filter(farm_product_id=OuterRef("pk"))
+            ),
+        )
+    )
+
+
+def stock_batch_queryset():
+    return (
+        FarmProductStockBatch.objects.select_related("farm_product__farm", "farm_product__product")
+        .annotate(
+            sold_quantity=Coalesce(
+                Sum(
+                    "store_stock_movements__quantity",
+                    filter=Q(store_stock_movements__kind=StoreStockMovementKind.SALE),
+                ),
+                Value(0),
+                output_field=IntegerField(),
+            ),
+            restocked_quantity=Coalesce(
+                Sum(
+                    "store_stock_movements__quantity",
+                    filter=Q(store_stock_movements__kind=StoreStockMovementKind.RESTOCK),
+                ),
+                Value(0),
+                output_field=IntegerField(),
+            ),
+        )
+        .annotate(
+            net_sold_quantity=Greatest(
+                Value(0),
+                ExpressionWrapper(
+                    F("sold_quantity") - F("restocked_quantity"), output_field=IntegerField()
+                ),
+            ),
+            remaining_quantity=Greatest(
+                Value(0),
+                ExpressionWrapper(
+                    F("quantity_units") - F("sold_quantity") + F("restocked_quantity"),
+                    output_field=IntegerField(),
+                ),
             ),
         )
     )
@@ -145,7 +246,28 @@ def create_farm(*, actor, data):
 def update_farm(*, farm_id, actor, expected_version, data):
     from content.models import TrackerFarm, TrackerFarmPhoto
 
+    # Match Store's Product -> FarmProduct -> Farm -> batch lock order.
+    # Lock all products of this farm before taking the farm lock: reservation
+    # checks also read other farms supplying the same products.
+    if data.get("is_active") is False:
+        product_ids = list(
+            FarmProduct.objects.filter(farm_id=farm_id).values_list("product_id", flat=True)
+        )
+        list(Product.objects.select_for_update().filter(pk__in=product_ids).order_by("pk"))
+        list(
+            FarmProduct.objects.select_for_update()
+            .filter(product_id__in=product_ids)
+            .order_by("pk")
+        )
     farm = Farm.objects.select_for_update().get(pk=farm_id)
+    if data.get("is_active") is False:
+        current_product_ids = set(
+            FarmProduct.objects.filter(farm_id=farm_id).values_list("product_id", flat=True)
+        )
+        if current_product_ids != set(product_ids):
+            # A newly attached product was not part of the ordered locks above.
+            # Retry from a fresh snapshot instead of locking it after Farm.
+            raise FarmConflict("farm_product_changed")
     store_product_slugs = list(
         Product.objects.filter(farm_offers__farm_id=farm_id).values_list("slug", flat=True)
     )
@@ -153,6 +275,16 @@ def update_farm(*, farm_id, actor, expected_version, data):
     if farm.version != expected_version:
         raise FarmConflict("version_conflict")
     values = dict(data)
+    if farm.is_active and values.get("is_active") is False:
+        from commerce.store_orders import (
+            StoreOrderError,
+            ensure_farm_deactivation_preserves_reservations,
+        )
+
+        try:
+            ensure_farm_deactivation_preserves_reservations(farm)
+        except StoreOrderError as error:
+            raise FarmConflict(error.code) from error
     photo_ids = values.pop("photo_ids", None)
     for field, value in values.items():
         setattr(farm, field, value)
@@ -230,10 +362,10 @@ def _validate_stock_batch_values(*, start_date, end_date, quantity_units, today=
 
 @transaction.atomic
 def add_farm_product(*, farm_id, product_id, start_date, end_date, quantity_units, actor):
-    farm = Farm.objects.select_for_update().get(pk=farm_id)
     product = Product.objects.select_for_update().filter(pk=product_id).first()
     if product is None:
         raise Product.DoesNotExist
+    farm = Farm.objects.select_for_update().get(pk=farm_id)
     if not product.is_active:
         raise FarmConflict("product_inactive")
     _validate_stock_batch_values(
@@ -289,6 +421,8 @@ def update_stock_batch(*, farm_id, product_id, batch_id, actor, expected_version
     relation = FarmProduct.objects.filter(farm_id=farm_id, product_id=product_id).first()
     if relation is None:
         raise FarmConflict("farm_product_changed")
+    if not Product.objects.select_for_update().filter(pk=product_id).exists():
+        raise FarmConflict("farm_product_changed")
     batch = (
         FarmProductStockBatch.objects.select_for_update()
         .select_related("farm_product__product")
@@ -315,6 +449,17 @@ def update_stock_batch(*, farm_id, product_id, batch_id, actor, expected_version
         end_date=end_date,
         quantity_units=quantity_units,
     )
+    from commerce.store_orders import StoreOrderError, ensure_batch_change_preserves_reservations
+
+    try:
+        ensure_batch_change_preserves_reservations(
+            batch,
+            quantity_units=quantity_units,
+            start_date=start_date,
+            end_date=end_date,
+        )
+    except StoreOrderError as error:
+        raise FarmConflict(error.code) from error
     before = {
         "start_date": batch.start_date.isoformat(),
         "end_date": batch.end_date.isoformat(),
@@ -339,6 +484,8 @@ def cancel_stock_batch(*, farm_id, product_id, batch_id, actor, expected_version
     relation = FarmProduct.objects.filter(farm_id=farm_id, product_id=product_id).first()
     if relation is None:
         raise FarmConflict("farm_product_changed")
+    if not Product.objects.select_for_update().filter(pk=product_id).exists():
+        raise FarmConflict("farm_product_changed")
     batch = (
         FarmProductStockBatch.objects.select_for_update()
         .select_related("farm_product__product")
@@ -354,6 +501,12 @@ def cancel_stock_batch(*, farm_id, product_id, batch_id, actor, expected_version
         raise FarmConflict("stock_batch_cancelled")
     if status == "expired":
         raise FarmConflict("stock_batch_expired")
+    from commerce.store_orders import StoreOrderError, ensure_batch_change_preserves_reservations
+
+    try:
+        ensure_batch_change_preserves_reservations(batch, cancelling=True)
+    except StoreOrderError as error:
+        raise FarmConflict(error.code) from error
     batch.cancelled_at = timezone.now()
     batch.cancelled_by = actor
     batch.version += 1
@@ -365,6 +518,8 @@ def cancel_stock_batch(*, farm_id, product_id, batch_id, actor, expected_version
 
 @transaction.atomic
 def update_farm_product(*, farm_id, product_id, is_active, actor):
+    if not Product.objects.select_for_update().filter(pk=product_id).exists():
+        raise FarmConflict("farm_product_changed")
     row = (
         FarmProduct.objects.select_for_update()
         .filter(farm_id=farm_id, product_id=product_id)
@@ -372,6 +527,12 @@ def update_farm_product(*, farm_id, product_id, is_active, actor):
     )
     if row is None:
         raise FarmConflict("farm_product_changed")
+    from commerce.store_orders import StoreOrderError, ensure_offer_change_preserves_reservations
+
+    try:
+        ensure_offer_change_preserves_reservations(row, active=is_active)
+    except StoreOrderError as error:
+        raise FarmConflict(error.code) from error
     if row.is_active != is_active:
         row.is_active = is_active
         row.save(update_fields=["is_active", "updated_at"])

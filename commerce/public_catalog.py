@@ -1,8 +1,15 @@
 from django.db.models import IntegerField, OuterRef, Prefetch, Q, Subquery, Sum, Value
-from django.db.models.functions import Coalesce
+from django.db.models.functions import Coalesce, Greatest
 from django.utils import timezone
 
-from commerce.models import PUBLIC_STORE_MAX_PRICE_VND, Category, Product
+from commerce.models import (
+    PUBLIC_STORE_MAX_PRICE_VND,
+    Category,
+    Product,
+    StoreStockMovement,
+    StoreStockMovementKind,
+    StoreStockReservation,
+)
 from content.serializers import media_payload
 from farms.models import FarmProduct, FarmProductStockBatch
 
@@ -35,6 +42,37 @@ def public_product_queryset():
         .annotate(total=Sum("quantity_units"))
         .values("total")[:1]
     )
+    movement_base = StoreStockMovement.objects.filter(
+        batch__farm_product__product_id=OuterRef("pk"),
+        batch__farm_product__farm__is_active=True,
+        batch__farm_product__is_active=True,
+        batch__cancelled_at__isnull=True,
+        batch__start_date__lte=current_date,
+        batch__end_date__gte=current_date,
+    )
+    sold = (
+        movement_base.filter(kind=StoreStockMovementKind.SALE)
+        .values("batch__farm_product__product_id")
+        .annotate(total=Sum("quantity"))
+        .values("total")[:1]
+    )
+    restocked = (
+        movement_base.filter(kind=StoreStockMovementKind.RESTOCK)
+        .values("batch__farm_product__product_id")
+        .annotate(total=Sum("quantity"))
+        .values("total")[:1]
+    )
+    reserved = (
+        StoreStockReservation.objects.filter(
+            product_id=OuterRef("pk"),
+            released_at__isnull=True,
+            line__order__status__in=["payment_pending", "pending_review"],
+            line__order__expires_at__gt=timezone.now(),
+        )
+        .values("product_id")
+        .annotate(total=Sum("quantity"))
+        .values("total")[:1]
+    )
     active_suppliers = FarmProduct.objects.filter(
         is_active=True, farm__is_active=True
     ).select_related("farm")
@@ -48,9 +86,12 @@ def public_product_queryset():
             "csa_quota_group",
         )
         .annotate(
-            available_quantity=Coalesce(
-                Subquery(current_stock, output_field=IntegerField()),
+            available_quantity=Greatest(
                 Value(0),
+                Coalesce(Subquery(current_stock, output_field=IntegerField()), Value(0))
+                - Coalesce(Subquery(sold, output_field=IntegerField()), Value(0))
+                + Coalesce(Subquery(restocked, output_field=IntegerField()), Value(0))
+                - Coalesce(Subquery(reserved, output_field=IntegerField()), Value(0)),
             )
         )
         .prefetch_related(

@@ -166,6 +166,8 @@ if os.getenv("DB_ENGINE", "sqlite") == "mysql":
             "PORT": os.getenv("DB_PORT", "3306"),
             "OPTIONS": {
                 "charset": "utf8mb4",
+                # Reservation reads must see commits made while checkout waited for locks.
+                "isolation_level": "read committed",
                 "init_command": "SET sql_mode='STRICT_TRANS_TABLES'",
             },
             "CONN_MAX_AGE": 60,
@@ -236,6 +238,7 @@ CONTENT_MAX_IMAGE_PIXELS = int(os.getenv("CONTENT_MAX_IMAGE_PIXELS", "16000000")
 CONTENT_SERVE_MEDIA = env_bool("CONTENT_SERVE_MEDIA", True)
 CONTENT_FRONTEND_REVALIDATE_URL = os.getenv("CONTENT_FRONTEND_REVALIDATE_URL", "").strip()
 CONTENT_FRONTEND_REVALIDATE_SECRET = os.getenv("CONTENT_FRONTEND_REVALIDATE_SECRET", "").strip()
+STORE_BFF_SHARED_SECRET = os.getenv("STORE_BFF_SHARED_SECRET", "").strip()
 STORAGES = {
     "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
     "staticfiles": {

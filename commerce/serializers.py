@@ -199,3 +199,123 @@ class PublicStoreProductQuerySerializer(PublicStoreLocaleSerializer):
                 {"price_max": "Must be greater than or equal to price_min."}
             )
         return attrs
+
+
+class StoreCheckoutLineSerializer(StrictSerializer):
+    product_id = serializers.UUIDField()
+    quantity = serializers.IntegerField(min_value=1, max_value=999)
+    use_quota = serializers.BooleanField()
+    expected_unit_price_vnd = serializers.IntegerField(
+        min_value=1, max_value=MAX_POSITIVE_BIG_INTEGER
+    )
+    expected_available_quantity = serializers.IntegerField(
+        min_value=0, max_value=MAX_POSITIVE_INTEGER
+    )
+    expected_quota_quantity = serializers.IntegerField(min_value=0, max_value=999)
+
+
+class StoreGuestAddressSerializer(ShippingAddressSerializer):
+    pass
+
+
+class StoreCheckoutSerializer(StrictSerializer):
+    idempotency_key = serializers.UUIDField()
+    locale = serializers.ChoiceField(choices=["vi", "en"], default="vi")
+    lines = StoreCheckoutLineSerializer(many=True, allow_empty=False, max_length=50)
+    guest = StoreGuestAddressSerializer(required=False)
+    expected_shipping_fee_vnd = serializers.IntegerField(
+        min_value=0, max_value=MAX_POSITIVE_BIG_INTEGER
+    )
+    expected_total_vnd = serializers.IntegerField(min_value=0, max_value=MAX_POSITIVE_BIG_INTEGER)
+    shipping_address_updated_at = serializers.DateTimeField(required=False)
+
+
+class StoreOrderAccessSerializer(StrictSerializer):
+    access_token = serializers.CharField(max_length=128, required=False, allow_blank=True)
+
+
+class StoreOrderCancelAccessSerializer(StoreOrderAccessSerializer):
+    idempotency_key = serializers.UUIDField()
+
+
+class StoreAllocationSerializer(StrictSerializer):
+    line_id = serializers.UUIDField()
+    batch_id = serializers.UUIDField()
+    quantity = serializers.IntegerField(min_value=1, max_value=999999)
+
+
+class StoreApproveSerializer(StrictSerializer):
+    idempotency_key = serializers.UUIDField()
+    allocations = StoreAllocationSerializer(many=True, allow_empty=False)
+
+    def validate_allocations(self, value):
+        pairs = [(item["line_id"], item["batch_id"]) for item in value]
+        if len(pairs) != len(set(pairs)):
+            raise serializers.ValidationError("Each line and batch pair may appear only once.")
+        return value
+
+
+class StoreOrderQuerySerializer(StrictSerializer):
+    page = serializers.IntegerField(min_value=1, max_value=10000, default=1)
+    page_size = serializers.IntegerField(min_value=1, max_value=50, default=20)
+    status = serializers.ChoiceField(
+        choices=[
+            "payment_pending",
+            "pending_review",
+            "pending_delivery",
+            "delivered",
+            "cancelled",
+        ],
+        required=False,
+    )
+    payment_status = serializers.ChoiceField(
+        choices=["not_required", "unconfirmed", "received", "refund_required", "refunded"],
+        required=False,
+    )
+    search = serializers.CharField(max_length=200, allow_blank=True, default="")
+    sort = serializers.ChoiceField(
+        choices=["created_desc", "created_asc", "deadline_asc", "total_desc"],
+        default="created_desc",
+    )
+
+
+class StoreGuestLookupSerializer(StrictSerializer):
+    reference_code = serializers.CharField(max_length=24, trim_whitespace=True)
+    phone_number = serializers.CharField(max_length=32, trim_whitespace=True)
+
+
+class StoreActionSerializer(StrictSerializer):
+    idempotency_key = serializers.UUIDField()
+
+
+class StoreCancelSerializer(StoreActionSerializer):
+    reason = serializers.CharField(max_length=1000, trim_whitespace=True)
+    reconciliation_note = serializers.CharField(
+        max_length=2000, allow_blank=True, default="", trim_whitespace=True
+    )
+
+
+class StoreRecordPaymentSerializer(StoreActionSerializer):
+    note = serializers.CharField(
+        max_length=2000, allow_blank=True, default="", trim_whitespace=True
+    )
+
+
+class StoreRefundSerializer(StoreActionSerializer):
+    amount_vnd = serializers.IntegerField(min_value=1, max_value=MAX_POSITIVE_BIG_INTEGER)
+    note = serializers.CharField(max_length=2000, trim_whitespace=True)
+
+
+class StoreRestockAllocationSerializer(StrictSerializer):
+    allocation_id = serializers.UUIDField()
+    quantity = serializers.IntegerField(min_value=1, max_value=999999)
+
+
+class StoreRestockSerializer(StoreActionSerializer):
+    allocations = StoreRestockAllocationSerializer(many=True, allow_empty=False)
+
+    def validate_allocations(self, value):
+        allocation_ids = [item["allocation_id"] for item in value]
+        if len(allocation_ids) != len(set(allocation_ids)):
+            raise serializers.ValidationError("Each allocation may appear only once.")
+        return value

@@ -1881,6 +1881,13 @@ class MembershipCycleQuota(models.Model):
 
 class MembershipUsageOrder(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    store_order = models.OneToOneField(
+        "commerce.StoreOrder",
+        related_name="quota_usage",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+    )
     membership = models.ForeignKey(
         Membership, related_name="usage_orders", on_delete=models.PROTECT
     )

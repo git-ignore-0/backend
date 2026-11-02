@@ -3,7 +3,7 @@ from datetime import date
 
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
-from django.db.models import F
+from django.db.models import Sum
 from django.utils import timezone
 
 from commerce.models import ShippingAddress
@@ -920,15 +920,93 @@ def ensure_due_cycles(
         if sequence not in existing:
             created.append(_create_cycle(membership, sequence))
     if membership.quota_policy_snapshot == QuotaPolicy.EXPIRE:
-        MembershipCycleQuota.objects.filter(
-            cycle__membership=membership,
-            cycle__end_date__lte=as_of,
-            remaining_units__gt=0,
-        ).update(
-            expired_units=F("expired_units") + F("remaining_units"),
-            remaining_units=0,
+        from commerce.models import StoreQuotaReservation
+
+        expiring = list(
+            MembershipCycleQuota.objects.select_for_update()
+            .filter(
+                cycle__membership=membership,
+                cycle__end_date__lte=as_of,
+                remaining_units__gt=0,
+            )
+            .order_by("pk")
         )
+        held_by_quota = {
+            row["cycle_quota_id"]: row["total"]
+            for row in StoreQuotaReservation.objects.filter(
+                cycle_quota_id__in=[quota.pk for quota in expiring],
+                released_at__isnull=True,
+                consumed_at__isnull=True,
+                line__order__status__in=["payment_pending", "pending_review"],
+                line__order__expires_at__gt=timezone.now(),
+            )
+            .values("cycle_quota_id")
+            .annotate(total=Sum("units"))
+        }
+        for quota in expiring:
+            held = min(quota.remaining_units, held_by_quota.get(quota.pk, 0))
+            newly_expired = quota.remaining_units - held
+            if newly_expired:
+                quota.expired_units += newly_expired
+                quota.remaining_units = held
+                quota.save(update_fields=["expired_units", "remaining_units"])
     return created
+
+
+def quota_availability_rows(
+    membership: Membership,
+    *,
+    product_ids=None,
+    current_order_id=None,
+    lock=False,
+    as_of: date | None = None,
+):
+    """Return quota rows with effective Store holds and spendable balances."""
+    as_of = as_of or timezone.localdate()
+    rows = MembershipCycleQuota.objects
+    if lock:
+        rows = rows.select_for_update()
+    rows = rows.filter(cycle__membership=membership).select_related("cycle", "product_snapshot")
+    if product_ids is not None:
+        rows = rows.filter(product_snapshot__product_id__in=product_ids)
+    if membership.quota_policy_snapshot == QuotaPolicy.EXPIRE:
+        rows = rows.filter(cycle__start_date__lte=as_of, cycle__end_date__gt=as_of)
+    rows = list(rows.order_by("cycle__sequence", "id"))
+
+    from commerce.models import StoreQuotaReservation
+
+    reservations = StoreQuotaReservation.objects.filter(
+        cycle_quota_id__in=[row.pk for row in rows],
+        released_at__isnull=True,
+        consumed_at__isnull=True,
+        line__order__status__in=["payment_pending", "pending_review"],
+        line__order__expires_at__gt=timezone.now(),
+    )
+    reserved = {
+        row["cycle_quota_id"]: row["total"]
+        for row in reservations.values("cycle_quota_id").annotate(total=Sum("units"))
+    }
+    current_reserved = {}
+    if current_order_id is not None:
+        current_reserved = {
+            row["cycle_quota_id"]: row["total"]
+            for row in reservations.filter(line__order_id=current_order_id)
+            .values("cycle_quota_id")
+            .annotate(total=Sum("units"))
+        }
+    return [
+        (
+            row,
+            reserved.get(row.pk, 0),
+            max(0, row.remaining_units - reserved.get(row.pk, 0)),
+            current_reserved.get(row.pk, 0),
+            max(
+                0,
+                row.remaining_units - reserved.get(row.pk, 0) + current_reserved.get(row.pk, 0),
+            ),
+        )
+        for row in rows
+    ]
 
 
 def _normalized_usage_lines(lines: list[dict]) -> list[tuple[str, int]]:
@@ -984,6 +1062,8 @@ def create_usage_order(*, membership_id, actor, idempotency_key, lines: list[dic
         .first()
     )
     if existing:
+        if existing.store_order_id is not None:
+            raise UsageIdempotencyConflict("Idempotency key belongs to a Store usage order")
         validate_usage_integrity(existing)
         existing_lines = sorted(
             (str(line.product_snapshot.product_id), line.units) for line in existing.lines.all()
@@ -1021,10 +1101,29 @@ def create_usage_order(*, membership_id, actor, idempotency_key, lines: list[dic
             quota for quota in quotas if quota.cycle.start_date <= today < quota.cycle.end_date
         ]
     by_product = {}
+    from commerce.models import StoreQuotaReservation
+
+    reserved_by_quota = {
+        row["cycle_quota_id"]: row["total"]
+        for row in StoreQuotaReservation.objects.filter(
+            cycle_quota_id__in=[quota.pk for quota in quotas],
+            released_at__isnull=True,
+            consumed_at__isnull=True,
+            line__order__status__in=["payment_pending", "pending_review"],
+            line__order__expires_at__gt=timezone.now(),
+        )
+        .values("cycle_quota_id")
+        .annotate(total=Sum("units"))
+    }
+    available_by_quota = {
+        quota.pk: max(0, quota.remaining_units - reserved_by_quota.get(quota.pk, 0))
+        for quota in quotas
+    }
     for quota in quotas:
         by_product.setdefault(str(quota.product_snapshot.product_id), []).append(quota)
     if any(
-        sum(q.remaining_units for q in by_product.get(pid, [])) < units for pid, units in requested
+        sum(available_by_quota[q.pk] for q in by_product.get(pid, [])) < units
+        for pid, units in requested
     ):
         raise InsufficientQuota("Requested units exceed available quota")
     order = MembershipUsageOrder.objects.create(
@@ -1040,10 +1139,11 @@ def create_usage_order(*, membership_id, actor, idempotency_key, lines: list[dic
         )
         needed = units
         for quota in by_product[product_id]:
-            allocated = min(needed, quota.remaining_units)
+            allocated = min(needed, available_by_quota[quota.pk])
             if not allocated:
                 continue
             quota.remaining_units -= allocated
+            available_by_quota[quota.pk] -= allocated
             quota.save(update_fields=["remaining_units"])
             MembershipUsageAllocation.objects.create(line=line, cycle_quota=quota, units=allocated)
             needed -= allocated
@@ -1063,6 +1163,8 @@ def undo_usage_order(*, order_id, actor, reason: str):
     if membership.status == MembershipStatus.REVOKED:
         raise UsageUndoConflict("Usage cannot be undone for a revoked membership")
     order = MembershipUsageOrder.objects.select_for_update().get(pk=order_id)
+    if order.store_order_id is not None:
+        raise UsageUndoConflict("Store usage can only be reversed by cancelling its Store order")
     if (
         order.status != UsageOrderStatus.APPLIED
         or MembershipUsageReversal.objects.filter(order=order).exists()

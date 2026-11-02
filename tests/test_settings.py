@@ -66,3 +66,28 @@ def test_cross_origin_oauth_popup_keeps_window_opener(client):
     response = client.get("/login")
 
     assert "Cross-Origin-Opener-Policy" not in response
+
+
+def test_mysql_store_transactions_use_read_committed(monkeypatch):
+    import runpy
+    from unittest.mock import MagicMock
+
+    for name, value in {
+        "DB_ENGINE": "mysql",
+        "DB_NAME": "test",
+        "DB_USER": "test",
+        "DB_PASSWORD": "test",
+    }.items():
+        monkeypatch.setenv(name, value)
+    namespace = runpy.run_path(str(settings.BASE_DIR / "config/settings.py"))
+    configured = namespace["DATABASES"]["default"]
+    wrapper = DatabaseWrapper(configured, alias="isolation-check")
+    wrapper.get_connection_params()
+    assert wrapper.isolation_level == "read committed"
+    wrapper.features = SimpleNamespace(is_sql_auto_is_null_enabled=False)
+    cursor = MagicMock()
+    wrapper.cursor = MagicMock(return_value=cursor)
+    wrapper.init_connection_state()
+    cursor.__enter__.return_value.execute.assert_called_once_with(
+        "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED"
+    )

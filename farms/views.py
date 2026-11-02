@@ -38,6 +38,7 @@ from farms.services import (
     delete_growth_tracker_profile,
     farm_product_queryset,
     farm_queryset,
+    stock_batch_queryset,
     update_farm,
     update_farm_product,
     update_growth_tracker_profile,
@@ -90,6 +91,8 @@ def farm_product_payload(row):
         "unit_label_vi": row.product.unit_label_vi,
         "unit_label_en": row.product.unit_label_en,
         "is_active": row.is_active,
+        "initial_quantity": row.initial_quantity,
+        "net_sold_quantity": row.net_sold_quantity,
         "available_quantity": row.available_quantity,
         "batch_count": row.batch_count,
         "active_batch_count": row.active_batch_count,
@@ -99,12 +102,23 @@ def farm_product_payload(row):
 
 
 def stock_batch_payload(batch):
+    remaining = batch.remaining_quantity
+    available = (
+        remaining
+        if stock_batch_status(batch) == "active"
+        and batch.farm_product.is_active
+        and batch.farm_product.farm.is_active
+        else 0
+    )
     return {
         "id": str(batch.pk),
         "farm_product_id": str(batch.farm_product_id),
         "start_date": batch.start_date.isoformat(),
         "end_date": batch.end_date.isoformat(),
         "quantity_units": batch.quantity_units,
+        "net_sold_quantity": batch.net_sold_quantity,
+        "remaining_quantity": remaining,
+        "available_quantity": available,
         "status": stock_batch_status(batch),
         "version": batch.version,
         "created_at": batch.created_at.isoformat(),
@@ -319,7 +333,7 @@ class AdminFarmStockBatchListView(APIView):
         relation = get_object_or_404(FarmProduct, farm_id=farm_id, product_id=product_id)
         serializer = StockBatchQuerySerializer(data=request.query_params.dict())
         serializer.is_valid(raise_exception=True)
-        rows = FarmProductStockBatch.objects.filter(farm_product=relation)
+        rows = stock_batch_queryset().filter(farm_product=relation)
         if requested_status := serializer.validated_data.get("status"):
             rows = rows.filter(stock_batch_status_q(requested_status))
         page = serializer.validated_data["page"]
@@ -350,6 +364,7 @@ class AdminFarmStockBatchListView(APIView):
             )
         except FarmConflict as error:
             return conflict(error.code)
+        batch = stock_batch_queryset().get(pk=batch.pk)
         return no_store(
             Response({"data": stock_batch_payload(batch)}, status=status.HTTP_201_CREATED)
         )
@@ -380,6 +395,7 @@ class AdminFarmStockBatchDetailView(APIView):
             )
         except FarmConflict as error:
             return conflict(error.code)
+        batch = stock_batch_queryset().get(pk=batch.pk)
         return no_store(Response({"data": stock_batch_payload(batch)}))
 
 
@@ -405,6 +421,7 @@ class AdminFarmStockBatchCancelView(APIView):
             )
         except FarmConflict as error:
             return conflict(error.code)
+        batch = stock_batch_queryset().get(pk=batch.pk)
         return no_store(Response({"data": stock_batch_payload(batch)}))
 
 

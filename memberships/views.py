@@ -162,6 +162,7 @@ from memberships.serializers import (
     PackageWriteSerializer,
     ProductWriteSerializer,
     PublicPackageQuerySerializer,
+    QuotaQuerySerializer,
     UsageCreateSerializer,
     UsageUndoSerializer,
 )
@@ -176,6 +177,7 @@ from memberships.services import (
     create_usage_order,
     ensure_due_cycles,
     link_csa_customer_to_user,
+    quota_availability_rows,
     refresh_membership_statuses,
     revoke_membership,
     sync_package_price_options,
@@ -915,13 +917,48 @@ def upcoming_purchase_request_payload(item: CSAPurchaseRequest):
     }
 
 
-def quota_payload(membership, *, locale=MembershipContentLocale.VI, admin=False):
+def quota_payload(
+    membership,
+    *,
+    locale=MembershipContentLocale.VI,
+    admin=False,
+    current_order_id=None,
+):
     balances = {
         str(row["product_snapshot_id"]): row["remaining"] or 0
         for row in MembershipCycleQuota.objects.filter(cycle__membership=membership)
         .values("product_snapshot_id")
         .annotate(remaining=Sum("remaining_units"))
     }
+    availability = {}
+    for (
+        quota,
+        reserved,
+        available,
+        current_reserved,
+        available_for_order,
+    ) in quota_availability_rows(
+        membership,
+        current_order_id=current_order_id,
+    ):
+        key = str(quota.product_snapshot_id)
+        totals = availability.setdefault(
+            key,
+            {
+                "reserved_units": 0,
+                "used_units": 0,
+                "available_units": 0,
+                "current_order_reserved_units": 0,
+                "available_units_for_order": 0,
+            },
+        )
+        totals["reserved_units"] += reserved
+        totals["used_units"] += max(
+            0, quota.granted_units - quota.remaining_units - quota.expired_units
+        )
+        totals["available_units"] += available
+        totals["current_order_reserved_units"] += current_reserved
+        totals["available_units_for_order"] += available_for_order
     return [
         {
             "product_id": str(snapshot.product_id),
@@ -935,6 +972,16 @@ def quota_payload(membership, *, locale=MembershipContentLocale.VI, admin=False)
             "unit_label_en": snapshot.unit_label_en,
             "quota_units_per_cycle": snapshot.quota_units_per_cycle,
             "remaining_units": balances.get(str(snapshot.pk), 0),
+            **availability.get(
+                str(snapshot.pk),
+                {
+                    "reserved_units": 0,
+                    "used_units": 0,
+                    "available_units": 0,
+                    "current_order_reserved_units": 0,
+                    "available_units_for_order": 0,
+                },
+            ),
         }
         for snapshot in membership.product_snapshots.all()
         for content in [
@@ -992,6 +1039,7 @@ def usage_payload(
     data = {
         "id": str(item.pk),
         "membership_id": str(item.membership_id),
+        "order_id": str(item.store_order_id) if getattr(item, "store_order_id", None) else None,
         "status": item.status,
         "note": item.note,
         "created_at": item.created_at.isoformat(),
@@ -1485,7 +1533,15 @@ class SelfQuotaView(APIView):
 
     @transaction.atomic
     def get(self, request):
-        locale = requested_locale(request)
+        query = QuotaQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+        locale = query.validated_data["locale"]
+        current_order_id = query.validated_data.get("store_order_id")
+        if current_order_id is not None:
+            from commerce.models import StoreOrder
+
+            if not StoreOrder.objects.filter(pk=current_order_id, buyer_user=request.user).exists():
+                return no_store(Response(status=status.HTTP_404_NOT_FOUND))
         refresh_membership_statuses()
         today = timezone.localdate()
         item = (
@@ -1511,7 +1567,12 @@ class SelfQuotaView(APIView):
                     "data": {
                         "membership_id": str(item.pk),
                         "requested_locale": locale,
-                        "products": quota_payload(item, locale=locale),
+                        "store_order_id": str(current_order_id) if current_order_id else None,
+                        "products": quota_payload(
+                            item,
+                            locale=locale,
+                            current_order_id=current_order_id,
+                        ),
                     }
                 }
             )

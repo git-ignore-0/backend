@@ -63,6 +63,10 @@ class LocalePageQuerySerializer(LocaleQuerySerializer):
     page = serializers.IntegerField(min_value=1, max_value=MAX_PAGE, default=1)
 
 
+class QuotaQuerySerializer(LocaleQuerySerializer):
+    store_order_id = serializers.UUIDField(required=False)
+
+
 class AdminProductQuerySerializer(PageQuerySerializer):
     search = serializers.CharField(max_length=200, allow_blank=True, default="")
     active = serializers.BooleanField(required=False)
