@@ -91,3 +91,19 @@ def test_mysql_store_transactions_use_read_committed(monkeypatch):
     cursor.__enter__.return_value.execute.assert_called_once_with(
         "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED"
     )
+
+
+@pytest.mark.parametrize("enabled,want", [(None, False), ("false", False), ("true", True)])
+def test_store_referral_settings_need_only_toggle(monkeypatch, enabled, want):
+    import runpy
+
+    # Only the environment selected by this test may define the toggle.
+    monkeypatch.setattr("dotenv.load_dotenv", lambda *_args, **_kwargs: False)
+
+    if enabled is None:
+        monkeypatch.delenv("STORE_REFERRAL_REWARDS_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("STORE_REFERRAL_REWARDS_ENABLED", enabled)
+    monkeypatch.delenv("STORE_REFERRAL_REWARDS_START_AT", raising=False)
+    namespace = runpy.run_path(str(settings.BASE_DIR / "config/settings.py"))
+    assert namespace["STORE_REFERRAL_REWARDS_ENABLED"] is want

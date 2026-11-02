@@ -873,3 +873,36 @@ def test_concurrent_complete_and_reject_only_commit_one_transition(reward):
     item.refresh_from_db()
     assert item.status in {RedemptionStatus.COMPLETED, RedemptionStatus.REJECTED}
     assert PointTransaction.objects.filter(template=PointTemplate.REWARD_REFUND).count() <= 1
+
+
+@pytest.mark.django_db
+def test_rejection_does_not_lock_user_or_ledger_before_points_account(
+    active_user, reward, monkeypatch
+):
+    """Observe executed locking SQL, emulating only FOR UPDATE syntax on SQLite."""
+    item, _ = create_open_redemption(active_user, reward)
+    locking_queries = []
+
+    def capture(execute, sql, params, many, context):
+        if "FOR UPDATE" in sql:
+            locking_queries.append(sql)
+            if connection.vendor == "sqlite":
+                sql = sql.replace(" FOR UPDATE", "")
+        return execute(sql, params, many, context)
+
+    monkeypatch.setattr(connection.features, "has_select_for_update", True)
+    with connection.execute_wrapper(capture):
+        rejected, balance = reject_redemption(
+            redemption_id=item.pk, actor=active_user, rejection_message="Unavailable"
+        )
+    assert rejected.status == RedemptionStatus.REJECTED
+    assert balance == 100
+    assert (
+        PointTransaction.objects.filter(
+            user=active_user, template=PointTemplate.REWARD_REFUND
+        ).count()
+        == 1
+    )
+    # The query must lock only the redemption or account, never joined parent rows.
+    assert locking_queries
+    assert all("JOIN" not in sql.upper() for sql in locking_queries)

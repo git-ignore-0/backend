@@ -93,9 +93,7 @@ def make_quota_group(*, vi_name="Rau", en_name="Vegetables"):
         is_active=True,
     )
     translations = [
-        MembershipProductTranslation(
-            product=group, locale="vi", name=vi_name, short_description=""
-        )
+        MembershipProductTranslation(product=group, locale="vi", name=vi_name, short_description="")
     ]
     if en_name is not None:
         translations.append(
@@ -262,9 +260,7 @@ def test_public_store_sums_only_current_stock_from_active_farms_and_links():
             location_en="Da Lat",
             is_active=farm_active,
         )
-        relation = FarmProduct.objects.create(
-            farm=farm, product=product, is_active=link_active
-        )
+        relation = FarmProduct.objects.create(farm=farm, product=product, is_active=link_active)
         FarmProductStockBatch.objects.create(
             farm_product=relation,
             start_date=today + timedelta(days=start_offset),

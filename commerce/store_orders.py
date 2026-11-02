@@ -43,6 +43,11 @@ from memberships.models import (
 )
 from memberships.phones import InvalidPhoneNumber, normalize_vietnam_phone
 from memberships.services import ensure_due_cycles, quota_availability_rows, sync_membership_status
+from referrals.store_rewards import (
+    evaluate_store_referral_reward,
+    lock_store_referral_referrer,
+    store_referral_rewards_active,
+)
 
 PAYMENT_WINDOW = timedelta(minutes=5)
 REVIEW_WINDOW = timedelta(hours=8)
@@ -471,6 +476,7 @@ def create_store_checkout(*, user, payload):
         id=order_id,
         reference_code=_reference_code(),
         buyer_user=user if user and user.is_authenticated else None,
+        referral_rewards_eligible=store_referral_rewards_active(),
         create_idempotency_key=key,
         request_fingerprint=fingerprint,
         locale=payload["locale"],
@@ -1089,6 +1095,7 @@ def record_store_payment(*, order_id, actor, idempotency_key, note=""):
         return order
     if order.total_vnd == 0 or order.payment_status == StorePaymentStatus.REFUNDED:
         raise StoreOrderError("store_payment_state_conflict")
+    lock_store_referral_referrer(order)
     order.payment_received_at = order.payment_received_at or timezone.now()
     order.payment_status = (
         StorePaymentStatus.REFUND_REQUIRED
@@ -1108,6 +1115,7 @@ def record_store_payment(*, order_id, actor, idempotency_key, note=""):
         actor,
         context={"note": note.strip(), "amount_vnd": order.total_vnd},
     )
+    evaluate_store_referral_reward(order_id=order.pk)
     return order
 
 
@@ -1157,11 +1165,13 @@ def deliver_store_order(*, order_id, actor, idempotency_key):
         return order
     if order.status != StoreOrderStatus.PENDING_DELIVERY:
         raise StoreOrderError("store_order_state_conflict")
+    lock_store_referral_referrer(order)
     order.status = StoreOrderStatus.DELIVERED
     order.delivered_at = timezone.now()
     order.delivered_by = actor
     order.save(update_fields=["status", "delivered_at", "delivered_by", "updated_at"])
     _record_action(order, "deliver", idempotency_key, fingerprint, actor)
+    evaluate_store_referral_reward(order_id=order.pk)
     return order
 
 

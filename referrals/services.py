@@ -111,7 +111,13 @@ def assign_referrer(*, referee, code: str) -> Referral:
     if referrer_account.user_id == locked_referee_account.user_id:
         raise SelfReferral("Self-referral is not allowed")
     try:
-        return Referral.objects.create(referrer=referrer_account.user, referee=referee)
+        from referrals.store_rewards import store_referral_rewards_active
+
+        return Referral.objects.create(
+            referrer=referrer_account.user,
+            referee=referee,
+            store_rewards_eligible=store_referral_rewards_active(),
+        )
     except IntegrityError as error:
         raise ReferralAlreadyAssigned("A referrer has already been assigned") from error
 
@@ -248,9 +254,7 @@ def create_redemption(
 
     try:
         reward = (
-            Reward.objects.select_for_update()
-            .prefetch_related("translations")
-            .get(pk=reward_id)
+            Reward.objects.select_for_update().prefetch_related("translations").get(pk=reward_id)
         )
     except Reward.DoesNotExist as error:
         raise RewardNotFound("Reward does not exist") from error
@@ -284,9 +288,11 @@ def create_redemption(
 
 
 def _locked_redemption(redemption_id) -> RedemptionRequest:
+    # Lock only the request. Joined FOR UPDATE would lock User before its points
+    # account, inverting ledger writes' account -> User FK lock order on MySQL.
     return (
         RedemptionRequest.objects.select_for_update()
-        .select_related("user", "debit_transaction", "refund_transaction")
+        .prefetch_related("user", "debit_transaction", "refund_transaction")
         .get(pk=redemption_id)
     )
 

@@ -214,6 +214,7 @@ class StoreStockMovementKind(models.TextChoices):
 
 
 class StoreOrder(models.Model):
+    referral_rewards_eligible = models.BooleanField(default=False, editable=False)
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     reference_code = models.CharField(max_length=24, unique=True, editable=False)
     buyer_user = models.ForeignKey(

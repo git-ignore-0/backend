@@ -20,6 +20,7 @@ class ReferralAccount(models.Model):
 
 
 class Referral(models.Model):
+    store_rewards_eligible = models.BooleanField(default=False, editable=False)
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     referrer = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -291,3 +292,51 @@ class RedemptionRequest(models.Model):
 
     def __str__(self) -> str:
         return f"{self.user_id}: {self.status} {self.point_cost_snapshot}"
+
+
+class StoreReferralReward(models.Model):
+    """Immutable completion decision; skipped orders cannot roll into a later month."""
+
+    referral = models.ForeignKey(Referral, on_delete=models.PROTECT, related_name="store_rewards")
+    order = models.OneToOneField(
+        "commerce.StoreOrder", on_delete=models.PROTECT, related_name="referral_reward"
+    )
+    milestone = models.PositiveSmallIntegerField(null=True, blank=True)
+    point_transaction = models.OneToOneField(
+        PointTransaction,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="store_referral_reward",
+    )
+    completed_at = models.DateTimeField()
+    reward_month = models.DateField(null=True, blank=True)
+    skip_reason = models.CharField(max_length=40, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["referral", "milestone"], name="referrals_store_milestone_unique"
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(
+                        milestone__in=[100, 50],
+                        milestone__isnull=False,
+                        point_transaction__isnull=False,
+                        reward_month__isnull=False,
+                        skip_reason="",
+                    )
+                    | Q(
+                        milestone__isnull=True,
+                        point_transaction__isnull=True,
+                        reward_month__isnull=True,
+                    )
+                    & ~Q(skip_reason="")
+                ),
+                name="referrals_store_reward_consistent",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.order_id}: {self.milestone or self.skip_reason}"
