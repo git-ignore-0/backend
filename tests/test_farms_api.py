@@ -711,9 +711,7 @@ def test_archived_zero_weekly_history_protects_farm_product_link(farm_admin_api)
     assert listed.status_code == 200
     assert listed.json()["data"][0]["has_supply_history"] is True
 
-    response = farm_admin_api.delete(
-        f"/api/v1/admin/farms/{farm.pk}/products/{product.pk}"
-    )
+    response = farm_admin_api.delete(f"/api/v1/admin/farms/{farm.pk}/products/{product.pk}")
 
     assert response.status_code == 409
     assert response.json()["errors"][0]["code"] == "farm_product_has_supply"
