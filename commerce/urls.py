@@ -28,6 +28,10 @@ urlpatterns = [
         "public/store-order-lookups/current",
         store_views.PublicStoreOrderLookupCurrentView.as_view(),
     ),
+    path(
+        "store-orders/<uuid:order_id>/buy-again",
+        store_views.SelfStoreBuyAgainView.as_view(),
+    ),
     path("store-orders", store_views.SelfStoreOrderListView.as_view()),
     path("store-orders/<uuid:order_id>", store_views.SelfStoreOrderDetailView.as_view()),
     path("admin/store-orders", store_views.AdminStoreOrderListView.as_view()),

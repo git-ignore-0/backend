@@ -3218,3 +3218,119 @@ def test_approve_products_sharing_cycle_quota_aggregates_usage(
     assert MembershipCycleQuota.objects.get().remaining_units == 4
     usage.refresh_from_db()
     assert usage.status == "reversed"
+
+
+@pytest.mark.django_db
+def test_buy_again_prepare_is_owner_scoped_and_uses_live_catalog(
+    store_product, payment_settings, active_user, access_token
+):
+    from types import SimpleNamespace
+
+    client = APIClient()
+    created = client.post(
+        "/api/v1/public/store-checkouts", guest_payload(store_product), format="json"
+    ).json()["data"]
+    order = StoreOrder.objects.get(pk=created["id"])
+    url = f"/api/v1/store-orders/{order.pk}/buy-again?locale=en"
+    assert client.get(url).status_code in (401, 403)
+    client.force_authenticate(active_user, token=access_token)
+    assert client.get(url).status_code == 404
+    from rest_framework.test import APIRequestFactory
+
+    from commerce.store_views import order_payload
+
+    request = APIRequestFactory().get("/")
+    request.user = active_user
+    assert order_payload(order, request=request)["can_buy_again"] is False
+    order.buyer_user = active_user
+    order.save(update_fields=["buyer_user"])
+    assert order_payload(order, request=request)["can_buy_again"] is True
+    for previous_status in StoreOrderStatus.values:
+        order.status = previous_status
+        order.save(update_fields=["status"])
+        assert client.get(url).status_code == 200
+    order.status = StoreOrderStatus.DELIVERED
+    order.save(update_fields=["status"])
+    store_product.retail_price_vnd = 50000
+    store_product.save(update_fields=["retail_price_vnd"])
+    assert order_payload(order, request=request)["can_buy_again"] is True
+    count = StoreOrder.objects.count()
+    data = client.get(url).json()["data"]
+    assert data["lines"][0]["quantity"] == 2
+    assert data["lines"][0]["product"]["retail_price_vnd"] == 50000
+    assert data["lines"][0]["product"]["name"] == "Tomato"
+    assert data["lines"][0]["reason"] is None
+    # A separate pending order reserves 9, leaving only one available.
+    client.force_authenticate(user=None)
+    store_product.retail_price_vnd = 45000
+    store_product.save(update_fields=["retail_price_vnd"])
+    reserved = client.post(
+        "/api/v1/public/store-checkouts", guest_payload(store_product, quantity=9), format="json"
+    )
+    assert reserved.status_code == 201
+    client.force_authenticate(active_user, token=access_token)
+    row = client.get(url).json()["data"]["lines"][0]
+    assert row["reason"] == "insufficient_stock"
+    assert row["product"]["available_quantity"] == 1
+    assert row["quantity"] == 2
+    store_product.is_published = False
+    store_product.save(update_fields=["is_published"])
+    row = client.get(url).json()["data"]["lines"][0]
+    assert row["reason"] == "unavailable"
+    assert row["product"] is None
+    assert StoreOrder.objects.count() == count + 1
+    client.force_authenticate(active_user, token=SimpleNamespace(scope="profile"))
+    assert client.get(url).status_code == 403
+
+
+@pytest.mark.django_db
+def test_buy_again_batches_all_lines_in_original_order_and_respects_category_visibility(
+    store_product, payment_settings, active_user, access_token
+):
+    from django.test.utils import CaptureQueriesContext
+
+    from commerce.models import StoreStockReservation
+
+    client = APIClient()
+    created = client.post(
+        "/api/v1/public/store-checkouts", guest_payload(store_product), format="json"
+    ).json()["data"]
+    order = StoreOrder.objects.get(pk=created["id"])
+    order.buyer_user = active_user
+    order.status = StoreOrderStatus.DELIVERED
+    order.save(update_fields=["buyer_user", "status"])
+    client.force_authenticate(active_user, token=access_token)
+    url = f"/api/v1/store-orders/{order.pk}/buy-again?locale=vi"
+    with CaptureQueriesContext(connection) as single:
+        assert client.get(url).status_code == 200
+    original_id = store_product.pk
+    second = Product.objects.get(pk=original_id)
+    second.pk = None
+    second.sku = "SECOND"
+    second.slug = "second"
+    second.save()
+    ProductTranslation.objects.create(product=second, locale="vi", name="Sản phẩm thứ hai")
+    line = order.lines.get()
+    line.pk = None
+    line.product = second
+    line.position = 1
+    line.quantity = 5
+    line.cash_quantity = 5
+    line.cash_subtotal_vnd = line.unit_price_vnd_snapshot * 5
+    line.save()
+    reservation_count = StoreStockReservation.objects.count()
+    with CaptureQueriesContext(connection) as batch:
+        response = client.get(url)
+    assert len(batch) == len(single)
+    rows = response.json()["data"]["lines"]
+    assert [row["product_id"] for row in rows] == [str(original_id), str(second.pk)]
+    assert [row["quantity"] for row in rows] == [2, 5]
+    assert [row["reason"] for row in rows] == [None, "out_of_stock"]
+    parent = Category.objects.create(slug="inactive-parent", is_active=False)
+    category = second.category
+    category.parent = parent
+    category.save(update_fields=["parent"])
+    rows = client.get(url).json()["data"]["lines"]
+    assert [row["reason"] for row in rows] == ["unavailable", "unavailable"]
+    assert StoreStockReservation.objects.count() == reservation_count
+    assert StoreOrder.objects.count() == 1

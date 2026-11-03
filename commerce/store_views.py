@@ -18,7 +18,9 @@ from commerce.models import (
     StoreOrderLine,
     StoreStockAllocation,
 )
+from commerce.public_catalog import public_product_payload, public_product_queryset
 from commerce.serializers import (
+    PublicStoreLocaleSerializer,
     StoreActionSerializer,
     StoreApproveSerializer,
     StoreCancelSerializer,
@@ -126,6 +128,7 @@ def _line_payload(line, request=None):
 
 
 def order_payload(order, *, guest_token=None, admin=False, request=None):
+    viewer = getattr(request, "user", None)
     lines = getattr(order, "payload_lines", None)
     if lines is None:
         lines = list(
@@ -158,6 +161,9 @@ def order_payload(order, *, guest_token=None, admin=False, request=None):
         }
     result = {
         "id": str(order.pk),
+        "can_buy_again": bool(
+            viewer and viewer.is_authenticated and order.buyer_user_id == viewer.pk
+        ),
         "reference_code": order.reference_code,
         "status": order.status,
         "payment_status": order.payment_status,
@@ -352,6 +358,44 @@ class SelfStoreOrderDetailView(APIView):
         return no_store(
             Response({"data": order_payload(StoreOrder.objects.get(pk=order.pk), request=request)})
         )
+
+
+class SelfStoreBuyAgainView(APIView):
+    permission_classes = [HasMembershipSelfScopes]
+
+    def get(self, request, order_id):
+        query = PublicStoreLocaleSerializer(data=request.query_params.dict())
+        query.is_valid(raise_exception=True)
+        order = get_object_or_404(StoreOrder, pk=order_id, buyer_user=request.user)
+        lines = list(order.lines.order_by("position", "id"))
+        products = {
+            product.pk: product
+            for product in public_product_queryset().filter(
+                pk__in=[line.product_id for line in lines]
+            )
+        }
+        result = []
+        for line in lines:
+            product = products.get(line.product_id)
+            reason = None
+            if product is None:
+                reason = "unavailable"
+            elif product.available_quantity < line.quantity:
+                reason = "out_of_stock" if product.available_quantity == 0 else "insufficient_stock"
+            result.append(
+                {
+                    "product_id": str(line.product_id),
+                    "quantity": line.quantity,
+                    "name": line.name_snapshot,
+                    "reason": reason,
+                    "product": public_product_payload(
+                        product, request, query.validated_data["locale"], detail=True
+                    )
+                    if product
+                    else None,
+                }
+            )
+        return no_store(Response({"data": {"lines": result}}))
 
 
 class AdminStoreOrderListView(APIView):
