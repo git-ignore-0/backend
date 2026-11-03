@@ -892,14 +892,8 @@ def refresh_membership_statuses(*, as_of: date | None = None) -> None:
     ).update(status=MembershipStatus.ACTIVE, updated_at=updated_at)
 
 
-@transaction.atomic
-def ensure_due_cycles(
-    membership: Membership, *, as_of: date | None = None
-) -> list[MembershipCycle]:
-    as_of = as_of or timezone.localdate()
-    membership = sync_membership_status(membership, as_of=as_of)
-    if membership.status == MembershipStatus.REVOKED:
-        return []
+def due_cycle_count(membership, *, as_of):
+    """Read-only paid/calendar limit shared by cycle creation and Store preview."""
     due = 0
     for sequence in range(1, membership.duration_months_snapshot + 1):
         if add_months(membership.start_date, sequence - 1) <= as_of:
@@ -917,6 +911,18 @@ def ensure_due_cycles(
         if paid > membership.duration_months_snapshot:
             raise QuotaError("Confirmed payment cycles exceed Membership duration")
         due = min(due, paid)
+    return due
+
+
+@transaction.atomic
+def ensure_due_cycles(
+    membership: Membership, *, as_of: date | None = None
+) -> list[MembershipCycle]:
+    as_of = as_of or timezone.localdate()
+    membership = sync_membership_status(membership, as_of=as_of)
+    if membership.status == MembershipStatus.REVOKED:
+        return []
+    due = due_cycle_count(membership, as_of=as_of)
     existing = {item.sequence: item for item in membership.cycles.all()}
     created = []
     for sequence in range(1, due + 1):

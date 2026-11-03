@@ -26,7 +26,13 @@ from memberships.contract_pdfs import (
 )
 from memberships.contract_versions import issue_contract_version
 from memberships.contracts import build_online_contract_snapshot, create_online_contract
-from memberships.coupons import CouponError, coupon_for_code, coupon_quote_snapshot, discounted_plan
+from memberships.coupons import (
+    CouponError,
+    check_coupon_customer,
+    coupon_for_code,
+    coupon_quote_snapshot,
+    discounted_plan,
+)
 from memberships.expiry import (
     expire_csa_purchase_request_if_due,
     expire_open_csa_purchase_request_for_phone,
@@ -75,6 +81,7 @@ from memberships.services import (
     update_csa_customer,
 )
 from memberships.terms import InvalidCSATerms, get_csa_terms, get_current_csa_terms
+from memberships.voucher_usage import consume_coupon, release_coupon
 
 
 class CSAPurchaseError(ValueError):
@@ -754,6 +761,76 @@ def _load_payment_quote(*, quote_token: str, now) -> dict:
         raise PaymentQuoteUnavailable("Payment quote is unavailable") from error
 
 
+def _selected_quote_plan(*, package_id, price_option_id, payment_plan_id=None):
+    try:
+        package = MembershipPackage.objects.select_for_update().get(pk=package_id, is_active=True)
+        option = MembershipPackagePriceOption.objects.select_for_update().get(
+            pk=price_option_id, package=package, is_active=True
+        )
+    except (MembershipPackage.DoesNotExist, MembershipPackagePriceOption.DoesNotExist) as error:
+        raise PurchasePackageUnavailable("Package or price option is unavailable") from error
+    plan = _quote_plan_snapshot(option=option, payment_plan_id=payment_plan_id)
+    return package, option, plan
+
+
+def _coupon_payment_payload(plan, coupon=None):
+    summary = {
+        "payment_type": plan["payment_type"],
+        "total_amount": plan["total_amount"],
+        "initial_payment_amount": plan["initial_payment_amount"],
+        "installment_count": plan["installment_count"],
+        "installments": plan["installments"],
+    }
+    if not coupon:
+        return {"payment_summary": summary}
+    summary.update(
+        {
+            key: coupon[key]
+            for key in (
+                "contract_total_before_discount",
+                "payment_plan_total_before_discount",
+                "discount_amount",
+                "customer_payable_total",
+                "initial_payment_before_discount",
+            )
+        }
+    )
+    summary["initial_payment_amount"] = coupon["initial_payment_after_discount"]
+    summary["installments"] = discounted_plan(plan, coupon)
+    return {
+        "payment_summary": summary,
+        "coupon": {
+            "code": coupon["coupon_code"],
+            **{
+                key: coupon[key]
+                for key in (
+                    "discount_type",
+                    "discount_value",
+                    "maximum_discount_amount",
+                    "discount_amount",
+                )
+            },
+        },
+    }
+
+
+@transaction.atomic
+def preview_csa_voucher(*, user, package_id, price_option_id, coupon_code, payment_plan_id=None):
+    package, option, plan = _selected_quote_plan(
+        package_id=package_id, price_option_id=price_option_id, payment_plan_id=payment_plan_id
+    )
+    coupon = coupon_for_code(coupon_code)
+    check_coupon_customer(coupon=coupon, user=user)
+    snapshot = coupon_quote_snapshot(
+        coupon=coupon,
+        package_id=package.pk,
+        price_option_id=option.pk,
+        plan={**plan, "contract_total": str(option.total_price_vnd)},
+        now=timezone.now(),
+    )
+    return _coupon_payment_payload(plan, snapshot)
+
+
 @transaction.atomic
 def create_csa_payment_quote(
     *,
@@ -768,6 +845,8 @@ def create_csa_payment_quote(
     guest_identity=None,
     now=None,
 ) -> tuple[str, dict]:
+    if coupon_code is not None and (user is None or not user.is_authenticated):
+        raise CouponError("coupon_authentication_required")
     if user is not None:
         identity = _locked_authenticated_identity(user)
         subject = {
@@ -778,14 +857,9 @@ def create_csa_payment_quote(
     else:
         identity = _guest_identity(identity=guest_identity or {})
         subject = {"kind": "guest", "fingerprint": _guest_identity_fingerprint(identity)}
-    try:
-        package = MembershipPackage.objects.select_for_update().get(pk=package_id, is_active=True)
-        option = MembershipPackagePriceOption.objects.select_for_update().get(
-            pk=price_option_id, package=package, is_active=True
-        )
-    except (MembershipPackage.DoesNotExist, MembershipPackagePriceOption.DoesNotExist) as error:
-        raise PurchasePackageUnavailable("Package or price option is unavailable") from error
-    plan = _quote_plan_snapshot(option=option, payment_plan_id=payment_plan_id)
+    package, option, plan = _selected_quote_plan(
+        package_id=package_id, price_option_id=price_option_id, payment_plan_id=payment_plan_id
+    )
     payment = _locked_payment_settings()
     terms = get_current_csa_terms(terms_locale)
     if terms_version is not None and (
@@ -797,8 +871,7 @@ def create_csa_payment_quote(
     coupon = coupon_for_code(coupon_code) if coupon_code is not None else None
     coupon_snapshot = None
     if coupon is not None:
-        if CSAPurchaseRequest.objects.filter(coupon=coupon, phone_e164=identity["phone"]).exists():
-            raise CouponError("coupon_already_used")
+        check_coupon_customer(coupon=coupon, user=user)
         coupon_snapshot = coupon_quote_snapshot(
             coupon=coupon,
             package_id=package.pk,
@@ -863,13 +936,7 @@ def csa_payment_quote_payload(quote_token: str, quote: dict) -> dict:
             "account_name": payment["account_name"],
             "transfer_content": payment["transfer_content"],
         },
-        "payment_summary": {
-            "payment_type": plan["payment_type"],
-            "total_amount": plan["total_amount"],
-            "initial_payment_amount": initial_amount,
-            "installment_count": plan["installment_count"],
-            "installments": plan["installments"],
-        },
+        **_coupon_payment_payload(plan, coupon),
         "terms": quote["terms"],
         "qr_payload": {
             "acqId": payment["bank_bin"],
@@ -881,25 +948,6 @@ def csa_payment_quote_payload(quote_token: str, quote: dict) -> dict:
             "template": "compact2",
         },
     }
-    if coupon:
-        result["coupon"] = {
-            "code": coupon["coupon_code"],
-            "discount_type": coupon["discount_type"],
-            "discount_value": coupon["discount_value"],
-            "maximum_discount_amount": coupon["maximum_discount_amount"],
-            "discount_amount": coupon["discount_amount"],
-        }
-        result["payment_summary"].update(
-            {
-                "contract_total_before_discount": coupon["contract_total_before_discount"],
-                "payment_plan_total_before_discount": coupon["payment_plan_total_before_discount"],
-                "discount_amount": coupon["discount_amount"],
-                "customer_payable_total": coupon["customer_payable_total"],
-                "initial_payment_before_discount": coupon["initial_payment_before_discount"],
-                "initial_payment_amount": initial_amount,
-                "installments": discounted_plan(plan, coupon),
-            }
-        )
     return result
 
 
@@ -919,6 +967,13 @@ def confirm_csa_payment_quote(*, quote_token, user=None, guest_identity=None, no
                 raise PaymentQuoteIdentityMismatch("Payment quote is unavailable")
             return existing, None
         identity = _locked_authenticated_identity(user)
+        # A concurrent confirm may have committed while we waited for User.
+        # Replay before checking mutable catalog data or the occupied phone slot.
+        existing = CSAPurchaseRequest.objects.filter(quote_nonce=quote["nonce"]).first()
+        if existing is not None:
+            if existing.user_id != user.pk:
+                raise PaymentQuoteIdentityMismatch("Payment quote is unavailable")
+            return existing, None
         if not hmac.compare_digest(
             str(subject.get("fingerprint") or ""), _guest_identity_fingerprint(identity)
         ):
@@ -939,21 +994,6 @@ def confirm_csa_payment_quote(*, quote_token, user=None, guest_identity=None, no
             return existing, None
     else:
         raise PaymentQuoteUnavailable("Payment quote is unavailable")
-
-    coupon = None
-    coupon_snapshot = quote.get("coupon")
-    if coupon_snapshot is not None:
-        try:
-            coupon = CSACoupon.objects.select_for_update().get(pk=quote["coupon_id"])
-        except CSACoupon.DoesNotExist as error:
-            raise CouponError("coupon_invalid") from error
-        existing = CSAPurchaseRequest.objects.filter(quote_nonce=quote["nonce"]).first()
-        if existing is not None:
-            return existing, None
-        if coupon.used_count >= coupon.usage_limit:
-            raise CouponError("coupon_usage_exhausted")
-        if CSAPurchaseRequest.objects.filter(coupon=coupon, phone_e164=identity["phone"]).exists():
-            raise CouponError("coupon_already_used")
 
     selection = quote["selection"]
     plan_data = selection.get("plan")
@@ -987,9 +1027,24 @@ def confirm_csa_payment_quote(*, quote_token, user=None, guest_identity=None, no
     if not hmac.compare_digest(str(terms_data.get("hash") or ""), terms["hash"]):
         raise PaymentQuoteUnavailable("Payment quote is unavailable")
 
-    expire_open_csa_purchase_request_for_phone(phone_e164=identity["phone"], now=now)
+    expire_open_csa_purchase_request_for_phone(
+        phone_e164=identity["phone"], now=now, additional_coupon_ids=(quote.get("coupon_id"),)
+    )
     if CSAPurchaseRequest.objects.filter(phone_e164=identity["phone"], open_slot=True).exists():
         raise PurchaseRequestConflict("Phone already has an open CSA purchase request")
+    coupon = None
+    coupon_snapshot = quote.get("coupon")
+    if coupon_snapshot is not None:
+        try:
+            coupon = CSACoupon.objects.select_for_update().get(pk=quote["coupon_id"])
+        except CSACoupon.DoesNotExist as error:
+            raise CouponError("coupon_invalid") from error
+        if coupon.used_count >= coupon.usage_limit:
+            raise CouponError("coupon_usage_exhausted")
+        if coupon.application_scope not in {"csa", "both"}:
+            raise CouponError("coupon_scope_mismatch")
+        check_coupon_customer(coupon=coupon, user=user)
+
     raw_token = None
     guest_token_hash = ""
     if identity["user"] is None:
@@ -1075,8 +1130,7 @@ def confirm_csa_payment_quote(*, quote_token, user=None, guest_identity=None, no
     except CSAPaymentError as error:
         raise CSAPurchaseError("Purchase payment schedule is invalid") from error
     if coupon is not None:
-        coupon.used_count += 1
-        coupon.save(update_fields=["used_count", "updated_at"])
+        consume_coupon(coupon=coupon, user=user, purchase_request=item)
     return item, raw_token
 
 
@@ -1161,6 +1215,7 @@ def _reject_locked_purchase_request(*, item, actor, reason, customer_resolution=
         membership_id=None,
         refund_status=item.refund_status,
     )
+    release_coupon(purchase_request=item, reason="rejected")
 
 
 @transaction.atomic
@@ -1230,6 +1285,7 @@ def _mark_csa_purchase_request_refunded(*, request_id, actor, note="") -> CSAPur
         action="refund_completed",
         refund_status=item.refund_status,
     )
+    release_coupon(purchase_request=item, reason="refunded")
     return item
 
 

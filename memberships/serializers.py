@@ -97,6 +97,7 @@ class AdminPaymentPlanWriteSerializer(StrictSerializer):
 
 
 class AdminCouponQuerySerializer(PageQuerySerializer):
+    application_scope = serializers.ChoiceField(choices=["csa", "store", "both"], required=False)
     status = serializers.ChoiceField(
         choices=("active", "inactive", "scheduled", "expired", "exhausted"), required=False
     )
@@ -104,6 +105,9 @@ class AdminCouponQuerySerializer(PageQuerySerializer):
 
 
 class AdminCouponWriteSerializer(StrictSerializer):
+    application_scope = serializers.ChoiceField(
+        choices=["csa", "store", "both"], required=False, default="csa"
+    )
     code = serializers.CharField(max_length=128, trim_whitespace=True, allow_blank=True)
     discount_type = serializers.CharField(max_length=20)
     discount_value = serializers.DecimalField(max_digits=19, decimal_places=2)
@@ -129,7 +133,22 @@ class AdminCouponWriteSerializer(StrictSerializer):
 
 
 class AdminCouponPreviewSerializer(AdminCouponWriteSerializer):
-    payment_plan_id = serializers.UUIDField()
+    target = serializers.ChoiceField(choices=["csa", "store"], default="csa")
+    payment_plan_id = serializers.UUIDField(required=False)
+    store_user_id = serializers.UUIDField(required=False)
+    # Same strict cart input as the owner preview; prices/quota are server-owned.
+    from commerce.serializers import StoreVoucherLineSerializer
+
+    lines = StoreVoucherLineSerializer(many=True, required=False, allow_empty=False, max_length=50)
+    locale = serializers.ChoiceField(choices=["vi", "en"], default="vi")
+
+    def validate(self, attrs):
+        if attrs["target"] == "csa":
+            if "payment_plan_id" not in attrs or "lines" in attrs or "store_user_id" in attrs:
+                raise serializers.ValidationError("CSA preview requires only payment_plan_id.")
+        elif "lines" not in attrs or "store_user_id" not in attrs or "payment_plan_id" in attrs:
+            raise serializers.ValidationError("Store preview requires lines and store_user_id.")
+        return attrs
 
 
 class AdminCSATermsClauseWriteSerializer(StrictSerializer):
@@ -203,6 +222,13 @@ class CSAGuestIdentitySerializer(StrictSerializer):
                 {"ward_code": "Ward code does not belong to province."}
             )
         return attrs
+
+
+class CSAVoucherPreviewSerializer(StrictSerializer):
+    package_id = serializers.UUIDField()
+    price_option_id = serializers.UUIDField()
+    payment_plan_id = serializers.UUIDField(required=False)
+    coupon_code = serializers.CharField(max_length=128, trim_whitespace=True)
 
 
 class CSAPaymentQuoteCreateSerializer(StrictSerializer):

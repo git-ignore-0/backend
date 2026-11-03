@@ -486,6 +486,15 @@ class MembershipPaymentSettings(models.Model):
 
 
 class CSACoupon(models.Model):
+    class ApplicationScope(models.TextChoices):
+        CSA = "csa", "CSA"
+        STORE = "store", "Store"
+        BOTH = "both", "CSA and Store"
+
+    application_scope = models.CharField(
+        max_length=5, choices=ApplicationScope.choices, default=ApplicationScope.CSA
+    )
+
     class DiscountType(models.TextChoices):
         PERCENT = "percent", "Percent"
         FIXED = "fixed", "Fixed VND"
@@ -521,6 +530,10 @@ class CSACoupon(models.Model):
     class Meta:
         ordering = ["-created_at", "id"]
         constraints = [
+            models.CheckConstraint(
+                condition=Q(application_scope__in=["csa", "store", "both"]),
+                name="coupon_application_scope_valid",
+            ),
             models.UniqueConstraint(Upper(Trim("code")), name="memberships_coupon_code_ci_unique"),
             models.CheckConstraint(condition=Q(usage_limit__gt=0), name="coupon_limit_positive"),
             models.CheckConstraint(
@@ -562,6 +575,17 @@ class CSACoupon(models.Model):
         except CouponError as error:
             raise ValidationError({"code": error.code}) from error
         errors = {}
+        if self.application_scope == self.ApplicationScope.STORE and (
+            self.package_id
+            or self.price_option_id
+            or self.payment_type
+            or self.installment_count
+            or self.package_ids
+            or self.price_option_ids
+            or self.payment_types
+            or self.installment_counts
+        ):
+            errors["application_scope"] = "coupon_csa_conditions_not_allowed"
         try:
             value = (
                 Decimal(str(self.discount_value))
@@ -599,6 +623,12 @@ class CSACoupon(models.Model):
             errors["installment_count"] = "coupon_not_applicable"
         if errors:
             raise ValidationError(errors)
+        from memberships.admin_coupons import validate_coupon_configuration
+
+        try:
+            validate_coupon_configuration(self)
+        except CouponError as error:
+            raise ValidationError(error.code) from error
 
 
 class CSAPurchaseRequest(models.Model):
@@ -1986,3 +2016,54 @@ class MembershipUsageReversal(models.Model):
     )
     reason = models.TextField()
     created_at = models.DateTimeField(auto_now_add=True)
+
+
+class CouponUsage(models.Model):
+    """One source per consumption; NULL slot permits reuse after release on MySQL."""
+
+    coupon = models.ForeignKey(CSACoupon, related_name="usages", on_delete=models.PROTECT)
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete=models.PROTECT)
+    purchase_request = models.OneToOneField(
+        CSAPurchaseRequest, null=True, blank=True, on_delete=models.PROTECT
+    )
+    store_order = models.OneToOneField(
+        "commerce.StoreOrder", null=True, blank=True, on_delete=models.PROTECT
+    )
+    active_slot = models.BooleanField(null=True, default=True, editable=False)
+    legacy_duplicate = models.BooleanField(default=False, editable=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    released_at = models.DateTimeField(null=True, editable=False)
+    release_reason = models.CharField(max_length=32, blank=True, editable=False)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["coupon", "user", "active_slot"], name="coupon_user_active_unique"
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(purchase_request__isnull=False, store_order__isnull=True)
+                    | Q(purchase_request__isnull=True, store_order__isnull=False)
+                ),
+                name="coupon_usage_one_source",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(
+                        active_slot=True,
+                        active_slot__isnull=False,
+                        legacy_duplicate=False,
+                        released_at__isnull=True,
+                        release_reason="",
+                    )
+                    | Q(
+                        active_slot__isnull=True,
+                        legacy_duplicate=True,
+                        released_at__isnull=True,
+                        release_reason="",
+                    )
+                    | Q(active_slot__isnull=True, released_at__isnull=False) & ~Q(release_reason="")
+                ),
+                name="coupon_usage_release_consistent",
+            ),
+        ]

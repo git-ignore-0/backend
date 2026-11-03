@@ -1,6 +1,7 @@
 """Validated administration of CSA coupon configurations."""
 
 from decimal import Decimal
+from uuid import UUID
 
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
@@ -11,6 +12,7 @@ from memberships.models import CSACoupon, MembershipPackage, MembershipPackagePr
 
 SCOPE_FIELDS = ("package_ids", "price_option_ids", "payment_types", "installment_counts")
 LOCKED_AFTER_USE = (
+    "application_scope",
     "code",
     "discount_type",
     "discount_value",
@@ -76,6 +78,7 @@ def coupon_payload(coupon, *, packages=None, options=None):
     )
     return {
         "id": str(coupon.pk),
+        "application_scope": coupon.application_scope,
         "code": coupon.code,
         "discount_type": coupon.discount_type,
         "discount_value": format(coupon.discount_value, "f"),
@@ -130,7 +133,11 @@ def coupon_payloads(coupons):
     return [coupon_payload(coupon, packages=packages, options=options) for coupon in rows]
 
 
-def validate_coupon_configuration(coupon, *, activating=False):
+def validate_coupon_configuration(coupon):
+    if coupon.application_scope not in CSACoupon.ApplicationScope.values:
+        raise CouponError("coupon_invalid_scope")
+    if coupon.application_scope == "store" and any(coupon_scope(coupon).values()):
+        raise CouponError("coupon_csa_conditions_not_allowed")
     if coupon.discount_type not in CSACoupon.DiscountType.values:
         raise CouponError("coupon_invalid_type")
     value = Decimal(str(coupon.discount_value))
@@ -150,7 +157,12 @@ def validate_coupon_configuration(coupon, *, activating=False):
         raise CouponError("coupon_invalid_date_range")
     scope = coupon_scope(coupon)
     for field in SCOPE_FIELDS:
-        if len(scope[field]) != len(set(scope[field])):
+        values = scope[field]
+        if not isinstance(values, list) or any(
+            isinstance(value, (list, dict, bool)) for value in values
+        ):
+            raise CouponError("coupon_not_applicable")
+        if len(values) != len(set(values)):
             raise CouponError("coupon_not_applicable")
     if any(value not in {"full", "installment"} for value in scope["payment_types"]):
         raise CouponError("coupon_not_applicable")
@@ -166,6 +178,11 @@ def validate_coupon_configuration(coupon, *, activating=False):
         raise CouponError("coupon_not_applicable")
     if coupon.minimum_amount is not None and coupon.minimum_amount <= 0:
         raise CouponError("coupon_invalid_value")
+    try:
+        for value in scope["package_ids"] + scope["price_option_ids"]:
+            UUID(str(value))
+    except (ValueError, TypeError, AttributeError) as error:
+        raise CouponError("coupon_not_applicable") from error
     package_ids = scope["package_ids"]
     option_ids = scope["price_option_ids"]
     packages = list(MembershipPackage.objects.filter(pk__in=package_ids))
@@ -180,13 +197,19 @@ def validate_coupon_configuration(coupon, *, activating=False):
         and any(count > option.duration_months for count in counts for option in options)
     ):
         raise CouponError("coupon_not_applicable")
-    if activating:
-        if timezone.now() >= coupon.expires_at or coupon.used_count >= coupon.usage_limit:
-            raise CouponError("coupon_cannot_activate")
-        if any(not item.is_active for item in packages) or any(
-            not item.is_active for item in options
-        ):
-            raise CouponError("coupon_cannot_activate")
+
+
+def validate_coupon_activation(coupon):
+    """Check live activation eligibility after full model configuration validation."""
+    if timezone.now() >= coupon.expires_at or coupon.used_count >= coupon.usage_limit:
+        raise CouponError("coupon_cannot_activate")
+    scope = coupon_scope(coupon)
+    if MembershipPackage.objects.filter(pk__in=scope["package_ids"], is_active=False).exists() or (
+        MembershipPackagePriceOption.objects.filter(
+            pk__in=scope["price_option_ids"], is_active=False
+        ).exists()
+    ):
+        raise CouponError("coupon_cannot_activate")
 
 
 @transaction.atomic
@@ -210,7 +233,7 @@ def save_admin_coupon(*, data, coupon_id=None):
     for field in SCOPE_FIELDS[:2]:
         if field in values:
             values[field] = [str(value) for value in values[field]]
-    if coupon.used_count:
+    if coupon.used_count or (coupon.pk and coupon.usages.exists()):
         current = {
             **coupon_scope(coupon),
             **{
@@ -237,14 +260,26 @@ def save_admin_coupon(*, data, coupon_id=None):
     ):
         if field in values:
             setattr(coupon, legacy, None)
-    validate_coupon_configuration(coupon)
     try:
         with transaction.atomic():
             coupon.save()
     except IntegrityError as error:
         raise CouponError("coupon_duplicate_code") from error
     except ValidationError as error:
-        raise CouponError("coupon_invalid") from error
+        public_codes = {
+            "coupon_invalid",
+            "coupon_invalid_scope",
+            "coupon_csa_conditions_not_allowed",
+            "coupon_invalid_type",
+            "coupon_invalid_value",
+            "coupon_invalid_usage_limit",
+            "coupon_invalid_date_range",
+            "coupon_not_applicable",
+        }
+        code = next(
+            (message for message in error.messages if message in public_codes), "coupon_invalid"
+        )
+        raise CouponError(code) from error
     return coupon
 
 
@@ -260,10 +295,13 @@ def set_admin_coupon_active(*, coupon_id, active):
         return coupon
     if active:
         try:
-            validate_coupon_configuration(coupon, activating=True)
             coupon.full_clean()
         except ValidationError as error:
             raise CouponError("coupon_cannot_activate") from error
+        validate_coupon_activation(coupon)
+    # Deactivation must remain possible even when a JSON catalog reference has
+    # disappeared. Activation has already passed full configuration validation.
     coupon.is_active = active
-    coupon.save(update_fields=["is_active", "updated_at"])
+    coupon.updated_at = timezone.now()
+    CSACoupon.objects.filter(pk=coupon.pk).update(is_active=active, updated_at=coupon.updated_at)
     return coupon

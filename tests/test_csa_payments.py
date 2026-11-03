@@ -285,16 +285,19 @@ def test_existing_installment_coupon_request_approves_and_versions_snapshot(cata
         "ward_code": "22015",
         "address": "12 Main Street",
     }
+    from tests.test_csa_purchase_admin_api import coupon_snapshot_user
+
+    user = coupon_snapshot_user(identity)
     quote_token, _quote = create_csa_payment_quote(
         package_id=package.pk,
         price_option_id=option.pk,
         payment_plan_id=plan.pk,
         coupon_code=coupon.code,
-        guest_identity=identity,
+        user=user,
     )
     item, _guest_token = confirm_csa_payment_quote(
         quote_token=quote_token,
-        guest_identity=identity,
+        user=user,
     )
     assert item.status == CSAPurchaseRequestStatus.PAYMENT_CONFIRMED
     assert [(payment.amount_due, payment.cycle_count) for payment in item.payments.all()] == [
@@ -404,16 +407,19 @@ def test_installment_coupon_snapshot_total_or_cycles_mismatch_blocks_approval(
         "ward_code": "22015",
         "address": "12 Main Street",
     }
+    from tests.test_csa_purchase_admin_api import coupon_snapshot_user
+
+    user = coupon_snapshot_user(identity)
     quote_token, _quote = create_csa_payment_quote(
         package_id=package.pk,
         price_option_id=option.pk,
         payment_plan_id=plan.pk,
         coupon_code=coupon.code,
-        guest_identity=identity,
+        user=user,
     )
     item, _guest_token = confirm_csa_payment_quote(
         quote_token=quote_token,
-        guest_identity=identity,
+        user=user,
     )
     broken = copy.deepcopy(item.payment_installments_snapshot)
     if mismatch == "total":

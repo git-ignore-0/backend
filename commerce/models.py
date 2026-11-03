@@ -242,6 +242,11 @@ class StoreOrder(models.Model):
         choices=StorePaymentStatus.choices,
         default=StorePaymentStatus.UNCONFIRMED,
     )
+    coupon = models.ForeignKey(
+        "memberships.CSACoupon", null=True, blank=True, editable=False, on_delete=models.PROTECT
+    )
+    coupon_snapshot = models.JSONField(null=True, blank=True, editable=False)
+    discount_amount_vnd = models.PositiveBigIntegerField(default=0, editable=False)
     subtotal_vnd = models.PositiveBigIntegerField()
     shipping_fee_vnd = models.PositiveBigIntegerField()
     total_vnd = models.PositiveBigIntegerField()
@@ -312,8 +317,25 @@ class StoreOrder(models.Model):
                 name="commerce_store_payment_status_valid",
             ),
             models.CheckConstraint(
-                condition=Q(total_vnd=models.F("subtotal_vnd") + models.F("shipping_fee_vnd")),
+                condition=Q(
+                    total_vnd=models.F("subtotal_vnd")
+                    - models.F("discount_amount_vnd")
+                    + models.F("shipping_fee_vnd")
+                ),
                 name="commerce_store_order_total_exact",
+            ),
+            models.CheckConstraint(
+                condition=Q(
+                    discount_amount_vnd__gte=0, discount_amount_vnd__lte=models.F("subtotal_vnd")
+                ),
+                name="store_discount_within_subtotal",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(coupon__isnull=True, coupon_snapshot__isnull=True, discount_amount_vnd=0)
+                    | Q(coupon__isnull=False, coupon_snapshot__isnull=False)
+                ),
+                name="store_coupon_snapshot_complete",
             ),
         ]
 

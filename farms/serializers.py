@@ -82,9 +82,7 @@ class StockBatchUpdateSerializer(StrictSerializer):
     version = serializers.IntegerField(min_value=1)
     start_date = serializers.DateField(required=False)
     end_date = serializers.DateField(required=False)
-    quantity_units = serializers.IntegerField(
-        min_value=1, max_value=2_147_483_647, required=False
-    )
+    quantity_units = serializers.IntegerField(min_value=1, max_value=2_147_483_647, required=False)
 
     def validate(self, data):
         data = super().validate(data)

@@ -155,6 +155,22 @@ def request_url(item, action=None):
     return f"{url}/{action}" if action else url
 
 
+def coupon_snapshot_user(identity):
+    from commerce.models import ShippingAddress
+    from identity.models import User
+
+    user = User.objects.create_user(email="coupon-snapshot@example.com", name=identity["name"])
+    ShippingAddress.objects.create(
+        user=user,
+        recipient_name=identity["name"],
+        phone_number=identity["phone"],
+        province_code=identity["province_code"],
+        ward_code=identity["ward_code"],
+        address=identity["address"],
+    )
+    return user
+
+
 def confirmed_coupon_request(
     *,
     package,
@@ -184,16 +200,17 @@ def confirmed_coupon_request(
         "ward_code": "22015",
         "address": "Địa chỉ snapshot",
     }
+    user = coupon_snapshot_user(identity)
     quote_token, _quote = create_csa_payment_quote(
         package_id=package.pk,
         price_option_id=option.pk,
         payment_plan_id=payment_plan.pk if payment_plan is not None else None,
         coupon_code=coupon.code,
-        guest_identity=identity,
+        user=user,
     )
     item, _guest_token = confirm_csa_payment_quote(
         quote_token=quote_token,
-        guest_identity=identity,
+        user=user,
     )
     return item, coupon
 
@@ -519,15 +536,16 @@ def test_existing_full_payment_coupon_request_approves_from_immutable_snapshot(
         "ward_code": "22015",
         "address": "Địa chỉ snapshot",
     }
+    user = coupon_snapshot_user(identity)
     quote_token, _quote = create_csa_payment_quote(
         package_id=package.pk,
         price_option_id=option.pk,
         coupon_code=coupon.code,
-        guest_identity=identity,
+        user=user,
     )
     item, _guest_token = confirm_csa_payment_quote(
         quote_token=quote_token,
-        guest_identity=identity,
+        user=user,
     )
     identity_snapshot = (
         item.guest_token_hash,
@@ -945,15 +963,16 @@ def test_coupon_snapshot_mismatch_is_rejected_without_partial_approval(
         "ward_code": "22015",
         "address": "Địa chỉ snapshot",
     }
+    user = coupon_snapshot_user(identity)
     quote_token, _quote = create_csa_payment_quote(
         package_id=package.pk,
         price_option_id=option.pk,
         coupon_code=coupon.code,
-        guest_identity=identity,
+        user=user,
     )
     item, _guest_token = confirm_csa_payment_quote(
         quote_token=quote_token,
-        guest_identity=identity,
+        user=user,
     )
     broken = {**item.coupon_snapshot, "discount_amount": "1"}
     type(item).objects.filter(pk=item.pk).update(coupon_snapshot=broken)

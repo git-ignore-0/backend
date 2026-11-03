@@ -10,6 +10,7 @@ from memberships.models import (
     CSAPurchaseRequest,
     CSAPurchaseRequestStatus,
 )
+from memberships.voucher_usage import lock_coupons, release_coupon
 
 DEFAULT_EXPIRY_SECONDS = 7 * 24 * 60 * 60
 MIN_EXPIRY_SECONDS = 5 * 60
@@ -62,6 +63,7 @@ def _expire_locked_request(item: CSAPurchaseRequest, *, now) -> bool:
             "updated_at",
         ]
     )
+    release_coupon(purchase_request=item, reason="expired")
     AuditLog.objects.create(
         user=None,
         action="csa_purchase_request.expired",
@@ -82,7 +84,9 @@ def expire_csa_purchase_request_if_due(*, request_id, now=None) -> bool:
 
 
 @transaction.atomic
-def expire_open_csa_purchase_request_for_phone(*, phone_e164, now=None) -> bool:
+def expire_open_csa_purchase_request_for_phone(
+    *, phone_e164, now=None, additional_coupon_ids=()
+) -> bool:
     now = now or timezone.now()
     item = (
         CSAPurchaseRequest.objects.select_for_update()
@@ -94,13 +98,16 @@ def expire_open_csa_purchase_request_for_phone(*, phone_e164, now=None) -> bool:
         )
         .first()
     )
+    # A confirmation can release an old voucher and consume a different one.
+    # Lock both before release, rather than old -> new in request-specific order.
+    lock_coupons((*additional_coupon_ids, item.coupon_id if item else None))
     return bool(item and _expire_locked_request(item, now=now))
 
 
 @transaction.atomic
 def expire_open_csa_purchase_requests_for_user(*, user_id, now=None) -> int:
     now = now or timezone.now()
-    items = (
+    items = list(
         CSAPurchaseRequest.objects.select_for_update()
         .filter(
             user_id=user_id,
@@ -110,6 +117,7 @@ def expire_open_csa_purchase_requests_for_user(*, user_id, now=None) -> int:
         )
         .order_by("expires_at", "id")
     )
+    lock_coupons(item.coupon_id for item in items)
     return sum(int(_expire_locked_request(item, now=now)) for item in items)
 
 
@@ -146,6 +154,7 @@ def expire_csa_purchase_requests(*, now=None, batch_size=DEFAULT_BATCH_SIZE, dry
             )
             if not items:
                 continue
+            lock_coupons(item.coupon_id for item in items)
             for item in items:
                 expired_count += int(_expire_locked_request(item, now=now))
     return expired_count

@@ -32,6 +32,7 @@ from commerce.serializers import (
     StoreRecordPaymentSerializer,
     StoreRefundSerializer,
     StoreRestockSerializer,
+    StoreVoucherPreviewSerializer,
 )
 from commerce.store_orders import (
     StoreOrderError,
@@ -41,6 +42,7 @@ from commerce.store_orders import (
     create_store_checkout,
     deliver_store_order,
     expire_order_if_needed,
+    preview_store_voucher,
     record_store_payment,
     refund_store_order,
     report_store_transfer,
@@ -51,6 +53,7 @@ from commerce.store_orders import (
 )
 from commerce.store_proxy import trusted_store_client_ip
 from content.permissions import IsWebsiteAdmin
+from memberships.coupons import CouponError
 from memberships.permissions import HasMembershipSelfScopes
 
 
@@ -85,7 +88,7 @@ def store_error(error):
     else:
         http_status = status.HTTP_400_BAD_REQUEST
     payload = {"code": error.code}
-    if error.context:
+    if getattr(error, "context", None):
         payload["context"] = error.context
     return no_store(Response({"errors": [payload]}, status=http_status))
 
@@ -177,6 +180,8 @@ def order_payload(order, *, guest_token=None, admin=False, request=None):
             "address": order.address_snapshot,
         },
         "subtotal_vnd": str(order.subtotal_vnd),
+        "discount_amount_vnd": str(order.discount_amount_vnd),
+        "coupon": order.coupon_snapshot,
         "shipping_fee_vnd": str(order.shipping_fee_vnd),
         "shipping_discount_reason": order.shipping_discount_reason or None,
         "total_vnd": str(order.total_vnd),
@@ -259,6 +264,19 @@ def order_list_queryset(rows):
     )
 
 
+class SelfStoreVoucherPreviewView(APIView):
+    permission_classes = [HasMembershipSelfScopes]
+
+    def post(self, request):
+        serializer = StoreVoucherPreviewSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            data = preview_store_voucher(user=request.user, payload=serializer.validated_data)
+        except (StoreOrderError, CouponError) as error:
+            return store_error(error)
+        return no_store(Response({"data": data}))
+
+
 class PublicStoreCheckoutView(APIView):
     permission_classes = [AllowAny]
 
@@ -271,7 +289,7 @@ class PublicStoreCheckoutView(APIView):
             order, guest_token, created = create_store_checkout(
                 user=request.user, payload=serializer.validated_data
             )
-        except StoreOrderError as error:
+        except (StoreOrderError, CouponError) as error:
             return store_error(error)
         return no_store(
             Response(
@@ -565,7 +583,7 @@ class PublicStoreOrderDetailView(APIView):
                 user=request.user,
                 guest_token=request.headers.get("X-Store-Access-Token", ""),
             )
-        except StoreOrderError as error:
+        except (StoreOrderError, CouponError) as error:
             return store_error(error)
         expire_order_if_needed(order.pk)
         order.refresh_from_db()

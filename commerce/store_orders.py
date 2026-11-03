@@ -5,7 +5,7 @@ import uuid
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 
-from django.db import transaction
+from django.db import connection, transaction
 from django.db.models import Q, Sum
 from django.db.models.functions import Round
 from django.utils import timezone
@@ -29,9 +29,17 @@ from commerce.models import (
 )
 from commerce.shipping import active_shipping_area
 from farms.models import Farm, FarmProduct, FarmProductStockBatch
+from identity.models import User
 from members.administrative_units import province_exists, ward_choices
+from memberships.coupons import (
+    CouponError,
+    check_coupon_customer,
+    coupon_for_code,
+    store_coupon_snapshot,
+)
 from memberships.models import (
     Membership,
+    MembershipCycle,
     MembershipCycleQuota,
     MembershipPaymentSettings,
     MembershipStatus,
@@ -43,7 +51,14 @@ from memberships.models import (
     UsageOrderStatus,
 )
 from memberships.phones import InvalidPhoneNumber, normalize_vietnam_phone
-from memberships.services import ensure_due_cycles, quota_availability_rows, sync_membership_status
+from memberships.services import (
+    add_months,
+    due_cycle_count,
+    ensure_due_cycles,
+    quota_availability_rows,
+    sync_membership_status,
+)
+from memberships.voucher_usage import consume_coupon, release_coupon
 from referrals.store_rewards import (
     evaluate_store_referral_reward,
     lock_store_referral_referrer,
@@ -112,8 +127,12 @@ def _active_membership_for_user(user, *, lock=False):
     )
     if membership is None:
         return None
-    membership = sync_membership_status(membership, as_of=today)
-    return membership if membership.status == MembershipStatus.ACTIVE else None
+    if lock:
+        membership = sync_membership_status(membership, as_of=today)
+    eligible_statuses = (
+        {MembershipStatus.ACTIVE} if lock else {MembershipStatus.ACTIVE, MembershipStatus.SCHEDULED}
+    )
+    return membership if membership.status in eligible_statuses else None
 
 
 def _translation(product, locale):
@@ -259,10 +278,12 @@ def _validate_address(payload):
     }, area
 
 
-def _address_for_checkout(user, guest):
+def _address_for_checkout(user, guest, *, lock=True):
     if user and user.is_authenticated:
         try:
-            address = ShippingAddress.objects.select_for_update().get(user=user)
+            address = (
+                ShippingAddress.objects.select_for_update() if lock else ShippingAddress.objects
+            ).get(user=user)
         except ShippingAddress.DoesNotExist as error:
             raise StoreOrderError("store_shipping_address_required") from error
         address_values, area = _validate_address(
@@ -281,52 +302,76 @@ def _address_for_checkout(user, guest):
     return address_values, area, None
 
 
-def _available_quota_rows(membership, group_ids):
-    return [
+def _available_quota_rows(membership, group_ids, *, lock=True):
+    rows = [
         (row, available)
         for row, _reserved, available, _current, _available_for_order in quota_availability_rows(
             membership,
             product_ids=group_ids,
-            lock=True,
+            lock=lock,
         )
         if row.remaining_units > 0
     ]
+    if not lock:
+        # Project not-yet-materialized paid cycles without creating records.
+        today = timezone.localdate()
+        existing = set(membership.cycles.values_list("sequence", flat=True))
+        for sequence in range(1, due_cycle_count(membership, as_of=today) + 1):
+            start = add_months(membership.start_date, sequence - 1)
+            end = min(add_months(membership.start_date, sequence), membership.end_date)
+            if sequence in existing or (
+                membership.quota_policy_snapshot == QuotaPolicy.EXPIRE and end <= today
+            ):
+                continue
+            cycle = MembershipCycle(
+                membership=membership, sequence=sequence, start_date=start, end_date=end
+            )
+            for snapshot in membership.product_snapshots.filter(product_id__in=group_ids):
+                quota = MembershipCycleQuota(
+                    cycle=cycle,
+                    product_snapshot=snapshot,
+                    granted_units=snapshot.quota_units_per_cycle,
+                    remaining_units=snapshot.quota_units_per_cycle,
+                )
+                rows.append((quota, quota.remaining_units))
+    return rows
 
 
 def _reference_code():
     return f"SO{timezone.localdate():%y%m%d}{secrets.token_hex(4).upper()}"
 
 
-@transaction.atomic
-def create_store_checkout(*, user, payload):
-    fingerprint = request_fingerprint(payload)
-    key = payload["idempotency_key"]
-    existing = StoreOrder.objects.filter(create_idempotency_key=key).first()
-    if existing is None:
-        # A concurrent request may create this key while we wait for inventory.
-        # Re-read under the shared lock before validating a new quote.
-        CatalogTreeLock.objects.select_for_update().get(pk=1)
-        existing = StoreOrder.objects.select_for_update().filter(create_idempotency_key=key).first()
-    if existing:
-        requester_user_id = user.pk if user and user.is_authenticated else None
-        if existing.buyer_user_id != requester_user_id:
-            raise StoreOrderError("store_idempotency_conflict")
-        if existing.request_fingerprint != fingerprint:
-            raise StoreOrderError("store_idempotency_conflict")
-        expire_order_if_needed(existing.pk)
-        guest_token = (
-            _guest_access_token(existing.pk, existing.create_idempotency_key)
-            if existing.buyer_user_id is None
-            else None
-        )
-        return StoreOrder.objects.get(pk=existing.pk), guest_token, False
+def _lock_checkout_identity(user):
+    """Serialize with identity updates without blocking actor FK shared locks.
 
+    Quota mutations may already hold Membership when writing an actor FK. An
+    exclusive User lock here would invert those locks. Store does not update User.
+    """
+    if connection.vendor not in {"mysql", "postgresql"}:
+        # SQLite has no row locks; retain the existence check used by checkout.
+        User.objects.only("pk").get(pk=user.pk)
+        return
+    pk = User._meta.pk
+    quote = connection.ops.quote_name
+    table, column = quote(User._meta.db_table), quote(pk.column)
+    clause = "LOCK IN SHARE MODE" if connection.vendor == "mysql" else "FOR SHARE"
+    value = pk.get_db_prep_value(user.pk, connection)
+    with connection.cursor() as cursor:
+        cursor.execute(f"SELECT {column} FROM {table} WHERE {column} = %s {clause}", [value])
+        if cursor.fetchone() is None:
+            raise User.DoesNotExist("Checkout user no longer exists")
+
+
+def calculate_store_quote(*, user, payload, lock=False, check_expected=False, draft_coupon=None):
+    """Single authoritative cash/quota/shipping calculator; read-only when lock=False."""
+    if payload.get("coupon_code") is not None and (user is None or not user.is_authenticated):
+        raise CouponError("coupon_authentication_required")
     requested = payload["lines"]
     product_ids = [item["product_id"] for item in requested]
     if len(product_ids) != len(set(product_ids)):
         raise StoreOrderError("store_duplicate_product")
     products = list(
-        Product.objects.select_for_update()
+        (Product.objects.select_for_update() if lock else Product.objects)
         .filter(
             pk__in=product_ids,
             is_active=True,
@@ -344,32 +389,39 @@ def create_store_checkout(*, user, payload):
     by_id = {item.pk: item for item in products}
     if len(products) != len(product_ids):
         raise StoreOrderError("store_product_changed")
-    address, area, address_updated_at = _address_for_checkout(user, payload.get("guest"))
-    if user and user.is_authenticated:
+    if lock and user and user.is_authenticated:
+        # Match Product -> identity -> address/quota, but keep actor FK writes
+        # compatible while cancellation/approval already holds Membership.
+        _lock_checkout_identity(user)
+    address, area, address_updated_at = _address_for_checkout(user, payload.get("guest"), lock=lock)
+    if check_expected and user and user.is_authenticated:
         expected_address_updated_at = payload.get("shipping_address_updated_at")
         if expected_address_updated_at is None or expected_address_updated_at != address_updated_at:
             raise StoreOrderError(
                 "store_requote_required", context={"reason": "shipping_address_changed"}
             )
-    membership = _active_membership_for_user(user, lock=True)
+    membership = _active_membership_for_user(user, lock=lock)
     has_csa_product = any(by_id[item["product_id"]].csa_quota_group_id for item in requested)
     free_shipping = membership is not None and has_csa_product
     shipping_fee = 0 if free_shipping else area.shipping_fee_vnd
 
-    offers = list(
-        FarmProduct.objects.select_for_update().filter(product_id__in=product_ids).order_by("pk")
-    )
-    list(
-        Farm.objects.select_for_update()
-        .filter(pk__in=[offer.farm_id for offer in offers])
-        .order_by("pk")
-    )
-    stock_totals, _batches = active_product_stock(product_ids, lock=True)
+    if lock:
+        offers = list(
+            FarmProduct.objects.select_for_update()
+            .filter(product_id__in=product_ids)
+            .order_by("pk")
+        )
+        list(
+            Farm.objects.select_for_update()
+            .filter(pk__in=[offer.farm_id for offer in offers])
+            .order_by("pk")
+        )
+    stock_totals, _batches = active_product_stock(product_ids, lock=lock)
     active_reserved = _active_reserved_stock(product_ids)
     for item in requested:
         available = stock_totals[item["product_id"]] - active_reserved.get(item["product_id"], 0)
         product = by_id[item["product_id"]]
-        if item["expected_unit_price_vnd"] != product.retail_price_vnd:
+        if check_expected and item["expected_unit_price_vnd"] != product.retail_price_vnd:
             raise StoreOrderError(
                 "store_requote_required",
                 context={
@@ -378,7 +430,7 @@ def create_store_checkout(*, user, payload):
                     "unit_price_vnd": product.retail_price_vnd,
                 },
             )
-        if item["expected_available_quantity"] != max(0, available):
+        if check_expected and item["expected_available_quantity"] != max(0, available):
             raise StoreOrderError(
                 "store_requote_required",
                 context={
@@ -401,9 +453,9 @@ def create_store_checkout(*, user, payload):
         for item in requested
         if item["use_quota"] and by_id[item["product_id"]].csa_quota_group_id
     }
-    if membership and group_ids:
+    if lock and membership and group_ids:
         ensure_due_cycles(membership)
-    quota_rows = _available_quota_rows(membership, group_ids) if membership else []
+    quota_rows = _available_quota_rows(membership, group_ids, lock=lock) if membership else []
     quota_by_group = defaultdict(list)
     for quota, available in quota_rows:
         quota_by_group[quota.product_snapshot.product_id].append([quota, available])
@@ -433,7 +485,7 @@ def create_store_checkout(*, user, payload):
                 if not units_needed:
                     break
         cash_quantity = item["quantity"] - quota_quantity
-        if item["expected_quota_quantity"] != quota_quantity:
+        if check_expected and item["expected_quota_quantity"] != quota_quantity:
             raise StoreOrderError(
                 "store_requote_required",
                 context={
@@ -448,19 +500,138 @@ def create_store_checkout(*, user, payload):
             (position, item, product, quota_quantity, cash_quantity, cash_subtotal, reservations)
         )
 
-    total = subtotal + shipping_fee
-    if (
-        payload["expected_shipping_fee_vnd"] != shipping_fee
-        or payload["expected_total_vnd"] != total
-    ):
-        raise StoreOrderError(
-            "store_requote_required",
-            context={
-                "reason": "total_changed",
-                "shipping_fee_vnd": shipping_fee,
-                "total_vnd": total,
-            },
+    coupon = draft_coupon
+    if coupon is None and payload.get("coupon_code") is not None:
+        coupon = coupon_for_code(payload["coupon_code"], lock=lock)
+    snapshot = None
+    discount = 0
+    if coupon is not None:
+        if draft_coupon is None:
+            check_coupon_customer(coupon=coupon, user=user)
+        snapshot = store_coupon_snapshot(
+            coupon=coupon,
+            subtotal_vnd=subtotal,
+            now=timezone.now(),
+            check_availability=draft_coupon is None,
         )
+        discount = snapshot["discount_amount_vnd"]
+    total = subtotal - discount + shipping_fee
+    if snapshot is not None:
+        snapshot["total_vnd"] = total
+    quote_material = {
+        "coupon": snapshot,
+        "configuration": {
+            key: str(getattr(coupon, key))
+            for key in (
+                "application_scope",
+                "is_active",
+                "starts_at",
+                "expires_at",
+                "minimum_amount",
+                "usage_limit",
+            )
+        }
+        if coupon
+        else None,
+        "shipping_fee_vnd": shipping_fee,
+    }
+    voucher_quote = (
+        salted_hmac(
+            "commerce.voucher-quote", json.dumps(quote_material, sort_keys=True)
+        ).hexdigest()
+        if coupon
+        else None
+    )
+    if check_expected:
+        if coupon is not None and payload.get("expected_voucher_quote") != voucher_quote:
+            raise StoreOrderError("store_requote_required", context={"reason": "voucher_changed"})
+        if (
+            payload["expected_shipping_fee_vnd"] != shipping_fee
+            or payload["expected_total_vnd"] != total
+        ):
+            raise StoreOrderError(
+                "store_requote_required",
+                context={
+                    "reason": "total_changed",
+                    "shipping_fee_vnd": shipping_fee,
+                    "total_vnd": total,
+                },
+            )
+    return {
+        "address": address,
+        "address_updated_at": address_updated_at,
+        "line_values": line_values,
+        "subtotal": subtotal,
+        "shipping_fee": shipping_fee,
+        "total": total,
+        "free_shipping": free_shipping,
+        "coupon": coupon,
+        "snapshot": snapshot,
+        "discount": discount,
+        "voucher_quote": voucher_quote,
+        "stock_totals": stock_totals,
+        "active_reserved": active_reserved,
+    }
+
+
+def preview_store_voucher(*, user, payload, draft_coupon=None):
+    quote = calculate_store_quote(user=user, payload=payload, draft_coupon=draft_coupon)
+    return {
+        "subtotal_vnd": str(quote["subtotal"]),
+        "eligible_subtotal_vnd": str(quote["subtotal"]),
+        "coupon": quote["snapshot"],
+        "discount_amount_vnd": str(quote["discount"]),
+        "shipping_fee_vnd": str(quote["shipping_fee"]),
+        "total_vnd": str(quote["total"]),
+        "voucher_quote": quote["voucher_quote"],
+        "shipping_address_updated_at": quote["address_updated_at"].isoformat()
+        if quote["address_updated_at"]
+        else None,
+        "lines": [
+            {
+                "product_id": str(product.pk),
+                "quantity": item["quantity"],
+                "use_quota": item["use_quota"],
+                "expected_unit_price_vnd": product.retail_price_vnd,
+                "expected_available_quantity": max(
+                    0,
+                    quote["stock_totals"][product.pk] - quote["active_reserved"].get(product.pk, 0),
+                ),
+                "expected_quota_quantity": quota_quantity,
+            }
+            for _, item, product, quota_quantity, *_ in quote["line_values"]
+        ],
+    }
+
+
+@transaction.atomic
+def create_store_checkout(*, user, payload):
+    fingerprint = request_fingerprint(payload)
+    key = payload["idempotency_key"]
+    existing = StoreOrder.objects.filter(create_idempotency_key=key).first()
+    if existing is None:
+        # A concurrent request may create this key while we wait for inventory.
+        # Re-read under the shared lock before validating a new quote.
+        CatalogTreeLock.objects.select_for_update().get(pk=1)
+        existing = StoreOrder.objects.select_for_update().filter(create_idempotency_key=key).first()
+    if existing:
+        requester_user_id = user.pk if user and user.is_authenticated else None
+        if existing.buyer_user_id != requester_user_id:
+            raise StoreOrderError("store_idempotency_conflict")
+        if existing.request_fingerprint != fingerprint:
+            raise StoreOrderError("store_idempotency_conflict")
+        expire_order_if_needed(existing.pk)
+        guest_token = (
+            _guest_access_token(existing.pk, existing.create_idempotency_key)
+            if existing.buyer_user_id is None
+            else None
+        )
+        return StoreOrder.objects.get(pk=existing.pk), guest_token, False
+
+    quote = calculate_store_quote(user=user, payload=payload, lock=True, check_expected=True)
+    address = quote["address"]
+    subtotal, shipping_fee, total = quote["subtotal"], quote["shipping_fee"], quote["total"]
+    free_shipping, line_values = quote["free_shipping"], quote["line_values"]
     payment = None
     if total:
         payment = (
@@ -484,6 +655,9 @@ def create_store_checkout(*, user, payload):
         **address,
         status=StoreOrderStatus.PAYMENT_PENDING if total else StoreOrderStatus.PENDING_REVIEW,
         payment_status=StorePaymentStatus.UNCONFIRMED if total else StorePaymentStatus.NOT_REQUIRED,
+        coupon=quote["coupon"],
+        coupon_snapshot=quote["snapshot"],
+        discount_amount_vnd=quote["discount"],
         subtotal_vnd=subtotal,
         shipping_fee_vnd=shipping_fee,
         total_vnd=total,
@@ -533,6 +707,8 @@ def create_store_checkout(*, user, payload):
                 for quota, units in reservations
             ]
         )
+    if quote["coupon"] is not None:
+        consume_coupon(coupon=quote["coupon"], user=user, store_order=order)
     return order, guest_token, True
 
 
@@ -608,6 +784,7 @@ def _expire_locked_order(order, *, now):
             "updated_at",
         ]
     )
+    release_coupon(store_order=order, reason="expired")
     return True
 
 
@@ -713,6 +890,7 @@ def cancel_pending_store_order(*, order_id, user, guest_token, idempotency_key):
         ]
     )
     _record_action(order, "buyer_cancel", idempotency_key, fingerprint, None)
+    release_coupon(store_order=order, reason="buyer_cancelled")
     return order
 
 
@@ -1087,6 +1265,7 @@ def cancel_store_order(*, order_id, actor, idempotency_key, reason, reconciliati
         actor,
         context={"reason": reason.strip(), "reconciliation_note": reconciliation_note.strip()},
     )
+    release_coupon(store_order=order, reason="cancelled")
     return order
 
 
@@ -1157,6 +1336,7 @@ def refund_store_order(*, order_id, actor, idempotency_key, amount_vnd, note):
         actor,
         context={"amount_vnd": amount_vnd, "note": note.strip()},
     )
+    release_coupon(store_order=order, reason="refunded")
     return order
 
 

@@ -620,3 +620,40 @@ def test_mysql_delivery_and_redemption_rejection_do_not_deadlock(
     assert (
         PointTransaction.objects.filter(user=referrer, template="referral_successful").count() == 1
     )
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("cash,expected_points", [(320_000, 100), (280_000, 0)])
+def test_voucher_does_not_reduce_referral_cash_threshold(
+    order_factory, referral_pair, cash, expected_points
+):
+    from memberships.models import CSACoupon
+
+    now = timezone.now()
+    coupon = CSACoupon.objects.create(
+        code="REFERRAL30",
+        application_scope="store",
+        discount_type="fixed",
+        discount_value=30_000,
+        usage_limit=10,
+        starts_at=now - timedelta(days=1),
+        expires_at=now + timedelta(days=1),
+    )
+    order = order_factory(cash=cash)
+    order.coupon = coupon
+    order.coupon_snapshot = {
+        "id": str(coupon.pk),
+        "code": coupon.code,
+        "discount_type": "fixed",
+        "discount_value": "30000",
+        "maximum_discount_amount": None,
+        "subtotal_vnd": cash,
+        "eligible_subtotal_vnd": cash,
+        "discount_amount_vnd": 30_000,
+        "total_vnd": cash,
+    }
+    order.discount_amount_vnd = 30_000
+    order.total_vnd = cash  # cash - 30k voucher + 30k ship
+    order.save(update_fields=["coupon", "coupon_snapshot", "discount_amount_vnd", "total_vnd"])
+    complete(order, referral_pair[0])
+    assert point_balance(referral_pair[0]) == expected_points

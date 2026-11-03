@@ -3334,3 +3334,92 @@ def test_buy_again_batches_all_lines_in_original_order_and_respects_category_vis
     assert [row["reason"] for row in rows] == ["unavailable", "unavailable"]
     assert StoreStockReservation.objects.count() == reservation_count
     assert StoreOrder.objects.count() == 1
+
+
+@pytest.mark.django_db
+def test_voucher_preview_checkout_replay_and_cancel(
+    store_product, payment_settings, active_user, access_token
+):
+    from memberships.models import CouponUsage, CSACoupon
+
+    ShippingAddress.objects.create(
+        user=active_user,
+        recipient_name="Voucher",
+        phone_number="+84901234567",
+        province_code=PROVINCE,
+        ward_code=WARD,
+        address="12 Nguyen Hue",
+    )
+    voucher = CSACoupon.objects.create(
+        code="STORE30",
+        application_scope="both",
+        discount_type="fixed",
+        discount_value=30_000,
+        usage_limit=1,
+        starts_at=timezone.now() - timedelta(days=1),
+        expires_at=timezone.now() + timedelta(days=1),
+    )
+    client = APIClient()
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token.token}")
+    preview_input = {
+        "coupon_code": voucher.code,
+        "lines": [{"product_id": str(store_product.pk), "quantity": 2, "use_quota": False}],
+    }
+    preview = client.post("/api/v1/store-voucher-preview", preview_input, format="json")
+    assert preview.status_code == 200, preview.data
+    quote = preview.json()["data"]
+    assert quote["subtotal_vnd"] == "90000"
+    assert quote["discount_amount_vnd"] == "30000"
+    assert quote["total_vnd"] == "90000"
+    assert not StoreOrder.objects.exists()
+    assert not CouponUsage.objects.exists()
+    voucher.refresh_from_db()
+    assert voucher.used_count == 0
+    body = {
+        "idempotency_key": str(uuid.uuid4()),
+        "locale": "vi",
+        "coupon_code": voucher.code,
+        "expected_voucher_quote": quote["voucher_quote"],
+        "lines": quote["lines"],
+        "shipping_address_updated_at": quote["shipping_address_updated_at"],
+        "expected_shipping_fee_vnd": 30_000,
+        "expected_total_vnd": 90_000,
+    }
+    created = client.post("/api/v1/public/store-checkouts", body, format="json")
+    assert created.status_code == 201, created.data
+    order = StoreOrder.objects.get()
+    assert (order.subtotal_vnd, order.discount_amount_vnd, order.total_vnd) == (
+        90_000,
+        30_000,
+        90_000,
+    )
+    assert order.coupon_snapshot["code"] == "STORE30"
+    assert CouponUsage.objects.get().user == active_user
+    voucher.refresh_from_db()
+    assert voucher.used_count == 1
+    CSACoupon.objects.filter(pk=voucher.pk).update(expires_at=timezone.now() - timedelta(seconds=1))
+    replay = client.post("/api/v1/public/store-checkouts", body, format="json")
+    assert replay.status_code == 200, replay.data
+    assert replay.json()["data"]["id"] == str(order.pk)
+    from commerce.store_orders import cancel_pending_store_order
+
+    key = uuid.uuid4()
+    cancel_pending_store_order(
+        order_id=order.pk, user=active_user, guest_token="", idempotency_key=key
+    )
+    cancel_pending_store_order(
+        order_id=order.pk, user=active_user, guest_token="", idempotency_key=key
+    )
+    voucher.refresh_from_db()
+    assert voucher.used_count == 0
+    assert CouponUsage.objects.get().active_slot is None
+
+
+@pytest.mark.django_db
+def test_guest_voucher_is_rejected_without_order(store_product, payment_settings):
+    body = guest_payload(store_product)
+    body["coupon_code"] = "STORE30"
+    response = APIClient().post("/api/v1/public/store-checkouts", body, format="json")
+    assert response.status_code == 400
+    assert response.json()["errors"][0]["code"] == "coupon_authentication_required"
+    assert not StoreOrder.objects.exists()

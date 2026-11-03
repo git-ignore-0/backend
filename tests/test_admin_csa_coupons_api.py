@@ -82,6 +82,7 @@ def test_admin_permission_and_crud(admin_client, catalog):
     assert data["status"] == "active"
     assert data["scope"]["packages"][0]["name"] == "CSA"
     assert set(data) == {
+        "application_scope",
         "id",
         "code",
         "discount_type",
@@ -342,3 +343,30 @@ def test_percent_coupon_maximum_discount_cap_is_validated_and_previewed(admin_cl
     )
     assert invalid_fixed.status_code == 400
     assert invalid_fixed.json() == {"errors": [{"code": "coupon_invalid_value"}]}
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("action", ["save", "activate"])
+def test_admin_coupon_validates_configuration_once(admin_client, catalog, action):
+    from unittest.mock import patch
+
+    from memberships.admin_coupons import (
+        save_admin_coupon,
+        set_admin_coupon_active,
+        validate_coupon_configuration,
+    )
+
+    created = admin_client.post(BASE, payload(), format="json")
+    assert created.status_code == 201
+    coupon_id = created.data["data"]["id"]
+    if action == "activate":
+        CSACoupon.objects.filter(pk=coupon_id).update(is_active=False)
+    with patch(
+        "memberships.admin_coupons.validate_coupon_configuration",
+        wraps=validate_coupon_configuration,
+    ) as validate:
+        if action == "save":
+            save_admin_coupon(coupon_id=coupon_id, data={"usage_limit": 12})
+        else:
+            set_admin_coupon_active(coupon_id=coupon_id, active=True)
+    assert validate.call_count == 1

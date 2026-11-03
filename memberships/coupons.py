@@ -66,7 +66,7 @@ def calculate_coupon_discount(
         discount = value
     else:
         raise CouponError("coupon_invalid_value")
-    if discount > first:
+    if discount <= 0 or discount > first:
         raise CouponError("coupon_invalid_value")
     return first, value, maximum_discount, discount.quantize(Decimal(1))
 
@@ -74,14 +74,9 @@ def calculate_coupon_discount(
 def coupon_quote_snapshot(
     *, coupon, package_id, price_option_id, plan, now, check_availability=True
 ):
-    if check_availability and not coupon.is_active:
-        raise CouponError("coupon_inactive")
-    if check_availability and now < coupon.starts_at:
-        raise CouponError("coupon_not_started")
-    if check_availability and now >= coupon.expires_at:
-        raise CouponError("coupon_expired")
-    if check_availability and coupon.used_count >= coupon.usage_limit:
-        raise CouponError("coupon_usage_exhausted")
+    check_coupon_availability(
+        coupon=coupon, scope="csa", now=now, check_availability=check_availability
+    )
     if (
         (coupon.package_ids and str(package_id) not in coupon.package_ids)
         or (
@@ -153,3 +148,52 @@ def discounted_plan(plan, snapshot):
             }
         )
     return rows
+
+
+def check_coupon_availability(*, coupon, scope, now, check_availability=True):
+    if coupon.application_scope not in {scope, "both"}:
+        raise CouponError("coupon_scope_mismatch")
+    if not check_availability:
+        return
+    if not coupon.is_active:
+        raise CouponError("coupon_inactive")
+    if now < coupon.starts_at:
+        raise CouponError("coupon_not_started")
+    if now >= coupon.expires_at:
+        raise CouponError("coupon_expired")
+    if coupon.used_count >= coupon.usage_limit:
+        raise CouponError("coupon_usage_exhausted")
+
+
+def check_coupon_customer(*, coupon, user):
+    from memberships.models import CouponUsage
+
+    if user is None or not user.is_authenticated:
+        raise CouponError("coupon_authentication_required")
+    if CouponUsage.objects.filter(coupon=coupon, user=user, released_at__isnull=True).exists():
+        raise CouponError("coupon_already_used")
+
+
+def store_coupon_snapshot(*, coupon, subtotal_vnd, now, check_availability=True):
+    check_coupon_availability(
+        coupon=coupon, scope="store", now=now, check_availability=check_availability
+    )
+    subtotal = _whole_vnd(subtotal_vnd)
+    if coupon.minimum_amount is not None and subtotal < coupon.minimum_amount:
+        raise CouponError("coupon_minimum_amount_not_met")
+    _, value, maximum, discount = calculate_coupon_discount(
+        discount_type=coupon.discount_type,
+        discount_value=coupon.discount_value,
+        maximum_discount_amount=coupon.maximum_discount_amount,
+        initial_payment_amount=subtotal,
+    )
+    return {
+        "id": str(coupon.pk),
+        "code": coupon.code,
+        "discount_type": coupon.discount_type,
+        "discount_value": format(value, "f"),
+        "maximum_discount_amount": format(maximum, "f") if maximum is not None else None,
+        "subtotal_vnd": int(subtotal),
+        "eligible_subtotal_vnd": int(subtotal),
+        "discount_amount_vnd": int(discount),
+    }

@@ -123,6 +123,7 @@ from memberships.purchases import (
     create_public_csa_purchase_request,
     csa_payment_quote_payload,
     mark_csa_purchase_request_refunded,
+    preview_csa_voucher,
     reject_csa_purchase_request,
     update_membership_payment_settings,
 )
@@ -155,6 +156,7 @@ from memberships.serializers import (
     CSAPurchaseRequestRefundSerializer,
     CSAPurchaseRequestRejectSerializer,
     CSATrackerLookupSerializer,
+    CSAVoucherPreviewSerializer,
     LocalePageQuerySerializer,
     LocaleQuerySerializer,
     MembershipAssignSerializer,
@@ -1187,12 +1189,35 @@ class PublicCSATermsView(APIView):
         return response
 
 
+class CSAVoucherPreviewView(APIView):
+    permission_classes = [HasMembershipSelfScopes]
+    throttle_classes = [CSAPaymentQuoteCreateThrottle]
+
+    def post(self, request):
+        serializer = CSAVoucherPreviewSerializer(data=request.data)
+        if not serializer.is_valid():
+            return csa_purchase_validation_error(
+                code="invalid_csa_purchase_request", fields=serializer.errors
+            )
+        try:
+            result = preview_csa_voucher(user=request.user, **serializer.validated_data)
+        except (CSAPurchaseError, CouponError) as error:
+            return csa_purchase_error(error)
+        return no_store(Response({"data": result}))
+
+
 class PublicCSAPaymentQuoteView(APIView):
     permission_classes = [AllowAny]
     throttle_classes = [CSAPaymentQuoteCreateThrottle]
 
     def post(self, request):
         user = request.user if request.user and request.user.is_authenticated else None
+        if user is not None and not HasMembershipSelfScopes().has_permission(request, self):
+            response = no_store(Response({"errors": [{"code": "insufficient_scope"}]}, status=403))
+            response["WWW-Authenticate"] = (
+                'Bearer error="insufficient_scope", scope="profile email"'
+            )
+            return response
         serializer_class = (
             AuthenticatedCSAPaymentQuoteCreateSerializer
             if user is not None
@@ -1232,6 +1257,12 @@ class PublicCSAPaymentQuoteConfirmView(APIView):
 
     def post(self, request):
         user = request.user if request.user and request.user.is_authenticated else None
+        if user is not None and not HasMembershipSelfScopes().has_permission(request, self):
+            response = no_store(Response({"errors": [{"code": "insufficient_scope"}]}, status=403))
+            response["WWW-Authenticate"] = (
+                'Bearer error="insufficient_scope", scope="profile email"'
+            )
+            return response
         serializer_class = (
             AuthenticatedCSAPaymentQuoteConfirmSerializer
             if user is not None
@@ -1984,6 +2015,7 @@ def _coupon_input_error(errors):
         "expires_at": "coupon_invalid_date_range",
         "minimum_amount": "coupon_invalid_value",
         "maximum_discount_amount": "coupon_invalid_value",
+        "application_scope": "coupon_invalid_scope",
     }.get(field, "coupon_not_applicable")
     return _coupon_error(code)
 
@@ -1999,6 +2031,8 @@ class AdminCouponListView(APIView):
             return _coupon_error("coupon_invalid")
         now = timezone.now()
         queryset = CSACoupon.objects.all()
+        if application_scope := query.validated_data.get("application_scope"):
+            queryset = queryset.filter(application_scope=application_scope)
         if discount_type := query.validated_data.get("discount_type"):
             queryset = queryset.filter(discount_type=discount_type)
         status_filter = query.validated_data.get("status")
@@ -2092,13 +2126,31 @@ class AdminCouponPreviewView(APIView):
         if not serializer.is_valid():
             return _coupon_input_error(serializer.errors)
         data = dict(serializer.validated_data)
-        plan_id = data.pop("payment_plan_id")
+        target = data.pop("target")
+        plan_id = data.pop("payment_plan_id", None)
+        store_user_id = data.pop("store_user_id", None)
+        lines = data.pop("lines", None)
+        locale = data.pop("locale")
         data["package_ids"] = [str(value) for value in data.get("package_ids", [])]
         data["price_option_ids"] = [str(value) for value in data.get("price_option_ids", [])]
         coupon = CSACoupon(**data)
         try:
             coupon.code = normalize_coupon_code(coupon.code)
             validate_coupon_configuration(coupon)
+            if target == "store":
+                from commerce.store_orders import StoreOrderError, preview_store_voucher
+                from identity.models import User
+
+                owner = User.objects.filter(pk=store_user_id, is_active=True).first()
+                if owner is None:
+                    return _coupon_error("coupon_customer_not_found")
+                try:
+                    result = preview_store_voucher(
+                        user=owner, payload={"lines": lines, "locale": locale}, draft_coupon=coupon
+                    )
+                except StoreOrderError as error:
+                    return _coupon_error(error.code)
+                return no_store(Response({"data": result}))
             plan = MembershipPaymentPlan.objects.select_related("price_option__package").get(
                 pk=plan_id
             )
@@ -2120,7 +2172,13 @@ class AdminCouponPreviewView(APIView):
             MembershipPaymentPlan.DoesNotExist,
         ) as error:
             code = error.code if isinstance(error, CouponError) else "coupon_not_applicable"
-            if code not in {"coupon_invalid_value", "coupon_not_applicable"}:
+            if code not in {
+                "coupon_invalid_value",
+                "coupon_not_applicable",
+                "coupon_scope_mismatch",
+                "coupon_invalid_scope",
+                "coupon_csa_conditions_not_allowed",
+            }:
                 code = "coupon_not_applicable"
             return _coupon_error(code)
         return no_store(

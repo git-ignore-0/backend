@@ -228,7 +228,21 @@ class StoreGuestAddressSerializer(ShippingAddressSerializer):
     pass
 
 
+class StoreVoucherLineSerializer(StrictSerializer):
+    product_id = serializers.UUIDField()
+    quantity = serializers.IntegerField(min_value=1, max_value=999)
+    use_quota = serializers.BooleanField()
+
+
+class StoreVoucherPreviewSerializer(StrictSerializer):
+    locale = serializers.ChoiceField(choices=["vi", "en"], default="vi")
+    coupon_code = serializers.CharField(max_length=64, trim_whitespace=True)
+    lines = StoreVoucherLineSerializer(many=True, allow_empty=False, max_length=50)
+
+
 class StoreCheckoutSerializer(StrictSerializer):
+    coupon_code = serializers.CharField(max_length=64, trim_whitespace=True, required=False)
+    expected_voucher_quote = serializers.CharField(max_length=64, required=False)
     idempotency_key = serializers.UUIDField()
     locale = serializers.ChoiceField(choices=["vi", "en"], default="vi")
     lines = StoreCheckoutLineSerializer(many=True, allow_empty=False, max_length=50)

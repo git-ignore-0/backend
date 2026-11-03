@@ -32,6 +32,14 @@ urlpatterns = [
         "admin/csa-terms/<uuid:document_id>/publish",
         views.AdminCSATermsPublishView.as_view(),
     ),
+    path("admin/vouchers", views.AdminCouponListView.as_view()),
+    path("admin/vouchers/options", views.AdminCouponOptionsView.as_view()),
+    path("admin/vouchers/preview", views.AdminCouponPreviewView.as_view()),
+    path("admin/vouchers/<uuid:coupon_id>", views.AdminCouponDetailView.as_view()),
+    path(
+        "admin/vouchers/<uuid:coupon_id>/<str:action>",
+        views.AdminCouponActivationView.as_view(),
+    ),
     path("admin/csa-coupons", views.AdminCouponListView.as_view()),
     path("admin/csa-coupons/options", views.AdminCouponOptionsView.as_view()),
     path("admin/csa-coupons/preview", views.AdminCouponPreviewView.as_view()),
@@ -67,6 +75,7 @@ urlpatterns = [
     path("admin/membership-banks", views.AdminMembershipBanksView.as_view()),
     path("public/membership-packages", views.PublicPackageListView.as_view()),
     path("public/csa-terms", views.PublicCSATermsView.as_view()),
+    path("csa-voucher-preview", views.CSAVoucherPreviewView.as_view()),
     path(
         "public/csa-payment-quotes",
         views.PublicCSAPaymentQuoteView.as_view(),
