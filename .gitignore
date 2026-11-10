@@ -16,6 +16,7 @@ __pycache__/
 .ruff_cache/
 build/
 dist/
+/backend-release*.zip
 
 # Test and coverage output
 .coverage
