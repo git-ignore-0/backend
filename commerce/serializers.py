@@ -129,9 +129,17 @@ class CategoryQuerySerializer(StrictSerializer):
 
 
 class ProductTranslationSerializer(TranslationSerializer):
+    description = serializers.CharField(allow_blank=True, required=False, trim_whitespace=False)
+    description_document = serializers.JSONField(allow_null=True, required=False)
     short_description = serializers.CharField(
         max_length=800, allow_blank=True, required=False, default=""
     )
+
+    def validate(self, attrs):
+        # A partial product update still needs a locale for every submitted translation.
+        if "locale" not in attrs:
+            raise serializers.ValidationError({"locale": "This field is required."})
+        return attrs
 
 
 class ProductWriteSerializer(StrictSerializer):

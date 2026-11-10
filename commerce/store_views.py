@@ -388,7 +388,7 @@ class SelfStoreBuyAgainView(APIView):
         lines = list(order.lines.order_by("position", "id"))
         products = {
             product.pk: product
-            for product in public_product_queryset().filter(
+            for product in public_product_queryset(detail=True).filter(
                 pk__in=[line.product_id for line in lines]
             )
         }

@@ -13,6 +13,7 @@ from commerce.models import (
     Product,
     ProductTranslation,
 )
+from commerce.product_descriptions import prepare_product_translations
 from content.models import MediaAsset
 from content.services import delete_orphan_media_asset, request_frontend_revalidation
 from memberships.models import Product as MembershipProduct
@@ -255,7 +256,7 @@ def _validate_product(data, *, instance=None, translations=None):
 def create_product(*, actor, payload):
     _lock_category_tree()
     data = payload.copy()
-    translations = data.pop("translations", [])
+    translations = prepare_product_translations(data.pop("translations", []))
     required = {
         "sku",
         "category_id",
@@ -302,7 +303,7 @@ def update_product(*, actor, product, payload):
         or LegacyFarmWeeklySupply.objects.filter(farm_product__product=product).exists()
     ):
         raise CatalogConflict("product_unit_in_use")
-    translations = data.pop("translations", None)
+    translations = prepare_product_translations(data.pop("translations", None), instance=product)
     previous_image = product.primary_image
     requested_category_id = data.pop("category_id", product.category_id)
     keeping_draft_category = (

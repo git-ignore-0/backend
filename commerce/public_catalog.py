@@ -6,6 +6,7 @@ from commerce.models import (
     PUBLIC_STORE_MAX_PRICE_VND,
     Category,
     Product,
+    ProductTranslation,
     StoreStockMovement,
     StoreStockMovementKind,
     StoreStockReservation,
@@ -27,7 +28,7 @@ def _public_product_filter():
     )
 
 
-def public_product_queryset():
+def public_product_queryset(*, detail=False):
     current_date = timezone.localdate()
     current_stock = (
         FarmProductStockBatch.objects.filter(
@@ -95,7 +96,12 @@ def public_product_queryset():
             )
         )
         .prefetch_related(
-            "translations",
+            Prefetch(
+                "translations",
+                queryset=ProductTranslation.objects.all()
+                if detail
+                else ProductTranslation.objects.defer("description", "description_document"),
+            ),
             "category__translations",
             "csa_quota_group__translations",
             Prefetch("farm_offers", queryset=active_suppliers, to_attr="public_farm_offers"),
@@ -245,4 +251,5 @@ def public_product_payload(product, request, locale, *, detail=False):
     }
     if detail:
         result["description"] = translation.description
+        result["description_document"] = translation.description_document
     return result

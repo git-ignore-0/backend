@@ -1,5 +1,5 @@
 from django.db import transaction
-from django.db.models import CharField, Count, Exists, OuterRef, Q, Subquery
+from django.db.models import CharField, Count, Exists, OuterRef, Prefetch, Q, Subquery
 from django.db.models.functions import Coalesce
 from django.shortcuts import get_object_or_404
 from rest_framework import status, viewsets
@@ -161,7 +161,7 @@ class PublicStoreProductDetailView(APIView):
     def get(self, request, slug):
         query = PublicStoreLocaleSerializer(data=request.query_params.dict())
         query.is_valid(raise_exception=True)
-        item = get_object_or_404(public_product_queryset(), slug=slug)
+        item = get_object_or_404(public_product_queryset(detail=True), slug=slug)
         return no_store(
             Response(
                 {
@@ -269,20 +269,35 @@ def category_queryset():
     )
 
 
-def product_queryset():
+def product_queryset(*, include_document=True):
     return Product.objects.select_related(
         "category", "csa_quota_group", "primary_image"
-    ).prefetch_related("translations", "csa_quota_group__translations")
+    ).prefetch_related(
+        Prefetch(
+            "translations",
+            queryset=ProductTranslation.objects.all()
+            if include_document
+            else ProductTranslation.objects.defer("description_document"),
+        ),
+        "csa_quota_group__translations",
+    )
 
 
-def _translations(item):
+def _translations(item, *, include_document=True):
     return [
         {
             "locale": translation.locale,
             "name": translation.name,
             "description": translation.description,
             **(
-                {"short_description": translation.short_description}
+                {
+                    "short_description": translation.short_description,
+                    **(
+                        {"description_document": translation.description_document}
+                        if include_document
+                        else {}
+                    ),
+                }
                 if hasattr(translation, "short_description")
                 else {}
             ),
@@ -319,7 +334,7 @@ def category_payload(item):
     }
 
 
-def product_payload(item, request):
+def product_payload(item, request, *, include_document=True):
     group = item.csa_quota_group
     return {
         "id": str(item.pk),
@@ -353,7 +368,7 @@ def product_payload(item, request):
         "primary_image": media_payload(item.primary_image, request) if item.primary_image else None,
         "is_active": item.is_active,
         "is_published": item.is_published,
-        "translations": _translations(item),
+        "translations": _translations(item, include_document=include_document),
         "created_at": item.created_at.isoformat(),
         "updated_at": item.updated_at.isoformat(),
     }
@@ -422,7 +437,7 @@ class AdminProductViewSet(viewsets.ViewSet):
         query = ProductQuerySerializer(data=request.query_params.dict())
         query.is_valid(raise_exception=True)
         data = query.validated_data
-        rows = product_queryset()
+        rows = product_queryset(include_document=False)
         if search := data["search"]:
             rows = rows.filter(
                 Q(sku__icontains=search)
@@ -450,7 +465,9 @@ class AdminProductViewSet(viewsets.ViewSet):
         return no_store(
             Response(
                 {
-                    "data": [product_payload(item, request) for item in items],
+                    "data": [
+                        product_payload(item, request, include_document=False) for item in items
+                    ],
                     "meta": {"page": page, "page_size": page_size, "total": total},
                 }
             )

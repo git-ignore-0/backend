@@ -175,6 +175,7 @@ class ProductTranslation(models.Model):
     name = models.CharField(max_length=200)
     short_description = models.CharField(max_length=800, blank=True)
     description = models.TextField(blank=True)
+    description_document = models.JSONField(null=True, blank=True)
 
     class Meta:
         ordering = ["locale", "id"]
