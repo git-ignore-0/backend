@@ -29,6 +29,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m venv .venv
+          .venv/bin/python -m pip install --upgrade 'pip>=26.2' 'setuptools>=84.1.0'
           .venv/bin/python -m pip install -e '.[dev,mysql]'
       - name: Quality gate
         run: |
