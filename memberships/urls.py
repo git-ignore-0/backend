@@ -1,6 +1,7 @@
 from django.urls import path
 from rest_framework.routers import SimpleRouter
 
+from memberships import csa_round_views as rounds
 from memberships import views
 
 router = SimpleRouter(trailing_slash=False, use_regex_path=False)
@@ -22,6 +23,17 @@ router.register(
 )
 
 urlpatterns = [
+    path("admin/csa-rounds", rounds.AdminRounds.as_view()),
+    path("admin/csa-rounds/<uuid:round_id>", rounds.AdminRound.as_view()),
+    path("admin/csa-rounds/<uuid:round_id>/publish", rounds.AdminRoundPublish.as_view()),
+    path("admin/csa-rounds/<uuid:round_id>/cancel", rounds.AdminRoundCancel.as_view()),
+    path("admin/csa-rounds/<uuid:round_id>/selections", rounds.AdminRoundSelections.as_view()),
+    path("admin/csa-selections/<uuid:selection_id>/reopen", rounds.AdminReopen.as_view()),
+    path("admin/csa-selections/<uuid:selection_id>/events", rounds.AdminSelectionEvents.as_view()),
+    path("csa-rounds", rounds.MemberRounds.as_view()),
+    path("csa-rounds/<uuid:round_id>/products", rounds.MemberProducts.as_view()),
+    path("csa-rounds/<uuid:round_id>/selection", rounds.MemberSelection.as_view()),
+    path("csa-selections/<uuid:selection_id>/confirm", rounds.MemberConfirm.as_view()),
     path("admin/csa-terms", views.AdminCSATermsListView.as_view()),
     path("admin/csa-terms/<uuid:document_id>", views.AdminCSATermsDetailView.as_view()),
     path(

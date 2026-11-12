@@ -28,7 +28,7 @@ def _public_product_filter():
     )
 
 
-def public_product_queryset(*, detail=False):
+def public_product_queryset(*, detail=False, csa_selection=None):
     current_date = timezone.localdate()
     current_stock = (
         FarmProductStockBatch.objects.filter(
@@ -74,6 +74,18 @@ def public_product_queryset(*, detail=False):
         .annotate(total=Sum("quantity"))
         .values("total")[:1]
     )
+    from memberships.csa_rounds import active_stock_holds
+    from memberships.models import CSAStockHold
+
+    csa_reserved = (
+        CSAStockHold.objects.filter(
+            product_id=OuterRef("pk"),
+            selection__in=active_stock_holds(exclude_selection=csa_selection),
+        )
+        .values("product_id")
+        .annotate(total=Sum("quantity"))
+        .values("total")[:1]
+    )
     active_suppliers = FarmProduct.objects.filter(
         is_active=True, farm__is_active=True
     ).select_related("farm")
@@ -92,7 +104,8 @@ def public_product_queryset(*, detail=False):
                 Coalesce(Subquery(current_stock, output_field=IntegerField()), Value(0))
                 - Coalesce(Subquery(sold, output_field=IntegerField()), Value(0))
                 + Coalesce(Subquery(restocked, output_field=IntegerField()), Value(0))
-                - Coalesce(Subquery(reserved, output_field=IntegerField()), Value(0)),
+                - Coalesce(Subquery(reserved, output_field=IntegerField()), Value(0))
+                - Coalesce(Subquery(csa_reserved, output_field=IntegerField()), Value(0)),
             )
         )
         .prefetch_related(

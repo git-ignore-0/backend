@@ -21,6 +21,7 @@ class MembershipStatus(models.TextChoices):
     SCHEDULED = "scheduled", "Scheduled"
     ACTIVE = "active", "Active"
     ENDED = "ended", "Ended"
+    FROZEN = "frozen", "Frozen"
     REVOKED = "revoked", "Revoked"
 
 
@@ -1275,6 +1276,7 @@ class Membership(models.Model):
     farmbrite_order_reference_key = models.CharField(max_length=240, unique=True, editable=False)
     start_date = models.DateField()
     end_date = models.DateField()
+    extension_end_date = models.DateField(null=True, blank=True)
     status = models.CharField(
         max_length=12, choices=MembershipStatus.choices, default=MembershipStatus.ACTIVE
     )
@@ -1334,7 +1336,11 @@ class Membership(models.Model):
                         current_slot=True,
                     )
                     | Q(
-                        status__in=[MembershipStatus.ENDED, MembershipStatus.REVOKED],
+                        status__in=[
+                            MembershipStatus.ENDED,
+                            MembershipStatus.REVOKED,
+                            MembershipStatus.FROZEN,
+                        ],
                         current_slot__isnull=True,
                     )
                 ),
@@ -1915,6 +1921,13 @@ class MembershipCycleQuota(models.Model):
 
 
 class MembershipUsageOrder(models.Model):
+    csa_selection = models.ForeignKey(
+        "CSASelection",
+        null=True,
+        blank=True,
+        related_name="usage_history",
+        on_delete=models.PROTECT,
+    )
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     store_order = models.OneToOneField(
         "commerce.StoreOrder",
@@ -2067,3 +2080,142 @@ class CouponUsage(models.Model):
                 name="coupon_usage_release_consistent",
             ),
         ]
+
+
+class CSARound(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    sequence = models.PositiveIntegerField(unique=True)
+    name = models.CharField(max_length=200)
+    opens_at = models.DateTimeField()
+    closes_at = models.DateTimeField()
+    delivery_at = models.DateTimeField()
+    published_at = models.DateTimeField(null=True, blank=True)
+    cancelled_at = models.DateTimeField(null=True, blank=True)
+    cancellation_reason = models.TextField(blank=True, default="")
+    cancelled_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="cancelled_csa_rounds",
+    )
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["sequence"]
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(closes_at__gt=models.F("opens_at")), name="csa_round_open_before_close"
+            ),
+            models.CheckConstraint(
+                condition=Q(delivery_at__gt=models.F("closes_at")),
+                name="csa_round_close_before_delivery",
+            ),
+        ]
+
+
+class CSASelection(models.Model):
+    class State(models.TextChoices):
+        SELECTING = "selecting", "Selecting"
+        LOCKED = "locked", "Locked"
+        RESELECTING = "reselecting", "Reselecting"
+        CONFIRMED = "confirmed", "Confirmed"
+        CANCELLED = "cancelled", "Cancelled"
+        DELIVERED = "delivered", "Delivered"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    round = models.ForeignKey(CSARound, related_name="selections", on_delete=models.PROTECT)
+    membership = models.ForeignKey(
+        Membership, related_name="csa_selections", on_delete=models.PROTECT
+    )
+    state = models.CharField(max_length=16, choices=State.choices, default=State.SELECTING)
+    order = models.OneToOneField(
+        "commerce.StoreOrder",
+        null=True,
+        blank=True,
+        related_name="csa_selection",
+        on_delete=models.PROTECT,
+    )
+    current_usage = models.OneToOneField(
+        MembershipUsageOrder,
+        null=True,
+        blank=True,
+        related_name="current_csa_selection",
+        on_delete=models.PROTECT,
+    )
+    reopen_until = models.DateTimeField(null=True, blank=True)
+    revision = models.PositiveIntegerField(default=0)
+    locale = models.CharField(max_length=2, default="vi")
+    address_snapshot = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["round", "membership"], name="csa_round_membership_unique"
+            )
+        ]
+
+
+class CSASelectionLine(models.Model):
+    selection = models.ForeignKey(CSASelection, related_name="lines", on_delete=models.CASCADE)
+    product = models.ForeignKey("commerce.Product", on_delete=models.PROTECT)
+    quantity = models.PositiveIntegerField()
+    snapshot = models.JSONField()
+
+    class Meta:
+        ordering = ["product_id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["selection", "product"], name="csa_selection_product_unique"
+            ),
+            models.CheckConstraint(condition=Q(quantity__gt=0), name="csa_selection_qty_positive"),
+        ]
+
+
+class CSAStockHold(models.Model):
+    selection = models.ForeignKey(
+        CSASelection, related_name="stock_holds", on_delete=models.CASCADE
+    )
+    product = models.ForeignKey("commerce.Product", on_delete=models.PROTECT)
+    quantity = models.PositiveIntegerField()
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["selection", "product"], name="csa_stock_hold_unique"),
+            models.CheckConstraint(condition=Q(quantity__gt=0), name="csa_stock_hold_positive"),
+        ]
+
+
+class CSAQuotaHold(models.Model):
+    selection = models.ForeignKey(
+        CSASelection, related_name="quota_holds", on_delete=models.CASCADE
+    )
+    cycle_quota = models.ForeignKey(MembershipCycleQuota, on_delete=models.PROTECT)
+    units = models.DecimalField(max_digits=14, decimal_places=2)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["selection", "cycle_quota"], name="csa_quota_hold_unique"
+            ),
+            models.CheckConstraint(condition=Q(units__gt=0), name="csa_quota_hold_positive"),
+        ]
+
+
+class CSASelectionEvent(models.Model):
+    selection = models.ForeignKey(CSASelection, related_name="events", on_delete=models.PROTECT)
+    action = models.CharField(max_length=40)
+    actor = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL)
+    context = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+
+
+class CSARoundScheduleLock(models.Model):
+    id = models.PositiveSmallIntegerField(primary_key=True, default=1, editable=False)

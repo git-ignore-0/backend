@@ -126,6 +126,18 @@ def _active_membership_for_user(user, *, lock=False):
         .first()
     )
     if membership is None:
+        # Dates also cover an expired active row before the status worker runs.
+        frozen = (
+            rows.filter(
+                customer__user=user,
+                end_date__lte=today,
+                extension_end_date__gte=today,
+            )
+            .exclude(status=MembershipStatus.REVOKED)
+            .exists()
+        )
+        if frozen:
+            raise StoreOrderError("store_membership_frozen")
         return None
     if lock:
         membership = sync_membership_status(membership, as_of=today)
@@ -177,7 +189,7 @@ def active_product_stock(product_ids, *, lock=False):
     return totals, batches
 
 
-def _active_reserved_stock(product_ids, *, exclude_order=None):
+def _active_reserved_stock(product_ids, *, exclude_order=None, exclude_selection=None):
     rows = StoreStockReservation.objects.filter(
         product_id__in=product_ids,
         released_at__isnull=True,
@@ -189,10 +201,19 @@ def _active_reserved_stock(product_ids, *, exclude_order=None):
     )
     if exclude_order is not None:
         rows = rows.exclude(line__order=exclude_order)
-    return {
+    totals = {
         row["product_id"]: row["total"]
         for row in rows.values("product_id").annotate(total=Sum("quantity"))
     }
+    from memberships.csa_rounds import reserved_stock
+    from memberships.models import CSASelection
+
+    selection = exclude_selection
+    if selection is None and exclude_order is not None:
+        selection = CSASelection.objects.filter(order=exclude_order).first()
+    for product_id, quantity in reserved_stock(product_ids, exclude_selection=selection).items():
+        totals[product_id] = totals.get(product_id, 0) + quantity
+    return totals
 
 
 def ensure_batch_change_preserves_reservations(
@@ -754,6 +775,13 @@ def _release_reservations(order, reason):
                     .aggregate(total=Round(Sum("units"), precision=2))["total"]
                     or 0
                 )
+                from memberships.csa_rounds import preserve_expiring_quota, reserved_quota
+
+                if quota.cycle.membership.end_date <= today and preserve_expiring_quota(
+                    quota.cycle.membership
+                ):
+                    continue
+                held_elsewhere += reserved_quota([quota_id]).get(quota_id, 0)
                 kept = min(quota.remaining_units, held_elsewhere)
                 quota.expired_units += quota.remaining_units - kept
                 quota.remaining_units = kept
@@ -788,8 +816,20 @@ def _expire_locked_order(order, *, now):
     return True
 
 
-@transaction.atomic
 def expire_order_if_needed(order_id, *, now=None):
+    # Reconcile before taking the StoreOrder lock: CSA locks round before order.
+    from memberships.csa_rounds import process_round
+    from memberships.models import CSASelection
+
+    selection = CSASelection.objects.filter(order_id=order_id).values_list("round_id", "pk").first()
+    if selection:
+        round_id, selection_id = selection
+        process_round(round_id, now=now, selection_ids=[selection_id])
+    return _expire_store_order_atomic(order_id, now=now)
+
+
+@transaction.atomic
+def _expire_store_order_atomic(order_id, *, now=None):
     order = StoreOrder.objects.select_for_update().get(pk=order_id)
     if order.status not in {StoreOrderStatus.PAYMENT_PENDING, StoreOrderStatus.PENDING_REVIEW}:
         return order, False
@@ -956,6 +996,12 @@ def source_inventory(order):
         .values("product_id")
         .annotate(total=Sum("quantity"))
     }
+    from memberships.models import CSASelection
+
+    csa = CSASelection.objects.filter(order=order).first()
+    if csa:
+        for hold in csa.stock_holds.all():
+            current_order_reserved[hold.product_id] = hold.quantity
     return {
         "refresh_required_before_approve": True,
         "product_reservations": [
@@ -1118,6 +1164,13 @@ def _approve_store_order_atomic(*, order_id, actor, idempotency_key, allocations
             idempotency_key=idempotency_key,
             actor=actor,
         )
+    from memberships.models import CSASelection
+
+    csa = CSASelection.objects.filter(order=order).first()
+    if csa:
+        if csa.state not in ("locked", "confirmed"):
+            raise StoreOrderError("store_order_state_conflict")
+        csa.stock_holds.all().delete()
     _consume_reserved_quota(order, actor)
     _release_reservations(order, "approved")
     order.status = StoreOrderStatus.PENDING_DELIVERY
@@ -1231,6 +1284,14 @@ def cancel_store_order(*, order_id, actor, idempotency_key, reason, reconciliati
         return order
     if order.status in {StoreOrderStatus.CANCELLED, StoreOrderStatus.DELIVERED}:
         raise StoreOrderError("store_order_state_conflict")
+    from memberships.csa_rounds import _cancel_locked
+    from memberships.models import CSASelection
+
+    csa = CSASelection.objects.filter(order=order).first()
+    if csa:
+        _lock_order_products(order)
+        Membership.objects.select_for_update().get(pk=csa.membership_id)
+        _cancel_locked(csa, actor, reason.strip())
     was_approved = order.status == StoreOrderStatus.PENDING_DELIVERY
     if was_approved:
         _reverse_store_quota(order, actor, reason.strip())
@@ -1349,6 +1410,9 @@ def deliver_store_order(*, order_id, actor, idempotency_key):
     if order.status != StoreOrderStatus.PENDING_DELIVERY:
         raise StoreOrderError("store_order_state_conflict")
     lock_store_referral_referrer(order)
+    from memberships.models import CSASelection
+
+    CSASelection.objects.filter(order=order).update(state="delivered")
     order.status = StoreOrderStatus.DELIVERED
     order.delivered_at = timezone.now()
     order.delivered_by = actor

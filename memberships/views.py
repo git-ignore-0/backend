@@ -869,6 +869,9 @@ def membership_payload(
         "quota_policy": item.quota_policy_snapshot,
         "start_date": item.start_date.isoformat(),
         "end_date": item.end_date.isoformat(),
+        "extension_end_date": (
+            item.extension_end_date or item.end_date - timezone.timedelta(days=1)
+        ).isoformat(),
         "activated_at": item.activated_at.isoformat(),
         **({"current_slot": item.current_slot} if admin else {}),
     }
@@ -1042,7 +1045,13 @@ def usage_payload(
     data = {
         "id": str(item.pk),
         "membership_id": str(item.membership_id),
-        "order_id": str(item.store_order_id) if getattr(item, "store_order_id", None) else None,
+        "order_id": (
+            str(item.store_order_id)
+            if item.store_order_id
+            else str(item.csa_selection.order_id)
+            if item.csa_selection_id and item.csa_selection.order_id
+            else None
+        ),
         "status": item.status,
         "note": item.note,
         "created_at": item.created_at.isoformat(),
@@ -1134,7 +1143,7 @@ def membership_queryset():
 
 def usage_queryset():
     return MembershipUsageOrder.objects.select_related(
-        "membership", "customer", "customer__user", "reversal"
+        "membership", "customer", "customer__user", "reversal", "csa_selection"
     ).prefetch_related("lines__product_snapshot", "lines__allocations__cycle_quota__cycle")
 
 
@@ -1455,7 +1464,7 @@ class SelfMembershipView(APIView):
     @transaction.atomic
     def get(self, request):
         locale = requested_locale(request)
-        refresh_membership_statuses()
+        refresh_membership_statuses(user=request.user)
         today = timezone.localdate()
         item = (
             membership_queryset()
@@ -1483,7 +1492,7 @@ class SelfMembershipOverviewView(APIView):
     @transaction.atomic
     def get(self, request):
         locale = requested_locale(request)
-        refresh_membership_statuses()
+        refresh_membership_statuses(user=request.user)
         expire_open_csa_purchase_requests_for_user(user_id=request.user.pk)
         today = timezone.localdate()
         memberships = membership_queryset().filter(customer__user=request.user)
@@ -1504,6 +1513,11 @@ class SelfMembershipOverviewView(APIView):
             ),
         ).order_by("created_at", "id")
 
+        frozen = (
+            memberships.filter(status=MembershipStatus.FROZEN)
+            .order_by("-extension_end_date", "id")
+            .first()
+        )
         upcoming = [
             {"kind": "membership", **membership_payload(item, locale=locale)} for item in scheduled
         ]
@@ -1516,6 +1530,11 @@ class SelfMembershipOverviewView(APIView):
                             membership_payload(active, locale=locale) if active else None
                         ),
                         "upcoming": upcoming,
+                        **(
+                            {"frozen_membership": membership_payload(frozen, locale=locale)}
+                            if frozen and active is None
+                            else {}
+                        ),
                     }
                 }
             )
@@ -1574,7 +1593,7 @@ class SelfQuotaView(APIView):
 
             if not StoreOrder.objects.filter(pk=current_order_id, buyer_user=request.user).exists():
                 return no_store(Response(status=status.HTTP_404_NOT_FOUND))
-        refresh_membership_statuses()
+        refresh_membership_statuses(user=request.user)
         today = timezone.localdate()
         item = (
             membership_queryset()

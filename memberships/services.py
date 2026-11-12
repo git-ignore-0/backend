@@ -4,7 +4,7 @@ from decimal import Decimal, InvalidOperation
 
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
-from django.db.models import Sum
+from django.db.models import Q, Sum
 from django.db.models.functions import Round
 from django.utils import timezone
 
@@ -859,10 +859,14 @@ def _create_cycle(membership: Membership, sequence: int) -> MembershipCycle:
 def sync_membership_status(membership: Membership, *, as_of: date | None = None) -> Membership:
     as_of = as_of or timezone.localdate()
     membership = Membership.objects.select_for_update().get(pk=membership.pk)
-    if membership.status == MembershipStatus.REVOKED:
+    if membership.status in {MembershipStatus.REVOKED, MembershipStatus.ENDED}:
         return membership
-    if membership.status == MembershipStatus.ENDED or membership.end_date <= as_of:
-        expected_status = MembershipStatus.ENDED
+    if membership.end_date <= as_of:
+        expected_status = (
+            MembershipStatus.FROZEN
+            if membership.extension_end_date and membership.extension_end_date >= as_of
+            else MembershipStatus.ENDED
+        )
         expected_slot = None
     elif membership.start_date <= as_of:
         expected_status = MembershipStatus.ACTIVE
@@ -878,13 +882,25 @@ def sync_membership_status(membership: Membership, *, as_of: date | None = None)
 
 
 @transaction.atomic
-def refresh_membership_statuses(*, as_of: date | None = None) -> None:
+def refresh_membership_statuses(*, as_of: date | None = None, user=None) -> None:
     as_of = as_of or timezone.localdate()
+    rows = Membership.objects.exclude(status=MembershipStatus.REVOKED)
+    if user is not None:
+        # Keep the transition predicates in a single UPDATE on MySQL. A joined
+        # owner filter can cause Django to preselect IDs and then update by IDs
+        # alone, overwriting a concurrent terminal revoke.
+        rows = rows.filter(customer_id__in=CSACustomer.objects.filter(user=user).values("pk"))
     updated_at = timezone.now()
-    Membership.objects.filter(current_slot=True, end_date__lte=as_of).exclude(
-        status=MembershipStatus.REVOKED
-    ).update(status=MembershipStatus.ENDED, current_slot=None, updated_at=updated_at)
-    Membership.objects.filter(
+    rows.filter(end_date__lte=as_of, extension_end_date__gte=as_of).exclude(
+        status=MembershipStatus.FROZEN,
+        current_slot__isnull=True,
+    ).update(status=MembershipStatus.FROZEN, current_slot=None, updated_at=updated_at)
+    rows.filter(end_date__lte=as_of).filter(
+        Q(extension_end_date__lt=as_of) | Q(extension_end_date__isnull=True)
+    ).exclude(status=MembershipStatus.ENDED, current_slot__isnull=True).update(
+        status=MembershipStatus.ENDED, current_slot=None, updated_at=updated_at
+    )
+    rows.filter(
         current_slot=True,
         status=MembershipStatus.SCHEDULED,
         start_date__lte=as_of,
@@ -952,8 +968,16 @@ def ensure_due_cycles(
             .values("cycle_quota_id")
             .annotate(total=Round(Sum("units"), precision=2))
         }
+        from memberships.csa_rounds import preserve_expiring_quota, reserved_quota
+
+        csa_held = reserved_quota([quota.pk for quota in expiring])
+        preserve = membership.end_date <= as_of and preserve_expiring_quota(membership)
         for quota in expiring:
-            held = min(quota.remaining_units, held_by_quota.get(quota.pk, 0))
+            if preserve:
+                continue
+            held = min(
+                quota.remaining_units, held_by_quota.get(quota.pk, 0) + csa_held.get(quota.pk, 0)
+            )
             newly_expired = quota.remaining_units - held
             if newly_expired:
                 quota.expired_units += newly_expired
@@ -967,6 +991,7 @@ def quota_availability_rows(
     *,
     product_ids=None,
     current_order_id=None,
+    exclude_csa_selection=None,
     lock=False,
     as_of: date | None = None,
 ):
@@ -978,7 +1003,11 @@ def quota_availability_rows(
     rows = rows.filter(cycle__membership=membership).select_related("cycle", "product_snapshot")
     if product_ids is not None:
         rows = rows.filter(product_snapshot__product_id__in=product_ids)
-    if membership.quota_policy_snapshot == QuotaPolicy.EXPIRE:
+    from memberships.csa_rounds import preserve_expiring_quota
+
+    if membership.quota_policy_snapshot == QuotaPolicy.EXPIRE and not (
+        membership.end_date <= as_of and preserve_expiring_quota(membership)
+    ):
         rows = rows.filter(cycle__start_date__lte=as_of, cycle__end_date__gt=as_of)
     rows = list(rows.order_by("cycle__sequence", "id"))
 
@@ -997,6 +1026,11 @@ def quota_availability_rows(
             total=Round(Sum("units"), precision=2)
         )
     }
+    from memberships.csa_rounds import reserved_quota
+
+    csa_reserved = reserved_quota([row.pk for row in rows], exclude_selection=exclude_csa_selection)
+    for pk, amount in csa_reserved.items():
+        reserved[pk] = reserved.get(pk, 0) + amount
     current_reserved = {}
     if current_order_id is not None:
         current_reserved = {
@@ -1140,6 +1174,10 @@ def create_usage_order(*, membership_id, actor, idempotency_key, lines: list[dic
         .values("cycle_quota_id")
         .annotate(total=Round(Sum("units"), precision=2))
     }
+    from memberships.csa_rounds import reserved_quota
+
+    for pk, amount in reserved_quota([quota.pk for quota in quotas]).items():
+        reserved_by_quota[pk] = reserved_by_quota.get(pk, 0) + amount
     available_by_quota = {
         quota.pk: max(0, quota.remaining_units - reserved_by_quota.get(quota.pk, 0))
         for quota in quotas
@@ -1188,7 +1226,7 @@ def undo_usage_order(*, order_id, actor, reason: str):
     if membership.status == MembershipStatus.REVOKED:
         raise UsageUndoConflict("Usage cannot be undone for a revoked membership")
     order = MembershipUsageOrder.objects.select_for_update().get(pk=order_id)
-    if order.store_order_id is not None:
+    if order.store_order_id is not None or order.csa_selection_id is not None:
         raise UsageUndoConflict("Store usage can only be reversed by cancelling its Store order")
     if (
         order.status != UsageOrderStatus.APPLIED

@@ -54,6 +54,7 @@ from commerce.store_orders import (
 from commerce.store_proxy import trusted_store_client_ip
 from content.permissions import IsWebsiteAdmin
 from memberships.coupons import CouponError
+from memberships.csa_payloads import round_payload, selection_payload
 from memberships.permissions import HasMembershipSelfScopes
 
 
@@ -83,6 +84,7 @@ def store_error(error):
         "store_restock_invalid",
         "store_restock_duplicate",
         "store_requote_required",
+        "store_membership_frozen",
     }:
         http_status = status.HTTP_409_CONFLICT
     else:
@@ -199,6 +201,10 @@ def order_payload(order, *, guest_token=None, admin=False, request=None):
         "created_at": order.created_at.isoformat(),
         "updated_at": order.updated_at.isoformat(),
     }
+    csa = getattr(order, "csa_selection", None)
+    if csa:
+        result["csa"] = {"round": round_payload(csa.round), "selection": selection_payload(csa)}
+        result["can_buy_again"] = False
     if guest_token:
         result["guest_access_token"] = guest_token
     if admin:
@@ -253,15 +259,57 @@ def order_payload(order, *, guest_token=None, admin=False, request=None):
 
 
 def order_list_queryset(rows):
-    return rows.prefetch_related(
+    return rows.select_related("csa_selection__round").prefetch_related(
+        "csa_selection__lines",
         Prefetch(
             "lines",
             queryset=StoreOrderLine.objects.select_related("product__primary_image").order_by(
                 "position", "id"
             ),
             to_attr="payload_lines",
-        )
+        ),
     )
+
+
+def overdue_csa_order_filter(*, now):
+    """One deadline predicate for list status projection and page reconciliation."""
+    return Q(
+        status="pending_review",
+        csa_selection__state="reselecting",
+        csa_selection__reopen_until__lte=now,
+        csa_selection__round__published_at__isnull=False,
+        csa_selection__round__cancelled_at__isnull=True,
+    )
+
+
+def filter_order_list_status(rows, requested_status, *, now):
+    if not requested_status:
+        return rows
+    # Count/filter overdue CSA orders as cancelled even when they are off-page.
+    # The worker owns global reconciliation; reads only reconcile the returned page.
+    overdue = overdue_csa_order_filter(now=now)
+    if requested_status == "cancelled":
+        return rows.filter(Q(status="cancelled") | overdue)
+    if requested_status == "pending_review":
+        return rows.filter(status=requested_status).exclude(overdue)
+    return rows.filter(status=requested_status)
+
+
+def order_list_page(rows, *, page, page_size, now):
+    rows = rows.annotate(csa_reselection_overdue=overdue_csa_order_filter(now=now))
+    items = list(order_list_queryset(rows)[(page - 1) * page_size : page * page_size])
+    overdue_ids = []
+    for order in items:
+        if order.csa_reselection_overdue:
+            expire_order_if_needed(order.pk, now=now)
+            overdue_ids.append(order.pk)
+    if overdue_ids:
+        refreshed = {
+            order.pk: order
+            for order in order_list_queryset(StoreOrder.objects.filter(pk__in=overdue_ids))
+        }
+        items = [refreshed.get(order.pk, order) for order in items]
+    return items
 
 
 class SelfStoreVoucherPreviewView(APIView):
@@ -350,13 +398,16 @@ class SelfStoreOrderListView(APIView):
     def get(self, request):
         query = StoreOrderQuerySerializer(data=request.query_params.dict())
         query.is_valid(raise_exception=True)
-        rows = StoreOrder.objects.filter(buyer_user=request.user)
-        if requested_status := query.validated_data.get("status"):
-            rows = rows.filter(status=requested_status)
+        now = timezone.now()
+        rows = filter_order_list_status(
+            StoreOrder.objects.filter(buyer_user=request.user),
+            query.validated_data.get("status"),
+            now=now,
+        )
         page = query.validated_data["page"]
         page_size = query.validated_data["page_size"]
         total = rows.count()
-        rows = order_list_queryset(rows)[(page - 1) * page_size : page * page_size]
+        rows = order_list_page(rows, page=page, page_size=page_size, now=now)
         return no_store(
             Response(
                 {
@@ -420,11 +471,13 @@ class AdminStoreOrderListView(APIView):
     permission_classes = [IsWebsiteAdmin]
 
     def get(self, request):
+
         query = StoreOrderQuerySerializer(data=request.query_params.dict())
         query.is_valid(raise_exception=True)
-        rows = StoreOrder.objects.all()
-        if requested_status := query.validated_data.get("status"):
-            rows = rows.filter(status=requested_status)
+        now = timezone.now()
+        rows = filter_order_list_status(
+            StoreOrder.objects.all(), query.validated_data.get("status"), now=now
+        )
         if payment_status := query.validated_data.get("payment_status"):
             rows = rows.filter(payment_status=payment_status)
         if search := query.validated_data["search"]:
@@ -445,7 +498,7 @@ class AdminStoreOrderListView(APIView):
         page = query.validated_data["page"]
         page_size = query.validated_data["page_size"]
         total = rows.count()
-        rows = order_list_queryset(rows)[(page - 1) * page_size : page * page_size]
+        rows = order_list_page(rows, page=page, page_size=page_size, now=now)
         return no_store(
             Response(
                 {
