@@ -242,13 +242,20 @@ class StoreVoucherLineSerializer(StrictSerializer):
     use_quota = serializers.BooleanField()
 
 
-class StoreVoucherPreviewSerializer(StrictSerializer):
+class StoreQuoteSerializer(StrictSerializer):
+    delivery_date = serializers.DateField()
+    guest = StoreGuestAddressSerializer(required=False)
+    coupon_code = serializers.CharField(max_length=64, trim_whitespace=True, required=False)
     locale = serializers.ChoiceField(choices=["vi", "en"], default="vi")
-    coupon_code = serializers.CharField(max_length=64, trim_whitespace=True)
     lines = StoreVoucherLineSerializer(many=True, allow_empty=False, max_length=50)
 
 
+class StoreVoucherPreviewSerializer(StoreQuoteSerializer):
+    coupon_code = serializers.CharField(max_length=64, trim_whitespace=True)
+
+
 class StoreCheckoutSerializer(StrictSerializer):
+    delivery_date = serializers.DateField()
     coupon_code = serializers.CharField(max_length=64, trim_whitespace=True, required=False)
     expected_voucher_quote = serializers.CharField(max_length=64, required=False)
     idempotency_key = serializers.UUIDField()

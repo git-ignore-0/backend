@@ -26,6 +26,7 @@ from tests.test_csa_rounds import save
 from tests.test_store_orders import quota_checkout_payload
 from tests.test_store_orders import store_product as store_product
 from tests.test_store_orders import supported_area as supported_area
+from tests.test_store_orders import zero_shipping_fee as zero_shipping_fee
 
 pytestmark = pytest.mark.django_db
 
@@ -40,7 +41,7 @@ def _reopen(context, selection):
     )
 
 
-def test_store_client_selection_uuid_cannot_block_round_close(context):
+def test_store_client_selection_uuid_cannot_block_round_close(zero_shipping_fee, context):
     user, product, _, round_, _ = context
     selected = save(context)
     payload = quota_checkout_payload(

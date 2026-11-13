@@ -25,6 +25,7 @@ from tests.test_store_orders import (
 from tests.test_store_orders import payment_settings as payment_settings
 from tests.test_store_orders import store_product as store_product
 from tests.test_store_orders import supported_area as supported_area
+from tests.test_store_orders import zero_shipping_fee as zero_shipping_fee
 
 
 @pytest.mark.parametrize("cost", ["0.25", "0.5", "0.75", "1", "2", "2147483647"])
@@ -88,7 +89,7 @@ def quota_projection(client):
 
 @pytest.mark.django_db
 def test_admin_cost_public_catalog_and_checkout_keep_fractional_contract(
-    active_user, store_product, admin_api, csa_context
+    zero_shipping_fee, active_user, store_product, admin_api, csa_context
 ):
     response = admin_api.patch(
         f"/api/v1/admin/store-products/{store_product.pk}",
@@ -111,7 +112,7 @@ def test_admin_cost_public_catalog_and_checkout_keep_fractional_contract(
     "cost,orders,remaining", [("0.25", 4, "3"), ("0.5", 2, "3"), ("0.1", 10, "3")]
 )
 def test_repeat_orders_debit_exactly_one_point(
-    active_user, store_product, csa_context, cost, orders, remaining
+    zero_shipping_fee, active_user, store_product, csa_context, cost, orders, remaining
 ):
     membership, client = csa_context
     Product.objects.filter(pk=store_product.pk).update(csa_quota_cost=Decimal(cost))
@@ -136,7 +137,7 @@ def test_repeat_orders_debit_exactly_one_point(
 
 @pytest.mark.django_db
 def test_cancel_hold_and_cancel_approved_restore_exact_fraction(
-    active_user, store_product, csa_context
+    zero_shipping_fee, active_user, store_product, csa_context
 ):
     membership, client = csa_context
     Product.objects.filter(pk=store_product.pk).update(csa_quota_cost=Decimal("0.25"))
@@ -161,7 +162,7 @@ def test_cancel_hold_and_cancel_approved_restore_exact_fraction(
 
 @pytest.mark.django_db
 def test_small_balance_covers_only_whole_selling_units(
-    active_user, store_product, csa_context, payment_settings
+    zero_shipping_fee, active_user, store_product, csa_context, payment_settings
 ):
     membership, client = csa_context
     Product.objects.filter(pk=store_product.pk).update(csa_quota_cost=Decimal("0.25"))
@@ -219,7 +220,7 @@ def test_manual_service_rejects_invalid_fractional_debits(
 
 @pytest.mark.django_db
 def test_cycle_expiry_keeps_tenth_point_hold_without_precision_error(
-    active_user, store_product, csa_context
+    zero_shipping_fee, active_user, store_product, csa_context
 ):
     from datetime import timedelta
 
@@ -246,7 +247,7 @@ def test_cycle_expiry_keeps_tenth_point_hold_without_precision_error(
 
 @pytest.mark.django_db
 def test_catalog_cost_change_does_not_reprice_reserved_quota(
-    active_user, store_product, csa_context
+    zero_shipping_fee, active_user, store_product, csa_context
 ):
     _, client = csa_context
     Product.objects.filter(pk=store_product.pk).update(csa_quota_cost=Decimal("0.25"))
@@ -260,7 +261,9 @@ def test_catalog_cost_change_does_not_reprice_reserved_quota(
 
 
 @pytest.mark.django_db
-def test_manual_usage_cannot_spend_fraction_held_by_store(active_user, store_product, csa_context):
+def test_manual_usage_cannot_spend_fraction_held_by_store(
+    zero_shipping_fee, active_user, store_product, csa_context
+):
     from memberships.services import InsufficientQuota
 
     membership, client = csa_context
@@ -280,7 +283,7 @@ def test_manual_usage_cannot_spend_fraction_held_by_store(active_user, store_pro
 @pytest.mark.django_db
 @pytest.mark.parametrize("remaining,orders", [("1", 10), ("0.7", 7)])
 def test_repeated_tenth_point_approvals_exhaust_balance_exactly(
-    active_user, store_product, csa_context, remaining, orders
+    zero_shipping_fee, active_user, store_product, csa_context, remaining, orders
 ):
     membership, client = csa_context
     Product.objects.filter(pk=store_product.pk).update(csa_quota_cost=Decimal("0.1"))

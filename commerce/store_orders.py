@@ -28,6 +28,11 @@ from commerce.models import (
     StoreStockReservation,
 )
 from commerce.shipping import active_shipping_area
+from commerce.store_delivery import (
+    companion_benefits,
+    lock_companion_sources,
+    validate_delivery_date,
+)
 from farms.models import Farm, FarmProduct, FarmProductStockBatch
 from identity.models import User
 from members.administrative_units import province_exists, ward_choices
@@ -387,6 +392,10 @@ def calculate_store_quote(*, user, payload, lock=False, check_expected=False, dr
     """Single authoritative cash/quota/shipping calculator; read-only when lock=False."""
     if payload.get("coupon_code") is not None and (user is None or not user.is_authenticated):
         raise CouponError("coupon_authentication_required")
+    delivery_date = payload.get("delivery_date")
+    validate_delivery_date(delivery_date)
+    if lock:
+        lock_companion_sources(user=user, delivery_date=delivery_date)
     requested = payload["lines"]
     product_ids = [item["product_id"] for item in requested]
     if len(product_ids) != len(set(product_ids)):
@@ -422,9 +431,6 @@ def calculate_store_quote(*, user, payload, lock=False, check_expected=False, dr
                 "store_requote_required", context={"reason": "shipping_address_changed"}
             )
     membership = _active_membership_for_user(user, lock=lock)
-    has_csa_product = any(by_id[item["product_id"]].csa_quota_group_id for item in requested)
-    free_shipping = membership is not None and has_csa_product
-    shipping_fee = 0 if free_shipping else area.shipping_fee_vnd
 
     if lock:
         offers = list(
@@ -536,6 +542,14 @@ def calculate_store_quote(*, user, payload, lock=False, check_expected=False, dr
             check_availability=draft_coupon is None,
         )
         discount = snapshot["discount_amount_vnd"]
+    # All catalog, identity, membership, inventory and coupon waits have finished.
+    decision_time = timezone.now()
+    validate_delivery_date(delivery_date, now=decision_time)
+    benefit = companion_benefits(
+        user=user, first=delivery_date, last=delivery_date, now=decision_time
+    ).get(delivery_date)
+    free_shipping = benefit is not None
+    shipping_fee = 0 if free_shipping else area.shipping_fee_vnd
     total = subtotal - discount + shipping_fee
     if snapshot is not None:
         snapshot["total_vnd"] = total
@@ -555,6 +569,7 @@ def calculate_store_quote(*, user, payload, lock=False, check_expected=False, dr
         if coupon
         else None,
         "shipping_fee_vnd": shipping_fee,
+        "delivery_date": delivery_date.isoformat(),
     }
     voucher_quote = (
         salted_hmac(
@@ -586,6 +601,8 @@ def calculate_store_quote(*, user, payload, lock=False, check_expected=False, dr
         "shipping_fee": shipping_fee,
         "total": total,
         "free_shipping": free_shipping,
+        "delivery_date": delivery_date,
+        "normal_shipping_fee": area.shipping_fee_vnd,
         "coupon": coupon,
         "snapshot": snapshot,
         "discount": discount,
@@ -598,6 +615,8 @@ def calculate_store_quote(*, user, payload, lock=False, check_expected=False, dr
 def preview_store_voucher(*, user, payload, draft_coupon=None):
     quote = calculate_store_quote(user=user, payload=payload, draft_coupon=draft_coupon)
     return {
+        "delivery_date": quote["delivery_date"].isoformat(),
+        "shipping_discount_reason": "csa_companion_delivery" if quote["free_shipping"] else None,
         "subtotal_vnd": str(quote["subtotal"]),
         "eligible_subtotal_vnd": str(quote["subtotal"]),
         "coupon": quote["snapshot"],
@@ -652,7 +671,7 @@ def create_store_checkout(*, user, payload):
     quote = calculate_store_quote(user=user, payload=payload, lock=True, check_expected=True)
     address = quote["address"]
     subtotal, shipping_fee, total = quote["subtotal"], quote["shipping_fee"], quote["total"]
-    free_shipping, line_values = quote["free_shipping"], quote["line_values"]
+    line_values = quote["line_values"]
     payment = None
     if total:
         payment = (
@@ -665,6 +684,23 @@ def create_store_checkout(*, user, payload):
         _guest_access_token(order_id, key) if not user or not user.is_authenticated else None
     )
     now = timezone.now()
+    validate_delivery_date(quote["delivery_date"], now=now)
+    # Payment configuration may have blocked after the quote was calculated.
+    benefit = companion_benefits(
+        user=user, first=quote["delivery_date"], last=quote["delivery_date"], now=now
+    ).get(quote["delivery_date"])
+    final_shipping = 0 if benefit else quote["normal_shipping_fee"]
+    if final_shipping != shipping_fee:
+        raise StoreOrderError(
+            "store_requote_required",
+            context={
+                "reason": "total_changed",
+                "shipping_fee_vnd": final_shipping,
+                "total_vnd": total - shipping_fee + final_shipping,
+            },
+        )
+    if benefit:
+        benefit["decided_at"] = now.isoformat()
     order = StoreOrder.objects.create(
         id=order_id,
         reference_code=_reference_code(),
@@ -682,7 +718,9 @@ def create_store_checkout(*, user, payload):
         subtotal_vnd=subtotal,
         shipping_fee_vnd=shipping_fee,
         total_vnd=total,
-        shipping_discount_reason="active_csa_with_csa_product" if free_shipping else "",
+        delivery_date=quote["delivery_date"],
+        shipping_benefit_snapshot=benefit,
+        shipping_discount_reason="csa_companion_delivery" if benefit else "",
         bank_bin_snapshot=payment.bank_bin if payment else "",
         bank_name_snapshot=payment.bank_name if payment else "",
         account_number_snapshot=payment.account_number if payment else "",

@@ -20,6 +20,7 @@ from tests.test_store_orders import guest_payload
 from tests.test_store_orders import payment_settings as payment_settings
 from tests.test_store_orders import store_product as store_product
 from tests.test_store_orders import supported_area as supported_area
+from tests.test_store_orders import zero_shipping_fee as zero_shipping_fee
 
 pytestmark = pytest.mark.django_db
 
@@ -43,15 +44,12 @@ def frozen_context(context, monkeypatch):
     return member
 
 
-def cash_payload(context, *, renewed=False):
+def cash_payload(context):
     payload = guest_payload(context[1], quantity=1, expected_available=9)
     payload.pop("guest")
     payload["shipping_address_updated_at"] = ShippingAddress.objects.get(
         user=context[0]
     ).updated_at.isoformat()
-    if renewed:
-        payload["expected_shipping_fee_vnd"] = 0
-        payload["expected_total_vnd"] = 45000
     return payload
 
 
@@ -93,7 +91,7 @@ def test_new_active_plan_restores_cash_checkout_while_old_plan_is_frozen(
     fresh.farmbrite_order_reference_key = str(uuid.uuid4())
     fresh.save(force_insert=True)
     response = authenticated_client(context[0]).post(
-        "/api/v1/public/store-checkouts", cash_payload(context, renewed=True), format="json"
+        "/api/v1/public/store-checkouts", cash_payload(context), format="json"
     )
     assert response.status_code == 201, response.json()
 

@@ -251,6 +251,8 @@ class StoreOrder(models.Model):
     subtotal_vnd = models.PositiveBigIntegerField()
     shipping_fee_vnd = models.PositiveBigIntegerField()
     total_vnd = models.PositiveBigIntegerField()
+    delivery_date = models.DateField(null=True, blank=True)
+    shipping_benefit_snapshot = models.JSONField(null=True, blank=True, editable=False)
     shipping_discount_reason = models.CharField(max_length=80, blank=True)
     bank_bin_snapshot = models.CharField(max_length=6, blank=True)
     bank_name_snapshot = models.CharField(max_length=160, blank=True)

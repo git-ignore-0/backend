@@ -117,6 +117,8 @@ def update_round(*, round_id, actor, **values):
             setattr(row, key, values[key])
     if not row.opens_at < row.closes_at < row.delivery_at or not row.name.strip():
         _fail("csa_round_schedule_invalid")
+    if row.companion_delivery_cutoff and row.companion_delivery_cutoff >= row.delivery_at:
+        _fail("csa_companion_deadline_invalid")
     if row.published_at:
         _validate_schedule(row)
         if row.closes_at <= timezone.now():
@@ -138,6 +140,26 @@ def publish_round(*, round_id, actor):
         _fail("csa_round_already_closed")
     row.published_at = timezone.now()
     row.save(update_fields=["published_at", "updated_at"])
+    return row
+
+
+@transaction.atomic
+def configure_companion_delivery(*, round_id, actor, **values):
+    row = CSARound.objects.select_for_update().get(pk=round_id)
+    now = timezone.now()  # Decide after waiting for the round lock.
+    if row.cancelled_at:
+        _fail("csa_round_cancelled")
+    enabled = values.get("companion_delivery_enabled", row.companion_delivery_enabled)
+    cutoff = values.get("companion_delivery_cutoff", row.companion_delivery_cutoff)
+    if cutoff is not None and cutoff >= row.delivery_at:
+        _fail("csa_companion_deadline_invalid")
+    if (enabled or "companion_delivery_cutoff" in values) and (cutoff is None or cutoff <= now):
+        _fail("csa_companion_deadline_invalid")
+    row.companion_delivery_enabled = enabled
+    row.companion_delivery_cutoff = cutoff
+    row.save(
+        update_fields=["companion_delivery_enabled", "companion_delivery_cutoff", "updated_at"]
+    )
     return row
 
 

@@ -25,6 +25,10 @@ router.register(
 urlpatterns = [
     path("admin/csa-rounds", rounds.AdminRounds.as_view()),
     path("admin/csa-rounds/<uuid:round_id>", rounds.AdminRound.as_view()),
+    path(
+        "admin/csa-rounds/<uuid:round_id>/companion-delivery",
+        rounds.AdminRoundCompanionDelivery.as_view(),
+    ),
     path("admin/csa-rounds/<uuid:round_id>/publish", rounds.AdminRoundPublish.as_view()),
     path("admin/csa-rounds/<uuid:round_id>/cancel", rounds.AdminRoundCancel.as_view()),
     path("admin/csa-rounds/<uuid:round_id>/selections", rounds.AdminRoundSelections.as_view()),

@@ -136,6 +136,7 @@ class AdminCouponPreviewSerializer(AdminCouponWriteSerializer):
     target = serializers.ChoiceField(choices=["csa", "store"], default="csa")
     payment_plan_id = serializers.UUIDField(required=False)
     store_user_id = serializers.UUIDField(required=False)
+    delivery_date = serializers.DateField(required=False)
     # Same strict cart input as the owner preview; prices/quota are server-owned.
     from commerce.serializers import StoreVoucherLineSerializer
 
@@ -144,9 +145,19 @@ class AdminCouponPreviewSerializer(AdminCouponWriteSerializer):
 
     def validate(self, attrs):
         if attrs["target"] == "csa":
-            if "payment_plan_id" not in attrs or "lines" in attrs or "store_user_id" in attrs:
+            if (
+                "payment_plan_id" not in attrs
+                or "lines" in attrs
+                or "store_user_id" in attrs
+                or "delivery_date" in attrs
+            ):
                 raise serializers.ValidationError("CSA preview requires only payment_plan_id.")
-        elif "lines" not in attrs or "store_user_id" not in attrs or "payment_plan_id" in attrs:
+        elif (
+            "lines" not in attrs
+            or "store_user_id" not in attrs
+            or "delivery_date" not in attrs
+            or "payment_plan_id" in attrs
+        ):
             raise serializers.ValidationError("Store preview requires lines and store_user_id.")
         return attrs
 

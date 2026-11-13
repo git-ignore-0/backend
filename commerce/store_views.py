@@ -29,6 +29,7 @@ from commerce.serializers import (
     StoreOrderAccessSerializer,
     StoreOrderCancelAccessSerializer,
     StoreOrderQuerySerializer,
+    StoreQuoteSerializer,
     StoreRecordPaymentSerializer,
     StoreRefundSerializer,
     StoreRestockSerializer,
@@ -185,6 +186,8 @@ def order_payload(order, *, guest_token=None, admin=False, request=None):
         "discount_amount_vnd": str(order.discount_amount_vnd),
         "coupon": order.coupon_snapshot,
         "shipping_fee_vnd": str(order.shipping_fee_vnd),
+        "delivery_date": order.delivery_date.isoformat() if order.delivery_date else None,
+        "shipping_benefit": order.shipping_benefit_snapshot,
         "shipping_discount_reason": order.shipping_discount_reason or None,
         "total_vnd": str(order.total_vnd),
         "payment": payment,
@@ -317,6 +320,35 @@ class SelfStoreVoucherPreviewView(APIView):
 
     def post(self, request):
         serializer = StoreVoucherPreviewSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            data = preview_store_voucher(user=request.user, payload=serializer.validated_data)
+        except (StoreOrderError, CouponError) as error:
+            return store_error(error)
+        return no_store(Response({"data": data}))
+
+
+class PublicStoreDeliveryDatesView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        from commerce.store_delivery import delivery_calendar
+
+        if error_response := public_store_scope_error(request):
+            return error_response
+        try:
+            return no_store(Response({"data": delivery_calendar(user=request.user)}))
+        except StoreOrderError as error:
+            return store_error(error)
+
+
+class PublicStoreQuoteView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        if error_response := public_store_scope_error(request):
+            return error_response
+        serializer = StoreQuoteSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         try:
             data = preview_store_voucher(user=request.user, payload=serializer.validated_data)

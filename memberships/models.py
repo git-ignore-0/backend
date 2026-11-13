@@ -2089,6 +2089,8 @@ class CSARound(models.Model):
     opens_at = models.DateTimeField()
     closes_at = models.DateTimeField()
     delivery_at = models.DateTimeField()
+    companion_delivery_enabled = models.BooleanField(default=False)
+    companion_delivery_cutoff = models.DateTimeField(null=True, blank=True)
     published_at = models.DateTimeField(null=True, blank=True)
     cancelled_at = models.DateTimeField(null=True, blank=True)
     cancellation_reason = models.TextField(blank=True, default="")
@@ -2112,6 +2114,16 @@ class CSARound(models.Model):
             models.CheckConstraint(
                 condition=Q(delivery_at__gt=models.F("closes_at")),
                 name="csa_round_close_before_delivery",
+            ),
+            models.CheckConstraint(
+                condition=Q(companion_delivery_cutoff__isnull=True)
+                | Q(companion_delivery_cutoff__lt=models.F("delivery_at")),
+                name="csa_companion_cutoff_before_delivery",
+            ),
+            models.CheckConstraint(
+                condition=Q(companion_delivery_enabled=False)
+                | Q(companion_delivery_cutoff__isnull=False),
+                name="csa_companion_enabled_has_cutoff",
             ),
         ]
 

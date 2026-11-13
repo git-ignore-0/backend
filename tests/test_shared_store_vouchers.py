@@ -28,6 +28,7 @@ from tests.test_store_orders import (
 from tests.test_store_orders import (
     supported_area as supported_area,
 )
+from tests.test_store_orders import zero_shipping_fee as zero_shipping_fee
 
 pytestmark = pytest.mark.django_db
 
@@ -54,6 +55,7 @@ def context(active_user, access_token, store_product, payment_settings, supporte
     client = APIClient()
     client.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token.token}")
     preview_input = {
+        "delivery_date": timezone.localdate(),
         "coupon_code": voucher.code,
         "lines": [{"product_id": str(store_product.pk), "quantity": 2, "use_quota": False}],
     }
@@ -62,6 +64,7 @@ def context(active_user, access_token, store_product, payment_settings, supporte
 
 def checkout_body(quote, code):
     return {
+        "delivery_date": timezone.localdate(),
         "idempotency_key": str(uuid.uuid4()),
         "locale": "vi",
         "coupon_code": code,
@@ -158,7 +161,7 @@ def test_zero_goods_still_pays_shipping_and_uuid_cannot_reuse(context):
 
 
 def test_mixed_quota_discount_and_zero_total_use_existing_workflow(
-    context, active_user, store_product
+    zero_shipping_fee, context, active_user, store_product
 ):
     client, voucher, payload = context
     ShippingAddress.objects.filter(user=active_user).delete()
@@ -256,6 +259,7 @@ def test_admin_store_preview_uses_owner_cart_and_keeps_csa_conditions_off_store(
     access_token.scope = "profile email content:manage"
     access_token.save(update_fields=["scope"])
     body = {
+        "delivery_date": timezone.localdate(),
         "code": "DRAFT",
         "application_scope": "store",
         "discount_type": "fixed",
@@ -277,7 +281,7 @@ def test_admin_store_preview_uses_owner_cart_and_keeps_csa_conditions_off_store(
         {
             key: value
             for key, value in invalid.items()
-            if key not in {"target", "lines", "store_user_id"}
+            if key not in {"target", "lines", "store_user_id", "delivery_date"}
         },
         format="json",
     )
@@ -325,7 +329,7 @@ def test_preview_projects_scheduled_membership_that_has_started(
     context[2]["lines"][0].update(quantity=3, use_quota=True)
     quote = preview(context)
     assert quote["lines"][0]["expected_quota_quantity"] == 2
-    assert quote["shipping_fee_vnd"] == "0"
+    assert quote["shipping_fee_vnd"] == "30000"
     membership.refresh_from_db()
     assert membership.status == MembershipStatus.SCHEDULED
     response = context[0].post(

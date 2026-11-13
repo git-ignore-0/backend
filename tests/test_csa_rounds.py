@@ -13,6 +13,7 @@ from memberships.models import CSASelection, MembershipCycleQuota
 from tests.test_store_orders import attach_active_membership
 from tests.test_store_orders import store_product as store_product
 from tests.test_store_orders import supported_area as supported_area
+from tests.test_store_orders import zero_shipping_fee as zero_shipping_fee
 
 pytestmark = pytest.mark.django_db
 
@@ -448,7 +449,9 @@ def test_order_detail_reconciles_expired_reselection_without_worker(
     assert MembershipCycleQuota.objects.get(cycle__membership=context[2]).remaining_units == 4
 
 
-def test_store_release_at_cycle_boundary_preserves_csa_points(context, monkeypatch):
+def test_store_release_at_cycle_boundary_preserves_csa_points(
+    zero_shipping_fee, context, monkeypatch
+):
     import uuid
 
     from commerce.models import ShippingAddress, StoreOrder

@@ -11,6 +11,8 @@ router.register("admin/store-products", views.AdminProductViewSet, basename="adm
 
 urlpatterns = [
     path("store-voucher-preview", store_views.SelfStoreVoucherPreviewView.as_view()),
+    path("public/store-delivery-dates", store_views.PublicStoreDeliveryDatesView.as_view()),
+    path("public/store-quotes", store_views.PublicStoreQuoteView.as_view()),
     path("public/store-checkouts", store_views.PublicStoreCheckoutView.as_view()),
     path(
         "public/store-orders/<uuid:order_id>/report-transfer",

@@ -116,6 +116,43 @@ class AdminRound(PrivateView):
         return Response({"data": round_payload(row)})
 
 
+class CompanionCutoffField(serializers.DateTimeField):
+    def enforce_timezone(self, value):
+        if timezone.is_naive(value):
+            self.fail("invalid", format="ISO 8601 with timezone")
+        return super().enforce_timezone(value)
+
+
+class CompanionDeliveryInput(StrictSerializer):
+    companion_delivery_enabled = serializers.BooleanField(required=False)
+    companion_delivery_cutoff = CompanionCutoffField(required=False)
+
+
+class AdminRoundCompanionDelivery(PrivateView):
+    permission_classes = [IsWebsiteAdmin]
+
+    @staticmethod
+    def payload(row):
+        return {
+            "companion_delivery_enabled": row.companion_delivery_enabled,
+            "companion_delivery_cutoff": row.companion_delivery_cutoff.isoformat()
+            if row.companion_delivery_cutoff
+            else None,
+        }
+
+    def get(self, request, round_id):
+        row = get_object_or_404(CSARound, pk=round_id)
+        return Response({"data": self.payload(row)})
+
+    def patch(self, request, round_id):
+        row = domain.configure_companion_delivery(
+            round_id=round_id,
+            actor=request.user,
+            **validated(CompanionDeliveryInput, request),
+        )
+        return Response({"data": self.payload(row)})
+
+
 class AdminRoundPublish(PrivateView):
     permission_classes = [IsWebsiteAdmin]
 

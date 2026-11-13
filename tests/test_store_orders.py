@@ -59,6 +59,13 @@ def supported_area(db):
 
 
 @pytest.fixture
+def zero_shipping_fee(supported_area):
+    """Quota/payment workflow tests explicitly use a zero-fee delivery area."""
+    supported_area.shipping_fee_vnd = 0
+    supported_area.save(update_fields=["shipping_fee_vnd"])
+
+
+@pytest.fixture
 def payment_settings(monkeypatch):
     monkeypatch.setattr(
         "memberships.banks.get_transfer_banks",
@@ -125,6 +132,7 @@ def store_product():
 
 def guest_payload(product, *, quantity=2, idempotency_key=None, expected_available=10):
     return {
+        "delivery_date": timezone.localdate(),
         "idempotency_key": str(idempotency_key or uuid.uuid4()),
         "locale": "vi",
         "lines": [
@@ -349,7 +357,7 @@ def attach_active_membership(user, product):
 
 
 @pytest.mark.django_db
-def test_authenticated_checkout_partially_uses_quota_and_gets_csa_free_shipping(
+def test_membership_and_csa_cart_alone_do_not_waive_shipping(
     active_user, access_token, store_product, payment_settings
 ):
     attach_active_membership(active_user, store_product)
@@ -359,6 +367,7 @@ def test_authenticated_checkout_partially_uses_quota_and_gets_csa_free_shipping(
     response = client.post(
         "/api/v1/public/store-checkouts",
         {
+            "delivery_date": timezone.localdate(),
             "idempotency_key": str(uuid.uuid4()),
             "locale": "vi",
             "lines": [
@@ -371,8 +380,8 @@ def test_authenticated_checkout_partially_uses_quota_and_gets_csa_free_shipping(
                     "expected_quota_quantity": 2,
                 }
             ],
-            "expected_shipping_fee_vnd": 0,
-            "expected_total_vnd": 45_000,
+            "expected_shipping_fee_vnd": 30_000,
+            "expected_total_vnd": 75_000,
             "shipping_address_updated_at": address.updated_at.isoformat(),
         },
         format="json",
@@ -382,14 +391,14 @@ def test_authenticated_checkout_partially_uses_quota_and_gets_csa_free_shipping(
     data = response.json()["data"]
     assert data["lines"][0]["quota_quantity"] == 2
     assert data["lines"][0]["cash_quantity"] == 1
-    assert data["shipping_fee_vnd"] == "0"
-    assert data["shipping_discount_reason"] == "active_csa_with_csa_product"
-    assert data["total_vnd"] == "45000"
+    assert data["shipping_fee_vnd"] == "30000"
+    assert data["shipping_discount_reason"] is None
+    assert data["total_vnd"] == "75000"
 
 
 @pytest.mark.django_db
 def test_zero_total_checkout_skips_qr_and_enters_pending_review(
-    active_user, access_token, store_product
+    zero_shipping_fee, active_user, access_token, store_product
 ):
     attach_active_membership(active_user, store_product)
     address = ShippingAddress.objects.get(user=active_user)
@@ -398,6 +407,7 @@ def test_zero_total_checkout_skips_qr_and_enters_pending_review(
     response = client.post(
         "/api/v1/public/store-checkouts",
         {
+            "delivery_date": timezone.localdate(),
             "idempotency_key": str(uuid.uuid4()),
             "locale": "vi",
             "lines": [
@@ -527,6 +537,7 @@ def test_user_list_is_owner_scoped(active_user, access_token, store_product, pay
     created = member.post(
         "/api/v1/public/store-checkouts",
         {
+            "delivery_date": timezone.localdate(),
             "idempotency_key": str(uuid.uuid4()),
             "locale": "vi",
             "lines": [
@@ -698,7 +709,7 @@ def test_cancelled_paid_late_order_can_be_refunded_idempotently(
 
 @pytest.mark.django_db
 def test_cancel_after_approval_reverses_quota_without_automatic_stock_restock(
-    active_user, access_token, store_product
+    zero_shipping_fee, active_user, access_token, store_product
 ):
     attach_active_membership(active_user, store_product)
     address = ShippingAddress.objects.get(user=active_user)
@@ -711,6 +722,7 @@ def test_cancel_after_approval_reverses_quota_without_automatic_stock_restock(
     created = member.post(
         "/api/v1/public/store-checkouts",
         {
+            "delivery_date": timezone.localdate(),
             "idempotency_key": str(uuid.uuid4()),
             "locale": "vi",
             "lines": [
@@ -963,7 +975,7 @@ def test_admin_restock_is_explicit_and_idempotent(
 
 @pytest.mark.django_db
 def test_existing_membership_usage_cannot_spend_store_reserved_quota(
-    active_user, access_token, store_product
+    zero_shipping_fee, active_user, access_token, store_product
 ):
     membership = attach_active_membership(active_user, store_product)
     address = ShippingAddress.objects.get(user=active_user)
@@ -972,6 +984,7 @@ def test_existing_membership_usage_cannot_spend_store_reserved_quota(
     created = client.post(
         "/api/v1/public/store-checkouts",
         {
+            "delivery_date": timezone.localdate(),
             "idempotency_key": str(uuid.uuid4()),
             "locale": "vi",
             "lines": [
@@ -1003,7 +1016,7 @@ def test_existing_membership_usage_cannot_spend_store_reserved_quota(
 
 @pytest.mark.django_db
 def test_cycle_expiry_preserves_held_quota_then_cancel_expires_it(
-    active_user, access_token, store_product
+    zero_shipping_fee, active_user, access_token, store_product
 ):
     membership = attach_active_membership(active_user, store_product)
     address = ShippingAddress.objects.get(user=active_user)
@@ -1012,6 +1025,7 @@ def test_cycle_expiry_preserves_held_quota_then_cancel_expires_it(
     created = client.post(
         "/api/v1/public/store-checkouts",
         {
+            "delivery_date": timezone.localdate(),
             "idempotency_key": str(uuid.uuid4()),
             "locale": "vi",
             "lines": [
@@ -1060,7 +1074,7 @@ def test_cycle_expiry_preserves_held_quota_then_cancel_expires_it(
 
 @pytest.mark.django_db
 def test_multiple_lines_share_quota_in_checkout_position_order(
-    active_user, access_token, store_product, payment_settings
+    zero_shipping_fee, active_user, access_token, store_product, payment_settings
 ):
     attach_active_membership(active_user, store_product)
     second = Product.objects.create(
@@ -1103,6 +1117,7 @@ def test_multiple_lines_share_quota_in_checkout_position_order(
     response = client.post(
         "/api/v1/public/store-checkouts",
         {
+            "delivery_date": timezone.localdate(),
             "idempotency_key": str(uuid.uuid4()),
             "locale": "vi",
             "lines": [
@@ -1228,7 +1243,7 @@ def test_expired_reservation_is_not_effective_before_worker(
 
 @pytest.mark.django_db
 def test_expired_quota_reservation_does_not_block_usage_before_worker(
-    active_user, access_token, store_product
+    zero_shipping_fee, active_user, access_token, store_product
 ):
     membership = attach_active_membership(active_user, store_product)
     address = ShippingAddress.objects.get(user=active_user)
@@ -1237,6 +1252,7 @@ def test_expired_quota_reservation_does_not_block_usage_before_worker(
     created = client.post(
         "/api/v1/public/store-checkouts",
         {
+            "delivery_date": timezone.localdate(),
             "idempotency_key": str(uuid.uuid4()),
             "locale": "vi",
             "lines": [
@@ -1743,6 +1759,7 @@ def test_concurrent_store_checkouts_cannot_overreserve_quota(
         response = client.post(
             "/api/v1/public/store-checkouts",
             {
+                "delivery_date": timezone.localdate(),
                 "idempotency_key": str(uuid.uuid4()),
                 "locale": "vi",
                 "lines": [
@@ -1947,7 +1964,7 @@ def test_concurrent_approve_and_farm_deactivation_preserve_allocation(
 
 @pytest.mark.django_db
 def test_due_scheduled_membership_is_resolved_before_store_checkout(
-    active_user, access_token, store_product
+    zero_shipping_fee, active_user, access_token, store_product
 ):
     membership = attach_active_membership(active_user, store_product)
     Membership.objects.filter(pk=membership.pk).update(status=MembershipStatus.SCHEDULED)
@@ -1958,6 +1975,7 @@ def test_due_scheduled_membership_is_resolved_before_store_checkout(
     response = client.post(
         "/api/v1/public/store-checkouts",
         {
+            "delivery_date": timezone.localdate(),
             "idempotency_key": str(uuid.uuid4()),
             "locale": "vi",
             "lines": [
@@ -1978,7 +1996,7 @@ def test_due_scheduled_membership_is_resolved_before_store_checkout(
     )
 
     assert response.status_code == 201, response.json()
-    assert response.json()["data"]["shipping_discount_reason"] == "active_csa_with_csa_product"
+    assert response.json()["data"]["shipping_discount_reason"] is None
     membership.refresh_from_db()
     assert membership.status == MembershipStatus.ACTIVE
 
@@ -2011,6 +2029,7 @@ def test_ineligible_membership_does_not_receive_store_benefits(
     response = client.post(
         "/api/v1/public/store-checkouts",
         {
+            "delivery_date": timezone.localdate(),
             "idempotency_key": str(uuid.uuid4()),
             "locale": "vi",
             "lines": [
@@ -2039,7 +2058,13 @@ def test_ineligible_membership_does_not_receive_store_benefits(
 @pytest.mark.parametrize("future_first", [True, False])
 @pytest.mark.parametrize("use_quota", [True, False])
 def test_current_membership_is_not_hidden_by_future_membership(
-    future_first, use_quota, active_user, access_token, store_product, payment_settings
+    zero_shipping_fee,
+    future_first,
+    use_quota,
+    active_user,
+    access_token,
+    store_product,
+    payment_settings,
 ):
     current = attach_active_membership(active_user, store_product)
     future = Membership.objects.get(pk=current.pk)
@@ -2063,7 +2088,7 @@ def test_current_membership_is_not_hidden_by_future_membership(
     assert response.status_code == 201, response.json()
     data = response.json()["data"]
     assert data["shipping_fee_vnd"] == "0"
-    assert data["shipping_discount_reason"] == "active_csa_with_csa_product"
+    assert data["shipping_discount_reason"] is None
     assert data["lines"][0]["quota_quantity"] == (2 if use_quota else 0)
     future.refresh_from_db()
     assert future.status == MembershipStatus.SCHEDULED
@@ -2071,6 +2096,7 @@ def test_current_membership_is_not_hidden_by_future_membership(
 
 def quota_checkout_payload(product, address, *, quantity, expected_available=10):
     return {
+        "delivery_date": timezone.localdate(),
         "idempotency_key": str(uuid.uuid4()),
         "locale": "vi",
         "lines": [
@@ -2091,7 +2117,7 @@ def quota_checkout_payload(product, address, *, quantity, expected_available=10)
 
 @pytest.mark.django_db
 def test_quota_api_reports_raw_reserved_and_available_units(
-    active_user, access_token, store_product
+    zero_shipping_fee, active_user, access_token, store_product
 ):
     attach_active_membership(active_user, store_product)
     address = ShippingAddress.objects.get(user=active_user)
@@ -2120,7 +2146,9 @@ def test_quota_api_reports_raw_reserved_and_available_units(
 
 
 @pytest.mark.django_db
-def test_quota_api_excludes_expired_hold_before_worker(active_user, access_token, store_product):
+def test_quota_api_excludes_expired_hold_before_worker(
+    zero_shipping_fee, active_user, access_token, store_product
+):
     attach_active_membership(active_user, store_product)
     address = ShippingAddress.objects.get(user=active_user)
     client = APIClient()
@@ -2140,7 +2168,9 @@ def test_quota_api_excludes_expired_hold_before_worker(active_user, access_token
 
 
 @pytest.mark.django_db
-def test_quota_api_resume_includes_current_order_hold(active_user, access_token, store_product):
+def test_quota_api_resume_includes_current_order_hold(
+    zero_shipping_fee, active_user, access_token, store_product
+):
     attach_active_membership(active_user, store_product)
     address = ShippingAddress.objects.get(user=active_user)
     client = APIClient()
@@ -2164,7 +2194,7 @@ def test_quota_api_resume_includes_current_order_hold(active_user, access_token,
 
 @pytest.mark.django_db
 def test_quota_api_release_and_consume_do_not_double_subtract(
-    active_user, access_token, store_product
+    zero_shipping_fee, active_user, access_token, store_product
 ):
     attach_active_membership(active_user, store_product)
     address = ShippingAddress.objects.get(user=active_user)
@@ -2236,7 +2266,7 @@ def test_quota_api_release_and_consume_do_not_double_subtract(
 
 @pytest.mark.django_db
 def test_quota_api_aggregates_multiple_effective_store_holds(
-    active_user, access_token, store_product
+    zero_shipping_fee, active_user, access_token, store_product
 ):
     attach_active_membership(active_user, store_product)
     address = ShippingAddress.objects.get(user=active_user)
@@ -2355,7 +2385,7 @@ def test_cash_store_cancel_never_reverses_unrelated_usage_key(
 
 @pytest.mark.django_db
 def test_store_quota_approval_is_independent_of_manual_usage_key(
-    active_user, access_token, store_product
+    zero_shipping_fee, active_user, access_token, store_product
 ):
     from memberships.models import MembershipUsageOrder
 
@@ -2377,7 +2407,9 @@ def test_store_quota_approval_is_independent_of_manual_usage_key(
 
 
 @pytest.mark.django_db
-def test_store_usage_cannot_be_undone_through_csa_api(active_user, access_token, store_product):
+def test_store_usage_cannot_be_undone_through_csa_api(
+    zero_shipping_fee, active_user, access_token, store_product
+):
     from memberships.models import MembershipUsageOrder
 
     membership = attach_active_membership(active_user, store_product)
@@ -2530,7 +2562,7 @@ def test_farm_deactivation_uses_store_inventory_lock_order(active_user, store_pr
 @pytest.mark.django_db
 @pytest.mark.parametrize("cancelled", [False, True])
 def test_store_usage_migration_links_legacy_allocations_and_preserves_reversal(
-    active_user, access_token, store_product, cancelled
+    zero_shipping_fee, active_user, access_token, store_product, cancelled
 ):
     from importlib import import_module
     from types import SimpleNamespace
@@ -2569,7 +2601,7 @@ def test_store_usage_migration_links_legacy_allocations_and_preserves_reversal(
 @pytest.mark.django_db
 @pytest.mark.parametrize("mismatch", ["owner", "allocations", "note"])
 def test_store_usage_migration_never_guesses_from_uuid_alone(
-    active_user, access_token, store_product, mismatch
+    zero_shipping_fee, active_user, access_token, store_product, mismatch
 ):
     from importlib import import_module
     from types import SimpleNamespace
@@ -2599,7 +2631,7 @@ def test_store_usage_migration_never_guesses_from_uuid_alone(
 
 @pytest.mark.django_db
 def test_manual_usage_cannot_replay_store_usage_idempotency_key(
-    active_user, access_token, store_product
+    zero_shipping_fee, active_user, access_token, store_product
 ):
     from memberships.models import MembershipUsageOrder
     from memberships.services import UsageIdempotencyConflict
@@ -2621,7 +2653,7 @@ def test_manual_usage_cannot_replay_store_usage_idempotency_key(
 
 @pytest.mark.django_db
 def test_store_approval_locks_membership_before_inventory_sources(
-    active_user, access_token, store_product, monkeypatch
+    zero_shipping_fee, active_user, access_token, store_product, monkeypatch
 ):
     from django.db.models import QuerySet
 
@@ -2740,6 +2772,7 @@ def test_store_approval_expires_after_waiting_for_resource_locks(
     from memberships.models import MembershipUsageOrder
 
     if payment_mode == "quota":
+        ShippingArea.objects.update(shipping_fee_vnd=0)
         membership = attach_active_membership(active_user, store_product)
         data = create_review_quota_checkout(active_user, access_token, store_product)
     else:
@@ -2805,6 +2838,7 @@ def test_store_approval_expires_after_waiting_for_resource_locks(
     }
     assert order.payment_status == expected_payment[payment_mode]
     if payment_mode == "quota":
+        ShippingArea.objects.update(shipping_fee_vnd=0)
         quota = MembershipCycleQuota.objects.get(cycle__membership=membership)
         assert quota.remaining_units == 4
         assert not StoreQuotaReservation.objects.filter(released_at__isnull=True).exists()
@@ -3110,7 +3144,7 @@ def test_restock_projection_matches_server_eligibility(
 @pytest.mark.django_db
 @pytest.mark.parametrize("second_cost", [1, 2])
 def test_approve_products_sharing_cycle_quota_aggregates_usage(
-    active_user, access_token, store_product, payment_settings, second_cost
+    zero_shipping_fee, active_user, access_token, store_product, payment_settings, second_cost
 ):
     attach_active_membership(active_user, store_product)
     second = Product.objects.create(
@@ -3153,6 +3187,7 @@ def test_approve_products_sharing_cycle_quota_aggregates_usage(
     response = client.post(
         "/api/v1/public/store-checkouts",
         {
+            "delivery_date": timezone.localdate(),
             "idempotency_key": str(uuid.uuid4()),
             "locale": "vi",
             "lines": [
@@ -3362,6 +3397,7 @@ def test_voucher_preview_checkout_replay_and_cancel(
     client = APIClient()
     client.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token.token}")
     preview_input = {
+        "delivery_date": timezone.localdate(),
         "coupon_code": voucher.code,
         "lines": [{"product_id": str(store_product.pk), "quantity": 2, "use_quota": False}],
     }
@@ -3376,6 +3412,7 @@ def test_voucher_preview_checkout_replay_and_cancel(
     voucher.refresh_from_db()
     assert voucher.used_count == 0
     body = {
+        "delivery_date": timezone.localdate(),
         "idempotency_key": str(uuid.uuid4()),
         "locale": "vi",
         "coupon_code": voucher.code,

@@ -2148,6 +2148,7 @@ class AdminCouponPreviewView(APIView):
         target = data.pop("target")
         plan_id = data.pop("payment_plan_id", None)
         store_user_id = data.pop("store_user_id", None)
+        delivery_date = data.pop("delivery_date", None)
         lines = data.pop("lines", None)
         locale = data.pop("locale")
         data["package_ids"] = [str(value) for value in data.get("package_ids", [])]
@@ -2165,7 +2166,9 @@ class AdminCouponPreviewView(APIView):
                     return _coupon_error("coupon_customer_not_found")
                 try:
                     result = preview_store_voucher(
-                        user=owner, payload={"lines": lines, "locale": locale}, draft_coupon=coupon
+                        user=owner,
+                        payload={"lines": lines, "locale": locale, "delivery_date": delivery_date},
+                        draft_coupon=coupon,
                     )
                 except StoreOrderError as error:
                     return _coupon_error(error.code)
