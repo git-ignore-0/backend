@@ -1,12 +1,13 @@
 # ruff: noqa: DJ008
 import uuid
+from datetime import UTC, timedelta
 from decimal import Decimal, InvalidOperation
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.db.models import Q
-from django.db.models.functions import Round, Trim, Upper
+from django.db.models.functions import Round, Trim, TruncDate, Upper
 
 from memberships.phones import InvalidPhoneNumber, normalize_vietnam_phone
 from memberships.pricing import calculate_total_price_vnd
@@ -2088,7 +2089,7 @@ class CSARound(models.Model):
     name = models.CharField(max_length=200)
     opens_at = models.DateTimeField()
     closes_at = models.DateTimeField()
-    delivery_at = models.DateTimeField()
+    delivery_date = models.DateField()
     companion_delivery_enabled = models.BooleanField(default=False)
     companion_delivery_cutoff = models.DateTimeField(null=True, blank=True)
     published_at = models.DateTimeField(null=True, blank=True)
@@ -2112,12 +2113,20 @@ class CSARound(models.Model):
                 condition=Q(closes_at__gt=models.F("opens_at")), name="csa_round_open_before_close"
             ),
             models.CheckConstraint(
-                condition=Q(delivery_at__gt=models.F("closes_at")),
+                condition=Q(
+                    delivery_date__gt=TruncDate(
+                        models.F("closes_at") + timedelta(hours=7), tzinfo=UTC
+                    )
+                ),
                 name="csa_round_close_before_delivery",
             ),
             models.CheckConstraint(
                 condition=Q(companion_delivery_cutoff__isnull=True)
-                | Q(companion_delivery_cutoff__lt=models.F("delivery_at")),
+                | Q(
+                    delivery_date__gt=TruncDate(
+                        models.F("companion_delivery_cutoff") + timedelta(hours=7), tzinfo=UTC
+                    )
+                ),
                 name="csa_companion_cutoff_before_delivery",
             ),
             models.CheckConstraint(

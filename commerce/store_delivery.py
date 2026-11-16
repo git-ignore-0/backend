@@ -1,6 +1,6 @@
 """Vietnam delivery dates and per-owner CSA companion shipping eligibility."""
 
-from datetime import datetime, time, timedelta
+from datetime import timedelta
 from zoneinfo import ZoneInfo
 
 from django.db.models import Q
@@ -22,13 +22,11 @@ def validate_delivery_date(value, *, now=None):
 
 
 def _selections(user, first, last):
-    start = datetime.combine(first, time.min, tzinfo=VIETNAM)
-    end = datetime.combine(last + timedelta(days=1), time.min, tzinfo=VIETNAM)
     return CSASelection.objects.filter(
         membership__customer__user=user,
         order__isnull=False,
-        round__delivery_at__gte=start,
-        round__delivery_at__lt=end,
+        round__delivery_date__gte=first,
+        round__delivery_date__lte=last,
     )
 
 
@@ -64,12 +62,12 @@ def companion_benefits(*, user, first, last, now=None):
         .exclude(state="cancelled")
         .exclude(order__status="cancelled")
         .exclude(Q(state="reselecting") & Q(reopen_until__lte=now))
-        .values("id", "order_id", "round_id", "round__delivery_at")
-        .order_by("round__delivery_at", "round_id", "id")
+        .values("id", "order_id", "round_id", "round__delivery_date")
+        .order_by("round__delivery_date", "round_id", "id")
     )
     benefits = {}
     for row in rows:
-        day = row["round__delivery_at"].astimezone(VIETNAM).date()
+        day = row["round__delivery_date"]
         benefits.setdefault(
             day,
             {
@@ -77,7 +75,7 @@ def companion_benefits(*, user, first, last, now=None):
                 "round_id": str(row["round_id"]),
                 "selection_id": str(row["id"]),
                 "csa_order_id": str(row["order_id"]),
-                "delivery_at": row["round__delivery_at"].isoformat(),
+                "delivery_date": row["round__delivery_date"].isoformat(),
             },
         )
     return benefits

@@ -67,7 +67,7 @@ def public_product_queryset(*, detail=False, csa_selection=None):
         StoreStockReservation.objects.filter(
             product_id=OuterRef("pk"),
             released_at__isnull=True,
-            line__order__status__in=["payment_pending", "pending_review"],
+            line__order__status__in=["payment_pending", "pending_review", "payment_review"],
             line__order__expires_at__gt=timezone.now(),
         )
         .values("product_id")

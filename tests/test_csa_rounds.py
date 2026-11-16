@@ -1,6 +1,6 @@
 """CSA rounds: shared-resource holds, deadlines and membership entitlement."""
 
-from datetime import timedelta
+from datetime import UTC, timedelta
 from decimal import Decimal
 
 import pytest
@@ -20,7 +20,8 @@ pytestmark = pytest.mark.django_db
 
 @pytest.fixture
 def context(active_user, store_product, monkeypatch):
-    now = timezone.now().replace(microsecond=0)
+    # Use an elapsed daytime anchor (07:00 VN), independent of the run hour.
+    now = timezone.now().astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
     monkeypatch.setattr(timezone, "now", lambda: now)
     membership = attach_active_membership(active_user, store_product)
     store_product.csa_quota_cost = Decimal("1")
@@ -29,7 +30,7 @@ def context(active_user, store_product, monkeypatch):
         name="CSA",
         opens_at=now - timedelta(hours=1),
         closes_at=now + timedelta(hours=1),
-        delivery_at=now + timedelta(days=1),
+        delivery_date=timezone.localdate(now) + timedelta(days=1),
         actor=active_user,
     )
     round_ = service.publish_round(round_id=round_.pk, actor=active_user)
@@ -52,7 +53,7 @@ def test_round_schedule_no_overlapping_published_windows(context):
         name="Next",
         opens_at=now,
         closes_at=now + timedelta(hours=2),
-        delivery_at=round_.delivery_at,
+        delivery_date=round_.delivery_date,
         actor=user,
     )
     with pytest.raises(service.CSARoundError, match="csa_round_schedule_conflict"):
@@ -85,7 +86,7 @@ def test_reopen_confirm_twice_and_expiry_refunds_once(context):
     user, _, membership, round_, _ = context
     selection = save(context)
     service.process_round(round_.pk, now=round_.closes_at)
-    deadline = round_.delivery_at - timedelta(hours=1)
+    deadline = service.delivery_start(round_) - timedelta(hours=1)
     for _ in range(2):
         service.reopen_selection(
             selection_id=selection.pk, actor=user, deadline=deadline, now=round_.closes_at
@@ -174,8 +175,8 @@ def test_deadline_must_be_future_and_strictly_before_delivery(context):
     service.process_round(round_.pk, now=round_.closes_at)
     for deadline in (
         round_.closes_at,
-        round_.delivery_at,
-        round_.delivery_at + timedelta(seconds=1),
+        service.delivery_start(round_),
+        service.delivery_start(round_) + timedelta(seconds=1),
     ):
         with pytest.raises(service.CSARoundError, match="csa_reselection_deadline_invalid"):
             service.reopen_selection(
@@ -194,7 +195,7 @@ def test_freeze_preserves_old_round_until_delivery_day_and_blocks_new_round(cont
     quota.cycle.end_date = tomorrow
     quota.cycle.save(update_fields=["end_date"])
     round_.closes_at = now + timedelta(days=1, hours=1)
-    round_.delivery_at = now + timedelta(days=3)
+    round_.delivery_date = timezone.localdate(now) + timedelta(days=3)
     round_.save()
     selection = save(context, 1)
     later = now + timedelta(days=1, hours=2)
@@ -206,7 +207,9 @@ def test_freeze_preserves_old_round_until_delivery_day_and_blocks_new_round(cont
     assert quota.remaining_units == 4
     service.process_round(round_.pk)
     service.reopen_selection(
-        selection_id=selection.pk, actor=user, deadline=round_.delivery_at - timedelta(hours=1)
+        selection_id=selection.pk,
+        actor=user,
+        deadline=service.delivery_start(round_) - timedelta(hours=1),
     )
     save(context, 3)
     service.confirm_selection(selection_id=selection.pk, user=user)
@@ -216,7 +219,7 @@ def test_freeze_preserves_old_round_until_delivery_day_and_blocks_new_round(cont
         name="Next",
         opens_at=later,
         closes_at=later + timedelta(hours=1),
-        delivery_at=round_.delivery_at,
+        delivery_date=round_.delivery_date,
         actor=user,
     )
     service.publish_round(round_id=next_.pk, actor=user)
@@ -224,7 +227,10 @@ def test_freeze_preserves_old_round_until_delivery_day_and_blocks_new_round(cont
         service.save_selection(
             round_id=next_.pk, user=user, lines=[{"product_id": product.pk, "quantity": 1}]
         )
-    day_after = round_.delivery_at + timedelta(days=1)
+    delivery_day_end = service.delivery_start(round_) + timedelta(hours=23, minutes=59, seconds=59)
+    monkeypatch.setattr(timezone, "now", lambda: delivery_day_end)
+    assert sync_membership_status(member).status == "frozen"
+    day_after = service.delivery_start(round_) + timedelta(days=1)
     monkeypatch.setattr(timezone, "now", lambda: day_after)
     assert sync_membership_status(member).status == "ended"
 
@@ -258,7 +264,7 @@ def test_order_can_be_allocated_and_delivered_without_double_debit(context):
         service.reopen_selection(
             selection_id=selected.pk,
             actor=context[0],
-            deadline=context[3].delivery_at - timedelta(hours=1),
+            deadline=service.delivery_start(context[3]) - timedelta(hours=1),
             now=context[3].closes_at,
         )
     deliver_store_order(order_id=order.pk, actor=context[0], idempotency_key=uuid.uuid4())
@@ -313,12 +319,12 @@ def test_month_rollover_edit_cannot_double_count_preserved_hold(context, monkeyp
     quota.cycle.save(update_fields=["end_date"])
     later = now.replace(year=boundary.year, month=boundary.month, day=boundary.day)
     round_.closes_at = later + timedelta(hours=1)
-    round_.delivery_at = later + timedelta(days=1)
+    round_.delivery_date = timezone.localdate(later) + timedelta(days=1)
     round_.save()
     from farms.models import FarmProductStockBatch
 
     FarmProductStockBatch.objects.filter(farm_product__product=context[1]).update(
-        end_date=timezone.localdate(round_.delivery_at)
+        end_date=round_.delivery_date
     )
     save(context, 2)
     monkeypatch.setattr(timezone, "now", lambda: later)
@@ -343,7 +349,7 @@ def test_admin_api_round_crud_publish_cancel_and_private_contract(context, acces
         "name": "Later",
         "opens_at": (round_.closes_at + timedelta(seconds=1)).isoformat(),
         "closes_at": (round_.closes_at + timedelta(hours=1)).isoformat(),
-        "delivery_at": round_.delivery_at.isoformat(),
+        "delivery_date": round_.delivery_date.isoformat(),
     }
     response = client.post("/api/v1/admin/csa-rounds", {**request, "products": []}, format="json")
     assert response.status_code == 400
@@ -399,7 +405,7 @@ def test_frozen_old_order_does_not_take_new_membership_points(context, monkeypat
     member.end_date = timezone.localdate(now) + timedelta(days=1)
     member.save(update_fields=["end_date"])
     round_.closes_at = now + timedelta(hours=2)
-    round_.delivery_at = now + timedelta(days=2)
+    round_.delivery_date = timezone.localdate(now) + timedelta(days=2)
     round_.save()
     selected = save(context, 1)
     service.process_round(round_.pk, now=round_.closes_at)
@@ -418,7 +424,9 @@ def test_frozen_old_order_does_not_take_new_membership_points(context, monkeypat
     fresh.farmbrite_order_reference_key = str(uuid.uuid4())
     fresh.save(force_insert=True)
     service.reopen_selection(
-        selection_id=selected.pk, actor=user, deadline=round_.delivery_at - timedelta(hours=1)
+        selection_id=selected.pk,
+        actor=user,
+        deadline=service.delivery_start(round_) - timedelta(hours=1),
     )
     save(context, 3)
     service.confirm_selection(selection_id=selected.pk, user=user)
@@ -434,7 +442,7 @@ def test_order_detail_reconciles_expired_reselection_without_worker(
     selected = save(context)
     service.process_round(context[3].pk, now=context[3].closes_at)
     selected.refresh_from_db()
-    deadline = context[3].delivery_at - timedelta(hours=1)
+    deadline = service.delivery_start(context[3]) - timedelta(hours=1)
     service.reopen_selection(
         selection_id=selected.pk, actor=context[0], deadline=deadline, now=context[3].closes_at
     )
@@ -465,7 +473,7 @@ def test_store_release_at_cycle_boundary_preserves_csa_points(
     quota.cycle.end_date = timezone.localdate(tomorrow)
     quota.cycle.save(update_fields=["end_date"])
     round_.closes_at = tomorrow + timedelta(hours=1)
-    round_.delivery_at = tomorrow + timedelta(days=1)
+    round_.delivery_date = timezone.localdate(tomorrow) + timedelta(days=1)
     round_.save()
     save(context, 1)
     from types import SimpleNamespace
@@ -487,3 +495,34 @@ def test_store_release_at_cycle_boundary_preserves_csa_points(
     cancel_store_order(order_id=order_id, actor=user, idempotency_key=uuid.uuid4(), reason="cancel")
     quota.refresh_from_db()
     assert quota.remaining_units == 1
+
+
+@pytest.mark.parametrize("hour", [15, 16, 17])
+def test_shared_context_remains_valid_around_vietnam_midnight(
+    active_user, store_product, monkeypatch, request, hour
+):
+    late = timezone.now().replace(hour=hour, minute=30, second=0, microsecond=0)
+    monkeypatch.setattr(timezone, "now", lambda: late)
+    value = request.getfixturevalue("context")
+    round_ = value[3]
+    assert round_.closes_at < service.delivery_start(round_)
+    assert round_.closes_at < service.delivery_start(round_) - timedelta(hours=1)
+    selected = save(value)
+    assert selected.lines.count() == 1
+
+
+def test_native_csa_buy_again_is_rejected_by_api_as_well_as_projection(context):
+    from types import SimpleNamespace
+
+    selected = save(context)
+    service.process_round(context[3].pk, now=context[3].closes_at)
+    selected.refresh_from_db()
+    client = APIClient()
+    client.force_authenticate(context[0], token=SimpleNamespace(scope="profile email"))
+    detail = client.get(f"/api/v1/store-orders/{selected.order_id}")
+    assert detail.status_code == 200
+    assert detail.json()["data"]["can_buy_again"] is False
+    before = StoreOrder.objects.count()
+    response = client.get(f"/api/v1/store-orders/{selected.order_id}/buy-again?locale=vi")
+    assert response.status_code == 404
+    assert StoreOrder.objects.count() == before

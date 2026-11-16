@@ -1,6 +1,7 @@
 import hashlib
 import secrets
-from datetime import timedelta
+from datetime import UTC, timedelta
+from uuid import UUID
 
 from django.conf import settings
 from django.db.models import Prefetch, Q, prefetch_related_objects
@@ -31,6 +32,8 @@ from commerce.serializers import (
     StoreOrderQuerySerializer,
     StoreQuoteSerializer,
     StoreRecordPaymentSerializer,
+    StoreRefundRequestAccessSerializer,
+    StoreRefundRequestCloseSerializer,
     StoreRefundSerializer,
     StoreRestockSerializer,
     StoreVoucherPreviewSerializer,
@@ -40,6 +43,7 @@ from commerce.store_orders import (
     approve_store_order,
     cancel_pending_store_order,
     cancel_store_order,
+    close_store_refund_request,
     create_store_checkout,
     deliver_store_order,
     expire_order_if_needed,
@@ -47,6 +51,7 @@ from commerce.store_orders import (
     record_store_payment,
     refund_store_order,
     report_store_transfer,
+    request_store_refund,
     restock_store_order,
     restock_unavailable_reason,
     source_inventory,
@@ -133,6 +138,15 @@ def _line_payload(line, request=None):
     }
 
 
+def _can_buy_again(order, viewer):
+    return bool(
+        viewer
+        and viewer.is_authenticated
+        and order.buyer_user_id == viewer.pk
+        and not getattr(order, "csa_selection", None)
+    )
+
+
 def order_payload(order, *, guest_token=None, admin=False, request=None):
     viewer = getattr(request, "user", None)
     lines = getattr(order, "payload_lines", None)
@@ -141,7 +155,7 @@ def order_payload(order, *, guest_token=None, admin=False, request=None):
             order.lines.select_related("product__primary_image").order_by("position", "id")
         )
     payment = None
-    if order.total_vnd:
+    if order.total_vnd and (order.workflow_version == 1 or order.approved_at is not None):
         payment = {
             "status": order.payment_status,
             "bank_bin": order.bank_bin_snapshot,
@@ -167,12 +181,12 @@ def order_payload(order, *, guest_token=None, admin=False, request=None):
         }
     result = {
         "id": str(order.pk),
-        "can_buy_again": bool(
-            viewer and viewer.is_authenticated and order.buyer_user_id == viewer.pk
-        ),
+        "can_buy_again": _can_buy_again(order, viewer),
         "reference_code": order.reference_code,
         "status": order.status,
+        "workflow_version": order.workflow_version,
         "payment_status": order.payment_status,
+        "refund_status": order.refund_status,
         "locale": order.locale,
         "lines": [_line_payload(line, request) for line in lines],
         "shipping_address": {
@@ -191,14 +205,45 @@ def order_payload(order, *, guest_token=None, admin=False, request=None):
         "shipping_discount_reason": order.shipping_discount_reason or None,
         "total_vnd": str(order.total_vnd),
         "payment": payment,
-        "expires_at": order.expires_at.isoformat() if order.expires_at else None,
+        "expires_at": order.expires_at.astimezone(UTC).isoformat() if order.expires_at else None,
         "server_time": timezone.now().isoformat(),
         "transfer_reported_at": order.transfer_reported_at.isoformat()
         if order.transfer_reported_at
         else None,
+        "transfer_reported_by": str(order.transfer_reported_by_id)
+        if order.transfer_reported_by_id
+        else None,
         "approved_at": order.approved_at.isoformat() if order.approved_at else None,
+        "approved_by": str(order.approved_by_id) if order.approved_by_id else None,
+        "payment_received_at": order.payment_received_at.isoformat()
+        if order.payment_received_at
+        else None,
+        "payment_received_by": str(order.payment_received_by_id)
+        if order.payment_received_by_id
+        else None,
+        "refund_requested_at": order.refund_requested_at.isoformat()
+        if order.refund_requested_at
+        else None,
+        "refund_requested_by": str(order.refund_requested_by_id)
+        if order.refund_requested_by_id
+        else None,
+        "refund_request_closed_at": order.refund_request_closed_at.isoformat()
+        if order.refund_request_closed_at
+        else None,
+        "refund_request_closed_by": str(order.refund_request_closed_by_id)
+        if order.refund_request_closed_by_id
+        else None,
+        "refund_request_closed_reason": order.refund_request_closed_reason or None,
+        "refunded_at": order.refunded_at.isoformat() if order.refunded_at else None,
+        "refunded_by": str(order.refunded_by_id) if order.refunded_by_id else None,
+        "refund_amount_vnd": str(order.refund_amount_vnd)
+        if order.refund_amount_vnd is not None
+        else None,
+        "refund_note": order.refund_note,
         "delivered_at": order.delivered_at.isoformat() if order.delivered_at else None,
+        "delivered_by": str(order.delivered_by_id) if order.delivered_by_id else None,
         "cancelled_at": order.cancelled_at.isoformat() if order.cancelled_at else None,
+        "cancelled_by": str(order.cancelled_by_id) if order.cancelled_by_id else None,
         "cancellation_reason": order.cancellation_reason or None,
         "reconciliation_note": order.reconciliation_note,
         "created_at": order.created_at.isoformat(),
@@ -207,7 +252,6 @@ def order_payload(order, *, guest_token=None, admin=False, request=None):
     csa = getattr(order, "csa_selection", None)
     if csa:
         result["csa"] = {"round": round_payload(csa.round), "selection": selection_payload(csa)}
-        result["can_buy_again"] = False
     if guest_token:
         result["guest_access_token"] = guest_token
     if admin:
@@ -285,21 +329,40 @@ def overdue_csa_order_filter(*, now):
     )
 
 
+def overdue_order_filter(*, now):
+    return overdue_csa_order_filter(now=now) | Q(
+        status__in=["pending_review", "payment_pending", "payment_review"],
+        expires_at__lte=now,
+        csa_selection__isnull=True,
+    )
+
+
 def filter_order_list_status(rows, requested_status, *, now):
     if not requested_status:
         return rows
     # Count/filter overdue CSA orders as cancelled even when they are off-page.
     # The worker owns global reconciliation; reads only reconcile the returned page.
-    overdue = overdue_csa_order_filter(now=now)
+    overdue = overdue_order_filter(now=now)
     if requested_status == "cancelled":
         return rows.filter(Q(status="cancelled") | overdue)
-    if requested_status == "pending_review":
+    if requested_status in {"pending_review", "payment_pending", "payment_review"}:
         return rows.filter(status=requested_status).exclude(overdue)
     return rows.filter(status=requested_status)
 
 
+def filter_order_list_payment_status(rows, requested_status, *, now):
+    # Expiry can turn an existing receipt into a refund before the worker runs.
+    # Apply the same effective state to filtering/counts and returned rows.
+    overdue_received = overdue_order_filter(now=now) & Q(payment_status="received")
+    if requested_status == "refund_required":
+        return rows.filter(Q(payment_status="refund_required") | overdue_received)
+    if requested_status == "received":
+        return rows.filter(payment_status="received").exclude(overdue_received)
+    return rows.filter(payment_status=requested_status)
+
+
 def order_list_page(rows, *, page, page_size, now):
-    rows = rows.annotate(csa_reselection_overdue=overdue_csa_order_filter(now=now))
+    rows = rows.annotate(csa_reselection_overdue=overdue_order_filter(now=now))
     items = list(order_list_queryset(rows)[(page - 1) * page_size : page * page_size])
     overdue_ids = []
     for order in items:
@@ -364,6 +427,21 @@ class PublicStoreCheckoutView(APIView):
         if error_response := public_store_scope_error(request):
             return error_response
         serializer = StoreCheckoutSerializer(data=request.data)
+        if hasattr(request.data, "get") and "delivery_date" not in request.data:
+            # Requests created before delivery dates were introduced must replay
+            # their exact original payload. The service still verifies owner and
+            # fingerprint before returning that order; new checkout stays strict.
+            try:
+                replay_key = UUID(str(request.data.get("idempotency_key", "")))
+            except (ValueError, TypeError, AttributeError):
+                replay_key = None
+            if (
+                replay_key
+                and StoreOrder.objects.filter(
+                    create_idempotency_key=replay_key, workflow_version=1
+                ).exists()
+            ):
+                serializer.fields["delivery_date"].required = False
         serializer.is_valid(raise_exception=True)
         try:
             order, guest_token, created = create_store_checkout(
@@ -410,6 +488,31 @@ class PublicStoreOrderCancelView(APIView):
         serializer.is_valid(raise_exception=True)
         try:
             order = cancel_pending_store_order(
+                order_id=order_id,
+                user=request.user,
+                guest_token=serializer.validated_data.get("access_token", ""),
+                idempotency_key=serializer.validated_data["idempotency_key"],
+                request_refund=serializer.validated_data["request_refund"],
+            )
+        except (StoreOrder.DoesNotExist, StoreOrderError) as error:
+            return store_error(
+                error
+                if isinstance(error, StoreOrderError)
+                else StoreOrderError("store_order_not_found")
+            )
+        return no_store(Response({"data": order_payload(order, request=request)}))
+
+
+class PublicStoreRefundRequestView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request, order_id):
+        if error_response := public_store_scope_error(request):
+            return error_response
+        serializer = StoreRefundRequestAccessSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            order = request_store_refund(
                 order_id=order_id,
                 user=request.user,
                 guest_token=serializer.validated_data.get("access_token", ""),
@@ -468,6 +571,8 @@ class SelfStoreBuyAgainView(APIView):
         query = PublicStoreLocaleSerializer(data=request.query_params.dict())
         query.is_valid(raise_exception=True)
         order = get_object_or_404(StoreOrder, pk=order_id, buyer_user=request.user)
+        if not _can_buy_again(order, request.user):
+            return store_error(StoreOrderError("store_order_not_found"))
         lines = list(order.lines.order_by("position", "id"))
         products = {
             product.pk: product
@@ -511,7 +616,7 @@ class AdminStoreOrderListView(APIView):
             StoreOrder.objects.all(), query.validated_data.get("status"), now=now
         )
         if payment_status := query.validated_data.get("payment_status"):
-            rows = rows.filter(payment_status=payment_status)
+            rows = filter_order_list_payment_status(rows, payment_status, now=now)
         if search := query.validated_data["search"]:
             rows = rows.filter(
                 Q(reference_code__icontains=search)
@@ -687,7 +792,7 @@ class AdminStoreOrderCancelView(APIView):
                 actor=request.user,
                 idempotency_key=serializer.validated_data["idempotency_key"],
                 reason=serializer.validated_data["reason"],
-                reconciliation_note=serializer.validated_data["reconciliation_note"],
+                reconciliation_note=serializer.validated_data.get("reconciliation_note"),
             )
         except (StoreOrder.DoesNotExist, StoreOrderError) as error:
             return store_error(
@@ -731,6 +836,28 @@ class AdminStoreOrderRefundView(APIView):
                 order_id=order_id,
                 actor=request.user,
                 **serializer.validated_data,
+            )
+        except (StoreOrder.DoesNotExist, StoreOrderError) as error:
+            return store_error(
+                error
+                if isinstance(error, StoreOrderError)
+                else StoreOrderError("store_order_not_found")
+            )
+        return no_store(Response({"data": order_payload(order, request=request, admin=True)}))
+
+
+class AdminStoreRefundRequestCloseView(APIView):
+    permission_classes = [IsWebsiteAdmin]
+
+    def post(self, request, order_id):
+        serializer = StoreRefundRequestCloseSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            order = close_store_refund_request(
+                order_id=order_id,
+                actor=request.user,
+                idempotency_key=serializer.validated_data["idempotency_key"],
+                reason=serializer.validated_data["reason"],
             )
         except (StoreOrder.DoesNotExist, StoreOrderError) as error:
             return store_error(

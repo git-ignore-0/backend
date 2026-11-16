@@ -3,7 +3,8 @@ import json
 import secrets
 import uuid
 from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 from django.db import connection, transaction
 from django.db.models import Q, Sum
@@ -43,6 +44,7 @@ from memberships.coupons import (
     store_coupon_snapshot,
 )
 from memberships.models import (
+    CouponUsage,
     Membership,
     MembershipCycle,
     MembershipCycleQuota,
@@ -63,15 +65,43 @@ from memberships.services import (
     quota_availability_rows,
     sync_membership_status,
 )
-from memberships.voucher_usage import consume_coupon, release_coupon
+from memberships.voucher_usage import consume_coupon, lock_coupons, release_coupon
 from referrals.store_rewards import (
     evaluate_store_referral_reward,
     lock_store_referral_referrer,
     store_referral_rewards_active,
 )
 
-PAYMENT_WINDOW = timedelta(minutes=5)
 REVIEW_WINDOW = timedelta(hours=8)
+NEW_PAYMENT_WINDOW = timedelta(hours=12)
+VIETNAM = ZoneInfo("Asia/Ho_Chi_Minh")
+WAITING_STATES = {
+    StoreOrderStatus.PENDING_REVIEW,
+    StoreOrderStatus.PAYMENT_PENDING,
+    StoreOrderStatus.PAYMENT_REVIEW,
+}
+
+
+def delivery_end(order):
+    return datetime.combine(order.delivery_date + timedelta(days=1), time.min, VIETNAM)
+
+
+def _workflow_deadline(order, started_at):
+    return min(started_at + NEW_PAYMENT_WINDOW, delivery_end(order))
+
+
+def _expiry_reason(order):
+    if order.workflow_version == 1:
+        return "expired"
+    end = delivery_end(order)
+    # The stored deadline is the decision, even when reconciliation runs late.
+    if end <= order.expires_at:
+        return "delivery_date_expired"
+    return (
+        "payment_review_expired"
+        if order.status == StoreOrderStatus.PAYMENT_REVIEW
+        else "payment_expired"
+    )
 
 
 class StoreOrderError(Exception):
@@ -201,6 +231,7 @@ def _active_reserved_stock(product_ids, *, exclude_order=None, exclude_selection
         line__order__status__in=[
             StoreOrderStatus.PAYMENT_PENDING,
             StoreOrderStatus.PENDING_REVIEW,
+            StoreOrderStatus.PAYMENT_REVIEW,
         ],
         line__order__expires_at__gt=timezone.now(),
     )
@@ -710,7 +741,8 @@ def create_store_checkout(*, user, payload):
         request_fingerprint=fingerprint,
         locale=payload["locale"],
         **address,
-        status=StoreOrderStatus.PAYMENT_PENDING if total else StoreOrderStatus.PENDING_REVIEW,
+        workflow_version=2,
+        status=StoreOrderStatus.PENDING_REVIEW,
         payment_status=StorePaymentStatus.UNCONFIRMED if total else StorePaymentStatus.NOT_REQUIRED,
         coupon=quote["coupon"],
         coupon_snapshot=quote["snapshot"],
@@ -728,7 +760,7 @@ def create_store_checkout(*, user, payload):
         payment_config_version=payment.version if payment else None,
         transfer_content=_reference_code() if payment else None,
         guest_access_token_hash=_hash(guest_token) if guest_token else "",
-        expires_at=now + (PAYMENT_WINDOW if total else REVIEW_WINDOW),
+        expires_at=datetime.combine(quote["delivery_date"] + timedelta(days=1), time.min, VIETNAM),
     )
     for (
         position,
@@ -806,6 +838,7 @@ def _release_reservations(order, reason):
                         line__order__status__in=[
                             StoreOrderStatus.PAYMENT_PENDING,
                             StoreOrderStatus.PENDING_REVIEW,
+                            StoreOrderStatus.PAYMENT_REVIEW,
                         ],
                         line__order__expires_at__gt=now,
                     )
@@ -830,15 +863,17 @@ def _release_reservations(order, reason):
 
 
 def _expire_locked_order(order, *, now):
-    """Expire a pending order once; caller holds its product and membership locks."""
-    if order.status not in {StoreOrderStatus.PAYMENT_PENDING, StoreOrderStatus.PENDING_REVIEW}:
+    """Expire once after taking resource locks; do not reinterpret legacy deadlines."""
+    if order.status not in WAITING_STATES:
         return False
     if order.expires_at is None or now < order.expires_at:
         return False
-    _release_reservations(order, "expired")
+    reason = _expiry_reason(order)
+    _cancel_resources(order, None, reason)
+    _open_cancellation_reconciliation(order, None)
     order.status = StoreOrderStatus.CANCELLED
     order.cancelled_at = now
-    order.cancellation_reason = "expired"
+    order.cancellation_reason = reason
     if order.payment_status == StorePaymentStatus.RECEIVED:
         order.payment_status = StorePaymentStatus.REFUND_REQUIRED
     order.save(
@@ -850,7 +885,7 @@ def _expire_locked_order(order, *, now):
             "updated_at",
         ]
     )
-    release_coupon(store_order=order, reason="expired")
+    release_coupon(store_order=order, reason=reason)
     return True
 
 
@@ -869,11 +904,12 @@ def expire_order_if_needed(order_id, *, now=None):
 @transaction.atomic
 def _expire_store_order_atomic(order_id, *, now=None):
     order = StoreOrder.objects.select_for_update().get(pk=order_id)
-    if order.status not in {StoreOrderStatus.PAYMENT_PENDING, StoreOrderStatus.PENDING_REVIEW}:
+    if order.status not in WAITING_STATES:
         return order, False
-    _lock_order_products(order)
-    _lock_order_memberships(order)
-    return order, _expire_locked_order(order, now=now if now is not None else timezone.now())
+    _lock_cancellation_resources(order)
+    return order, _expire_locked_order(
+        order, now=max(now, timezone.now()) if now is not None else timezone.now()
+    )
 
 
 def _lock_order_products(order):
@@ -893,9 +929,9 @@ def _lock_order_memberships(order):
 def _lock_order_quotas(order):
     _lock_order_memberships(order)
     quota_ids = list(
-        StoreQuotaReservation.objects.filter(
-            line__order=order, released_at__isnull=True, consumed_at__isnull=True
-        )
+        # Committed quota also needs its lock before cancellation's final clock
+        # check, because reversing a consumed usage writes these same rows.
+        StoreQuotaReservation.objects.filter(line__order=order)
         .order_by("cycle_quota_id")
         .values_list("cycle_quota_id", flat=True)
     )
@@ -921,54 +957,216 @@ def report_store_transfer(*, order_id, user, guest_token=""):
     with transaction.atomic():
         order = StoreOrder.objects.select_for_update().get(pk=order_id)
         verify_order_access(order, user=user, guest_token=guest_token)
-        _lock_order_products(order)
-        _lock_order_quotas(order)
-        if order.status == StoreOrderStatus.PENDING_REVIEW and order.transfer_reported_at:
-            return order
-        if order.status != StoreOrderStatus.PAYMENT_PENDING:
-            raise StoreOrderError("store_order_state_conflict")
+        _lock_cancellation_resources(order, actor=user)
         now = timezone.now()
-        if order.expires_at is None or now >= order.expires_at:
-            # A concurrent expiry won the transition; finish it outside this rollback path.
+        if _expire_locked_order(order, now=now):
             expired_id = order.pk
         else:
-            order.status = StoreOrderStatus.PENDING_REVIEW
-            order.transfer_reported_at = now
-            order.expires_at = now + REVIEW_WINDOW
-            order.save(update_fields=["status", "transfer_reported_at", "expires_at", "updated_at"])
+            report_state = (
+                StoreOrderStatus.PAYMENT_REVIEW
+                if order.workflow_version == 2
+                else StoreOrderStatus.PENDING_REVIEW
+            )
+            if order.status == report_state and order.transfer_reported_at:
+                return order
+            if order.status != StoreOrderStatus.PAYMENT_PENDING:
+                raise StoreOrderError("store_order_state_conflict")
+            order.status = report_state
+            order.transfer_reported_at = order.transfer_reported_at or now
+            order.transfer_reported_by = user if user and user.is_authenticated else None
+            order.expires_at = (
+                _workflow_deadline(order, order.transfer_reported_at)
+                if order.workflow_version == 2
+                else now + REVIEW_WINDOW
+            )
+            order.save(
+                update_fields=[
+                    "status",
+                    "transfer_reported_at",
+                    "transfer_reported_by",
+                    "expires_at",
+                    "updated_at",
+                ]
+            )
             return order
-    expire_order_if_needed(expired_id)
-    raise StoreOrderError("store_order_expired")
+    raise StoreOrderError("store_order_expired", context={"order_id": str(expired_id)})
+
+
+def cancel_pending_store_order(
+    *, order_id, user, guest_token, idempotency_key, request_refund=False
+):
+    order, expired = _cancel_pending_store_order_atomic(
+        order_id=order_id,
+        user=user,
+        guest_token=guest_token,
+        idempotency_key=idempotency_key,
+        request_refund=request_refund,
+    )
+    if expired:
+        raise StoreOrderError("store_order_expired")
+    return order
 
 
 @transaction.atomic
-def cancel_pending_store_order(*, order_id, user, guest_token, idempotency_key):
+def _cancel_pending_store_order_atomic(
+    *, order_id, user, guest_token, idempotency_key, request_refund=False
+):
     order = StoreOrder.objects.select_for_update().get(pk=order_id)
     verify_order_access(order, user=user, guest_token=guest_token)
-    fingerprint = request_fingerprint({})
+    fingerprint = request_fingerprint({"request_refund": True} if request_refund else {})
     if _action_replay(order, "buyer_cancel", idempotency_key, fingerprint):
-        return order
-    if order.status != StoreOrderStatus.PAYMENT_PENDING:
+        return order, False
+    _lock_cancellation_resources(order, actor=user)
+    if _expire_locked_order(order, now=timezone.now()):
+        return order, True
+    allowed = {StoreOrderStatus.PAYMENT_PENDING}
+    if order.workflow_version == 2:
+        allowed.add(StoreOrderStatus.PENDING_REVIEW)
+        allowed.add(StoreOrderStatus.PAYMENT_REVIEW)
+    elif request_refund:
+        allowed.add(StoreOrderStatus.PENDING_REVIEW)
+    if order.status not in allowed or (
+        request_refund
+        and (
+            order.total_vnd == 0
+            or (order.workflow_version == 2 and order.status == StoreOrderStatus.PENDING_REVIEW)
+        )
+    ):
         raise StoreOrderError("store_order_state_conflict")
-    _release_reservations(order, "buyer_cancelled")
+    actor = user if user and user.is_authenticated else None
+    previous_status = order.status
+    _cancel_resources(order, actor, "buyer_cancelled")
     order.status = StoreOrderStatus.CANCELLED
     order.cancelled_at = timezone.now()
+    order.cancelled_by = actor
     order.cancellation_reason = "buyer_cancelled"
     order.expires_at = None
     if order.payment_status == StorePaymentStatus.RECEIVED:
         order.payment_status = StorePaymentStatus.REFUND_REQUIRED
+    if order.workflow_version == 2:
+        _open_cancellation_reconciliation(order, actor, previous_status=previous_status)
+    elif request_refund:
+        _open_refund_request(order, actor)
     order.save(
         update_fields=[
             "status",
             "cancelled_at",
+            "cancelled_by",
             "cancellation_reason",
             "expires_at",
             "payment_status",
             "updated_at",
         ]
     )
-    _record_action(order, "buyer_cancel", idempotency_key, fingerprint, None)
+    _record_action(
+        order,
+        "buyer_cancel",
+        idempotency_key,
+        fingerprint,
+        actor,
+        context={
+            "request_refund": request_refund
+            or (
+                order.workflow_version == 2
+                and previous_status
+                in {StoreOrderStatus.PAYMENT_PENDING, StoreOrderStatus.PAYMENT_REVIEW}
+            )
+        },
+    )
     release_coupon(store_order=order, reason="buyer_cancelled")
+    return order, False
+
+
+def _open_cancellation_reconciliation(order, actor, *, previous_status=None):
+    """Only cancellation after payment became possible opens a v2 money review."""
+    status = previous_status if previous_status is not None else order.status
+    if (
+        order.workflow_version == 2
+        and order.total_vnd > 0
+        and status in {StoreOrderStatus.PAYMENT_PENDING, StoreOrderStatus.PAYMENT_REVIEW}
+    ):
+        _open_refund_request(order, actor)
+
+
+def _open_refund_request(order, actor):
+    if order.refund_requested_at is not None and order.refund_request_closed_at is None:
+        return False
+    order.refund_requested_at = timezone.now()
+    order.refund_requested_by = actor
+    order.refund_request_closed_at = None
+    order.refund_request_closed_by = None
+    order.refund_request_closed_reason = ""
+    order.save(
+        update_fields=[
+            "refund_requested_at",
+            "refund_requested_by",
+            "refund_request_closed_at",
+            "refund_request_closed_by",
+            "refund_request_closed_reason",
+            "updated_at",
+        ]
+    )
+    return True
+
+
+@transaction.atomic
+def request_store_refund(*, order_id, user, guest_token, idempotency_key):
+    order = StoreOrder.objects.select_for_update().get(pk=order_id)
+    verify_order_access(order, user=user, guest_token=guest_token)
+    fingerprint = request_fingerprint({})
+    if _action_replay(order, "request_refund", idempotency_key, fingerprint):
+        return order
+    if (
+        order.status != StoreOrderStatus.CANCELLED
+        or not order.total_vnd
+        or order.refund_status == "refunded"
+        or order.workflow_version == 2
+    ):
+        raise StoreOrderError("store_refund_state_conflict")
+    actor = user if user and user.is_authenticated else None
+    opened = _open_refund_request(order, actor)
+    # Persist accepted no-op keys too: retrying one after admin resolution must
+    # not create a second request or change the original request timestamp.
+    _record_action(
+        order, "request_refund", idempotency_key, fingerprint, actor, context={"opened": opened}
+    )
+    return order
+
+
+@transaction.atomic
+def close_store_refund_request(*, order_id, actor, idempotency_key, reason):
+    order = StoreOrder.objects.select_for_update().get(pk=order_id)
+    reason = reason.strip()
+    fingerprint = request_fingerprint({"reason": reason})
+    if _action_replay(order, "close_refund_request", idempotency_key, fingerprint):
+        return order
+    if (
+        not reason
+        or order.status != StoreOrderStatus.CANCELLED
+        or order.refund_status != "pending"
+        or order.payment_received_at is not None
+        or order.payment_status in {StorePaymentStatus.RECEIVED, StorePaymentStatus.REFUND_REQUIRED}
+    ):
+        raise StoreOrderError("store_refund_state_conflict")
+    order.refund_request_closed_at = timezone.now()
+    order.refund_request_closed_by = actor
+    order.refund_request_closed_reason = reason
+    order.save(
+        update_fields=[
+            "refund_request_closed_at",
+            "refund_request_closed_by",
+            "refund_request_closed_reason",
+            "updated_at",
+        ]
+    )
+    _record_action(
+        order,
+        "close_refund_request",
+        idempotency_key,
+        fingerprint,
+        actor,
+        context={"reason": reason},
+    )
     return order
 
 
@@ -1122,6 +1320,7 @@ def _approve_store_order_atomic(*, order_id, actor, idempotency_key, allocations
     if len(allocation_pairs) != len(set(allocation_pairs)):
         raise StoreOrderError("store_allocation_duplicate")
     _lock_order_products(order)
+    _lock_checkout_identity(actor)
     _lock_order_memberships(order)
     if _expire_locked_order(order, now=timezone.now()):
         return order, True
@@ -1153,7 +1352,8 @@ def _approve_store_order_atomic(*, order_id, actor, idempotency_key, allocations
         .order_by("pk")
     }
     _lock_order_quotas(order)
-    # Waiting for a source or quota lock may have crossed the deadline. This is
+    _lock_cancellation_coupon(order)
+    # Waiting for a source, quota or coupon lock may have crossed the deadline. This is
     # the approval decision time; keep it for the recorded approval timestamp.
     decision_at = timezone.now()
     if _expire_locked_order(order, now=decision_at):
@@ -1211,13 +1411,23 @@ def _approve_store_order_atomic(*, order_id, actor, idempotency_key, allocations
         csa.stock_holds.all().delete()
     _consume_reserved_quota(order, actor)
     _release_reservations(order, "approved")
-    order.status = StoreOrderStatus.PENDING_DELIVERY
-    order.approved_at = decision_at
+    order.status = (
+        StoreOrderStatus.PAYMENT_PENDING
+        if order.workflow_version == 2 and order.total_vnd
+        else StoreOrderStatus.PENDING_DELIVERY
+    )
+    order.approved_at = order.approved_at or decision_at
     order.approved_by = actor
-    order.expires_at = None
-    if order.total_vnd:
+    order.expires_at = (
+        _workflow_deadline(order, order.approved_at)
+        if order.status == StoreOrderStatus.PAYMENT_PENDING
+        else None
+    )
+    if order.total_vnd and order.workflow_version == 1:
         order.payment_status = StorePaymentStatus.RECEIVED
-        order.payment_received_at = order.payment_received_at or decision_at
+        if order.payment_received_at is None:
+            order.payment_received_at = decision_at
+            order.payment_received_by = actor
     order.save(
         update_fields=[
             "status",
@@ -1226,6 +1436,7 @@ def _approve_store_order_atomic(*, order_id, actor, idempotency_key, allocations
             "expires_at",
             "payment_status",
             "payment_received_at",
+            "payment_received_by",
             "updated_at",
         ]
     )
@@ -1256,7 +1467,7 @@ def expire_store_orders(*, limit=200, now=None):
     now = now or timezone.now()
     ids = list(
         StoreOrder.objects.filter(
-            status__in=[StoreOrderStatus.PAYMENT_PENDING, StoreOrderStatus.PENDING_REVIEW],
+            status__in=WAITING_STATES,
             expires_at__lte=now,
         )
         .order_by("expires_at")
@@ -1292,9 +1503,9 @@ def _reverse_store_quota(order, actor, reason):
     )
     quotas = {
         quota.pk: quota
-        for quota in MembershipCycleQuota.objects.select_for_update().filter(
-            pk__in=[item.cycle_quota_id for item in allocations]
-        )
+        for quota in MembershipCycleQuota.objects.select_for_update()
+        .filter(pk__in=[item.cycle_quota_id for item in allocations])
+        .order_by("pk")
     }
     today = timezone.localdate()
     for allocation in allocations:
@@ -1312,14 +1523,120 @@ def _reverse_store_quota(order, actor, reason):
     usage.save(update_fields=["status", "reversed_at"])
 
 
-@transaction.atomic
-def cancel_store_order(*, order_id, actor, idempotency_key, reason, reconciliation_note=""):
-    order = StoreOrder.objects.select_for_update().get(pk=order_id)
-    fingerprint = request_fingerprint(
-        {"reason": reason.strip(), "reconciliation_note": reconciliation_note.strip()}
+def _lock_order_stock_sources(order):
+    allocations = list(
+        StoreStockAllocation.objects.filter(line__order=order)
+        .select_related("batch__farm_product")
+        .order_by("pk")
     )
+    if allocations:
+        list(
+            FarmProduct.objects.select_for_update()
+            .filter(pk__in=[item.batch.farm_product_id for item in allocations])
+            .order_by("pk")
+        )
+        list(
+            Farm.objects.select_for_update()
+            .filter(pk__in=[item.batch.farm_product.farm_id for item in allocations])
+            .order_by("pk")
+        )
+        list(
+            FarmProductStockBatch.objects.select_for_update()
+            .filter(pk__in=[item.batch_id for item in allocations])
+            .order_by("pk")
+        )
+    return allocations
+
+
+def _lock_cancellation_coupon(order):
+    if order.coupon_id is not None and order.status in WAITING_STATES:
+        lock_coupons([order.coupon_id])
+        list(CouponUsage.objects.select_for_update().filter(store_order=order).order_by("pk"))
+
+
+def _lock_cancellation_resources(order, *, actor=None, lock_coupon=True):
+    _lock_order_products(order)
+    # Match checkout's Product -> shared User -> Membership order. Actor FK
+    # writes after the coupon lock can then reuse this shared lock without
+    # waiting behind a CSA purchase's exclusive identity lock.
+    if actor is not None and actor.is_authenticated:
+        _lock_checkout_identity(actor)
+    _lock_order_memberships(order)
+    _lock_order_stock_sources(order)
+    _lock_order_quotas(order)
+    if lock_coupon:
+        _lock_cancellation_coupon(order)
+
+
+def _restore_committed_stock(order, actor):
+    """Append reversal movements, including expired/disabled sources, exactly once."""
+    allocations = _lock_order_stock_sources(order)
+    restored = {
+        item["allocation_id"]: item["total"]
+        for item in StoreStockMovement.objects.filter(
+            allocation_id__in=[item.pk for item in allocations], kind=StoreStockMovementKind.RESTOCK
+        )
+        .values("allocation_id")
+        .annotate(total=Sum("quantity"))
+    }
+    for allocation in allocations:
+        remaining = allocation.quantity - restored.get(allocation.pk, 0)
+        if remaining:
+            StoreStockMovement.objects.create(
+                allocation=allocation,
+                batch_id=allocation.batch_id,
+                line_id=allocation.line_id,
+                kind=StoreStockMovementKind.RESTOCK,
+                quantity=remaining,
+                idempotency_key=uuid.uuid5(order.pk, f"cancel:{allocation.pk}"),
+                actor=actor,
+            )
+
+
+def _cancel_resources(order, actor, reason):
+    _lock_order_products(order)
+    _lock_order_memberships(order)
+    from memberships.models import CSASelection
+
+    # Future retail cancellations release committed batches in either workflow.
+    # CSA-native fulfillment keeps its existing resource policy; historical
+    # cancelled orders never enter this transition again.
+    if order.workflow_version == 2 or not CSASelection.objects.filter(order=order).exists():
+        _restore_committed_stock(order, actor)
+    if order.approved_at is not None:
+        _reverse_store_quota(order, actor, reason)
+    _release_reservations(order, reason)
+
+
+def cancel_store_order(*, order_id, actor, idempotency_key, reason, reconciliation_note=None):
+    order, expired = _cancel_store_order_atomic(
+        order_id=order_id,
+        actor=actor,
+        idempotency_key=idempotency_key,
+        reason=reason,
+        reconciliation_note=reconciliation_note,
+    )
+    if expired:
+        raise StoreOrderError("store_order_expired")
+    return order
+
+
+@transaction.atomic
+def _cancel_store_order_atomic(
+    *, order_id, actor, idempotency_key, reason, reconciliation_note=None
+):
+    if not reason.strip():
+        raise StoreOrderError("store_cancellation_reason_required")
+    order = StoreOrder.objects.select_for_update().get(pk=order_id)
+    note = (reconciliation_note or "").strip()
+    # Keep the accepted historical fingerprint: omitted and explicit blank notes
+    # have always shared the same request identity.
+    fingerprint = request_fingerprint({"reason": reason.strip(), "reconciliation_note": note})
     if _action_replay(order, "cancel", idempotency_key, fingerprint):
-        return order
+        return order, False
+    _lock_cancellation_resources(order, actor=actor)
+    if _expire_locked_order(order, now=timezone.now()):
+        return order, True
     if order.status in {StoreOrderStatus.CANCELLED, StoreOrderStatus.DELIVERED}:
         raise StoreOrderError("store_order_state_conflict")
     from memberships.csa_rounds import _cancel_locked
@@ -1327,20 +1644,16 @@ def cancel_store_order(*, order_id, actor, idempotency_key, reason, reconciliati
 
     csa = CSASelection.objects.filter(order=order).first()
     if csa:
-        _lock_order_products(order)
         Membership.objects.select_for_update().get(pk=csa.membership_id)
         _cancel_locked(csa, actor, reason.strip())
-    was_approved = order.status == StoreOrderStatus.PENDING_DELIVERY
-    if was_approved:
-        _reverse_store_quota(order, actor, reason.strip())
-    else:
-        _release_reservations(order, "cancelled")
-    now = timezone.now()
+    _cancel_resources(order, actor, reason.strip())
+    _open_cancellation_reconciliation(order, actor)
     order.status = StoreOrderStatus.CANCELLED
-    order.cancelled_at = now
+    order.cancelled_at = timezone.now()
     order.cancelled_by = actor
     order.cancellation_reason = reason.strip()
-    order.reconciliation_note = reconciliation_note.strip()
+    if reconciliation_note is not None or order.workflow_version == 1:
+        order.reconciliation_note = note
     order.expires_at = None
     if order.payment_status == StorePaymentStatus.RECEIVED:
         order.payment_status = StorePaymentStatus.REFUND_REQUIRED
@@ -1362,10 +1675,10 @@ def cancel_store_order(*, order_id, actor, idempotency_key, reason, reconciliati
         idempotency_key,
         fingerprint,
         actor,
-        context={"reason": reason.strip(), "reconciliation_note": reconciliation_note.strip()},
+        context={"reason": reason.strip(), "reconciliation_note": note},
     )
     release_coupon(store_order=order, reason="cancelled")
-    return order
+    return order, False
 
 
 @transaction.atomic
@@ -1376,17 +1689,59 @@ def record_store_payment(*, order_id, actor, idempotency_key, note=""):
         return order
     if order.total_vnd == 0 or order.payment_status == StorePaymentStatus.REFUNDED:
         raise StoreOrderError("store_payment_state_conflict")
+    _lock_cancellation_resources(order, actor=actor, lock_coupon=False)
     lock_store_referral_referrer(order)
+    _lock_cancellation_coupon(order)
+    _expire_locked_order(order, now=timezone.now())
+    if order.workflow_version == 2:
+        if order.status == StoreOrderStatus.CANCELLED and (
+            order.refund_request_closed_at is not None or order.refund_status != "pending"
+        ):
+            raise StoreOrderError("store_payment_state_conflict")
+        if order.status not in {
+            StoreOrderStatus.PAYMENT_PENDING,
+            StoreOrderStatus.PAYMENT_REVIEW,
+            StoreOrderStatus.CANCELLED,
+            StoreOrderStatus.PENDING_DELIVERY,
+        }:
+            raise StoreOrderError("store_payment_state_conflict")
+        if order.status == StoreOrderStatus.PENDING_DELIVERY and order.payment_received_at is None:
+            raise StoreOrderError("store_payment_state_conflict")
+    if order.payment_status in {StorePaymentStatus.RECEIVED, StorePaymentStatus.REFUND_REQUIRED}:
+        _record_action(
+            order,
+            "record_payment",
+            idempotency_key,
+            fingerprint,
+            actor,
+            context={"note": note.strip(), "amount_vnd": order.total_vnd, "already_received": True},
+        )
+        return order
     order.payment_received_at = order.payment_received_at or timezone.now()
+    order.payment_received_by = actor
     order.payment_status = (
         StorePaymentStatus.REFUND_REQUIRED
         if order.status == StoreOrderStatus.CANCELLED
         else StorePaymentStatus.RECEIVED
     )
+    if order.workflow_version == 2 and order.status in {
+        StoreOrderStatus.PAYMENT_PENDING,
+        StoreOrderStatus.PAYMENT_REVIEW,
+    }:
+        order.status = StoreOrderStatus.PENDING_DELIVERY
+        order.expires_at = None
     if note.strip():
         order.reconciliation_note = note.strip()
     order.save(
-        update_fields=["payment_received_at", "payment_status", "reconciliation_note", "updated_at"]
+        update_fields=[
+            "payment_received_at",
+            "payment_received_by",
+            "payment_status",
+            "status",
+            "expires_at",
+            "reconciliation_note",
+            "updated_at",
+        ]
     )
     _record_action(
         order,

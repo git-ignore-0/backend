@@ -43,7 +43,7 @@ class RoundInput(StrictSerializer):
     name = serializers.CharField(max_length=200)
     opens_at = serializers.DateTimeField()
     closes_at = serializers.DateTimeField()
-    delivery_at = serializers.DateTimeField()
+    delivery_date = serializers.DateField()
 
 
 class LineInput(StrictSerializer):
@@ -260,7 +260,7 @@ class MemberRounds(PrivateView):
         rows = (
             CSARound.objects.filter(published_at__isnull=False)
             .filter(
-                Q(delivery_at__gte=timezone.now())
+                Q(delivery_date__gte=timezone.now().astimezone(domain.VIETNAM).date())
                 | Q(selections__membership__customer__user=request.user)
             )
             .distinct()
@@ -315,7 +315,7 @@ class MemberProducts(PrivateView):
         existing = CSASelection.objects.filter(
             round=round_, membership__customer__user=request.user
         ).first()
-        today = timezone.localdate()
+        today = timezone.now().astimezone(domain.VIETNAM).date()
         member = (
             existing.membership
             if existing

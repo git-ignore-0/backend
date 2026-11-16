@@ -196,6 +196,7 @@ class ProductTranslation(models.Model):
 class StoreOrderStatus(models.TextChoices):
     PAYMENT_PENDING = "payment_pending", "Payment pending"
     PENDING_REVIEW = "pending_review", "Pending review"
+    PAYMENT_REVIEW = "payment_review", "Payment review"
     PENDING_DELIVERY = "pending_delivery", "Pending delivery"
     DELIVERED = "delivered", "Delivered"
     CANCELLED = "cancelled", "Cancelled"
@@ -215,6 +216,8 @@ class StoreStockMovementKind(models.TextChoices):
 
 
 class StoreOrder(models.Model):
+    # Historical and CSA-native orders retain their original transitions/deadlines.
+    workflow_version = models.PositiveSmallIntegerField(default=1, editable=False)
     referral_rewards_eligible = models.BooleanField(default=False, editable=False)
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     reference_code = models.CharField(max_length=24, unique=True, editable=False)
@@ -264,6 +267,37 @@ class StoreOrder(models.Model):
     expires_at = models.DateTimeField(null=True, blank=True)
     transfer_reported_at = models.DateTimeField(null=True, blank=True)
     payment_received_at = models.DateTimeField(null=True, blank=True)
+    transfer_reported_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        related_name="store_transfers_reported",
+        on_delete=models.SET_NULL,
+    )
+    payment_received_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        related_name="store_payments_received",
+        on_delete=models.SET_NULL,
+    )
+    refund_requested_at = models.DateTimeField(null=True, blank=True)
+    refund_requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        related_name="store_refunds_requested",
+        on_delete=models.SET_NULL,
+    )
+    refund_request_closed_at = models.DateTimeField(null=True, blank=True)
+    refund_request_closed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        related_name="store_refund_requests_closed",
+        on_delete=models.SET_NULL,
+    )
+    refund_request_closed_reason = models.TextField(blank=True)
     approved_at = models.DateTimeField(null=True, blank=True)
     approved_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -344,6 +378,16 @@ class StoreOrder(models.Model):
 
     def __str__(self):
         return self.reference_code
+
+    @property
+    def refund_status(self):
+        if self.payment_status == StorePaymentStatus.REFUNDED:
+            return "refunded"
+        if self.payment_status == StorePaymentStatus.REFUND_REQUIRED or (
+            self.refund_requested_at is not None and self.refund_request_closed_at is None
+        ):
+            return "pending"
+        return None
 
 
 class StoreOrderLine(models.Model):

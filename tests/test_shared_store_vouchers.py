@@ -376,8 +376,9 @@ def test_voucher_approval_cancel_refund_and_buy_again_keep_snapshots(context, ac
     )
     assert created.status_code == 201
     order = StoreOrder.objects.get()
-    report_store_transfer(order_id=order.pk, user=active_user)
     approve_review_order({"id": order.pk}, active_user)
+    report_store_transfer(order_id=order.pk, user=active_user)
+    record_store_payment(order_id=order.pk, actor=active_user, idempotency_key=uuid.uuid4())
     order.refresh_from_db()
     assert order.status == "pending_delivery"
     voucher.refresh_from_db()
@@ -444,6 +445,9 @@ def test_store_usage_release_survives_deleted_csa_catalog(context, active_user, 
         expire_order_if_needed(order.pk)
         expire_order_if_needed(order.pk)
     else:
+        from tests.test_store_orders import approve_review_order
+
+        approve_review_order({"id": order.pk}, active_user)
         record_store_payment(order_id=order.pk, actor=active_user, idempotency_key=uuid.uuid4())
         cancel_store_order(
             order_id=order.pk,

@@ -64,9 +64,9 @@ def test_companion_configuration_and_committed_csa_only(context, monkeypatch):
         round_id=round_.pk,
         actor=user,
         companion_delivery_enabled=True,
-        companion_delivery_cutoff=round_.delivery_at - timedelta(minutes=1),
+        companion_delivery_cutoff=csa_rounds.delivery_start(round_) - timedelta(minutes=1),
     )
-    date = timezone.localdate(round_.delivery_at).isoformat()
+    date = round_.delivery_date.isoformat()
 
     def free():
         return {
@@ -96,7 +96,7 @@ def companion(context, monkeypatch):
         round_id=round_.pk,
         actor=user,
         companion_delivery_enabled=True,
-        companion_delivery_cutoff=round_.delivery_at - timedelta(minutes=30),
+        companion_delivery_cutoff=csa_rounds.delivery_start(round_) - timedelta(minutes=30),
     )
     selected.refresh_from_db()
     return context, selected
@@ -104,7 +104,7 @@ def companion(context, monkeypatch):
 
 def preview_body(context, *, day=None, quota=False):
     return {
-        "delivery_date": (day or context[3].delivery_at.astimezone(VIETNAM).date()).isoformat(),
+        "delivery_date": (day or context[3].delivery_date).isoformat(),
         "lines": [{"product_id": str(context[1].pk), "quantity": 1, "use_quota": quota}],
     }
 
@@ -140,8 +140,8 @@ def test_admin_rejects_invalid_cutoff(context, admin_client, invalid):
     value = {
         "yesterday": now - timedelta(days=1),
         "now": now,
-        "delivery": round_.delivery_at,
-        "later": round_.delivery_at + timedelta(seconds=1),
+        "delivery": csa_rounds.delivery_start(round_),
+        "later": csa_rounds.delivery_start(round_) + timedelta(seconds=1),
     }
     body = {"companion_delivery_enabled": True}
     if invalid != "missing":
@@ -234,10 +234,10 @@ def test_multiple_rounds_same_day_checks_all_sources(companion):
         name="Second",
         opens_at=round_.opens_at,
         closes_at=round_.closes_at,
-        delivery_at=round_.delivery_at,
+        delivery_date=round_.delivery_date,
         published_at=context[4],
         companion_delivery_enabled=True,
-        companion_delivery_cutoff=round_.delivery_at - timedelta(minutes=1),
+        companion_delivery_cutoff=csa_rounds.delivery_start(round_) - timedelta(minutes=1),
     )
     order = copy(selected.order)
     order.pk = uuid4()
@@ -423,8 +423,11 @@ def test_vietnam_delivery_day_differs_from_utc(companion):
     CSARound.objects.filter(pk=context[3].pk).update(
         opens_at=context[4] - timedelta(hours=2),
         closes_at=context[4] - timedelta(minutes=1),
-        delivery_at=delivery,
-        companion_delivery_cutoff=delivery - timedelta(minutes=1),
+        delivery_date=delivery.date(),
+        companion_delivery_cutoff=datetime.combine(
+            delivery.date(), datetime.min.time(), tzinfo=VIETNAM
+        )
+        - timedelta(minutes=1),
     )
     days = {
         d["delivery_date"]: d["free_shipping"] for d in delivery_calendar(user=context[0])["dates"]
@@ -575,7 +578,9 @@ def test_admin_can_close_after_expiry_and_reopen_with_new_deadline(
         path,
         {
             "companion_delivery_enabled": True,
-            "companion_delivery_cutoff": (row.delivery_at - timedelta(seconds=1)).isoformat(),
+            "companion_delivery_cutoff": (
+                csa_rounds.delivery_start(row) - timedelta(seconds=1)
+            ).isoformat(),
         },
         format="json",
     )
@@ -628,7 +633,8 @@ def test_placed_retail_order_survives_real_csa_cancellation(companion, payment_s
     selection.refresh_from_db()
     assert selection.state == "cancelled"
     order = StoreOrder.objects.get(pk=created.data["data"]["id"])
-    assert order.status == "payment_pending"
+    assert order.status == "pending_review"
+    assert order.workflow_version == 2
     assert order.shipping_fee_vnd == 0
     assert order.shipping_benefit_snapshot == snapshot
 
@@ -690,7 +696,7 @@ def test_frozen_only_blocked_but_renewal_can_use_original_csa_trip(context, monk
         round_id=round_.pk,
         actor=user,
         companion_delivery_enabled=True,
-        companion_delivery_cutoff=round_.delivery_at - timedelta(minutes=1),
+        companion_delivery_cutoff=csa_rounds.delivery_start(round_) - timedelta(minutes=1),
     )
     assert member_client(user).get("/api/v1/public/store-delivery-dates").status_code == 409
     fresh = copy(old)
@@ -710,11 +716,10 @@ def test_frozen_only_blocked_but_renewal_can_use_original_csa_trip(context, monk
 
 
 @pytest.mark.django_db(transaction=True)
-def test_additive_migrations_keep_legacy_orders_and_rounds_unconfigured(companion):
+def test_additive_migrations_keep_legacy_orders_and_rounds_unconfigured():
     from django.db import connection
     from django.db.migrations.executor import MigrationExecutor
 
-    context, selected = companion
     executor = MigrationExecutor(connection)
     latest = executor.loader.graph.leaf_nodes()
     old = [
@@ -722,24 +727,43 @@ def test_additive_migrations_keep_legacy_orders_and_rounds_unconfigured(companio
         ("memberships", "0036_csa_round_cancellation_audit"),
     ]
     try:
+        # Build real old-schema records; date-only rounds cannot be reversed into
+        # invented legacy delivery times solely to create a migration fixture.
         executor.migrate(old)
         executor = MigrationExecutor(connection)
         historical = executor.loader.project_state(old).apps
+        legacy_round = historical.get_model("memberships", "CSARound").objects.create(
+            sequence=1,
+            name="Legacy",
+            opens_at=datetime(2026, 11, 10, 1, tzinfo=UTC),
+            closes_at=datetime(2026, 11, 11, 1, tzinfo=UTC),
+            delivery_at=datetime(2026, 11, 12, 17, 30, tzinfo=UTC),
+        )
+        legacy_order = historical.get_model("commerce", "StoreOrder").objects.create(
+            reference_code="LEGACY-DELIVERY",
+            create_idempotency_key=uuid4(),
+            request_fingerprint="legacy",
+            locale="vi",
+            subtotal_vnd=0,
+            shipping_fee_vnd=0,
+            total_vnd=0,
+        )
         assert (
             historical.get_model("commerce", "StoreOrder")
-            .objects.filter(pk=selected.order_id)
+            .objects.filter(pk=legacy_order.pk)
             .exists()
         )
         assert (
             historical.get_model("memberships", "CSARound")
-            .objects.filter(pk=context[3].pk)
+            .objects.filter(pk=legacy_round.pk)
             .exists()
         )
         executor.migrate(latest)
-        restored = StoreOrder.objects.get(pk=selected.order_id)
+        restored = StoreOrder.objects.get(pk=legacy_order.pk)
         assert restored.delivery_date is None
         assert restored.shipping_benefit_snapshot is None
-        round_ = CSARound.objects.get(pk=context[3].pk)
+        round_ = CSARound.objects.get(pk=legacy_round.pk)
+        assert round_.delivery_date.isoformat() == "2026-11-13"
         assert not round_.companion_delivery_enabled
         assert round_.companion_delivery_cutoff is None
     finally:

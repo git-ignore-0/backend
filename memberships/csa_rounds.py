@@ -2,8 +2,9 @@
 
 import uuid
 from collections import defaultdict
-from datetime import timedelta
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from django.db import transaction
 from django.db.models import Q, Sum
@@ -36,6 +37,12 @@ from memberships.models import (
 from memberships.services import ensure_due_cycles, quota_availability_rows
 
 TERMINAL = ("cancelled", "delivered")
+VIETNAM = ZoneInfo("Asia/Ho_Chi_Minh")
+
+
+def delivery_start(round_):
+    """Boundary for deadlines, never an asserted delivery appointment."""
+    return datetime.combine(round_.delivery_date, time.min, tzinfo=VIETNAM)
 
 
 class CSARoundError(ValueError):
@@ -63,13 +70,13 @@ def round_status(round_, now=None):
         return "scheduled"
     if now < round_.closes_at:
         return "open"
-    if now < round_.delivery_at:
+    if now.astimezone(VIETNAM).date() < round_.delivery_date:
         return "closed"
     return "delivery"
 
 
 def _validate_schedule(round_):
-    if not round_.name.strip() or not round_.opens_at < round_.closes_at < round_.delivery_at:
+    if not round_.name.strip() or not round_.opens_at < round_.closes_at < delivery_start(round_):
         _fail("csa_round_schedule_invalid")
     published = CSARound.objects.filter(published_at__isnull=False, cancelled_at__isnull=True)
     before = published.filter(sequence__lt=round_.sequence).order_by("-sequence").first()
@@ -81,18 +88,20 @@ def _validate_schedule(round_):
 
 
 @transaction.atomic
-def create_round(*, name, opens_at, closes_at, delivery_at, actor):
+def create_round(*, name, opens_at, closes_at, delivery_date, actor):
+    if type(delivery_date) is not date:
+        _fail("csa_round_schedule_invalid")
     _schedule_lock()
     last = CSARound.objects.order_by("-sequence").first()
     row = CSARound(
         name=name.strip(),
         opens_at=opens_at,
         closes_at=closes_at,
-        delivery_at=delivery_at,
+        delivery_date=delivery_date,
         created_by=actor,
         sequence=last.sequence + 1 if last else 1,
     )
-    if not row.opens_at < row.closes_at < row.delivery_at or not row.name:
+    if not row.opens_at < row.closes_at < delivery_start(row) or not row.name:
         _fail("csa_round_schedule_invalid")
     row.save()
     return row
@@ -112,12 +121,14 @@ def update_round(*, round_id, actor, **values):
     # Once public, dates define entitlement and reservations; create drafts freely.
     if not can_edit_round(row):
         _fail("csa_round_published_immutable")
-    for key in ("name", "opens_at", "closes_at", "delivery_at"):
+    for key in ("name", "opens_at", "closes_at", "delivery_date"):
         if key in values:
             setattr(row, key, values[key])
-    if not row.opens_at < row.closes_at < row.delivery_at or not row.name.strip():
+    if type(row.delivery_date) is not date:
         _fail("csa_round_schedule_invalid")
-    if row.companion_delivery_cutoff and row.companion_delivery_cutoff >= row.delivery_at:
+    if not row.opens_at < row.closes_at < delivery_start(row) or not row.name.strip():
+        _fail("csa_round_schedule_invalid")
+    if row.companion_delivery_cutoff and row.companion_delivery_cutoff >= delivery_start(row):
         _fail("csa_companion_deadline_invalid")
     if row.published_at:
         _validate_schedule(row)
@@ -151,9 +162,9 @@ def configure_companion_delivery(*, round_id, actor, **values):
         _fail("csa_round_cancelled")
     enabled = values.get("companion_delivery_enabled", row.companion_delivery_enabled)
     cutoff = values.get("companion_delivery_cutoff", row.companion_delivery_cutoff)
-    if cutoff is not None and cutoff >= row.delivery_at:
-        _fail("csa_companion_deadline_invalid")
-    if (enabled or "companion_delivery_cutoff" in values) and (cutoff is None or cutoff <= now):
+    if (enabled or "companion_delivery_cutoff" in values) and (
+        cutoff is None or not now < cutoff < delivery_start(row)
+    ):
         _fail("csa_companion_deadline_invalid")
     row.companion_delivery_enabled = enabled
     row.companion_delivery_cutoff = cutoff
@@ -237,7 +248,7 @@ def extension_date(membership):
 def preserve_expiring_quota(membership):
     """Only extend expiry for resources of a legitimate outstanding participation."""
     return (
-        extension_date(membership) >= timezone.localdate()
+        extension_date(membership) >= timezone.now().astimezone(VIETNAM).date()
         and membership.csa_selections.exclude(state__in=TERMINAL).exists()
     )
 
@@ -254,7 +265,7 @@ def _lock_resources(selection, product_ids):
 
 
 def _entitled_membership(user, round_, existing, now):
-    today = timezone.localdate(now)
+    today = now.astimezone(VIETNAM).date()
     if existing:
         member = Membership.objects.select_for_update().get(pk=existing.membership_id)
         if member.status == MembershipStatus.REVOKED or today > extension_date(member):
@@ -313,7 +324,7 @@ def _quota_candidates(membership, selection, group_ids, *, lock=True):
             cycle_quota_id__in=extra_ids,
             released_at__isnull=True,
             consumed_at__isnull=True,
-            line__order__status__in=["payment_pending", "pending_review"],
+            line__order__status__in=["payment_pending", "pending_review", "payment_review"],
             line__order__expires_at__gt=timezone.now(),
         )
         .values("cycle_quota_id")
@@ -332,7 +343,7 @@ def _quota_candidates(membership, selection, group_ids, *, lock=True):
 
 
 def _validate_selection_window(round_, member, existing, now):
-    today = timezone.localdate(now)
+    today = now.astimezone(VIETNAM).date()
     if (existing and today > extension_date(member)) or (
         not existing and not member.start_date <= today < member.end_date
     ):
@@ -459,7 +470,7 @@ def save_selection(*, round_id, user, lines, locale="vi", now=None, expected_rev
     selection.revision += 1
     selection.locale = locale
     selection.save(update_fields=["revision", "locale", "updated_at"])
-    member.extension_end_date = max(extension_date(member), timezone.localdate(round_.delivery_at))
+    member.extension_end_date = max(extension_date(member), round_.delivery_date)
     member.save(update_fields=["extension_end_date", "updated_at"])
     _event(
         selection,
@@ -538,6 +549,7 @@ def _write_order(selection):
             reference_code=_reference_code(),
             locale=selection.locale,
             status="pending_review",
+            workflow_version=1,
             payment_status="not_required",
             subtotal_vnd=0,
             shipping_fee_vnd=0,
@@ -590,7 +602,7 @@ def reopen_selection(*, selection_id, actor, deadline, now=None, expected_revisi
     now = supplied_now or timezone.now()
     if expected_revision is not None and expected_revision != selection.revision:
         _fail("csa_selection_stale")
-    if not now < deadline < selection.round.delivery_at:
+    if not now < deadline < delivery_start(selection.round):
         _fail("csa_reselection_deadline_invalid")
     if (
         selection.state not in ("locked", "confirmed", "reselecting")
@@ -776,5 +788,5 @@ def process_due_rounds(*, now=None, user=None):
         count += 1
     from memberships.services import refresh_membership_statuses
 
-    refresh_membership_statuses(as_of=timezone.localdate(now), user=user)
+    refresh_membership_statuses(as_of=now.astimezone(VIETNAM).date(), user=user)
     return count

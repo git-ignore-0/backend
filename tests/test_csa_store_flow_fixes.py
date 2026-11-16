@@ -36,7 +36,7 @@ def frozen_context(context, monkeypatch):
     member.end_date = timezone.localdate(now) + timedelta(days=1)
     member.save(update_fields=["end_date"])
     round_.closes_at = now + timedelta(days=1, hours=1)
-    round_.delivery_at = now + timedelta(days=3)
+    round_.delivery_date = timezone.localdate(now) + timedelta(days=3)
     round_.save()
     save(context, 1)
     monkeypatch.setattr(timezone, "now", lambda: now + timedelta(days=1))
@@ -99,7 +99,7 @@ def test_new_active_plan_restores_cash_checkout_while_old_plan_is_frozen(
 def expire_reselection(context, monkeypatch):
     selected = save(context)
     service.process_round(context[3].pk, now=context[3].closes_at)
-    deadline = context[3].delivery_at - timedelta(hours=1)
+    deadline = service.delivery_start(context[3]) - timedelta(hours=1)
     service.reopen_selection(
         selection_id=selected.pk,
         actor=context[0],

@@ -12,7 +12,7 @@ def round_payload(row):
         "name": row.name,
         "opens_at": row.opens_at.isoformat(),
         "closes_at": row.closes_at.isoformat(),
-        "delivery_at": row.delivery_at.isoformat(),
+        "delivery_date": row.delivery_date.isoformat(),
         "status": domain.round_status(row),
         "server_time": timezone.now().isoformat(),
         "cancellation_reason": row.cancellation_reason or None,

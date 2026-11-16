@@ -119,6 +119,9 @@ def test_store_releases_and_allows_same_uuid_in_csa(context, active_user, catalo
         expire_order_if_needed(order.pk)
         expire_order_if_needed(order.pk)
     else:
+        from tests.test_store_orders import approve_review_order
+
+        approve_review_order({"id": order.pk}, active_user)
         record_store_payment(order_id=order.pk, actor=active_user, idempotency_key=uuid.uuid4())
         key = uuid.uuid4()
         cancel_store_order(order_id=order.pk, actor=active_user, idempotency_key=key, reason="test")
@@ -349,12 +352,7 @@ def test_mysql_checkout_and_approve_by_same_user_do_not_deadlock(
     )
     assert created.status_code == 201, created.data
     data = created.json()["data"]
-    reported = guest.post(
-        f"/api/v1/public/store-orders/{data['id']}/report-transfer",
-        {"access_token": data["guest_access_token"]},
-        format="json",
-    )
-    assert reported.status_code == 200, reported.data
+    assert data["status"] == "pending_review"
     order = StoreOrder.objects.get(pk=data["id"])
     batch = FarmProductStockBatch.objects.get(farm_product__product=store_product)
     serializer = StoreCheckoutSerializer(data=checkout_body(preview(context), context[1].code))

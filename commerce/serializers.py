@@ -275,6 +275,19 @@ class StoreOrderAccessSerializer(StrictSerializer):
 
 class StoreOrderCancelAccessSerializer(StoreOrderAccessSerializer):
     idempotency_key = serializers.UUIDField()
+    request_refund = serializers.BooleanField(default=False)
+
+    def validate(self, attrs):
+        if (
+            "request_refund" in self.initial_data
+            and type(self.initial_data["request_refund"]) is not bool
+        ):
+            raise serializers.ValidationError({"request_refund": "Must be a JSON boolean."})
+        return attrs
+
+
+class StoreRefundRequestAccessSerializer(StoreOrderAccessSerializer):
+    idempotency_key = serializers.UUIDField()
 
 
 class StoreAllocationSerializer(StrictSerializer):
@@ -301,6 +314,7 @@ class StoreOrderQuerySerializer(StrictSerializer):
         choices=[
             "payment_pending",
             "pending_review",
+            "payment_review",
             "pending_delivery",
             "delivered",
             "cancelled",
@@ -330,8 +344,12 @@ class StoreActionSerializer(StrictSerializer):
 class StoreCancelSerializer(StoreActionSerializer):
     reason = serializers.CharField(max_length=1000, trim_whitespace=True)
     reconciliation_note = serializers.CharField(
-        max_length=2000, allow_blank=True, default="", trim_whitespace=True
+        max_length=2000, allow_blank=True, required=False, trim_whitespace=True
     )
+
+
+class StoreRefundRequestCloseSerializer(StoreActionSerializer):
+    reason = serializers.CharField(max_length=1000, trim_whitespace=True)
 
 
 class StoreRecordPaymentSerializer(StoreActionSerializer):

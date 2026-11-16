@@ -23,6 +23,10 @@ urlpatterns = [
         store_views.PublicStoreOrderCancelView.as_view(),
     ),
     path(
+        "public/store-orders/<uuid:order_id>/request-refund",
+        store_views.PublicStoreRefundRequestView.as_view(),
+    ),
+    path(
         "public/store-orders/<uuid:order_id>",
         store_views.PublicStoreOrderDetailView.as_view(),
     ),
@@ -54,6 +58,10 @@ urlpatterns = [
     path(
         "admin/store-orders/<uuid:order_id>/refund",
         store_views.AdminStoreOrderRefundView.as_view(),
+    ),
+    path(
+        "admin/store-orders/<uuid:order_id>/close-refund-request",
+        store_views.AdminStoreRefundRequestCloseView.as_view(),
     ),
     path(
         "admin/store-orders/<uuid:order_id>/deliver",

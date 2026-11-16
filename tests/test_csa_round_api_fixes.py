@@ -45,7 +45,7 @@ def admin_client(context):
 def test_catalog_own_hold_is_added_before_clamping_availability(context, monkeypatch):
     user, product, _, round_, now = context
     round_.closes_at = now + timedelta(days=5)
-    round_.delivery_at = now + timedelta(days=6)
+    round_.delivery_date = timezone.localdate(now) + timedelta(days=6)
     round_.save()
     save(context)
     monkeypatch.setattr(timezone, "now", lambda: now + timedelta(days=3))
@@ -100,7 +100,7 @@ def test_round_lists_are_paginated_with_validated_bounds(context, admin_client):
                 sequence=i,
                 opens_at=now,
                 closes_at=now + timedelta(hours=1),
-                delivery_at=now + timedelta(days=1),
+                delivery_date=timezone.localdate(now) + timedelta(days=1),
             )
             for i in range(2, 25)
         ]
@@ -292,7 +292,7 @@ def test_demand_excludes_expired_reselection_outside_requested_page(
 ):
     selected = save(context)
     service.process_round(context[3].pk, now=context[3].closes_at)
-    deadline = context[3].delivery_at - timedelta(hours=1)
+    deadline = service.delivery_start(context[3]) - timedelta(hours=1)
     service.reopen_selection(
         selection_id=selected.pk,
         actor=context[0],
@@ -334,7 +334,7 @@ def test_reopen_rejects_stale_admin_command_after_member_confirmation(context, a
     service.process_round(context[3].pk, now=context[3].closes_at)
     selected.refresh_from_db()
     payload = {
-        "deadline": (context[3].delivery_at - timedelta(hours=1)).isoformat(),
+        "deadline": (service.delivery_start(context[3]) - timedelta(hours=1)).isoformat(),
         "expected_revision": selected.revision,
     }
     path = f"/api/v1/admin/csa-selections/{selected.pk}/reopen"
@@ -365,7 +365,7 @@ def test_admin_reopen_requires_revision(context, admin_client):
     response = admin_client.post(
         path,
         {
-            "deadline": (context[3].delivery_at - timedelta(hours=1)).isoformat(),
+            "deadline": (service.delivery_start(context[3]) - timedelta(hours=1)).isoformat(),
         },
         format="json",
     )
@@ -387,7 +387,7 @@ def test_confirmation_invalidates_old_deadline_command_and_allows_safe_retries(
     selected = save(context)
     service.process_round(context[3].pk, now=context[3].closes_at)
     selected.refresh_from_db()
-    deadline = context[3].delivery_at - timedelta(hours=1)
+    deadline = service.delivery_start(context[3]) - timedelta(hours=1)
     service.reopen_selection(
         selection_id=selected.pk,
         actor=context[0],

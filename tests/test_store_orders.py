@@ -1,8 +1,9 @@
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import timedelta
+from datetime import datetime, time, timedelta
 from decimal import Decimal
 from threading import Barrier
+from zoneinfo import ZoneInfo
 
 import pytest
 from django.contrib.auth.models import Group
@@ -157,9 +158,56 @@ def guest_payload(product, *, quantity=2, idempotency_key=None, expected_availab
     }
 
 
+def legacy_checkout_snapshot(data):
+    """Represent an existing v1 row, without changing checkout request identity.
+
+    Only compatibility tests call this explicitly. New checkout tests use v2.
+    """
+    order = StoreOrder.objects.get(pk=data["id"])
+    StoreOrder.objects.filter(pk=order.pk).update(
+        workflow_version=1,
+        status="payment_pending" if order.total_vnd else "pending_review",
+        expires_at=order.created_at + timedelta(minutes=5)
+        if order.total_vnd
+        else order.created_at + timedelta(hours=8),
+    )
+    return data
+
+
+def historical_cancelled_snapshot(order_id, actor):
+    """A previously cancelled v1 order whose batches await manual restock.
+
+    New cancellation now reverses all retail stock, including v1. This fixture
+    represents historical rows; it must not call today's cancellation service.
+    """
+    from commerce.models import StoreOrderAction
+    from commerce.store_orders import request_fingerprint
+
+    order = StoreOrder.objects.get(pk=order_id)
+    assert order.workflow_version == 1
+    assert order.status == StoreOrderStatus.PENDING_DELIVERY
+    order.status = StoreOrderStatus.CANCELLED
+    order.cancelled_at = timezone.now()
+    order.cancelled_by = actor
+    order.cancellation_reason = "Historical cancellation awaiting restock"
+    order.expires_at = None
+    if order.payment_status == StorePaymentStatus.RECEIVED:
+        order.payment_status = StorePaymentStatus.REFUND_REQUIRED
+    order.save()
+    StoreOrderAction.objects.create(
+        order=order,
+        action="cancel",
+        idempotency_key=uuid.uuid4(),
+        actor=actor,
+        request_fingerprint=request_fingerprint({"reason": order.cancellation_reason}),
+        context={"reason": order.cancellation_reason},
+    )
+    return order
+
+
 @pytest.mark.django_db
 def test_guest_checkout_snapshots_price_shipping_bank_and_reserves_stock(
-    store_product, payment_settings
+    store_product, payment_settings, active_user
 ):
     response = APIClient().post(
         "/api/v1/public/store-checkouts", guest_payload(store_product), format="json"
@@ -167,21 +215,33 @@ def test_guest_checkout_snapshots_price_shipping_bank_and_reserves_stock(
 
     assert response.status_code == 201, response.json()
     data = response.json()["data"]
-    assert data["status"] == "payment_pending"
+    assert data["status"] == "pending_review"
+    assert data["workflow_version"] == 2
+    assert data["payment"] is None
     assert data["subtotal_vnd"] == "90000"
     assert data["shipping_fee_vnd"] == "30000"
     assert data["total_vnd"] == "120000"
-    assert data["payment"]["qr_payload"] == {
-        "acqId": "970436",
-        "accountNo": "123456789",
-        "accountName": "NATURAL FARMING VIETNAM",
-        "amount": 120000,
-        "addInfo": data["payment"]["transfer_content"],
-    }
+    order = StoreOrder.objects.get(pk=data["id"])
+    assert order.bank_bin_snapshot == "970436"
+    assert order.account_number_snapshot == "123456789"
+    assert order.account_name_snapshot == "NATURAL FARMING VIETNAM"
+    assert order.transfer_content
+    assert order.payment_received_at is None
     assert data["expires_at"] is not None
     assert data["server_time"] is not None
     order = StoreOrder.objects.get(pk=data["id"])
     assert order.lines.get().stock_reservations.get().quantity == 2
+    from commerce.store_views import order_payload
+
+    approved = approve_review_order(data, active_user)
+    assert order_payload(approved)["payment"]["qr_payload"] == {
+        "acqId": "970436",
+        "accountNo": "123456789",
+        "accountName": "NATURAL FARMING VIETNAM",
+        "amount": 120000,
+        "addInfo": order.transfer_content,
+    }
+    assert approved.payment_received_at is None
 
 
 @pytest.mark.django_db
@@ -259,7 +319,7 @@ def test_checkout_requires_requote_when_price_changes(store_product, payment_set
 
 
 @pytest.mark.django_db
-def test_paid_order_report_transfer_is_idempotent_and_starts_eight_hour_deadline(
+def test_legacy_paid_order_report_transfer_is_idempotent_and_starts_eight_hour_deadline(
     store_product, payment_settings
 ):
     created = (
@@ -271,6 +331,7 @@ def test_paid_order_report_transfer_is_idempotent_and_starts_eight_hour_deadline
         )
         .json()["data"]
     )
+    legacy_checkout_snapshot(created)
     client = APIClient()
     first = client.post(
         f"/api/v1/public/store-orders/{created['id']}/report-transfer",
@@ -285,6 +346,9 @@ def test_paid_order_report_transfer_is_idempotent_and_starts_eight_hour_deadline
 
     assert first.status_code == 200
     assert first.json()["data"]["status"] == "pending_review"
+    reported = StoreOrder.objects.get(pk=created["id"])
+    assert reported.workflow_version == 1
+    assert reported.expires_at == reported.transfer_reported_at + timedelta(hours=8)
     assert second.status_code == 200
     assert second.json()["data"]["expires_at"] == first.json()["data"]["expires_at"]
 
@@ -472,12 +536,6 @@ def test_admin_approval_uses_fefo_and_is_replay_safe(
         )
         .json()["data"]
     )
-    guest = APIClient()
-    guest.post(
-        f"/api/v1/public/store-orders/{created['id']}/report-transfer",
-        {"access_token": created["guest_access_token"]},
-        format="json",
-    )
     first_batch = FarmProductStockBatch.objects.get(farm_product__product=store_product)
     first_batch.quantity_units = 2
     first_batch.save(update_fields=["quantity_units", "updated_at"])
@@ -517,9 +575,9 @@ def test_admin_approval_uses_fefo_and_is_replay_safe(
     )
 
     assert approved.status_code == 200, approved.json()
-    assert approved.json()["data"]["status"] == "pending_delivery"
+    assert approved.json()["data"]["status"] == "payment_pending"
     assert replay.status_code == 200
-    assert StoreOrder.objects.get(pk=created["id"]).payment_status == StorePaymentStatus.RECEIVED
+    assert StoreOrder.objects.get(pk=created["id"]).payment_status == StorePaymentStatus.UNCONFIRMED
 
 
 @pytest.mark.django_db
@@ -582,11 +640,6 @@ def test_public_available_quantity_subtracts_live_reservation_and_approved_sale(
     listed = APIClient().get("/api/v1/public/store-products?locale=vi")
     assert listed.json()["data"][0]["available_quantity"] == 7
 
-    APIClient().post(
-        f"/api/v1/public/store-orders/{created['id']}/report-transfer",
-        {"access_token": created["guest_access_token"]},
-        format="json",
-    )
     group, _ = Group.objects.get_or_create(name="website_admin")
     active_user.groups.add(group)
     access_token.scope = "profile email content:manage"
@@ -644,7 +697,7 @@ def test_guest_lookup_uses_generic_failure_and_http_only_session(store_product, 
 
 
 @pytest.mark.django_db
-def test_cancelled_paid_late_order_can_be_refunded_idempotently(
+def test_legacy_cancelled_paid_late_order_can_be_refunded_idempotently(
     active_user, access_token, store_product, payment_settings
 ):
     group, _ = Group.objects.get_or_create(name="website_admin")
@@ -658,6 +711,12 @@ def test_cancelled_paid_late_order_can_be_refunded_idempotently(
     )
     admin = APIClient()
     admin.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token.token}")
+    # Legacy paid orders could receive funds before supply approval.
+    StoreOrder.objects.filter(pk=created["id"]).update(
+        workflow_version=1,
+        status=StoreOrderStatus.PAYMENT_PENDING,
+        expires_at=timezone.now() + timedelta(minutes=5),
+    )
     cancel_key = str(uuid.uuid4())
     cancelled = admin.post(
         f"/api/v1/admin/store-orders/{created['id']}/cancel",
@@ -708,7 +767,7 @@ def test_cancelled_paid_late_order_can_be_refunded_idempotently(
 
 
 @pytest.mark.django_db
-def test_cancel_after_approval_reverses_quota_without_automatic_stock_restock(
+def test_cancel_after_approval_reverses_quota_and_batch_ledger(
     zero_shipping_fee, active_user, access_token, store_product
 ):
     attach_active_membership(active_user, store_product)
@@ -765,7 +824,7 @@ def test_cancel_after_approval_reverses_quota_without_automatic_stock_restock(
     assert cancelled.status_code == 200, cancelled.json()
     quota.refresh_from_db()
     assert quota.remaining_units == 4
-    assert StoreStockMovement.objects.filter(kind="restock").count() == 0
+    assert StoreStockMovement.objects.filter(kind="restock").count() == 1
 
 
 @pytest.mark.django_db
@@ -797,24 +856,25 @@ def test_stock_batch_cannot_be_cancelled_while_product_reservation_depends_on_it
 
 
 @pytest.mark.django_db
-def test_expiry_command_is_repeatable(store_product, payment_settings):
+def test_expiry_command_is_repeatable(store_product, payment_settings, monkeypatch):
     created = (
         APIClient()
         .post("/api/v1/public/store-checkouts", guest_payload(store_product), format="json")
         .json()["data"]
     )
-    StoreOrder.objects.filter(pk=created["id"]).update(expires_at=timezone.now())
+    deadline = StoreOrder.objects.get(pk=created["id"]).expires_at
+    monkeypatch.setattr(timezone, "now", lambda: deadline)
 
     call_command("expire_store_orders", batch_size=50)
     call_command("expire_store_orders", batch_size=50)
 
     order = StoreOrder.objects.get(pk=created["id"])
     assert order.status == StoreOrderStatus.CANCELLED
-    assert order.cancellation_reason == "expired"
+    assert order.cancellation_reason == "delivery_date_expired"
 
 
 @pytest.mark.django_db
-def test_guest_can_cancel_only_during_payment_pending(store_product, payment_settings):
+def test_guest_can_cancel_while_waiting_for_goods(store_product, payment_settings):
     created = (
         APIClient()
         .post("/api/v1/public/store-checkouts", guest_payload(store_product), format="json")
@@ -843,11 +903,6 @@ def test_admin_can_mark_approved_order_delivered(
         .post("/api/v1/public/store-checkouts", guest_payload(store_product), format="json")
         .json()["data"]
     )
-    APIClient().post(
-        f"/api/v1/public/store-orders/{created['id']}/report-transfer",
-        {"access_token": created["guest_access_token"]},
-        format="json",
-    )
     admin = APIClient()
     admin.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token.token}")
     suggestion = admin.get(f"/api/v1/admin/store-orders/{created['id']}").json()["data"][
@@ -858,6 +913,12 @@ def test_admin_can_mark_approved_order_delivered(
         {"idempotency_key": str(uuid.uuid4()), "allocations": suggestion},
         format="json",
     )
+    payment = admin.post(
+        f"/api/v1/admin/store-orders/{created['id']}/record-payment",
+        {"idempotency_key": str(uuid.uuid4()), "note": "Bank received"},
+        format="json",
+    )
+    assert payment.status_code == 200, payment.json()
     key = str(uuid.uuid4())
     delivered = admin.post(
         f"/api/v1/admin/store-orders/{created['id']}/deliver",
@@ -886,11 +947,6 @@ def test_expired_order_cannot_be_approved_and_releases_reservation(
         .post("/api/v1/public/store-checkouts", guest_payload(store_product), format="json")
         .json()["data"]
     )
-    APIClient().post(
-        f"/api/v1/public/store-orders/{created['id']}/report-transfer",
-        {"access_token": created["guest_access_token"]},
-        format="json",
-    )
     StoreOrder.objects.filter(pk=created["id"]).update(expires_at=timezone.now())
     admin = APIClient()
     admin.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token.token}")
@@ -914,7 +970,7 @@ def test_expired_order_cannot_be_approved_and_releases_reservation(
 
 
 @pytest.mark.django_db
-def test_admin_restock_is_explicit_and_idempotent(
+def test_historical_cancelled_order_manual_restock_is_idempotent(
     active_user, access_token, store_product, payment_settings
 ):
     group, _ = Group.objects.get_or_create(name="website_admin")
@@ -926,6 +982,7 @@ def test_admin_restock_is_explicit_and_idempotent(
         .post("/api/v1/public/store-checkouts", guest_payload(store_product), format="json")
         .json()["data"]
     )
+    legacy_checkout_snapshot(created)
     APIClient().post(
         f"/api/v1/public/store-orders/{created['id']}/report-transfer",
         {"access_token": created["guest_access_token"]},
@@ -941,11 +998,7 @@ def test_admin_restock_is_explicit_and_idempotent(
         {"idempotency_key": str(uuid.uuid4()), "allocations": suggestion},
         format="json",
     ).json()["data"]
-    admin.post(
-        f"/api/v1/admin/store-orders/{created['id']}/cancel",
-        {"idempotency_key": str(uuid.uuid4()), "reason": "Hủy vận hành"},
-        format="json",
-    )
+    historical_cancelled_snapshot(created["id"], active_user)
     assert (
         APIClient()
         .get("/api/v1/public/store-products?locale=vi")
@@ -1153,7 +1206,7 @@ def test_multiple_lines_share_quota_in_checkout_position_order(
 
 
 @pytest.mark.django_db
-def test_paid_order_expired_by_approve_requires_refund_and_refund_replays(
+def test_legacy_paid_order_expired_by_approve_requires_refund_and_refund_replays(
     active_user, access_token, store_product, payment_settings
 ):
     group, _ = Group.objects.get_or_create(name="website_admin")
@@ -1164,6 +1217,7 @@ def test_paid_order_expired_by_approve_requires_refund_and_refund_replays(
     created = guest.post(
         "/api/v1/public/store-checkouts", guest_payload(store_product), format="json"
     ).json()["data"]
+    legacy_checkout_snapshot(created)
     guest.post(
         f"/api/v1/public/store-orders/{created['id']}/report-transfer",
         {"access_token": created["guest_access_token"]},
@@ -1210,13 +1264,14 @@ def test_paid_order_expired_by_approve_requires_refund_and_refund_replays(
 
 @pytest.mark.django_db
 @pytest.mark.parametrize("initial_status", ["payment_pending", "pending_review"])
-def test_expired_reservation_is_not_effective_before_worker(
+def test_legacy_expired_reservation_is_not_effective_before_worker(
     initial_status, store_product, payment_settings
 ):
     client = APIClient()
     created = client.post(
         "/api/v1/public/store-checkouts", guest_payload(store_product), format="json"
     ).json()["data"]
+    legacy_checkout_snapshot(created)
     if initial_status == "pending_review":
         client.post(
             f"/api/v1/public/store-orders/{created['id']}/report-transfer",
@@ -1386,11 +1441,6 @@ def test_duplicate_approve_allocation_is_rejected_without_partial_writes(
     created = guest.post(
         "/api/v1/public/store-checkouts", guest_payload(store_product), format="json"
     ).json()["data"]
-    guest.post(
-        f"/api/v1/public/store-orders/{created['id']}/report-transfer",
-        {"access_token": created["guest_access_token"]},
-        format="json",
-    )
     admin = APIClient()
     admin.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token.token}")
     suggestion = admin.get(f"/api/v1/admin/store-orders/{created['id']}").json()["data"][
@@ -1411,7 +1461,7 @@ def test_duplicate_approve_allocation_is_rejected_without_partial_writes(
 
 
 @pytest.mark.django_db
-def test_duplicate_restock_allocation_is_rejected_without_partial_writes(
+def test_historical_cancelled_order_duplicate_restock_is_rejected_without_partial_writes(
     active_user, access_token, store_product, payment_settings
 ):
     group, _ = Group.objects.get_or_create(name="website_admin")
@@ -1422,6 +1472,7 @@ def test_duplicate_restock_allocation_is_rejected_without_partial_writes(
     created = guest.post(
         "/api/v1/public/store-checkouts", guest_payload(store_product), format="json"
     ).json()["data"]
+    legacy_checkout_snapshot(created)
     guest.post(
         f"/api/v1/public/store-orders/{created['id']}/report-transfer",
         {"access_token": created["guest_access_token"]},
@@ -1437,11 +1488,7 @@ def test_duplicate_restock_allocation_is_rejected_without_partial_writes(
         {"idempotency_key": str(uuid.uuid4()), "allocations": suggestion},
         format="json",
     ).json()["data"]
-    admin.post(
-        f"/api/v1/admin/store-orders/{created['id']}/cancel",
-        {"idempotency_key": str(uuid.uuid4()), "reason": "Operational cancellation"},
-        format="json",
-    )
+    historical_cancelled_snapshot(created["id"], active_user)
     item = {"allocation_id": approved["allocations"][0]["id"], "quantity": 1}
 
     response = admin.post(
@@ -1512,7 +1559,7 @@ def test_admin_order_detail_exposes_all_source_candidates_and_restock_balance(
 
 @pytest.mark.django_db
 @pytest.mark.parametrize("expiry_trigger", ["read", "worker"])
-def test_paid_order_expired_by_read_or_worker_requires_refund(
+def test_legacy_paid_order_expired_by_read_or_worker_requires_refund(
     expiry_trigger, active_user, access_token, store_product, payment_settings
 ):
     group, _ = Group.objects.get_or_create(name="website_admin")
@@ -1523,6 +1570,7 @@ def test_paid_order_expired_by_read_or_worker_requires_refund(
     created = guest.post(
         "/api/v1/public/store-checkouts", guest_payload(store_product), format="json"
     ).json()["data"]
+    legacy_checkout_snapshot(created)
     guest.post(
         f"/api/v1/public/store-orders/{created['id']}/report-transfer",
         {"access_token": created["guest_access_token"]},
@@ -1594,11 +1642,6 @@ def test_farm_inventory_tracks_sale_cancel_and_restock(
     created = guest.post(
         "/api/v1/public/store-checkouts", guest_payload(store_product), format="json"
     ).json()["data"]
-    guest.post(
-        f"/api/v1/public/store-orders/{created['id']}/report-transfer",
-        {"access_token": created["guest_access_token"]},
-        format="json",
-    )
     admin = APIClient()
     admin.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token.token}")
     suggestion = admin.get(f"/api/v1/admin/store-orders/{created['id']}").json()["data"][
@@ -1621,9 +1664,9 @@ def test_farm_inventory_tracks_sale_cancel_and_restock(
         format="json",
     )
     after_cancel = admin.get(f"/api/v1/admin/farms/{farm_id}/products").json()["data"][0]
-    assert after_cancel["available_quantity"] == 8
+    assert after_cancel["available_quantity"] == 10
     allocation = approved["allocations"][0]
-    admin.post(
+    repeated_restock = admin.post(
         f"/api/v1/admin/store-orders/{created['id']}/restock",
         {
             "idempotency_key": str(uuid.uuid4()),
@@ -1631,6 +1674,8 @@ def test_farm_inventory_tracks_sale_cancel_and_restock(
         },
         format="json",
     )
+    assert repeated_restock.status_code == 409, repeated_restock.json()
+    assert StoreStockMovement.objects.filter(kind="restock").count() == 1
     after_restock = admin.get(f"/api/v1/admin/farms/{farm_id}/products").json()["data"][0]
     assert after_restock["net_sold_quantity"] == 0
     assert after_restock["available_quantity"] == 10
@@ -1694,6 +1739,7 @@ def test_public_store_user_branch_accepts_complete_self_scopes(
     if operation == "detail":
         response = client.get(f"/api/v1/public/store-orders/{order_id}")
     elif operation == "report":
+        approve_review_order(created.json()["data"], active_user)
         response = client.post(
             f"/api/v1/public/store-orders/{order_id}/report-transfer", {}, format="json"
         )
@@ -1802,11 +1848,6 @@ def test_concurrent_approve_and_expiry_have_one_cancelled_outcome(
     created = guest.post(
         "/api/v1/public/store-checkouts", guest_payload(store_product), format="json"
     ).json()["data"]
-    guest.post(
-        f"/api/v1/public/store-orders/{created['id']}/report-transfer",
-        {"access_token": created["guest_access_token"]},
-        format="json",
-    )
     order = StoreOrder.objects.get(pk=created["id"])
     batch = FarmProductStockBatch.objects.get(farm_product__product=store_product)
     allocations = [{"line_id": order.lines.get().pk, "batch_id": batch.pk, "quantity": 2}]
@@ -1911,11 +1952,6 @@ def test_concurrent_approve_and_farm_deactivation_preserve_allocation(
     created = guest.post(
         "/api/v1/public/store-checkouts", guest_payload(store_product), format="json"
     ).json()["data"]
-    guest.post(
-        f"/api/v1/public/store-orders/{created['id']}/report-transfer",
-        {"access_token": created["guest_access_token"]},
-        format="json",
-    )
     order = StoreOrder.objects.get(pk=created["id"])
     batch = FarmProductStockBatch.objects.get(farm_product__product=store_product)
     farm = batch.farm_product.farm
@@ -1957,7 +1993,7 @@ def test_concurrent_approve_and_farm_deactivation_preserve_allocation(
     order.refresh_from_db()
     assert outcomes["approve"] == "approved"
     assert outcomes["deactivate"] in {"stock_reserved", "deactivated"}
-    assert order.status == StoreOrderStatus.PENDING_DELIVERY
+    assert order.status == StoreOrderStatus.PAYMENT_PENDING
     assert StoreStockAllocation.objects.filter(line__order=order).count() == 1
     assert StoreStockMovement.objects.filter(line__order=order, kind="sale").count() == 1
 
@@ -2369,11 +2405,6 @@ def test_cash_store_cancel_never_reverses_unrelated_usage_key(
         guest_payload(store_product, idempotency_key=key),
         format="json",
     ).json()["data"]
-    client.post(
-        f"/api/v1/public/store-orders/{data['id']}/report-transfer",
-        {"access_token": data["guest_access_token"]},
-        format="json",
-    )
     approve_review_order(data, active_user)
     cancel_store_order(
         order_id=data["id"], actor=active_user, idempotency_key=uuid.uuid4(), reason="cancel"
@@ -2469,7 +2500,7 @@ def test_checkout_rechecks_key_after_waiting_for_inventory_lock(
 
 
 @pytest.mark.django_db
-def test_buyer_cancel_received_payment_can_be_refunded(
+def test_legacy_buyer_cancel_received_payment_can_be_refunded(
     active_user, store_product, payment_settings
 ):
     from commerce.store_orders import record_store_payment, refund_store_order
@@ -2478,6 +2509,7 @@ def test_buyer_cancel_received_payment_can_be_refunded(
     data = client.post(
         "/api/v1/public/store-checkouts", guest_payload(store_product), format="json"
     ).json()["data"]
+    legacy_checkout_snapshot(data)
     record_store_payment(
         order_id=data["id"], actor=active_user, idempotency_key=uuid.uuid4(), note="bank checked"
     )
@@ -2756,7 +2788,7 @@ def test_farm_deactivation_rejects_sources_added_while_acquiring_locks(
         ("quota", "quota", 0),
     ],
 )
-def test_store_approval_expires_after_waiting_for_resource_locks(
+def test_legacy_store_approval_expires_after_waiting_for_resource_locks(
     active_user,
     access_token,
     store_product,
@@ -2775,11 +2807,13 @@ def test_store_approval_expires_after_waiting_for_resource_locks(
         ShippingArea.objects.update(shipping_fee_vnd=0)
         membership = attach_active_membership(active_user, store_product)
         data = create_review_quota_checkout(active_user, access_token, store_product)
+        legacy_checkout_snapshot(data)
     else:
         client = APIClient()
         data = client.post(
             "/api/v1/public/store-checkouts", guest_payload(store_product), format="json"
         ).json()["data"]
+        legacy_checkout_snapshot(data)
         response = client.post(
             f"/api/v1/public/store-orders/{data['id']}/report-transfer",
             {"access_token": data["guest_access_token"]},
@@ -2926,11 +2960,6 @@ def test_admin_detail_allocation_query_count_is_constant(
         response = client.post("/api/v1/public/store-checkouts", payload, format="json")
         assert response.status_code == 201, response.json()
         data = response.json()["data"]
-        client.post(
-            f"/api/v1/public/store-orders/{data['id']}/report-transfer",
-            {"access_token": data["guest_access_token"]},
-            format="json",
-        )
         order = approve_review_order(data, active_user)
         order = StoreOrder.objects.get(pk=order.pk)
         with CaptureQueriesContext(connection) as queries:
@@ -2942,7 +2971,7 @@ def test_admin_detail_allocation_query_count_is_constant(
 
 
 @pytest.mark.django_db
-def test_approval_records_decision_after_locks_without_using_later_write_time(
+def test_legacy_approval_records_decision_after_locks_without_using_later_write_time(
     active_user, store_product, payment_settings, monkeypatch
 ):
     from django.db.models import QuerySet
@@ -2951,6 +2980,7 @@ def test_approval_records_decision_after_locks_without_using_later_write_time(
     data = client.post(
         "/api/v1/public/store-checkouts", guest_payload(store_product), format="json"
     ).json()["data"]
+    legacy_checkout_snapshot(data)
     client.post(
         f"/api/v1/public/store-orders/{data['id']}/report-transfer",
         {"access_token": data["guest_access_token"]},
@@ -2985,7 +3015,7 @@ def test_approval_records_decision_after_locks_without_using_later_write_time(
 
 
 @pytest.mark.django_db
-def test_approval_preserves_first_recorded_payment_time(
+def test_legacy_approval_preserves_first_recorded_payment_time(
     active_user, store_product, payment_settings, monkeypatch
 ):
     from commerce.store_orders import record_store_payment
@@ -2994,6 +3024,7 @@ def test_approval_preserves_first_recorded_payment_time(
     data = client.post(
         "/api/v1/public/store-checkouts", guest_payload(store_product), format="json"
     ).json()["data"]
+    legacy_checkout_snapshot(data)
     response = client.post(
         f"/api/v1/public/store-orders/{data['id']}/report-transfer",
         {"access_token": data["guest_access_token"]},
@@ -3024,7 +3055,7 @@ def test_approval_preserves_first_recorded_payment_time(
 
 
 @pytest.mark.django_db
-def test_checkout_payment_window_starts_after_bank_settings_lock_and_replay_keeps_it(
+def test_checkout_goods_review_deadline_after_bank_lock_and_replay_keeps_it(
     store_product, payment_settings, monkeypatch
 ):
     from django.db.models import QuerySet
@@ -3046,7 +3077,9 @@ def test_checkout_payment_window_starts_after_bank_settings_lock_and_replay_keep
     assert response.status_code == 201, response.json()
     order = StoreOrder.objects.get(pk=response.json()["data"]["id"])
     assert order.created_at == started + timedelta(seconds=40)
-    assert order.expires_at == order.created_at + timedelta(minutes=5)
+    assert order.expires_at == datetime.combine(
+        order.delivery_date + timedelta(days=1), time.min, ZoneInfo("Asia/Ho_Chi_Minh")
+    )
     clock[0] = order.created_at + timedelta(minutes=2)
     replay = client.post("/api/v1/public/store-checkouts", payload, format="json")
     assert replay.status_code == 200, replay.json()
@@ -3067,13 +3100,12 @@ def test_checkout_payment_window_starts_after_bank_settings_lock_and_replay_keep
         "fully_restocked",
     ],
 )
-def test_restock_projection_matches_server_eligibility(
+def test_historical_cancelled_order_restock_projection_matches_server_eligibility(
     active_user, store_product, payment_settings, monkeypatch, blocked
 ):
     from commerce.store_orders import (
         StoreOrderError,
         approve_store_order,
-        cancel_store_order,
         restock_store_order,
     )
     from commerce.store_views import order_payload
@@ -3084,6 +3116,7 @@ def test_restock_projection_matches_server_eligibility(
     )
     assert result.status_code == 201
     data = result.json()["data"]
+    legacy_checkout_snapshot(data)
     client.post(
         f"/api/v1/public/store-orders/{data['id']}/report-transfer",
         {"access_token": data["guest_access_token"]},
@@ -3097,9 +3130,7 @@ def test_restock_projection_matches_server_eligibility(
         idempotency_key=uuid.uuid4(),
         allocations=[{"line_id": order.lines.get().pk, "batch_id": batch.pk, "quantity": 2}],
     )
-    order = cancel_store_order(
-        order_id=order.pk, actor=active_user, idempotency_key=uuid.uuid4(), reason="test"
-    )
+    order = historical_cancelled_snapshot(order.pk, active_user)
     allocation = order.lines.get().stock_allocations.get()
     if blocked == "batch_expired":
         monkeypatch.setattr(

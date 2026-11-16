@@ -36,7 +36,7 @@ def _reopen(context, selection):
     return service.reopen_selection(
         selection_id=selection.pk,
         actor=context[0],
-        deadline=context[3].delivery_at - timedelta(hours=1),
+        deadline=service.delivery_start(context[3]) - timedelta(hours=1),
         now=context[3].closes_at,
     )
 
@@ -143,7 +143,7 @@ def test_reserved_quota_bulk_credits_need_one_aggregate(context):
     selected = save(context)
     quota = MembershipCycleQuota.objects.get(cycle__membership=context[2])
     selected.state = "reselecting"
-    selected.reopen_until = context[3].delivery_at
+    selected.reopen_until = service.delivery_start(context[3])
     usage = MembershipUsageOrder.objects.create(
         membership=context[2],
         customer=context[2].customer,
@@ -162,13 +162,13 @@ def test_reserved_quota_bulk_credits_need_one_aggregate(context):
             name="Other",
             opens_at=context[3].opens_at,
             closes_at=context[3].closes_at,
-            delivery_at=context[3].delivery_at,
+            delivery_date=context[3].delivery_date,
         )
         other = CSASelection.objects.create(
             round=round_,
             membership=context[2],
             state="reselecting",
-            reopen_until=context[3].delivery_at,
+            reopen_until=service.delivery_start(context[3]),
         )
         usage = MembershipUsageOrder.objects.create(
             membership=context[2],
@@ -232,7 +232,7 @@ def test_save_rechecks_deadline_after_inventory_lock(context, monkeypatch, resel
     if reselect:
         selected = save(context)
         _reopen(context, selected)
-        cutoff = context[3].delivery_at - timedelta(hours=1)
+        cutoff = service.delivery_start(context[3]) - timedelta(hours=1)
         monkeypatch.setattr(timezone, "now", lambda: context[3].closes_at)
     else:
         cutoff = context[3].closes_at
@@ -266,8 +266,8 @@ def test_save_rechecks_membership_end_date_after_inventory_lock(context, monkeyp
     member.end_date = timezone.localdate(now) + timedelta(days=1)
     member.save(update_fields=["end_date"])
     round_.closes_at = now + timedelta(days=2)
-    round_.delivery_at = now + timedelta(days=3)
-    round_.save(update_fields=["closes_at", "delivery_at"])
+    round_.delivery_date = timezone.localdate(now) + timedelta(days=3)
+    round_.save(update_fields=["closes_at", "delivery_date"])
     original = service.active_product_stock
 
     def delayed_stock(*args, **kwargs):

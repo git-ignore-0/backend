@@ -962,7 +962,7 @@ def ensure_due_cycles(
                 cycle_quota_id__in=[quota.pk for quota in expiring],
                 released_at__isnull=True,
                 consumed_at__isnull=True,
-                line__order__status__in=["payment_pending", "pending_review"],
+                line__order__status__in=["payment_pending", "pending_review", "payment_review"],
                 line__order__expires_at__gt=timezone.now(),
             )
             .values("cycle_quota_id")
@@ -1017,7 +1017,7 @@ def quota_availability_rows(
         cycle_quota_id__in=[row.pk for row in rows],
         released_at__isnull=True,
         consumed_at__isnull=True,
-        line__order__status__in=["payment_pending", "pending_review"],
+        line__order__status__in=["payment_pending", "pending_review", "payment_review"],
         line__order__expires_at__gt=timezone.now(),
     )
     reserved = {
@@ -1168,7 +1168,7 @@ def create_usage_order(*, membership_id, actor, idempotency_key, lines: list[dic
             cycle_quota_id__in=[quota.pk for quota in quotas],
             released_at__isnull=True,
             consumed_at__isnull=True,
-            line__order__status__in=["payment_pending", "pending_review"],
+            line__order__status__in=["payment_pending", "pending_review", "payment_review"],
             line__order__expires_at__gt=timezone.now(),
         )
         .values("cycle_quota_id")
