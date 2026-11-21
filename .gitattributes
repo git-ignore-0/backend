@@ -6,3 +6,5 @@
 *.py diff=python
 
 /.github export-ignore
+/package.json export-ignore
+/package-lock.json export-ignore

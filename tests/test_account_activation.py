@@ -2,7 +2,7 @@ import pytest
 from allauth.account.models import EmailAddress
 from allauth.account.signals import email_confirmed
 from django.contrib.auth.models import Group
-from django.db import IntegrityError, connection, transaction
+from django.db import DEFAULT_DB_ALIAS, IntegrityError, connection, connections, transaction
 
 from identity import services
 from identity.models import AccountStatus, AuditLog, IdentityEvent, User
@@ -262,7 +262,9 @@ def test_email_verification_requires_exact_address_even_with_accent_insensitive_
 
     user = User.objects.create_user(email="person@café.vn", name="Member")
     EmailAddress.objects.create(user=user, email="person@cafe.vn", verified=True)
-    if connection.vendor == "sqlite":
+    # Patch the wrapper that owns the attribute so monkeypatch can restore it.
+    db = connections[DEFAULT_DB_ALIAS]
+    if db.vendor == "sqlite":
         # A separate handle models MySQL accent-insensitive LIKE without changing the
         # test connection's built-in LIKE or its schema/data.
         def equivalent(pattern, value):
@@ -275,13 +277,13 @@ def test_email_verification_requires_exact_address_even_with_accent_insensitive_
 
             return key(pattern) == key(value)
 
-        raw = sqlite3.connect(connection.settings_dict["NAME"], uri=True)
+        raw = sqlite3.connect(db.settings_dict["NAME"], uri=True)
         try:
             raw.create_function(
                 "like", 3, lambda pattern, value, escape: equivalent(pattern, value)
             )
             with monkeypatch.context() as context:
-                context.setattr(connection, "connection", raw)
+                context.setattr(db, "connection", raw)
                 assert not user.email_verified
         finally:
             raw.close()
