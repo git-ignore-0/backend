@@ -1,5 +1,6 @@
 """Verified-current-email recovery using allauth's existing link/token flow."""
 
+from importlib import import_module
 from secrets import token_urlsafe
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -14,7 +15,6 @@ from allauth.account.forms import (
 from allauth.account.internal.flows.password_reset import finalize_password_reset
 from allauth.account.utils import user_pk_to_url_str
 from allauth.account.views import (
-    INTERNAL_RESET_SESSION_KEY,
     PasswordResetFromKeyDoneView,
     PasswordResetFromKeyView,
     PasswordResetView,
@@ -41,6 +41,11 @@ from identity.passwords import (
     can_reset_password,
     revoke_core_credentials,
 )
+
+# Resolve the session slot from the module that implements the reset view.
+INTERNAL_RESET_SESSION_KEY = import_module(
+    PasswordResetFromKeyView.__module__
+).INTERNAL_RESET_SESSION_KEY
 
 _RESET_FLOWS_KEY = "nfv_password_reset_flows"
 _OPEN_RESET_FLOWS_KEY = "nfv_open_password_reset_flows"
