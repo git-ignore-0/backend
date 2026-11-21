@@ -1,0 +1,10 @@
+{% load i18n %}
+{% if user.is_authenticated %}
+    {% url 'account' as close_url %}
+    {% translate "Back to account" as close_label %}
+{% else %}
+    {% translate "Back to sign in" as close_label %}
+{% endif %}
+<a class="auth-button auth-button-outline auth-close" href="{{ close_url|default:core_login_url }}" aria-label="{{ close_label }}">
+    <span aria-hidden="true">×</span>
+</a>

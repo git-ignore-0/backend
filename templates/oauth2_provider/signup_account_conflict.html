@@ -1,23 +1,30 @@
-{% extends "base.html" %}
+{% extends "account/layout.html" %}
 {% load i18n %}
 {% block title %}{% translate "Create another account" %}{% endblock %}
-{% block content %}
-<section class="card" aria-labelledby="signup-account-title">
-    <p class="eyebrow">{% translate "Create account" %}</p>
+{% block panel %}
+<section aria-labelledby="signup-account-title">
+    <p class="auth-eyebrow">{% translate "Create account" %}</p>
     <h1 id="signup-account-title">{% translate "You are already signed in" %}</h1>
-    <p>{% blocktranslate with email=account_email %}Signed in as <strong>{{ email }}</strong>.{% endblocktranslate %}</p>
-    <p>{% translate "To create a different account, sign out first. Your signup request will continue afterward." %}</p>
-    <div class="actions account-choice-actions">
+    <p class="auth-description">{% translate "To create a different account, sign out first. Your signup request will continue afterward." %}</p>
+    <c-alert>
+        {% blocktranslate with email=account_label %}Signed in as <strong>{{ email }}</strong>.{% endblocktranslate %}
+    </c-alert>
+    <dl class="auth-details">
+        <div><dt>{% translate "Sign in" %}</dt><dd>{% translate "Continue with this account" %}</dd></div>
+        <div><dt>{% translate "Create account" %}</dt><dd>{% translate "Sign out" %}</dd></div>
+    </dl>
+    <div class="auth-actions">
         <form method="post" action="{% url 'resolve-signup-account' %}">
             {% csrf_token %}
             <input type="hidden" name="next" value="{{ oauth_next }}">
-            <button class="secondary" type="submit" name="action" value="continue">{% translate "Continue with this account" %}</button>
+            <c-button variant="outline" type="submit" name="action" value="continue">{% translate "Continue with this account" %}</c-button>
         </form>
         <form method="post" action="{% url 'resolve-signup-account' %}">
             {% csrf_token %}
             <input type="hidden" name="next" value="{{ oauth_next }}">
-            <button type="submit" name="action" value="logout">{% translate "Sign out and create another account" %}</button>
+            <c-button type="submit" name="action" value="logout">{% translate "Sign out and create another account" %}</c-button>
         </form>
     </div>
 </section>
+<div class="auth-footer"><a href="{{ core_login_url }}">{% translate "Back to sign in" %}</a></div>
 {% endblock %}

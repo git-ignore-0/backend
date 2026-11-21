@@ -1,0 +1,229 @@
+<div class="auth-field" data-account-date>
+    <c-label id="profile-date-label" for="{{ field.id_for_label }}">{{ field.label }}</c-label>
+    {{ field }}
+    <c-button variant="outline" class="auth-date-trigger" id="profile-date-trigger" type="button"
+        popovertarget="profile-date-calendar" aria-haspopup="dialog"
+        aria-labelledby="profile-date-label profile-date-value" hidden>
+        <span id="profile-date-value">—</span>
+        <svg aria-hidden="true" focusable="false" width="16" height="16" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="5" width="18" height="16" rx="2"/>
+            <path d="M16 3v4M8 3v4M3 10h18"/>
+        </svg>
+    </c-button>
+
+    <div id="profile-date-calendar" class="auth-date-calendar" role="dialog"
+        aria-labelledby="profile-date-label" popover="auto" hidden>
+        <div class="auth-calendar-controls">
+            <details class="auth-calendar-month" data-calendar-month>
+                <summary class="auth-button auth-button-outline" autofocus>
+                    <span data-calendar-month-label></span>
+                    <svg aria-hidden="true" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="m4 6 4 4 4-4"/></svg>
+                </summary>
+                <div class="auth-calendar-month-options" data-calendar-month-options></div>
+            </details>
+            <div class="auth-calendar-year">
+                <input type="text" inputmode="numeric" maxlength="4" autocomplete="off"
+                    aria-describedby="profile-date-year-range" data-calendar-year>
+                <div class="auth-calendar-year-range" id="profile-date-year-range"></div>
+            </div>
+        </div>
+        <div class="auth-calendar-grid auth-calendar-week" aria-hidden="true"></div>
+        <div class="auth-calendar-grid" data-calendar-days></div>
+    </div>
+    {% if field.errors %}
+        <div class="auth-field-errors" role="alert">{{ field.errors }}</div>
+    {% endif %}
+</div>
+
+<script type="module">
+    const picker = document.querySelector("[data-account-date]");
+    const calendar = picker.querySelector("[popover]");
+
+    if (typeof calendar.showPopover === "function") {
+        const input = picker.querySelector('input[type="date"]');
+        const label = picker.querySelector("label");
+        const trigger = picker.querySelector("#profile-date-trigger");
+        const display = picker.querySelector("#profile-date-value");
+        const month = calendar.querySelector("[data-calendar-month]");
+        const monthToggle = month.querySelector("summary");
+        const monthLabel = month.querySelector("[data-calendar-month-label]");
+        const monthOptions = month.querySelector("[data-calendar-month-options]");
+        const year = calendar.querySelector("[data-calendar-year]");
+        const yearRange = calendar.querySelector("#profile-date-year-range");
+        const week = calendar.querySelector(".auth-calendar-week");
+        const days = calendar.querySelector("[data-calendar-days]");
+        const locale = document.documentElement.lang;
+        const maxDate = new Date(input.max + "T00:00:00Z");
+        const maxYear = maxDate.getUTCFullYear();
+        const minYear = maxYear - 100;
+        const minDate = dateAt(minYear, 0, 1);
+        const maxMonth = maxDate.getUTCMonth();
+        const firstWeekday = locale === "vi" ? 1 : 0;
+        const fieldNames = new Intl.DisplayNames(locale, {type: "dateTimeField"});
+        const formatDate = new Intl.DateTimeFormat(locale, {
+            year: "numeric", month: "2-digit", day: "2-digit", timeZone: "UTC",
+        });
+        const formatFullDate = new Intl.DateTimeFormat(locale, {
+            dateStyle: "full", timeZone: "UTC",
+        });
+        const formatMonth = new Intl.DateTimeFormat(locale, {month: "long", timeZone: "UTC"});
+        const formatWeekday = new Intl.DateTimeFormat(locale, {weekday: "short", timeZone: "UTC"});
+        let visibleYear = maxYear;
+        let visibleMonth = maxMonth;
+
+        function dateAt(targetYear, targetMonth, targetDay) {
+            const date = new Date(0);
+            date.setUTCFullYear(targetYear, targetMonth, targetDay);
+            return date;
+        }
+
+        function updateDisplay() {
+            display.textContent = input.valueAsDate ? formatDate.format(input.valueAsDate) : "—";
+        }
+
+        function renderMonth(target, focusDay = false) {
+            const earliestVisibleTime = Math.max(minDate.getTime(), target.getTime());
+            const visibleDate = new Date(Math.min(maxDate.getTime(), earliestVisibleTime));
+            visibleYear = visibleDate.getUTCFullYear();
+            visibleMonth = visibleDate.getUTCMonth();
+            const lastDay = dateAt(visibleYear, visibleMonth + 1, 0).getUTCDate();
+            const dayButtons = document.createDocumentFragment();
+
+            year.value = String(visibleYear);
+            year.removeAttribute("aria-invalid");
+            for (const option of monthOptions.children) {
+                const index = Number(option.dataset.month);
+                option.disabled = visibleYear === maxYear && index > maxMonth;
+                option.setAttribute("aria-pressed", String(index === visibleMonth));
+            }
+            monthLabel.textContent = formatMonth.format(visibleDate);
+            monthToggle.setAttribute("aria-label", `${fieldNames.of("month")}: ${monthLabel.textContent}`);
+            for (let day = 1; day <= lastDay; day++) {
+                const date = dateAt(visibleYear, visibleMonth, day);
+                const button = document.createElement("button");
+                button.type = "button";
+                button.className = "auth-button auth-button-ghost auth-calendar-day";
+                button.textContent = day;
+                button.dataset.date = date.toISOString().slice(0, 10);
+                button.disabled = date > maxDate;
+                button.tabIndex = day === visibleDate.getUTCDate() ? 0 : -1;
+                button.setAttribute("aria-label", formatFullDate.format(date));
+                button.setAttribute("aria-pressed", String(button.dataset.date === input.value));
+                if (day === 1) {
+                    button.style.gridColumnStart = ((date.getUTCDay() - firstWeekday + 7) % 7) + 1;
+                }
+                dayButtons.append(button);
+            }
+            days.replaceChildren(dayButtons);
+            if (focusDay) days.querySelector('[tabindex="0"]').focus();
+        }
+
+        year.setAttribute("aria-label", fieldNames.of("year"));
+        yearRange.textContent = `${minYear}–${maxYear}`;
+        for (let index = 0; index < 12; index++) {
+            const option = document.createElement("button");
+            option.type = "button";
+            option.className = "auth-button auth-button-ghost auth-calendar-month-option";
+            option.dataset.month = index;
+            option.textContent = formatMonth.format(dateAt(2000, index, 1));
+            monthOptions.append(option);
+        }
+        for (let index = 0; index < 7; index++) {
+            const heading = document.createElement("span");
+            heading.textContent = formatWeekday.format(dateAt(2024, 0, 7 + firstWeekday + index));
+            week.append(heading);
+        }
+
+        calendar.addEventListener("beforetoggle", (event) => {
+            month.open = false;
+            if (event.newState === "open") renderMonth(input.valueAsDate || maxDate);
+        });
+        calendar.addEventListener("click", (event) => {
+            if (month.open && !month.contains(event.target)) month.open = false;
+        });
+
+        function normalizeYearInput() {
+            const digits = year.value.replace(/[^0-9]/g, "").slice(0, 4);
+            if (year.value !== digits) year.value = digits;
+            const targetYear = Number(digits);
+            const valid = targetYear >= minYear && targetYear <= maxYear;
+            year.setAttribute("aria-invalid", String(!valid));
+            return valid;
+        }
+
+        function selectMonth(monthIndex = visibleMonth) {
+            if (!normalizeYearInput()) return false;
+            const targetYear = Number(year.value);
+            const targetMonth = targetYear === maxYear ? Math.min(monthIndex, maxMonth) : monthIndex;
+            if (targetYear !== visibleYear || targetMonth !== visibleMonth) {
+                renderMonth(dateAt(targetYear, targetMonth, 1));
+            }
+            return true;
+        }
+
+        function closeMonthOptions() {
+            month.open = false;
+            monthToggle.focus();
+        }
+
+        monthOptions.addEventListener("click", (event) => {
+            const option = event.target.closest("button[data-month]");
+            if (!option || option.disabled) return;
+            if (!selectMonth(Number(option.dataset.month))) {
+                month.open = false;
+                year.focus();
+                return;
+            }
+            closeMonthOptions();
+        });
+        month.addEventListener("keydown", (event) => {
+            if (event.key === "Escape" && month.open) {
+                event.preventDefault();
+                closeMonthOptions();
+            }
+        });
+        year.addEventListener("input", normalizeYearInput);
+        year.addEventListener("change", () => selectMonth());
+        year.addEventListener("keydown", (event) => {
+            if (event.key === "Enter") {
+                event.preventDefault();
+                selectMonth();
+            }
+        });
+
+        days.addEventListener("keydown", (event) => {
+            const offset = {ArrowLeft: -1, ArrowRight: 1, ArrowUp: -7, ArrowDown: 7}[event.key];
+            const value = event.target.dataset.date;
+            if (!offset || !value || !normalizeYearInput()) return;
+            event.preventDefault();
+            const target = new Date(value + "T00:00:00Z");
+            target.setUTCDate(target.getUTCDate() + offset);
+            if (target.getUTCFullYear() >= minYear && target <= maxDate) renderMonth(target, true);
+        });
+
+        days.addEventListener("click", (event) => {
+            const button = event.target.closest("button[data-date]");
+            if (!button || button.disabled) return;
+            if (!normalizeYearInput()) {
+                year.focus();
+                return;
+            }
+            input.value = button.dataset.date;
+            updateDisplay();
+            calendar.hidePopover();
+            trigger.focus();
+        });
+
+        for (const attribute of ["aria-invalid", "aria-describedby"]) {
+            if (input.hasAttribute(attribute)) {
+                trigger.setAttribute(attribute, input.getAttribute(attribute));
+            }
+        }
+        updateDisplay();
+        label.htmlFor = trigger.id;
+        calendar.hidden = false;
+        trigger.hidden = false;
+        input.hidden = true;
+    }
+</script>

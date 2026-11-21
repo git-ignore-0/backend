@@ -1,22 +1,26 @@
-{% extends "base.html" %}
+{% extends "account/layout.html" %}
 {% load i18n %}
 {% block title %}{% translate "Sign in" %}{% endblock %}
-{% block content %}
-<section class="card">
-    <p class="eyebrow">{% translate "Shared account" %}</p>
-    <h1>{% translate "Sign in" %}</h1>
-    <p>{% translate "Use one account for the Natural Farming Vietnam website and forum." %}</p>
-    <form method="post" action="{% url 'account_login' %}">
-        {% csrf_token %}
-        {{ form.as_p }}
-        {% if redirect_field_value %}
-            <input type="hidden" name="{{ redirect_field_name }}" value="{{ redirect_field_value }}">
-        {% endif %}
-        <button type="submit">{% translate "Sign in" %}</button>
-    </form>
-    <div class="links">
-        <a href="{{ password_reset_url }}">{% translate "Forgot password?" %}</a>
-        <a href="{{ signup_url }}">{% translate "Create account" %}</a>
+{% block panel %}
+<h1>{% translate "Sign in" %}</h1>
+<form method="post" action="{% url 'account_login' %}">
+    {% csrf_token %}
+    {% include "account/partials/form_errors.html" %}
+    <div class="auth-fields">
+        {% for field in form.visible_fields %}
+            {% if field.name != "remember" %}{% include "account/partials/field.html" with mark_required=True %}{% endif %}
+        {% endfor %}
     </div>
-</section>
+    <div class="auth-form-meta">
+        {% if form.remember %}{% include "account/partials/field.html" with field=form.remember mark_required=True %}{% endif %}
+        <a href="{{ password_reset_url }}">{% translate "Forgot password?" %}</a>
+    </div>
+    {% if redirect_field_value %}
+        <input type="hidden" name="{{ redirect_field_name }}" value="{{ redirect_field_value }}">
+    {% endif %}
+    <c-button type="submit">{% translate "Sign in" %}</c-button>
+</form>
+<div class="auth-footer auth-footer-inline">
+    <span>{% translate "Don't have an account?" %} <a href="{{ signup_url }}">{% translate "Sign up" %}</a></span>
+</div>
 {% endblock %}

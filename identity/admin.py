@@ -2,6 +2,8 @@ from django.contrib import admin, messages
 from django.contrib.admin.helpers import ACTION_CHECKBOX_NAME
 from django.contrib.auth.admin import UserAdmin as DjangoUserAdmin
 from django.contrib.auth.forms import UserChangeForm
+from django.core.exceptions import PermissionDenied
+from django.db import transaction
 from django.template.response import TemplateResponse
 from django.utils.translation import gettext_lazy as _
 
@@ -51,25 +53,55 @@ class UserAdmin(DjangoUserAdmin):
     )
     actions = ("suspend_accounts", "reactivate_accounts", "request_account_deletion")
 
+    def save_model(self, request, obj, form, change):
+        if not change:
+            super().save_model(request, obj, form, change)
+            return
+
+        # A lifecycle transition or password reset may have saved after the form load.
+        changed_fields = {
+            field.name
+            for field in obj._meta.concrete_fields
+            if field.editable and field.name in form.changed_data
+        }
+        if changed_fields:
+            obj.save(update_fields=changed_fields | {"updated_at"})
+
+    @staticmethod
+    def _require_lifecycle_actor(request):
+        # Refresh membership and privileges to bypass the request user's permission cache.
+        actor = User.objects.filter(pk=request.user.pk).first()
+        if (
+            actor is None
+            or not actor.is_staff
+            or not actor.can_access_core()
+            or not actor.has_perm("identity.change_user")
+        ):
+            raise PermissionDenied
+        return actor
+
     def _transition_accounts(self, request, queryset, *, target, allowed):
+        actor = self._require_lifecycle_actor(request)
         changed = 0
         skipped = 0
-        for user in queryset:
-            if user.is_superuser or user.pk == request.user.pk or user.status not in allowed:
-                skipped += 1
-                continue
+        for candidate in queryset:
             try:
-                transition_account(user, target)
+                with transaction.atomic():
+                    user = User.objects.select_for_update().get(pk=candidate.pk)
+                    if user.is_superuser or user.pk == actor.pk or user.status not in allowed:
+                        skipped += 1
+                        continue
+                    updated = transition_account(user, target, source="admin", actor=actor)
+                    AuditLog.objects.create(
+                        user=updated,
+                        action=f"admin.account.{target}",
+                        ip_address=request.META.get("REMOTE_ADDR"),
+                        user_agent=request.META.get("HTTP_USER_AGENT", "")[:1000],
+                        context={"actor_user_id": str(actor.pk)},
+                    )
             except InvalidAccountTransition:
                 skipped += 1
             else:
-                AuditLog.objects.create(
-                    user=user,
-                    action=f"admin.account.{target}",
-                    ip_address=request.META.get("REMOTE_ADDR"),
-                    user_agent=request.META.get("HTTP_USER_AGENT", "")[:1000],
-                    context={"actor_user_id": str(request.user.pk)},
-                )
                 changed += 1
 
         self.message_user(
@@ -79,7 +111,7 @@ class UserAdmin(DjangoUserAdmin):
             messages.SUCCESS if changed else messages.WARNING,
         )
 
-    @admin.action(description=_("Suspend selected accounts"))
+    @admin.action(permissions=["change"], description=_("Suspend selected accounts"))
     def suspend_accounts(self, request, queryset):
         self._transition_accounts(
             request,
@@ -88,7 +120,7 @@ class UserAdmin(DjangoUserAdmin):
             allowed={AccountStatus.ACTIVE},
         )
 
-    @admin.action(description=_("Reactivate selected suspended accounts"))
+    @admin.action(permissions=["change"], description=_("Reactivate selected suspended accounts"))
     def reactivate_accounts(self, request, queryset):
         self._transition_accounts(
             request,
@@ -97,7 +129,7 @@ class UserAdmin(DjangoUserAdmin):
             allowed={AccountStatus.SUSPENDED},
         )
 
-    @admin.action(description=_("Request deletion and hide forum content"))
+    @admin.action(permissions=["change"], description=_("Request deletion and hide forum content"))
     def request_account_deletion(self, request, queryset):
         if request.POST.get("confirm_lifecycle_action") == "yes":
             self._transition_accounts(
@@ -108,6 +140,7 @@ class UserAdmin(DjangoUserAdmin):
             )
             return None
 
+        self._require_lifecycle_actor(request)
         context = {
             **self.admin_site.each_context(request),
             "title": _("Confirm account deletion request"),

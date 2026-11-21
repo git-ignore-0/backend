@@ -1,0 +1,11 @@
+{
+  "name": "nfv-django-auth-styles",
+  "private": true,
+  "scripts": {
+    "build:auth-css": "tailwindcss -i ./assets/auth.css -o ./static/css/account-ui.css --minify"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "4.1.18",
+    "tailwindcss": "4.1.18"
+  }
+}

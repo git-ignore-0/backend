@@ -93,6 +93,7 @@ from memberships.payments import (
 )
 from memberships.permissions import HasMembershipSelfScopes
 from memberships.purchases import (
+    AuthAccountInactive,
     CSAPurchaseError,
     PaymentQuoteExpired,
     PaymentQuoteIdentityMismatch,
@@ -272,7 +273,9 @@ def csa_customer_error(error):
 
 
 def csa_purchase_error(error):
-    if isinstance(error, PaymentSettingsUnavailable):
+    if isinstance(error, AuthAccountInactive):
+        http_status = status.HTTP_403_FORBIDDEN
+    elif isinstance(error, PaymentSettingsUnavailable):
         http_status = status.HTTP_503_SERVICE_UNAVAILABLE
     elif isinstance(
         error,
@@ -1291,9 +1294,12 @@ class PublicCSAPaymentQuoteConfirmView(APIView):
             )
         except (CSAPurchaseError, CouponError) as error:
             return csa_purchase_error(error)
+        data = csa_purchase_payload(item, guest_confirmation_token=guest_token)
+        if user is not None:
+            data["recipient_phone"] = item.phone_e164
         return no_store(
             Response(
-                {"data": csa_purchase_payload(item, guest_confirmation_token=guest_token)},
+                {"data": data},
                 status=status.HTTP_201_CREATED if guest_token is not None else status.HTTP_200_OK,
             )
         )

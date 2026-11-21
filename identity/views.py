@@ -1,14 +1,19 @@
+from urllib.parse import urlsplit
+
 from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth import logout as django_logout
 from django.contrib.auth.decorators import login_required
+from django.core.exceptions import PermissionDenied
 from django.http import JsonResponse
 from django.shortcuts import redirect, render
+from django.urls import reverse
 from django.utils.translation import gettext as _
 from django.views.decorators.http import require_GET, require_http_methods, require_POST
 from django.views.i18n import set_language as django_set_language
 
-from identity.navigation import PUBLIC_RETURN_TO_SESSION_KEY, safe_public_return_to
+from identity.forms import AddPhoneForm
+from identity.navigation import PUBLIC_RETURN_TO_SESSION_KEY, safe_local_next, safe_public_return_to
 from identity.oauth import access_token_from_request, has_me_scopes
 from members.forms import MemberProfileForm
 from members.models import MemberProfile
@@ -52,7 +57,11 @@ def public_logout(request):
 @login_required
 @require_http_methods(["GET", "POST"])
 def fixed_account_email(request):
-    return redirect("account")
+    return redirect(
+        "account"
+        if request.user.can_access_core() and request.user.email_verified
+        else "account_complete"
+    )
 
 
 @require_POST
@@ -62,39 +71,71 @@ def set_language(request):
         if request.user.locale != language:
             request.user.locale = language
             request.user.save(update_fields=["locale", "updated_at"])
+    next_url = safe_local_next(request.POST.get("next"))
+    if next_url:
+        next_path = urlsplit(next_url).path
+        if next_path in {
+            reverse("account_email_add"),
+            reverse("account_phone_add"),
+            reverse("account_email_resend"),
+        }:
+            destination = "account_complete"
+            if (
+                next_path == reverse("account_phone_add")
+                and request.user.is_authenticated
+                and request.user.can_access_core()
+            ):
+                destination = "account"
+            request.POST = request.POST.copy()
+            request.POST["next"] = reverse(destination)
     return django_set_language(request)
+
+
+def _account_profile_form(user, data=None):
+    profile = MemberProfile.objects.filter(user=user).first()
+    initial = {
+        "name": user.name,
+        "date_of_birth": profile.date_of_birth if profile else None,
+    }
+    return MemberProfileForm(data, initial=initial)
+
+
+def render_account_dashboard(request, *, account_user, profile_form=None, phone_form=None):
+    if profile_form is None:
+        profile_form = _account_profile_form(account_user)
+    if phone_form is None and not account_user.login_phone_number:
+        phone_form = AddPhoneForm()
+    return render(
+        request,
+        "account/dashboard.html",
+        {
+            "account_user": account_user,
+            "profile_form": profile_form,
+            "phone_form": phone_form,
+        },
+    )
 
 
 @login_required
 @require_http_methods(["GET", "POST"])
 def account(request):
-    email_verified = request.user.email_verified
-    if not email_verified:
-        return redirect("account_email_verification_sent")
-    if not request.user.can_access_core(email_verified=email_verified):
+    if not request.user.can_access_core():
+        if request.user.can_authenticate():
+            return redirect("account_complete")
         return render(request, "account/account_inactive.html", status=403)
-    profile = MemberProfile.objects.filter(user=request.user).first()
-    initial = {
-        "name": request.user.name,
-        "phone_number": profile.phone_number if profile else "",
-        "date_of_birth": profile.date_of_birth if profile else None,
-        "province_code": profile.province_code if profile else "",
-        "ward_code": profile.ward_code if profile else "",
-        "address": profile.address if profile else "",
-    }
-    form = MemberProfileForm(
-        request.POST or None,
-        initial=initial,
-        language_code=request.LANGUAGE_CODE,
-    )
+    form = _account_profile_form(request.user, request.POST if request.method == "POST" else None)
     if request.method == "POST" and form.is_valid():
-        update_member_profile(user=request.user, data=form.cleaned_data)
-        messages.success(request, _("Profile updated."))
+        try:
+            profile_changed = update_member_profile(user=request.user, data=form.cleaned_data)
+        except PermissionDenied:
+            return render(request, "account/account_inactive.html", status=403)
         return_to = safe_public_return_to(request.session.pop(PUBLIC_RETURN_TO_SESSION_KEY, None))
         if return_to:
             return redirect(return_to)
+        if profile_changed:
+            messages.success(request, _("Changes saved"))
         return redirect("account")
-    return render(request, "account/dashboard.html", {"profile_form": form})
+    return render_account_dashboard(request, account_user=request.user, profile_form=form)
 
 
 @require_GET
@@ -111,8 +152,7 @@ def me(request):
         return oauth_error("insufficient_scope", 403)
 
     user = token.user
-    email_verified = user.email_verified
-    if not user.can_access_core(email_verified=email_verified):
+    if not user.can_access_core():
         return oauth_error("account_inactive", 403)
     profile = MemberProfile.objects.filter(user=user).first()
 
@@ -122,12 +162,13 @@ def me(request):
                 "data": {
                     "sub": str(user.pk),
                     "name": user.name,
-                    "email": user.email,
-                    "email_verified": email_verified,
+                    "email": user.email or None,
+                    "email_verified": user.email_verified,
+                    "login_phone_number": user.login_phone_number,
                     "locale": user.locale,
                     "status": user.status,
                     "roles": list(user.groups.order_by("name").values_list("name", flat=True)),
-                    "phone_number": profile.phone_number if profile else "",
+                    "phone_number": user.login_phone_number or "",
                     "date_of_birth": (
                         profile.date_of_birth.isoformat()
                         if profile and profile.date_of_birth

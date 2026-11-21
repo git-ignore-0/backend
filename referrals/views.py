@@ -1,5 +1,7 @@
+from allauth.account.models import EmailAddress
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
-from django.db.models import Case, F, IntegerField, Q, Sum, Value, When
+from django.db.models import Case, F, IntegerField, Prefetch, Q, Sum, Value, When
 from django.db.models.functions import Coalesce
 from django.shortcuts import get_object_or_404
 from rest_framework import status, viewsets
@@ -13,7 +15,9 @@ from rest_framework.views import APIView
 from content.permissions import IsWebsiteAdmin
 from content.serializers import media_payload
 from content.services import audit, store_reward_image
+from identity.admin_api import AdminAccountPasswordAPIView, create_admin_user
 from identity.models import User
+from identity.phones import normalize_login_phone
 from referrals.models import (
     PointDirection,
     PointTransaction,
@@ -433,22 +437,39 @@ def admin_user_csa_fields(user):
     }
 
 
-class AdminUserListView(APIView):
-    permission_classes = [IsWebsiteAdmin]
+class AdminUserListView(AdminAccountPasswordAPIView):
+    def post(self, request):
+        return create_admin_user(request)
 
     def get(self, request):
         query = AdminUserQuerySerializer(data=request.query_params)
         query.is_valid(raise_exception=True)
         search = query.validated_data["search"].strip()
-        queryset = User.objects.select_related("member_profile", "csa_customer").annotate(
-            points_balance=balance_expression()
+        queryset = (
+            User.objects.select_related("member_profile", "csa_customer")
+            .annotate(points_balance=balance_expression())
+            .prefetch_related(
+                Prefetch(
+                    "emailaddress_set",
+                    queryset=EmailAddress.objects.filter(verified=True).only("user_id", "email"),
+                    to_attr="verified_addresses",
+                )
+            )
         )
         if search:
-            queryset = queryset.filter(
+            matches = (
                 Q(name__icontains=search)
                 | Q(email__icontains=search)
                 | Q(member_profile__phone_number__icontains=search)
+                | Q(login_phone_number__icontains=search)
             )
+            try:
+                phone = normalize_login_phone(search)
+            except DjangoValidationError:
+                pass
+            else:
+                matches |= Q(login_phone_number=phone)
+            queryset = queryset.filter(matches)
         queryset = queryset.order_by("-date_joined", "-id")
         items, meta = paginate(queryset, query.validated_data["page"], page_size=ADMIN_PAGE_SIZE)
         return no_store(
@@ -459,6 +480,8 @@ class AdminUserListView(APIView):
                             "id": str(user.pk),
                             "name": user.name,
                             "email": user.email,
+                            "login_phone_number": user.login_phone_number,
+                            "email_verified": user.email_verified,
                             "phone": user_phone(user),
                             **admin_user_csa_fields(user),
                             "status": user.status,
@@ -487,6 +510,8 @@ def admin_user_payload(user, invited_page: int = 1) -> tuple[dict, dict]:
             "id": str(user.pk),
             "name": user.name,
             "email": user.email,
+            "login_phone_number": user.login_phone_number,
+            "email_verified": user.email_verified,
             "phone": profile.phone_number if profile else "",
             **admin_user_csa_fields(user),
             "date_joined": user.date_joined.isoformat(),

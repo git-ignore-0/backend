@@ -1,9 +1,13 @@
-{% extends "base.html" %}
+{% extends "account/layout.html" %}
 {% load i18n %}
 {% block title %}{% translate "Account unavailable" %}{% endblock %}
-{% block content %}
-<section class="card">
+{% block panel %}
+<div class="auth-status">
+    {% include "account/partials/status_icon.html" with icon="warning" %}
     <h1>{% translate "This account cannot sign in right now" %}</h1>
     <p>{% translate "Please contact a Natural Farming Vietnam administrator if you need help." %}</p>
-</section>
+    <div class="auth-actions">
+        <a class="auth-button auth-button-primary" href="{{ core_login_url }}">{% translate "Back to sign in" %}</a>
+    </div>
+</div>
 {% endblock %}

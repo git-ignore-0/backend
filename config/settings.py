@@ -106,6 +106,7 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
+    "django_cotton",
     "allauth",
     "allauth.account",
     "oauth2_provider",
@@ -130,7 +131,9 @@ MIDDLEWARE += [
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "identity.middleware.UserLocaleMiddleware",
+    "identity.middleware.CoreCredentialLockMiddleware",
     "allauth.account.middleware.AccountMiddleware",
+    "identity.middleware.RestrictedAccountMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
@@ -259,19 +262,30 @@ AUTHENTICATION_BACKENDS = [
 LOGIN_REDIRECT_URL = "/account"
 LOGOUT_REDIRECT_URL = "/login"
 
-ACCOUNT_LOGIN_METHODS = {"email"}
-ACCOUNT_SIGNUP_FIELDS = ["email*", "password1*", "password2*"]
+ACCOUNT_LOGIN_METHODS = {"email", "phone"}
+ACCOUNT_SIGNUP_FIELDS = ["phone*", "email", "password1*", "password2*"]
 ACCOUNT_USER_MODEL_USERNAME_FIELD = None
-ACCOUNT_EMAIL_VERIFICATION = "mandatory"
+ACCOUNT_EMAIL_VERIFICATION = "optional"
+ACCOUNT_PHONE_VERIFICATION_ENABLED = False
+ACCOUNT_LOGIN_BY_CODE_ENABLED = False
+ACCOUNT_PASSWORD_RESET_BY_CODE_ENABLED = False
+ACCOUNT_LOGIN_ON_PASSWORD_RESET = False
 ACCOUNT_MAX_EMAIL_ADDRESSES = 1
 ACCOUNT_EMAIL_SUBJECT_PREFIX = "[Natural Farming Vietnam] "
 ACCOUNT_EMAIL_CONFIRMATION_EXPIRE_DAYS = 1
+EMAIL_VERIFICATION_RESEND_SECONDS = 60
+ACCOUNT_RATE_LIMITS = {"confirm_email": f"1/{EMAIL_VERIFICATION_RESEND_SECONDS}s/key"}
 ACCOUNT_CONFIRM_EMAIL_ON_GET = False
 ACCOUNT_LOGIN_ON_EMAIL_CONFIRMATION = True
 ACCOUNT_PREVENT_ENUMERATION = True
 ACCOUNT_FORMS = {
     "login": "identity.forms.CoreLoginForm",
     "signup": "identity.forms.CoreSignupForm",
+    "change_password": "identity.forms.CoreChangePasswordForm",
+    "set_password": "identity.forms.CoreSetPasswordForm",
+    "reset_password": "identity.recovery.CoreResetPasswordForm",
+    "reset_password_from_key": "identity.recovery.CoreResetPasswordKeyForm",
+    "user_token": "identity.recovery.CoreUserTokenForm",
 }
 ACCOUNT_ADAPTER = "identity.adapters.CoreAccountAdapter"
 

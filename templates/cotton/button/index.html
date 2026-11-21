@@ -1,0 +1,7 @@
+<c-vars variant="default" class=""></c-vars>
+<button
+    class="auth-button {% if variant == 'default' %}auth-button-primary{% elif variant == 'outline' %}auth-button-outline{% elif variant == 'ghost' %}auth-button-ghost{% endif %} {{ class }}"
+    {{ attrs }}
+>
+    {{ slot }}
+</button>

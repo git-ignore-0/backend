@@ -6,10 +6,11 @@ from django.db.models import Q
 from django.utils import timezone
 
 from identity.managers import UserManager
+from identity.phones import normalize_login_phone
 
 
 class AccountStatus(models.TextChoices):
-    PENDING_VERIFICATION = "pending_verification", "Pending verification"
+    PENDING_ACTIVATION = "pending_activation", "Pending activation"
     ACTIVE = "active", "Active"
     SUSPENDED = "suspended", "Suspended"
     DELETION_REQUESTED = "deletion_requested", "Deletion requested"
@@ -18,12 +19,14 @@ class AccountStatus(models.TextChoices):
 
 class User(AbstractBaseUser, PermissionsMixin):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    email = models.EmailField(unique=True, max_length=254)
+    email = models.EmailField(unique=True, max_length=254, null=True, blank=True)
+    email_verification_attempted_at = models.DateTimeField(null=True, blank=True, editable=False)
+    login_phone_number = models.CharField(max_length=16, unique=True, null=True, blank=True)
     name = models.CharField(max_length=150)
     status = models.CharField(
         max_length=32,
         choices=AccountStatus.choices,
-        default=AccountStatus.PENDING_VERIFICATION,
+        default=AccountStatus.PENDING_ACTIVATION,
         db_index=True,
     )
     locale = models.CharField(max_length=10, default="vi")
@@ -44,7 +47,7 @@ class User(AbstractBaseUser, PermissionsMixin):
                 condition=(
                     Q(
                         status__in=[
-                            AccountStatus.PENDING_VERIFICATION,
+                            AccountStatus.PENDING_ACTIVATION,
                             AccountStatus.ACTIVE,
                         ],
                         is_active=True,
@@ -62,25 +65,53 @@ class User(AbstractBaseUser, PermissionsMixin):
             )
         ]
 
+    def _normalize_identifiers(self):
+        self.email = User.objects.normalize_email(self.email)
+        if isinstance(self.login_phone_number, str) and not self.login_phone_number.strip(" "):
+            self.login_phone_number = None
+        if self.login_phone_number is not None:
+            self.login_phone_number = normalize_login_phone(self.login_phone_number)
+
+    def clean_fields(self, exclude=None):
+        self._normalize_identifiers()
+        super().clean_fields(exclude=exclude)
+
+    def clean(self):
+        # AbstractBaseUser.clean applies username NFKC; email uses the same
+        # trim/lower contract as manager, save and migration instead.
+        self._normalize_identifiers()
+
+    def save(self, *args, **kwargs):
+        # Model/manager/service saves share the same canonical identifiers.
+        self._normalize_identifiers()
+        return super().save(*args, **kwargs)
+
     def __str__(self) -> str:
-        return self.email
+        return self.email or self.login_phone_number or str(self.pk)
 
     @property
     def email_verified(self) -> bool:
-        return self.emailaddress_set.filter(email__iexact=self.email, verified=True).exists()
+        if not self.email:
+            return False
+        # Database collations may equate distinct accented addresses. Verification
+        # requires the actual canonical string, not SQL collation equivalence.
+        addresses = getattr(self, "verified_addresses", None)
+        emails = (
+            (address.email for address in addresses)
+            if addresses is not None
+            else self.emailaddress_set.filter(verified=True).values_list("email", flat=True)
+        )
+        return any(User.objects.normalize_email(email) == self.email for email in emails)
 
     def can_authenticate(self) -> bool:
         return self.is_active and self.status in {
-            AccountStatus.PENDING_VERIFICATION,
+            AccountStatus.PENDING_ACTIVATION,
             AccountStatus.ACTIVE,
         }
 
     def can_access_core(self, *, email_verified: bool | None = None) -> bool:
-        if not self.is_active or self.status != AccountStatus.ACTIVE:
-            return False
-        if email_verified is None:
-            email_verified = self.email_verified
-        return email_verified
+        # Retain the legacy keyword while separating Core access from verification.
+        return self.is_active and self.status == AccountStatus.ACTIVE
 
 
 class EventStatus(models.TextChoices):

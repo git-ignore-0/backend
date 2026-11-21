@@ -159,7 +159,9 @@ def coupon_snapshot_user(identity):
     from commerce.models import ShippingAddress
     from identity.models import User
 
-    user = User.objects.create_user(email="coupon-snapshot@example.com", name=identity["name"])
+    user = User.objects.create_user(
+        email="coupon-snapshot@example.com", name=identity["name"], status=AccountStatus.ACTIVE
+    )
     ShippingAddress.objects.create(
         user=user,
         recipient_name=identity["name"],

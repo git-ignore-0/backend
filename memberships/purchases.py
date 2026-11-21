@@ -123,6 +123,10 @@ class AuthAccountIncomplete(CSAPurchaseError):
     )
 
 
+class AuthAccountInactive(CSAPurchaseError):
+    code = "account_inactive"
+
+
 class PurchaseConfirmationDenied(CSAPurchaseError):
     code = "csa_purchase_request_not_found"
 
@@ -229,10 +233,16 @@ def _validated_address(*, province_code, ward_code, address) -> tuple[str, str, 
 
 
 def _locked_authenticated_identity(user) -> dict:
+    locked_user = User.objects.select_for_update().filter(pk=user.pk).first()
+    return _purchase_identity_from_locked_user(locked_user)
+
+
+def _purchase_identity_from_locked_user(locked_user) -> dict:
+    if locked_user is None or not locked_user.can_access_core():
+        raise AuthAccountInactive("The account cannot access Core")
     try:
-        locked_user = User.objects.select_for_update().get(pk=user.pk)
         shipping_address = ShippingAddress.objects.select_for_update().get(user=locked_user)
-    except (User.DoesNotExist, ShippingAddress.DoesNotExist) as error:
+    except ShippingAddress.DoesNotExist as error:
         raise AuthAccountIncomplete("Delivery address is missing") from error
 
     values = {
@@ -241,7 +251,6 @@ def _locked_authenticated_identity(user) -> dict:
         "province_code": str(shipping_address.province_code or "").strip(),
         "ward_code": str(shipping_address.ward_code or "").strip(),
         "address": str(shipping_address.address or "").strip(),
-        "email": str(locked_user.email or "").strip(),
     }
     if any(not value for value in values.values()):
         raise AuthAccountIncomplete("Auth Account profile is incomplete")
@@ -258,7 +267,9 @@ def _locked_authenticated_identity(user) -> dict:
         )
     except (InvalidPhoneNumber, CSAPurchaseError) as error:
         raise AuthAccountIncomplete("Auth Account profile is incomplete") from error
+    values["email"] = locked_user.email
     values["user"] = locked_user
+    values["shipping_address_updated_at"] = shipping_address.updated_at.isoformat()
     return values
 
 
@@ -853,6 +864,7 @@ def create_csa_payment_quote(
             "kind": "user",
             "user_id": str(identity["user"].pk),
             "fingerprint": _guest_identity_fingerprint(identity),
+            "shipping_address_updated_at": identity["shipping_address_updated_at"],
         }
     else:
         identity = _guest_identity(identity=guest_identity or {})
@@ -948,6 +960,8 @@ def csa_payment_quote_payload(quote_token: str, quote: dict) -> dict:
             "template": "compact2",
         },
     }
+    if address_version := quote["subject"].get("shipping_address_updated_at"):
+        result["shipping_address_updated_at"] = address_version
     return result
 
 
@@ -966,14 +980,15 @@ def confirm_csa_payment_quote(*, quote_token, user=None, guest_identity=None, no
             if existing.user_id != user.pk:
                 raise PaymentQuoteIdentityMismatch("Payment quote is unavailable")
             return existing, None
-        identity = _locked_authenticated_identity(user)
+        locked_user = User.objects.select_for_update().filter(pk=user.pk).first()
         # A concurrent confirm may have committed while we waited for User.
-        # Replay before checking mutable catalog data or the occupied phone slot.
+        # Replay before checking the eligibility and shipping data for a new request.
         existing = CSAPurchaseRequest.objects.filter(quote_nonce=quote["nonce"]).first()
         if existing is not None:
             if existing.user_id != user.pk:
                 raise PaymentQuoteIdentityMismatch("Payment quote is unavailable")
             return existing, None
+        identity = _purchase_identity_from_locked_user(locked_user)
         if not hmac.compare_digest(
             str(subject.get("fingerprint") or ""), _guest_identity_fingerprint(identity)
         ):

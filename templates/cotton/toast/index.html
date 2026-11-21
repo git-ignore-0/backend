@@ -1,0 +1,38 @@
+<c-vars id class role="status" auto_show dismissal></c-vars>
+<div id="{{ id }}"
+    {% if dismissal == 'toast-manual' %}data-toast-manual{% endif %}
+    x-data="{
+    isVisible: false,
+    timeoutId: null,
+
+    show(persistent = false) {
+        this.isVisible = true;
+        // Clear any existing timeout
+        if (this.timeoutId) {
+            clearTimeout(this.timeoutId);
+        }
+
+        this.timeoutId = persistent ? null : setTimeout(() => {
+            this.hide();
+        }, 3000);
+    },
+
+    hide() {
+        this.isVisible = false;
+    }
+  }"
+    {% if auto_show %}x-init="show({% if dismissal == 'toast-manual' %}true{% endif %})"{% endif %}
+    @show-toast.window="if ($event.detail === $el.id || $event.detail?.value === $el.id) show($el.hasAttribute('data-toast-manual'))"
+    x-show="isVisible"
+    x-transition:enter="transition ease-out duration-300"
+    x-transition:enter-start="opacity-0 transform translate-y-full"
+    x-transition:enter-end="opacity-100 transform translate-y-0"
+    x-transition:leave="transition ease-in duration-200"
+    x-transition:leave-start="opacity-100 transform translate-x-0"
+    x-transition:leave-end="opacity-0 transform translate-x-full"
+    class="{% if class %}{{ class }}{% endif %} fixed bottom-5 right-5"
+    role="{{ role }}"
+    {{ attrs }}
+>
+  {{ slot }}
+</div>

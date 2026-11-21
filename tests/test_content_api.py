@@ -680,3 +680,49 @@ def test_oversized_image_is_rejected_before_decoding(monkeypatch, settings):
         store_workshop_image(image_upload("oversized.png"), actor=None)
 
     assert image.loaded is False
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("email_state", ["missing", "unverified", "verified"])
+def test_admin_session_projects_current_email_status_and_login_phone(
+    admin_api, active_user, email_state
+):
+    active_user.login_phone_number = "0987654321"
+    if email_state == "missing":
+        active_user.emailaddress_set.all().delete()
+        active_user.email = None
+    elif email_state == "unverified":
+        active_user.emailaddress_set.update(verified=False)
+    active_user.save(update_fields=["email", "login_phone_number"])
+
+    response = admin_api.get("/api/v1/admin/session")
+    assert response.status_code == 200
+    assert response.json() == {
+        "data": {
+            "id": str(active_user.pk),
+            "name": active_user.name,
+            "email": active_user.email,
+            "email_verified": email_state == "verified",
+            "login_phone_number": "+84987654321",
+            "locale": active_user.locale,
+            "roles": ["website_admin"],
+        }
+    }
+
+
+@pytest.mark.django_db
+def test_admin_session_rejects_missing_bearer_group_and_scope(
+    admin_api, active_user, access_token, client
+):
+    client.force_login(active_user, backend="identity.backends.CoreAuthenticationBackend")
+    assert client.get("/api/v1/admin/session").status_code == 401
+    assert (
+        client.get("/api/v1/admin/session", HTTP_AUTHORIZATION="Bearer invalid").status_code == 401
+    )
+    access_token.scope = "profile email"
+    access_token.save(update_fields=["scope"])
+    assert admin_api.get("/api/v1/admin/session").status_code == 403
+    access_token.scope = "profile email content:manage"
+    access_token.save(update_fields=["scope"])
+    active_user.groups.clear()
+    assert admin_api.get("/api/v1/admin/session").status_code == 403

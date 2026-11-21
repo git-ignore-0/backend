@@ -1,0 +1,6 @@
+{% include "account/partials/form_errors.html" %}
+<div class="auth-fields">
+    {% for field in form.visible_fields %}
+        {% include "account/partials/field.html" %}
+    {% endfor %}
+</div>

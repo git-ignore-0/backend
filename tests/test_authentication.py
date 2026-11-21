@@ -1,3 +1,5 @@
+import re
+
 import pytest
 from allauth.account import app_settings
 from allauth.account.models import EmailAddress
@@ -94,7 +96,7 @@ def test_suspended_user_cannot_log_in(client):
 
 
 @pytest.mark.django_db
-def test_pending_user_is_sent_to_email_verification(client):
+def test_pending_user_is_sent_to_account_completion(client):
     user = User.objects.create_user(
         email="pending@example.com",
         name="Pending User",
@@ -106,7 +108,7 @@ def test_pending_user_is_sent_to_email_verification(client):
     response = client.get("/account")
 
     assert response.status_code == 302
-    assert response.url == "/accounts/confirm-email/"
+    assert response.url == "/account/complete"
 
 
 @pytest.mark.django_db
@@ -118,22 +120,11 @@ def test_account_page_does_not_create_empty_member_profile(client, active_user):
     assert response.status_code == 200
     assert response.context["profile_form"]["name"].value() == active_user.name
     content = response.content.decode()
-    assert 'class="card account-card"' in content
-    assert 'id="profile-title"' in content
-    assert 'aria-labelledby="security-title"' in content
+    assert 'id="account-profile-form"' in content
     assert 'autocomplete="name"' in content
-    assert 'autocomplete="address-line1"' in content
-    assert "data-province-select" in content
-    assert "data-ward-select" in content
-    assert 'value="01">Thành phố Hà Nội</option>' in content
-    assert 'data-wards-url="/api/v1/administrative-units/wards"' in content
-    assert "data-profile-submit disabled" in content
-    assert content.count("required") == 6
     assert 'type="date"' in content
     assert f'max="{timezone.localdate().isoformat()}"' in content
-    assert 'type="tel"' in content
-    assert "data-phone-input" in content
-    assert 'src="/static/js/account.js"' in content
+    assert set(response.context["profile_form"].fields) == {"name", "date_of_birth"}
     assert "Manage email" not in content
     assert "/accounts/email/" not in content
     assert not MemberProfile.objects.filter(user=active_user).exists()
@@ -169,10 +160,8 @@ def test_account_page_updates_shared_identity_and_member_profile(client, active_
         {
             "name": "Nông Dân Mới",
             "phone_number": "+84 912 345 678",
+            "login_phone_number": "0955555555",
             "date_of_birth": "1990-06-15",
-            "province_code": "66",
-            "ward_code": "22015",
-            "address": "Số 12, ngõ 5",
             "email": "attacker@example.com",
         },
     )
@@ -182,12 +171,50 @@ def test_account_page_updates_shared_identity_and_member_profile(client, active_
     active_user.refresh_from_db()
     assert active_user.name == "Nông Dân Mới"
     assert active_user.email == "member@example.com"
+    assert active_user.login_phone_number is None
     profile = MemberProfile.objects.get(user=active_user)
-    assert profile.phone_number == "+84 912 345 678"
+    assert profile.phone_number == ""
     assert profile.date_of_birth.isoformat() == "1990-06-15"
-    assert profile.province_code == "66"
-    assert profile.ward_code == "22015"
-    assert profile.address == "Số 12, ngõ 5"
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("language", "saved_text"),
+    [("vi", "Đã lưu thay đổi"), ("en", "Changes saved")],
+)
+def test_profile_save_feedback_is_shown_once_in_shared_toast(
+    client, active_user, settings, language, saved_text
+):
+    client.cookies[settings.LANGUAGE_COOKIE_NAME] = language
+    login = client.post("/login", {"login": active_user.email, "password": "StrongPassword12"})
+    assert login.status_code == 302
+
+    response = client.post(
+        "/account", {"name": "Member", "date_of_birth": "1990-06-15"}, follow=True
+    )
+
+    assert response.redirect_chain == [("/account", 302)]
+    page = response.content.decode()
+    toast_stack = page.split('<div class="auth-toast-stack">', 1)[1]
+    assert re.findall(r'id="(auth-toast-\d+)"', toast_stack) == ["auth-toast-1", "auth-toast-2"]
+    assert toast_stack.count('x-init="show()"') == toast_stack.count('role="status"') == 2
+    assert saved_text in toast_stack and page.count(saved_text) == 1
+    assert active_user.email in toast_stack  # The separate sign-in message.
+    assert page.count("/static/js/vendor/alpine-3.14.8.min.js") == 1
+    assert "auth-toast-stack" not in client.get("/account").content.decode()
+
+
+@pytest.mark.django_db
+def test_saving_unchanged_profile_does_not_show_a_toast(client, active_user):
+    MemberProfile.objects.create(user=active_user, date_of_birth="1990-06-15")
+    client.force_login(active_user, backend="identity.backends.CoreAuthenticationBackend")
+
+    response = client.post(
+        "/account", {"name": active_user.name, "date_of_birth": "1990-06-15"}, follow=True
+    )
+
+    assert response.redirect_chain == [("/account", 302)]
+    assert b"auth-toast-stack" not in response.content
 
 
 @override_settings(PUBLIC_SITE_ORIGINS=("http://localhost:3000",))
@@ -207,15 +234,13 @@ def test_account_update_returns_to_validated_public_csa_purchase(client, active_
             "name": "Nông Dân Mới",
             "phone_number": "+84 912 345 678",
             "date_of_birth": "1990-06-15",
-            "province_code": "66",
-            "ward_code": "22015",
-            "address": "Số 12, ngõ 5",
         },
     )
 
     assert response.status_code == 302
     assert response.url == "http://localhost:3000/csa/purchase/vi"
     assert "nfv_public_return_to" not in client.session
+    assert "Đã lưu thay đổi" not in client.get("/account").content.decode()
 
 
 @override_settings(PUBLIC_SITE_ORIGINS=("http://localhost:3000",))
@@ -230,9 +255,6 @@ def test_account_update_ignores_unvalidated_public_return(client, active_user):
             "name": "Nông Dân Mới",
             "phone_number": "+84 912 345 678",
             "date_of_birth": "1990-06-15",
-            "province_code": "66",
-            "ward_code": "22015",
-            "address": "Số 12, ngõ 5",
         },
     )
 
@@ -250,42 +272,46 @@ def test_account_page_rejects_invalid_profile_fields(client, active_user):
             "name": active_user.name,
             "phone_number": "call-me",
             "date_of_birth": (timezone.localdate() + timezone.timedelta(days=1)).isoformat(),
-            "province_code": "",
-            "ward_code": "",
-            "address": "",
         },
     )
 
     assert response.status_code == 200
-    assert set(response.context["profile_form"].errors) == {
-        "phone_number",
-        "date_of_birth",
-        "province_code",
-        "ward_code",
-        "address",
-    }
+    assert set(response.context["profile_form"].errors) == {"date_of_birth"}
+    assert 'aria-describedby="id_date_of_birth_error"' in response.content.decode()
     assert not MemberProfile.objects.filter(user=active_user).exists()
 
 
 @pytest.mark.django_db
-def test_account_page_rejects_ward_from_another_province(client, active_user):
+def test_account_page_preserves_legacy_profile_phone_and_address(client, active_user):
     client.force_login(active_user, backend="identity.backends.CoreAuthenticationBackend")
+    profile = MemberProfile.objects.create(
+        user=active_user,
+        phone_number="0987654321",
+        province_code="66",
+        ward_code="22015",
+        address="Số 12, ngõ 5",
+    )
 
     response = client.post(
         "/account",
         {
             "name": active_user.name,
-            "phone_number": "",
-            "date_of_birth": "",
+            "phone_number": "0912345678",
+            "date_of_birth": "1990-06-15",
             "province_code": "01",
-            "ward_code": "22015",
-            "address": "Số 12",
+            "ward_code": "00004",
+            "address": "Địa chỉ thay thế",
         },
     )
 
-    assert response.status_code == 200
-    assert "ward_code" in response.context["profile_form"].errors
-    assert not MemberProfile.objects.filter(user=active_user).exists()
+    assert response.status_code == 302
+    profile.refresh_from_db()
+    assert profile.phone_number == "0987654321"
+    assert (profile.province_code, profile.ward_code, profile.address) == (
+        "66",
+        "22015",
+        "Số 12, ngõ 5",
+    )
 
 
 def test_administrative_wards_endpoint_returns_localized_wards(client):
@@ -299,7 +325,7 @@ def test_administrative_wards_endpoint_returns_localized_wards(client):
     assert response.json()["data"][0] == {"code": "00004", "name": "Ba Dinh Ward"}
 
 
-def test_administrative_provinces_endpoint_returns_auth_form_source(client):
+def test_administrative_provinces_endpoint_returns_localized_provinces(client):
     response = client.get(
         "/api/v1/administrative-units/provinces",
         HTTP_ACCEPT_LANGUAGE="en",

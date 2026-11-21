@@ -1,17 +1,23 @@
-{% extends "base.html" %}
+{% extends "account/layout.html" %}
 {% load i18n %}
 {% block title %}{% translate "Verify email" %}{% endblock %}
-{% block content %}
-<section class="card">
-    <h1>{% translate "Verify email" %}</h1>
+{% block panel %}
+<div class="auth-status">
     {% if confirmation %}
+        {% include "account/partials/status_icon.html" with icon="success" %}
+        <h1>{% translate "Verify email" %}</h1>
         <p>{% blocktranslate with email=confirmation.email_address.email %}Confirm that <strong>{{ email }}</strong> is your email address.{% endblocktranslate %}</p>
-        <form method="post">
+        <form method="post" class="auth-actions">
             {% csrf_token %}
-            <button type="submit">{% translate "Verify and activate" %}</button>
+            <c-button class="col-span-full" type="submit">{% translate "Verify email" %}</c-button>
         </form>
     {% else %}
+        {% include "account/partials/status_icon.html" with icon="warning" %}
+        <h1>{% translate "Verify email" %}</h1>
         <p>{% translate "This verification link is invalid or has expired." %}</p>
+        <div class="auth-actions">
+            <a class="auth-button auth-button-primary" href="{{ core_login_url }}">{% translate "Back to sign in" %}</a>
+        </div>
     {% endif %}
-</section>
+</div>
 {% endblock %}

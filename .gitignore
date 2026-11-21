@@ -36,3 +36,6 @@ test-media/
 .DS_Store
 .idea/
 .vscode/
+
+# Local Tailwind build tools
+node_modules/

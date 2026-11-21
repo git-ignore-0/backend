@@ -1,25 +1,53 @@
-{% extends "base.html" %}
+{% extends "account/layout.html" %}
 {% load i18n %}
 {% block title %}{% translate "Authorize access" %}{% endblock %}
-{% block content %}
-<section class="card">
-    {% if not error %}
-        <p class="eyebrow">{% translate "Connect account" %}</p>
-        <h1>{% blocktranslate with application_name=application.name %}Allow {{ application_name }}?{% endblocktranslate %}</h1>
-        <p>{% translate "This application is requesting the following permissions:" %}</p>
-        <ul>{% for scope in scopes_descriptions %}<li>{{ scope }}</li>{% endfor %}</ul>
-        <form method="post">
+{% block panel %}
+{% if not error %}
+    <p class="auth-eyebrow">{% translate "Connect account" %}</p>
+    <h1>{% blocktranslate with application_name=application.name %}Allow {{ application_name }}?{% endblocktranslate %}</h1>
+    <dl class="auth-details">
+        <div><dt>{% translate "Application" %}</dt><dd>{{ application.name }}</dd></div>
+        <div><dt>{% translate "Account" %}</dt><dd>{{ user.email|default:user.login_phone_number|default:user.name }}</dd></div>
+    </dl>
+    <h2>{% translate "This application is requesting the following permissions:" %}</h2>
+    <ul class="auth-permissions">
+        {% for scope in scopes_descriptions %}
+            <li><span aria-hidden="true">✓</span><span>{{ scope }}</span></li>
+        {% endfor %}
+    </ul>
+    <form id="oauth-consent-form" method="post">
+        {% csrf_token %}
+        {% for field in form %}{% if field.is_hidden %}{{ field }}{% endif %}{% endfor %}
+    </form>
+    {% if form.errors %}<c-alert variant="destructive">{{ form.errors }}</c-alert>{% endif %}
+    <c-button class="auth-primary-action" type="submit" form="oauth-consent-form" name="allow" value="Authorize">{% translate "Allow" %}</c-button>
+
+    <div class="auth-actions auth-secondary-actions">
+        <c-button variant="outline" type="submit" form="oauth-consent-form">{% translate "Decline" %}</c-button>
+        <form method="post" action="{% url 'account_logout' %}">
             {% csrf_token %}
-            {% for field in form %}{% if field.is_hidden %}{{ field }}{% endif %}{% endfor %}
-            {{ form.errors }}
-            <div class="actions">
-                <button class="secondary" type="submit">{% translate "Cancel" %}</button>
-                <button type="submit" name="allow" value="Authorize">{% translate "Allow" %}</button>
-            </div>
+            <input type="hidden" name="next" value="{{ request.get_full_path }}">
+            <c-button variant="outline" type="submit">{% translate "Sign out" %}</c-button>
         </form>
-    {% else %}
+    </div>
+{% else %}
+    <div class="auth-status">
+        {% include "account/partials/status_icon.html" with icon="warning" %}
         <h1>{% translate "Unable to authorize" %}</h1>
-        <p>{% translate "The authorization request is invalid or has expired. Please return to the application and try again." %}</p>
-    {% endif %}
-</section>
+        {% if oauth_return_url %}
+            <p>{% translate "The authorization request is invalid or has expired. Please return to the application and try again." %}</p>
+        {% else %}
+            <p>{% translate "The authorization request is invalid or has expired." %}</p>
+        {% endif %}
+        <div class="auth-actions">
+            {% if oauth_return_url %}
+                <a class="auth-button auth-button-primary" href="{{ oauth_return_url }}">{% translate "Back to application" %}</a>
+            {% elif user.is_authenticated %}
+                <a class="auth-button auth-button-primary" href="{% url 'account' %}">{% translate "Back to account" %}</a>
+            {% else %}
+                <a class="auth-button auth-button-primary" href="{% url 'account_login' %}">{% translate "Back to sign in" %}</a>
+            {% endif %}
+        </div>
+    </div>
+{% endif %}
 {% endblock %}

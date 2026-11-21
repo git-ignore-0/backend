@@ -16,7 +16,7 @@ from commerce.store_orders import (
     record_store_payment,
     refund_store_order,
 )
-from identity.models import User
+from identity.models import AccountStatus, User
 from memberships.coupons import CouponError
 from memberships.expiry import expire_csa_purchase_request_if_due
 from memberships.models import CouponUsage, CSACoupon, CSAPurchaseRequest
@@ -159,7 +159,9 @@ def test_mysql_last_voucher_use_across_csa_and_store(context, catalog, active_us
     _, voucher, payload = context
     CSACoupon.objects.filter(pk=voucher.pk).update(usage_limit=1)
     voucher.refresh_from_db()
-    second = User.objects.create_user(email="second-voucher@example.com", name="Second")
+    second = User.objects.create_user(
+        email="second-voucher@example.com", name="Second", status=AccountStatus.ACTIVE
+    )
     ShippingAddress.objects.create(
         user=second,
         recipient_name="Second",
@@ -495,7 +497,9 @@ def test_mysql_concurrent_csa_confirms_swap_vouchers_while_expiring_old_requests
     from memberships.models import MembershipPackage, MembershipPackagePriceOption, QuotaPolicy
 
     low, high = ordered_coupon_pair()
-    second = User.objects.create_user(email="swap-voucher@example.com", name="Second")
+    second = User.objects.create_user(
+        email="swap-voucher@example.com", name="Second", status=AccountStatus.ACTIVE
+    )
     ShippingAddress.objects.create(
         user=second,
         recipient_name="Second",

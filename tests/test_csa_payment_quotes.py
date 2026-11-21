@@ -11,6 +11,7 @@ from rest_framework.test import APIClient
 
 from commerce.models import ShippingAddress, ShippingArea
 from identity.models import AccountStatus, User
+from identity.services import transition_account
 from memberships.coupons import CouponError, normalize_coupon_code
 from memberships.models import (
     CSAContract,
@@ -31,6 +32,7 @@ from memberships.models import (
     QuotaPolicy,
 )
 from memberships.purchases import (
+    AuthAccountInactive,
     PaymentQuoteExpired,
     PaymentQuoteIdentityMismatch,
     PaymentQuoteTermsChanged,
@@ -39,12 +41,13 @@ from memberships.purchases import (
     _quote_token,
     confirm_csa_payment_quote,
     create_csa_payment_quote,
+    create_public_csa_purchase_request,
     csa_payment_quote_payload,
     update_membership_payment_settings,
 )
 from memberships.terms import get_current_csa_terms, publish_csa_terms
 from memberships.tracker import tracker_request_payload
-from memberships.views import admin_csa_purchase_payload
+from memberships.views import admin_csa_purchase_payload, csa_purchase_error
 
 QUOTE_URL = "/api/v1/public/csa-payment-quotes"
 CONFIRM_URL = "/api/v1/public/csa-purchase-requests/confirm-transfer"
@@ -317,6 +320,7 @@ def test_confirm_quote_creates_one_payment_confirmed_request_and_is_idempotent(
         .post(QUOTE_URL, quote_payload(package, option, plan, guest_identity), format="json")
         .json()["data"]
     )
+    assert "shipping_address_updated_at" not in quoted
 
     first = APIClient().post(
         CONFIRM_URL,
@@ -331,6 +335,7 @@ def test_confirm_quote_creates_one_payment_confirmed_request_and_is_idempotent(
     assert not Membership.objects.exists()
     assert not CSAContract.objects.exists()
     assert data["guest_confirmation_token"]
+    assert "recipient_phone" not in data
     assert item.amount_snapshot == 1_300_000
     assert "shipping_fee_vnd" not in data
     assert item.payment_installments_snapshot == quoted["payment_summary"]["installments"]
@@ -348,7 +353,56 @@ def test_confirm_quote_creates_one_payment_confirmed_request_and_is_idempotent(
     assert retried.status_code == 200
     assert retried.json()["data"]["id"] == data["id"]
     assert "guest_confirmation_token" not in retried.json()["data"]
+    assert "recipient_phone" not in retried.json()["data"]
     assert CSAPurchaseRequest.objects.count() == 1
+
+
+@pytest.mark.django_db
+def test_member_confirm_and_replay_return_the_saved_recipient_phone(
+    active_user, access_token, catalog, payment_settings, guest_identity
+):
+    package, option = catalog
+    plan = make_plan(option, payment_type=MembershipPaymentType.FULL)
+    address = ShippingAddress.objects.create(
+        user=active_user,
+        recipient_name=guest_identity["name"],
+        phone_number="+84922222222",
+        province_code=guest_identity["province_code"],
+        ward_code=guest_identity["ward_code"],
+        address=guest_identity["address"],
+    )
+    client = APIClient()
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token.token}")
+    payload = quote_payload(package, option, plan, guest_identity)
+    payload.pop("guest_identity")
+    quoted = client.post(QUOTE_URL, payload, format="json")
+    assert quoted.status_code == 200
+    quote_data = quoted.json()["data"]
+    assert quote_data["shipping_address_updated_at"] == address.updated_at.isoformat()
+    confirm_payload = {"quote_token": quote_data["quote_token"]}
+
+    confirmed = client.post(CONFIRM_URL, confirm_payload, format="json")
+    assert confirmed.status_code == 200
+    data = confirmed.json()["data"]
+    item = CSAPurchaseRequest.objects.get(pk=data["id"])
+    assert data["recipient_phone"] == item.phone_e164 == "+84922222222"
+    assert confirmed.headers["Cache-Control"] == "private, no-store"
+
+    address.phone_number = "+84933333333"
+    address.save(update_fields=["phone_number", "updated_at"])
+    replay = client.post(CONFIRM_URL, confirm_payload, format="json")
+    assert replay.status_code == 200
+    assert replay.json()["data"]["id"] == data["id"]
+    assert replay.json()["data"]["recipient_phone"] == item.phone_e164
+    assert CSAPurchaseRequest.objects.count() == 1
+
+    tracked = APIClient().post(
+        "/api/v1/public/csa-contract-tracker/lookup",
+        {"reference_code": data["request_code"], "phone": data["recipient_phone"]},
+        format="json",
+    )
+    assert tracked.status_code == 200
+    assert "recipient_phone" not in tracked.json()["data"]
 
 
 @pytest.mark.django_db
@@ -382,6 +436,50 @@ def test_retry_returns_existing_request_after_shipping_area_is_disabled(
 
 
 @pytest.mark.django_db
+@pytest.mark.parametrize("confirmed_before_suspension", [False, True])
+def test_member_csa_checks_access_before_new_writes_and_preserves_saved_replays(
+    active_user, catalog, payment_settings, guest_identity, confirmed_before_suspension
+):
+    package, option = catalog
+    plan = make_plan(option, payment_type=MembershipPaymentType.FULL)
+    ShippingAddress.objects.create(
+        user=active_user,
+        recipient_name=guest_identity["name"],
+        phone_number="+84922222222",
+        province_code=guest_identity["province_code"],
+        ward_code=guest_identity["ward_code"],
+        address=guest_identity["address"],
+    )
+    purchase = {
+        "user": active_user,
+        "package_id": package.pk,
+        "price_option_id": option.pk,
+        "payment_plan_id": plan.pk,
+    }
+    token, _quote = create_csa_payment_quote(**purchase)
+    if confirmed_before_suspension:
+        confirmed, _guest_token = confirm_csa_payment_quote(quote_token=token, user=active_user)
+    transition_account(active_user, AccountStatus.SUSPENDED)
+
+    with pytest.raises(AuthAccountInactive) as denied:
+        create_csa_payment_quote(**purchase)
+    response = csa_purchase_error(denied.value)
+    assert response.status_code == 403
+    assert response.data == {"errors": [{"code": "account_inactive"}]}
+    with pytest.raises(AuthAccountInactive):
+        create_public_csa_purchase_request(**purchase)
+    if confirmed_before_suspension:
+        replay, guest_token = confirm_csa_payment_quote(quote_token=token, user=active_user)
+        assert replay.pk == confirmed.pk
+        assert guest_token is None
+        assert CSAPurchaseRequest.objects.count() == 1
+    else:
+        with pytest.raises(AuthAccountInactive):
+            confirm_csa_payment_quote(quote_token=token, user=active_user)
+        assert not CSAPurchaseRequest.objects.exists()
+
+
+@pytest.mark.django_db
 def test_confirm_rejects_expired_or_identity_mismatched_quote_without_creating_request(
     catalog, payment_settings, guest_identity
 ):
@@ -412,7 +510,15 @@ def test_confirm_rejects_expired_or_identity_mismatched_quote_without_creating_r
 
 
 @pytest.mark.django_db
-def test_authenticated_quote_is_bound_to_the_current_user(catalog, payment_settings, active_user):
+@pytest.mark.parametrize("has_email", [True, False], ids=["email", "no-email"])
+def test_authenticated_quote_is_bound_to_the_current_user(
+    catalog, payment_settings, active_user, has_email
+):
+    if not has_email:
+        active_user.emailaddress_set.all().delete()
+        active_user.email = None
+        active_user.login_phone_number = "0987654321"
+        active_user.save(update_fields=["email", "login_phone_number"])
     package, option = catalog
     plan = make_plan(option, payment_type=MembershipPaymentType.FULL)
     ShippingAddress.objects.create(
@@ -451,6 +557,8 @@ def test_authenticated_quote_is_bound_to_the_current_user(catalog, payment_setti
     assert item.user_id == active_user.pk
     assert item.name_snapshot == "Nguyễn Văn An"
     assert item.address_snapshot == "Delivery address"
+    assert item.email_snapshot == active_user.email
+    assert item.phone_e164 == "+84901234567"
     assert guest_token is None
 
 
@@ -878,7 +986,9 @@ def test_concurrent_coupon_confirms_do_not_exceed_usage_limit(
     from tests.test_voucher_lifecycle import csa_quote
 
     coupon = make_coupon(value="100000", usage_limit=1)
-    second = User.objects.create_user(email="second-csa-voucher@example.com", name="Second")
+    second = User.objects.create_user(
+        email="second-csa-voucher@example.com", name="Second", status=AccountStatus.ACTIVE
+    )
     ShippingAddress.objects.create(
         user=second,
         recipient_name="Second",

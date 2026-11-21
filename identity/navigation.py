@@ -1,14 +1,15 @@
-from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit, urlunsplit
 
 from django.conf import settings
 from django.urls import reverse
 
 PUBLIC_RETURN_TO_SESSION_KEY = "nfv_public_return_to"
 LOGIN_NEXT_SESSION_KEY = "nfv_login_next"
+_PENDING_OAUTH_SESSION_KEY = "nfv_pending_completion_oauth"
 
 
 def safe_public_return_to(value: str | None) -> str | None:
-    if not value or "\r" in value or "\n" in value:
+    if not value or any(ord(char) < 32 or ord(char) == 127 for char in value):
         return None
     try:
         parsed = urlsplit(value)
@@ -40,8 +41,8 @@ def safe_local_next(value: str | None) -> str | None:
         not value
         or not value.startswith("/")
         or value.startswith("//")
-        or "\r" in value
-        or "\n" in value
+        or any(ord(char) < 32 or ord(char) == 127 for char in value)
+        or "\\" in value
     ):
         return None
     try:
@@ -50,7 +51,8 @@ def safe_local_next(value: str | None) -> str | None:
         return None
     if parsed.scheme or parsed.netloc:
         return None
-    return urlunsplit(("", "", parsed.path or "/", parsed.query, parsed.fragment))
+    target = urlunsplit(("", "", parsed.path or "/", parsed.query, parsed.fragment))
+    return target if target.startswith("/") and not target.startswith("//") else None
 
 
 def safe_oauth_signup_next(value: str | None) -> str | None:
@@ -58,7 +60,7 @@ def safe_oauth_signup_next(value: str | None) -> str | None:
     if not next_url:
         return None
     parsed = urlsplit(next_url)
-    if parsed.path.rstrip("/") != "/oauth/authorize":
+    if parsed.path.rstrip("/") != reverse("authorize").rstrip("/"):
         return None
     query = parse_qs(parsed.query)
     if query.get("screen_hint", [""])[0] != "signup":
@@ -71,7 +73,7 @@ def public_return_from_oauth_next(value: str | None) -> str | None:
     if not next_url:
         return None
     parsed = urlsplit(next_url)
-    if parsed.path.rstrip("/") != "/oauth/authorize":
+    if parsed.path.rstrip("/") != reverse("authorize").rstrip("/"):
         return None
     redirect_uri = parse_qs(parsed.query).get("redirect_uri", [None])[0]
     if not redirect_uri:
@@ -102,8 +104,24 @@ def core_login_url(request) -> str:
     return f"{login_url}?{urlencode({'next': next_url})}"
 
 
-def public_login_url(request) -> str:
-    return_url = public_site_url(request)
+def password_reset_url(request) -> str:
+    reset_url = reverse("account_reset_password")
+    match = request.resolver_match
+    if match is None or match.url_name not in {"account_login", "account_login_alias"}:
+        return reset_url
+    return_url = safe_public_return_to(request.GET.get("return_to"))
+    if not return_url:
+        return_url = public_return_from_oauth_next(
+            request.POST.get("next") or request.GET.get("next")
+        )
+    return f"{reset_url}?{urlencode({'return_to': return_url})}" if return_url else reset_url
+
+
+def password_reset_login_url(request, return_to) -> str:
+    return_url = safe_public_return_to(return_to)
+    if not return_url:
+        return reverse("account_login")
+
     parsed = urlsplit(return_url)
     return_path = urlunsplit(("", "", parsed.path or "/", parsed.query, parsed.fragment))
     query = urlencode(
@@ -113,3 +131,57 @@ def public_login_url(request) -> str:
         }
     )
     return urlunsplit((parsed.scheme, parsed.netloc, "/api/auth/login", query, ""))
+
+
+def pending_oauth_destination(request, *, user) -> str | None:
+    if not user.can_access_core():
+        return None
+    pending_user, next_url = request.session.pop(_PENDING_OAUTH_SESSION_KEY, (None, None))
+    if pending_user == str(user.pk):
+        return account_destination(request, user=user, candidate=next_url)
+    return None
+
+
+def account_destination(request, *, user=None, candidate=None, consume=True) -> str:
+    """Retain safe continuation through the restricted session, consume on access."""
+    from identity.models import User
+
+    user = user or request.user
+    if user.is_authenticated:
+        user = User.objects.get(pk=user.pk)
+    requested_next = candidate or request.POST.get("next") or request.GET.get("next")
+    next_url = safe_local_next(requested_next or request.session.get(LOGIN_NEXT_SESSION_KEY))
+    is_oauth_next = False
+    if next_url:
+        parsed = urlsplit(next_url)
+        path = parsed.path.rstrip("/")
+        if path in {
+            reverse(name).rstrip("/")
+            for name in (
+                "account_login_alias",
+                "account_signup_alias",
+                "account_login",
+                "account_signup",
+                "account_complete",
+            )
+        }:
+            next_url = None
+        else:
+            is_oauth_next = path == reverse("authorize").rstrip("/")
+            request.session[LOGIN_NEXT_SESSION_KEY] = next_url
+    if not user.can_access_core():
+        if requested_next and is_oauth_next and user.can_authenticate():
+            request.session[_PENDING_OAUTH_SESSION_KEY] = [str(user.pk), next_url]
+        return reverse("account_complete")
+    if is_oauth_next:
+        query = [
+            (key, value)
+            for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+            if key not in {"screen_hint", "referral_code"}
+        ]
+        next_url = urlunsplit(("", "", parsed.path, urlencode(query), parsed.fragment))
+    if consume:
+        request.session.pop(LOGIN_NEXT_SESSION_KEY, None)
+        if is_oauth_next:
+            request.session.pop(_PENDING_OAUTH_SESSION_KEY, None)
+    return next_url or reverse("account")

@@ -581,7 +581,15 @@ def test_admin_approval_uses_fefo_and_is_replay_safe(
 
 
 @pytest.mark.django_db
-def test_user_list_is_owner_scoped(active_user, access_token, store_product, payment_settings):
+@pytest.mark.parametrize("has_email", [True, False], ids=["email", "no-email"])
+def test_user_list_is_owner_scoped(
+    active_user, access_token, store_product, payment_settings, has_email, mailoutbox
+):
+    if not has_email:
+        active_user.emailaddress_set.all().delete()
+        active_user.email = None
+        active_user.login_phone_number = "0987654321"
+        active_user.save(update_fields=["email", "login_phone_number"])
     ShippingAddress.objects.create(
         user=active_user,
         recipient_name=active_user.name,
@@ -617,6 +625,11 @@ def test_user_list_is_owner_scoped(active_user, access_token, store_product, pay
         format="json",
     )
     assert created.status_code == 201, created.json()
+
+    order = StoreOrder.objects.get(pk=created.json()["data"]["id"])
+    assert order.buyer_user_id == active_user.pk
+    assert order.phone_e164_snapshot == "+84901234567"
+    assert not mailoutbox
 
     listed = member.get("/api/v1/store-orders")
 

@@ -442,13 +442,21 @@ def test_direct_purchase_rejects_terms_that_changed_before_submit(valid_payload,
 
 
 @pytest.mark.django_db
+@pytest.mark.parametrize("has_email", [True, False], ids=["email", "no-email"])
 def test_authenticated_user_creates_only_their_own_request(
     package_and_option,
     payment_settings,
     active_user,
     complete_member_profile,
     access_token,
+    has_email,
+    mailoutbox,
 ):
+    if not has_email:
+        active_user.emailaddress_set.all().delete()
+        active_user.email = None
+        active_user.login_phone_number = "0987654321"
+        active_user.save(update_fields=["email", "login_phone_number"])
     package, option = package_and_option
     response = bearer_client(access_token).post(
         CREATE_URL,
@@ -473,6 +481,7 @@ def test_authenticated_user_creates_only_their_own_request(
     assert purchase.email_snapshot == active_user.email
     assert purchase.guest_token_hash == ""
     assert "guest_confirmation_token" not in data
+    assert not mailoutbox
 
 
 @pytest.mark.django_db

@@ -4,14 +4,23 @@ from django.contrib.auth.base_user import BaseUserManager
 class UserManager(BaseUserManager):
     use_in_migrations = True
 
-    def normalize_email(self, email: str) -> str:
+    def normalize_email(self, email: str | None) -> str | None:
         normalized = super().normalize_email(email)
-        return normalized.strip().lower()
+        return normalized.strip().lower() or None
 
-    def create_user(self, email: str, password: str | None = None, **extra_fields):
-        if not email:
-            raise ValueError("Email is required")
-        user = self.model(email=self.normalize_email(email), **extra_fields)
+    def create_user(
+        self,
+        email: str | None = None,
+        password: str | None = None,
+        *,
+        login_phone_number: str | None = None,
+        **extra_fields,
+    ):
+        email = self.normalize_email(email)
+        user = self.model(email=email, login_phone_number=login_phone_number, **extra_fields)
+        user._normalize_identifiers()
+        if not user.email and not user.login_phone_number:
+            raise ValueError("Email or login phone number is required")
         user.set_password(password)
         user.full_clean(exclude={"password"})
         user.save(using=self._db)
@@ -20,6 +29,8 @@ class UserManager(BaseUserManager):
     def create_superuser(self, email: str, password: str, **extra_fields):
         from identity.models import AccountStatus
 
+        if not self.normalize_email(email):
+            raise ValueError("Email is required")
         extra_fields.setdefault("name", "Administrator")
         extra_fields.setdefault("is_staff", True)
         extra_fields.setdefault("is_superuser", True)

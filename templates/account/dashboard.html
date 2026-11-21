@@ -1,58 +1,69 @@
 {% extends "base.html" %}
-{% load i18n static %}
+{% load i18n %}
 {% block title %}{% translate "Account" %}{% endblock %}
+{% block shell_width %}auth-shell-wide{% endblock %}
 {% block content %}
-<section class="card account-card">
-    <a class="card-back" href="{{ public_site_url }}">← {% translate "Back to website" %}</a>
-    <p class="eyebrow">{% translate "Personal information" %}</p>
-    <h1 id="profile-title">{% translate "Account" %}</h1>
-    <p>{% translate "This information is shared across Natural Farming Vietnam services." %}</p>
+{% url 'account_complete' as complete_url %}
+<c-card class="auth-card">
+    <h1>{% translate "Account" %}</h1>
 
-    <form
-        class="account-form"
-        method="post"
-        action="{% url 'account' %}"
-        data-wards-url="{% url 'administrative-wards' %}"
-        data-ward-placeholder="{% translate 'Select a ward, commune or special zone' %}"
-        data-ward-loading="{% translate 'Loading administrative units…' %}"
-        data-ward-error="{% translate 'Unable to load administrative units. Please try again.' %}"
-        novalidate
-    >
-        {% csrf_token %}
-        {% if profile_form.non_field_errors %}
-            <div class="form-alert" role="alert">{{ profile_form.non_field_errors }}</div>
+    <div class="auth-fields auth-account-fields">
+        <form class="auth-profile-edit" id="account-profile-form" method="post" action="{% url 'account' %}" novalidate>
+            {% csrf_token %}
+            {% include "account/partials/form_errors.html" with form=profile_form %}
+            <div class="auth-account-wide">
+                {% include "account/partials/field.html" with field=profile_form.name %}
+            </div>
+            {% include "account/partials/birth_date.html" with field=profile_form.date_of_birth %}
+        </form>
+
+        {% if account_user.login_phone_number %}
+            <dl class="auth-field">
+                <dt class="auth-field-caption">{% translate "Phone number" %}</dt>
+                <dd class="auth-profile-value">{{ account_user.login_phone_number }}</dd>
+                {% if phone_form.errors %}
+                    <dd><c-alert variant="destructive">{{ phone_form.errors }}</c-alert></dd>
+                {% endif %}
+            </dl>
+        {% else %}
+            <details class="auth-phone-disclosure" id="add-phone"{% if phone_form.is_bound %} open{% endif %}>
+                <summary class="auth-field">
+                    <span class="auth-field-caption">{% translate "Phone number" %}</span>
+                    <span class="auth-profile-value auth-profile-action">{% translate "Add phone number" %}</span>
+                </summary>
+                <form class="auth-phone-form" method="post" action="{% url 'account_phone_add' %}">
+                    {% csrf_token %}
+                    {% include "account/partials/form_fields.html" with form=phone_form %}
+                    <c-button variant="outline" type="submit">{% translate "Add phone number" %}</c-button>
+                </form>
+            </details>
         {% endif %}
 
-        {% for field in profile_form %}
-            <div class="field-group{% if field.name == 'name' or field.name == 'address' %} field-group-wide{% endif %}">
-                <label for="{{ field.id_for_label }}">{{ field.label }}</label>
-                {{ field }}
-                {% if field.help_text %}<span class="helptext">{{ field.help_text }}</span>{% endif %}
-                {% if field.errors %}<div class="field-errors" role="alert">{{ field.errors }}</div>{% endif %}
-            </div>
-        {% endfor %}
+        <dl class="auth-field auth-account-wide">
+            <dt class="auth-field-caption">{% translate "Email" %}</dt>
+            <dd class="auth-profile-value">
+                {% if account_user.email %}
+                    <span>{{ account_user.email }}</span>
+                    {% if account_user.email_verified %}
+                        <c-badge class="auth-pill" variant="secondary">{% translate "Verified" %}</c-badge>
+                    {% else %}
+                        <a class="auth-profile-action" href="{{ complete_url }}#email">{% translate "Verify email" %}</a>
+                    {% endif %}
+                {% else %}
+                    <a class="auth-profile-action" href="{{ complete_url }}#email">{% translate "Add email" %}</a>
+                {% endif %}
+            </dd>
+        </dl>
+    </div>
 
-        <p class="address-status" data-address-status aria-live="polite"></p>
+    <c-button class="auth-primary-action" type="submit" form="account-profile-form">{% translate "Save changes" %}</c-button>
 
-        <div class="form-actions">
-            <button type="submit" data-profile-submit disabled>{% translate "Save changes" %}</button>
-        </div>
-    </form>
-
-    <div class="account-security" aria-labelledby="security-title">
-        <h2 id="security-title">{% translate "Account security" %}</h2>
-        <p class="account-email">{{ user.email }}</p>
-        <nav class="account-links" aria-label="{% translate 'Account security' %}">
-            <a href="{% url 'account_change_password' %}">
-                <span>{% translate "Change password" %}</span>
-                <span aria-hidden="true">→</span>
-            </a>
-        </nav>
-        <form class="sign-out" method="post" action="{% url 'account_logout' %}">
+    <div class="auth-actions auth-secondary-actions auth-actions-divider">
+        <a class="auth-button auth-button-outline" href="{% url 'account_change_password' %}">{% translate "Change password" %}</a>
+        <form method="post" action="{% url 'account_logout' %}">
             {% csrf_token %}
-            <button class="secondary" type="submit">{% translate "Sign out" %}</button>
+            <c-button variant="outline" type="submit">{% translate "Sign out" %}</c-button>
         </form>
     </div>
-</section>
-<script src="{% static 'js/account.js' %}" defer></script>
+</c-card>
 {% endblock %}

@@ -16,8 +16,14 @@ msgstr "Chọn ngôn ngữ"
 msgid "Full name"
 msgstr "Họ và tên"
 
+msgid "Your full name"
+msgstr "Họ và tên của bạn"
+
 msgid "Referral code"
 msgstr "Mã giới thiệu"
+
+msgid "Enter referral code"
+msgstr "Nhập mã giới thiệu"
 
 msgid "Enter a valid referral code."
 msgstr "Hãy nhập mã giới thiệu hợp lệ."
@@ -79,11 +85,26 @@ msgstr "Thông tin này được dùng chung trên các dịch vụ của Natura
 msgid "Save changes"
 msgstr "Lưu thay đổi"
 
+msgid "Personal profile"
+msgstr "Hồ sơ cá nhân"
+
+msgid "Sign-in and security"
+msgstr "Đăng nhập và bảo mật"
+
+msgid "Add phone number"
+msgstr "Thêm số điện thoại"
+
+msgid "Add recovery email"
+msgstr "Thêm email khôi phục"
+
 msgid "Account security"
 msgstr "Bảo mật tài khoản"
 
-msgid "Profile updated."
-msgstr "Đã cập nhật thông tin."
+msgid "Changes saved"
+msgstr "Đã lưu thay đổi"
+
+msgid "Close notification"
+msgstr "Đóng thông báo"
 
 msgid "Remember me"
 msgstr "Ghi nhớ đăng nhập"
@@ -203,6 +224,15 @@ msgid "Password"
 msgstr "Mật khẩu"
 
 msgid "Password (again)"
+msgstr "Nhập lại mật khẩu"
+
+msgid "Enter your password"
+msgstr "Nhập mật khẩu"
+
+msgid "At least 12 characters"
+msgstr "Tối thiểu 12 ký tự"
+
+msgid "Re-enter your password"
 msgstr "Nhập lại mật khẩu"
 
 msgid "Remember Me"
@@ -533,6 +563,9 @@ msgstr "Không thể cấp quyền"
 msgid "The authorization request is invalid or has expired. Please return to the application and try again."
 msgstr "Yêu cầu cấp quyền không hợp lệ hoặc đã hết hạn. Vui lòng quay lại ứng dụng và thử lại."
 
+msgid "The authorization request is invalid or has expired."
+msgstr "Yêu cầu cấp quyền không hợp lệ hoặc đã hết hạn."
+
 msgid "Read your stable identity and public profile"
 msgstr "Đọc mã định danh ổn định và hồ sơ công khai của bạn"
 
@@ -581,6 +614,9 @@ msgstr "Quay lại website"
 msgid "Back to account"
 msgstr "Quay lại tài khoản"
 
+msgid "Back to application"
+msgstr "Quay lại ứng dụng"
+
 msgid "Request another reset link"
 msgstr "Yêu cầu liên kết đặt lại khác"
 
@@ -589,3 +625,143 @@ msgstr "Mật khẩu mới đã sẵn sàng. Hãy đăng nhập lại để ti�
 
 msgid "Current Password"
 msgstr "Mật khẩu hiện tại"
+
+msgid "Phone number or email"
+msgstr "Số điện thoại hoặc email"
+
+msgid "Enter your phone number or email"
+msgstr "Nhập số điện thoại hoặc email"
+
+msgid "Login phone number"
+msgstr "Số điện thoại đăng nhập"
+
+msgid "This phone number is already in use."
+msgstr "Số điện thoại này đã được sử dụng."
+
+msgid "Enter a valid Vietnamese phone number."
+msgstr "Hãy nhập số điện thoại Việt Nam hợp lệ."
+
+msgid ""
+"Account created. Sign in to verify your email or wait for an administrator "
+"to activate your account."
+msgstr ""
+"Đã tạo tài khoản. Hãy đăng nhập để xác minh email hoặc chờ quản trị viên "
+"kích hoạt tài khoản."
+
+msgid ""
+"Account details changed or are already in use. Check your details and try "
+"again."
+msgstr ""
+"Thông tin tài khoản đã thay đổi hoặc đã được sử dụng. Hãy kiểm tra và thử "
+"lại."
+
+msgid "Current password"
+msgstr "Mật khẩu hiện tại"
+
+msgid "Account identifier added."
+msgstr "Đã bổ sung thông tin đăng nhập."
+
+msgid "This identifier is already in use. Reload and try again."
+msgstr "Thông tin đăng nhập này đã được sử dụng. Hãy tải lại và thử lại."
+
+msgid "Email records are inconsistent. Contact an administrator."
+msgstr "Dữ liệu email không nhất quán. Hãy liên hệ quản trị viên."
+
+msgid "This account is unavailable."
+msgstr "Tài khoản hiện không thể sử dụng."
+
+msgid "This identifier is already set and cannot be changed here."
+msgstr "Thông tin đăng nhập này đã có và không thể thay đổi tại đây."
+
+msgid "The current password is incorrect."
+msgstr "Mật khẩu hiện tại không đúng."
+
+msgid "This identifier is already in use."
+msgstr "Thông tin đăng nhập này đã được sử dụng."
+
+msgid "Complete your account"
+msgstr "Hoàn tất tài khoản"
+
+msgid ""
+"Your account is waiting for activation. Verify your email or ask an "
+"administrator to activate it."
+msgstr ""
+"Tài khoản đang chờ kích hoạt. Hãy xác minh email hoặc nhờ quản trị viên kích"
+" hoạt."
+
+msgid ""
+"Your account is active. Email verification is optional for Core access and "
+"required for email recovery and the forum."
+msgstr ""
+"Tài khoản đang hoạt động. Email đã xác minh không bắt buộc để dùng Core, "
+"nhưng cần cho khôi phục mật khẩu qua email và diễn đàn."
+
+msgid "No email address"
+msgstr "Chưa có email"
+
+msgid "No login phone number"
+msgstr "Chưa có số điện thoại đăng nhập"
+
+msgid "Not verified"
+msgstr "Chưa xác minh"
+
+msgid "Resend verification email"
+msgstr "Gửi lại email xác minh"
+
+msgid "Add login phone number"
+msgstr "Bổ sung số điện thoại đăng nhập"
+
+msgid ""
+"Sign up with your phone number. Email is optional. Verify your email or ask "
+"an administrator to activate your account."
+msgstr ""
+"Đăng ký bằng số điện thoại, email không bắt buộc. Hãy xác minh email hoặc "
+"nhờ quản trị viên kích hoạt tài khoản."
+
+msgid ""
+"If you do not have a verified email address, contact an administrator for "
+"help."
+msgstr ""
+"Nếu chưa có email đã xác minh, hãy liên hệ quản trị viên để được hỗ trợ."
+
+msgid "You can sign in to continue."
+msgstr "Bạn có thể đăng nhập để tiếp tục."
+
+msgid "If you provided an email address, check your inbox for a verification link."
+msgstr "Nếu bạn đã nhập email, hãy kiểm tra hộp thư để tìm liên kết xác minh."
+
+msgid "We could not send the verification email. Try sending it again later."
+msgstr "Không gửi được email xác minh. Vui lòng thử gửi lại sau."
+
+msgid "Email (optional)"
+msgstr "Email (không bắt buộc)"
+
+msgid "Contact phone number"
+msgstr "Số điện thoại liên hệ"
+
+msgid "Profile"
+msgstr "Hồ sơ"
+
+msgid "Change"
+msgstr "Thay đổi"
+
+msgid "Sign-in session"
+msgstr "Phiên đăng nhập"
+
+msgid "Decline"
+msgstr "Từ chối"
+
+msgid "Don't have an account?"
+msgstr "Chưa có tài khoản?"
+
+msgid "Application"
+msgstr "Ứng dụng"
+
+msgid "Send verification link"
+msgstr "Gửi link xác minh"
+
+msgid "Check your inbox and open the verification link."
+msgstr "Kiểm tra hộp thư và mở link xác minh."
+
+msgid "Sign in again to continue."
+msgstr "Hãy đăng nhập lại để tiếp tục."

@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}{% block head_title %}{{ block.super }}{% endblock %}{% endblock %}
+{% block head %}{% block extra_head %}{% endblock %}{% endblock %}
+{% block main %}
+<c-card class="auth-card">
+    {% block body %}{% block content %}{% endblock %}{% endblock %}
+</c-card>
+{% endblock %}
+{% block scripts %}{% block extra_body %}{% endblock %}{% endblock %}

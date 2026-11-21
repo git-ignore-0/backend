@@ -3,8 +3,8 @@ from django.conf import settings
 from django.contrib.auth.signals import user_logged_in, user_logged_out
 from django.dispatch import receiver
 
-from identity.models import AccountStatus, AuditLog
-from identity.services import transition_account
+from identity.models import AuditLog
+from identity.services import activate_account
 
 
 def request_metadata(request) -> dict[str, str | None]:
@@ -18,9 +18,7 @@ def request_metadata(request) -> dict[str, str | None]:
 
 @receiver(email_confirmed)
 def activate_verified_identity(request, email_address, **kwargs) -> None:
-    user = email_address.user
-    if user.status == AccountStatus.PENDING_VERIFICATION:
-        transition_account(user, AccountStatus.ACTIVE)
+    activate_account(user=email_address.user, source="email_verified")
 
 
 @receiver(user_logged_in)

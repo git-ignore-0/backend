@@ -1,0 +1,71 @@
+{% extends "account/layout.html" %}
+{% load i18n static %}
+{% block title %}{% translate "Complete your account" %}{% endblock %}
+{% block panel %}
+<h1>{% translate "Complete your account" %}</h1>
+{% if not account_user.can_access_core %}
+    <p class="auth-description">{% translate "Your account is waiting for activation. Verify your email or ask an administrator to activate it." %}</p>
+{% else %}
+    <p class="auth-description">{% translate "Your account is active. Email verification is optional for Core access and required for email recovery and the forum." %}</p>
+{% endif %}
+{% if completion_error %}<c-alert variant="destructive">{{ completion_error }}</c-alert>{% endif %}
+<section class="auth-completion-email" aria-labelledby="email">
+    {% if account_user.email %}
+        <h2 id="email" tabindex="-1">{% translate "Email" %}</h2>
+        {% if email_form.non_field_errors %}<c-alert variant="destructive">{{ email_form.non_field_errors }}</c-alert>{% endif %}
+        <div class="auth-profile-value">
+            <span>{{ account_user.email }}</span>
+            {% if account_user.email_verified %}
+                <c-badge class="auth-pill" variant="secondary">{% translate "Verified" %}</c-badge>
+            {% endif %}
+        </div>
+        {% if not account_user.email_verified %}
+            <p>{% translate "Check your inbox and open the verification link." %}</p>
+            <form method="post" action="{% url 'account_email_resend' %}">
+                {% csrf_token %}
+                {% if email_resend_seconds %}
+                    <c-button variant="outline" type="submit" disabled data-email-resend-seconds="{{ email_resend_seconds }}">
+                        {% translate "Resend verification email" %} <span data-email-resend-countdown>({{ email_resend_seconds }}s)</span>
+                    </c-button>
+                {% else %}
+                    <c-button variant="outline" type="submit">{% translate "Resend verification email" %}</c-button>
+                {% endif %}
+            </form>
+        {% endif %}
+    {% else %}
+        <h2 id="email" tabindex="-1">{% translate "Add email" %}</h2>
+        <form class="auth-completion-email-form{% if not email_form.is_bound or not email_form.current_password %} auth-completion-email-inline{% endif %}" method="post" action="{% url 'account_email_add' %}">
+            {% csrf_token %}
+            {% include "account/partials/form_errors.html" with form=email_form %}
+            {% include "account/partials/field.html" with field=email_form.email mark_required=True %}
+            {% if email_form.is_bound and email_form.current_password %}
+                {% include "account/partials/field.html" with field=email_form.current_password mark_required=True %}
+            {% endif %}
+            <c-button type="submit">{% translate "Send verification link" %}</c-button>
+        </form>
+    {% endif %}
+</section>
+{% if not account_user.can_access_core and not account_user.login_phone_number %}
+    <h2 id="phone" class="auth-section-heading" tabindex="-1">{% translate "Login phone number" %}</h2>
+    <form method="post" action="{% url 'account_phone_add' %}">
+        {% csrf_token %}
+        {% include "account/partials/form_fields.html" with form=phone_form %}
+        <c-button type="submit">{% translate "Add login phone number" %}</c-button>
+    </form>
+{% elif phone_form.non_field_errors %}
+    <c-alert variant="destructive">{{ phone_form.non_field_errors }}</c-alert>
+{% endif %}
+<div class="auth-actions">
+    {% if account_user.can_access_core %}
+        <a class="auth-button auth-button-outline" href="{% url 'account' %}">{% translate "Back to account" %}</a>
+    {% endif %}
+    <form method="post" action="{% url 'account_logout' %}">
+        {% csrf_token %}<c-button variant="outline" type="submit">{% translate "Sign out" %}</c-button>
+    </form>
+</div>
+{% endblock %}
+{% block scripts %}
+    {% if email_resend_seconds and account_user.email and not account_user.email_verified %}
+        <script src="{% static 'js/email-resend-countdown.js' %}" defer></script>
+    {% endif %}
+{% endblock %}

@@ -153,7 +153,9 @@ class AdminSessionView(APIView):
             {
                 "data": {
                     "id": str(request.user.pk),
-                    "email": request.user.email,
+                    "email": request.user.email or None,
+                    "email_verified": request.user.email_verified,
+                    "login_phone_number": request.user.login_phone_number,
                     "name": request.user.name,
                     "locale": request.user.locale,
                     "roles": list(request.user.groups.values_list("name", flat=True)),

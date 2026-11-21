@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 import pytest
 from django.conf import settings
 from django.template.loader import render_to_string
+from django.urls import reverse
 from django.utils import translation
 
 
@@ -78,23 +79,29 @@ def test_language_switch_translates_auth_pages_and_preserves_destination(client)
     assert response.url == "/login"
     assert response.cookies[settings.LANGUAGE_COOKIE_NAME].value == "en"
 
-    login = client.get("/login")
-    assert '<html lang="en">' in login.content.decode()
-    assert (
-        "Use one account for the Natural Farming Vietnam website and forum."
-        in login.content.decode()
-    )
+    signup_url = reverse("account_signup")
+    login_content = client.get("/login").content.decode()
+    assert '<html lang="en">' in login_content
+    assert "Use one account for the Natural Farming Vietnam website and forum." not in login_content
+    assert f'Don\'t have an account? <a href="{signup_url}">Sign up</a>' in login_content
 
-    client.post("/language/", {"language": "vi", "next": "/register"})
+    response = client.post("/language/", {"language": "vi", "next": "/register"})
+    assert response.status_code == 302
+    assert response.url == "/register"
     signup = client.get("/register")
     assert '<html lang="vi">' in signup.content.decode()
-    assert "Tài khoản dùng chung" in signup.content.decode()
+    assert "Tài khoản dùng chung" not in signup.content.decode()
+    assert "Đăng ký bằng số điện thoại, email không bắt buộc." not in signup.content.decode()
     assert "Họ và tên" in signup.content.decode()
     assert 'name="locale"' not in signup.content.decode()
 
-    login = client.get("/login")
-    assert "Ghi nhớ đăng nhập" in login.content.decode()
-    assert "Forgot your password?" not in login.content.decode()
+    login_content = client.get("/login").content.decode()
+    assert (
+        "Dùng một tài khoản cho website và diễn đàn Natural Farming Vietnam." not in login_content
+    )
+    assert f'Chưa có tài khoản? <a href="{signup_url}">Đăng ký</a>' in login_content
+    assert "Ghi nhớ đăng nhập" in login_content
+    assert "Forgot your password?" not in login_content
 
 
 def test_language_switch_rejects_external_destination(client):
@@ -142,7 +149,8 @@ def test_public_auth_pages_use_project_layout_in_both_languages(
 
     assert vietnamese.status_code == 200
     assert '<html lang="vi">' in vietnamese_content
-    assert 'class="language-switcher"' in vietnamese_content
+    assert 'name="language" value="vi"' in vietnamese_content
+    assert 'name="language" value="en"' in vietnamese_content
     assert vietnamese_text in vietnamese_content
     assert "Menu:" not in vietnamese_content
 
@@ -152,7 +160,8 @@ def test_public_auth_pages_use_project_layout_in_both_languages(
 
     assert english.status_code == 200
     assert '<html lang="en">' in english_content
-    assert 'class="language-switcher"' in english_content
+    assert 'name="language" value="vi"' in english_content
+    assert 'name="language" value="en"' in english_content
     assert english_text in english_content
     assert "Menu:" not in english_content
 
@@ -161,7 +170,7 @@ def test_public_auth_pages_use_project_layout_in_both_languages(
 @pytest.mark.parametrize(
     ("path", "expected"),
     [
-        ("/account", "Thông tin cá nhân"),
+        ("/account", "<h1>Tài khoản</h1>"),
         ("/accounts/logout/", "Bạn có chắc muốn kết thúc phiên đăng nhập?"),
         ("/accounts/reauthenticate/", "Xác nhận danh tính"),
         ("/accounts/password/change/", "Đổi mật khẩu"),
@@ -179,7 +188,8 @@ def test_authenticated_auth_pages_use_vietnamese_project_layout(
 
     assert response.status_code == 200
     assert '<html lang="vi">' in content
-    assert 'class="language-switcher"' in content
+    assert 'name="language" value="vi"' in content
+    assert 'name="language" value="en"' in content
     assert expected in content
     assert "Menu:" not in content
 
@@ -207,7 +217,7 @@ def test_saved_profile_language_is_used_on_a_new_browser(client, active_user):
     response = client.get("/account")
 
     assert '<html lang="en">' in response.content.decode()
-    assert "Personal information" in response.content.decode()
+    assert "<h1>Account</h1>" in response.content.decode()
     assert response.cookies[settings.LANGUAGE_COOKIE_NAME].value == "en"
 
 
@@ -239,6 +249,7 @@ def test_verification_email_uses_registration_language(client, mailoutbox):
     response = client.post(
         "/register",
         {
+            "phone": "0901234567",
             "name": "English Member",
             "email": "english@example.com",
             "password1": "StrongPassword12",
@@ -258,6 +269,7 @@ def test_email_confirmation_feedback_is_fully_vietnamese(client, mailoutbox):
     registration = client.post(
         "/register",
         {
+            "phone": "0901234567",
             "name": "Người Xác Minh",
             "email": email,
             "password1": "StrongPassword12",
@@ -266,8 +278,12 @@ def test_email_confirmation_feedback_is_fully_vietnamese(client, mailoutbox):
         follow=True,
     )
     registration_content = registration.content.decode()
-    assert f"Email xác minh đã được gửi tới {email}." in registration_content
-    assert f"Confirmation email sent to {email}." not in registration_content
+    assert "Bạn có thể đăng nhập để tiếp tục." in registration_content
+    assert (
+        "Nếu bạn đã nhập email, hãy kiểm tra hộp thư để tìm liên kết xác minh."
+        in registration_content
+    )
+    assert "You can sign in to continue." not in registration_content
     confirmation_url = re.search(
         r"https?://[^\s]+/accounts/confirm-email/[^\s]+", mailoutbox[0].body
     )
@@ -328,7 +344,7 @@ def test_password_reset_flow_is_fully_vietnamese(client, active_user, mailoutbox
 
 
 @pytest.mark.django_db
-def test_unknown_account_email_is_fully_vietnamese(client, mailoutbox):
+def test_unknown_recovery_is_silent_with_vietnamese_generic_feedback(client, mailoutbox):
     client.post("/language/", {"language": "vi", "next": "/accounts/password/reset/"})
 
     response = client.post(
@@ -337,9 +353,11 @@ def test_unknown_account_email_is_fully_vietnamese(client, mailoutbox):
     )
 
     assert response.status_code == 302
-    assert "Không tìm thấy tài khoản" in mailoutbox[0].subject
-    assert "không có tài khoản Natural Farming Vietnam nào" in mailoutbox[0].body
-    assert "Unknown Account" not in mailoutbox[0].subject
+    assert not mailoutbox
+    content = client.get(response.url).content.decode()
+    assert "Nếu email tồn tại" in content
+    assert "quản trị viên" in content
+    assert "If that email exists" not in content
 
 
 @pytest.mark.django_db
@@ -371,3 +389,36 @@ def test_oauth_consent_and_scope_descriptions_are_translated(
     assert "Cho phép NFV Forum?" in content
     assert "Đọc địa chỉ email và trạng thái xác minh của bạn" in content
     assert "Quản lý thông tin website và nội dung workshop" in content
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "language,login_label,phone_label,completion_title",
+    [
+        ("vi", "Số điện thoại hoặc email", "Số điện thoại đăng nhập", "Hoàn tất tài khoản"),
+        ("en", "Phone number or email", "Login phone number", "Complete your account"),
+    ],
+)
+def test_phone_auth_and_completion_have_translated_labels(
+    client, language, login_label, phone_label, completion_title
+):
+    from identity.models import User
+
+    client.post("/language/", {"language": language, "next": "/login"})
+    assert login_label in client.get("/login").content.decode()
+    signup_content = client.get("/register").content.decode()
+    assert phone_label in signup_content
+    assert re.search(r'<label\b[^>]*\sfor="id_email"[^>]*>\s*Email\s*</label>', signup_content)
+    email_input = re.search(r'<input\b[^>]*\sname="email"[^>]*>', signup_content)
+    assert email_input
+    assert not re.search(r"\srequired(?=\s|=|/?>)", email_input[0])
+    user = User.objects.create_user(
+        name="Pending", login_phone_number="0901234567", locale=language
+    )
+    client.force_login(user, backend="identity.backends.CoreAuthenticationBackend")
+    response = client.get("/account/complete")
+    completion = response.content.decode()
+    assert completion_title in completion
+    assert ("Gửi link xác minh" if language == "vi" else "Send verification link") in completion
+    assert phone_label not in completion
+    assert "None" not in completion

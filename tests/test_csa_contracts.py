@@ -594,3 +594,39 @@ def test_contract_migration_does_not_backfill_legacy_memberships():
         assert migrated.get_model("memberships", "CSAContract").objects.count() == 0
     finally:
         MigrationExecutor(connection).migrate([migrate_latest])
+
+
+@pytest.mark.django_db
+def test_phone_only_customer_contract_keeps_missing_email_out_of_pdf(package_and_option):
+    from io import BytesIO
+
+    from pypdf import PdfReader
+
+    from memberships.contract_pdfs import render_contract_pdf
+
+    membership = create_membership(*package_and_option)
+    customer = membership.customer
+    customer.user = User.objects.create_user(
+        login_phone_number="0987654321", name="Phone-only member", status=AccountStatus.ACTIVE
+    )
+    customer.save(update_fields=["user"])
+    snapshot = build_manual_contract_snapshot(
+        customer=customer,
+        membership=membership,
+        payment_settings=MembershipPaymentSettings(
+            bank_bin="970436",
+            bank_name="Vietcombank",
+            account_number="123456789",
+            account_name="NFV",
+        ),
+    )
+    contract = create_manual_contract(membership_id=membership.pk, snapshot=snapshot)
+
+    assert snapshot.email is None and contract.email_snapshot is None
+    assert contract.phone_e164_snapshot == customer.phone_e164
+    for locale in ("vi", "en"):
+        pdf = PdfReader(BytesIO(render_contract_pdf(contract, locale, pdf_version=1)))
+        content = "\n".join(page.extract_text() for page in pdf.pages)
+        assert "None" not in content
+        assert "Email" in content
+        assert "Nguyễn Văn An" in content

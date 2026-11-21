@@ -1,11 +1,20 @@
-{% extends "base.html" %}
+{% extends "account/layout.html" %}
 {% load i18n %}
 {% block title %}{% translate "Email verification required" %}{% endblock %}
-{% block content %}
-<section class="card">
-    <p class="eyebrow">{% translate "Account security" %}</p>
+{% block panel %}
+<div class="auth-status">
+    {% include "account/partials/status_icon.html" with icon="mail" %}
     <h1>{% translate "Verify your email to continue" %}</h1>
     <p>{% translate "You must verify your email address before accessing this page." %}</p>
-    <p>{% translate "Open the verification link we sent you. If you do not see the email, check your spam folder." %}</p>
-</section>
+    {% if user.email %}
+        <p>{% translate "Open the verification link we sent you. If you do not see the email, check your spam folder." %}</p>
+    {% endif %}
+    <div class="auth-actions">
+        {% if user.is_authenticated %}
+            <a class="auth-button auth-button-primary" href="{% url 'account_complete' %}#email">{% if user.email %}{% translate "Verify email" %}{% else %}{% translate "Add email" %}{% endif %}</a>
+        {% else %}
+            <a class="auth-button auth-button-primary" href="{{ core_login_url }}">{% translate "Back to sign in" %}</a>
+        {% endif %}
+    </div>
+</div>
 {% endblock %}

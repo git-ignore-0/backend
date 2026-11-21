@@ -1,4 +1,5 @@
 import importlib
+import re
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -90,39 +91,45 @@ def test_backfill_allocates_code_for_existing_user():
 
 
 @pytest.mark.django_db
-def test_signup_referral_code_is_optional_and_valid_code_links_once(client):
-    referrer = create_active_user("referrer@example.com", "Referrer")
+@pytest.mark.parametrize("signup_path", ["/register", reverse("account_signup")])
+def test_regular_signup_does_not_render_referral_field(client, signup_path):
+    client.cookies[settings.LANGUAGE_COOKIE_NAME] = "vi"
+    response = client.get(signup_path, {"referral_code": "NFV2345678"})
+    assert response.status_code == 200
+    html = response.content.decode()
+    assert 'name="referral_code"' not in html
+    assert "<details" not in html
+    assert "Mã giới thiệu" not in html
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("signup_path", ["/register", reverse("account_signup")])
+@pytest.mark.parametrize("code_kind", ["missing", "existing", "invalid", "too_long"])
+def test_regular_signup_ignores_referral_without_invitation_session(client, signup_path, code_kind):
+    referrer = create_active_user("referrer@example.com")
+    code = referrer.referral_account.code
     payload = {
+        "phone": "0901234567",
         "name": "New Member",
         "email": "new@example.com",
         "password1": "StrongPassword12",
         "password2": "StrongPassword12",
+        "next": f"/oauth/authorize?screen_hint=signup&referral_code={code}",
     }
-    response = client.post("/register", payload)
-    assert response.status_code == 302
-    assert not Referral.objects.filter(referee__email="new@example.com").exists()
-
-    payload["email"] = "referred@example.com"
-    payload["referral_code"] = referrer.referral_account.code.lower()
-    response = client.post("/register", payload)
-    assert response.status_code == 302
-    assert Referral.objects.filter(referrer=referrer, referee__email=payload["email"]).exists()
-
-
-@pytest.mark.django_db
-def test_invalid_signup_code_does_not_create_user(client):
+    if code_kind != "missing":
+        payload["referral_code"] = {
+            "existing": code,
+            "invalid": "NOT-A-CODE",
+            "too_long": "X" * 50,
+        }[code_kind]
     response = client.post(
-        "/register",
-        {
-            "name": "New Member",
-            "email": "invalid-code@example.com",
-            "password1": "StrongPassword12",
-            "password2": "StrongPassword12",
-            "referral_code": "NOT-A-CODE",
-        },
+        f"{signup_path}?referral_code={code}",
+        payload,
     )
-    assert response.status_code == 200
-    assert not User.objects.filter(email="invalid-code@example.com").exists()
+    assert response.status_code == 302
+    user = User.objects.get(email=payload["email"])
+    assert not Referral.objects.filter(referee=user).exists()
+    assert SIGNUP_REFERRAL_SESSION_KEY not in client.session
 
 
 @pytest.mark.django_db
@@ -154,7 +161,12 @@ def test_locked_signup_referral_is_prefilled_readonly_on_both_routes(
     assert response.context["form"]["referral_code"].value() == referrer.referral_account.code
     assert field.widget.attrs["readonly"] is True
     assert str(field.help_text) == expected_help
-    assert expected_help in response.content.decode()
+    html = response.content.decode()
+    assert expected_help in html
+    field_html = re.search(r'<input\b[^>]*\bname="referral_code"[^>]*>', html)
+    assert field_html
+    assert 'type="text"' in field_html[0] and "readonly" in field_html[0]
+    assert f'value="{referrer.referral_account.code}"' in field_html[0]
 
 
 @pytest.mark.django_db
@@ -163,17 +175,24 @@ def test_locked_signup_uses_session_code_over_forged_post_and_clears_session(cli
     forged_referrer = create_active_user("forged-referrer@example.com")
     continuation = start_referral_signup(client, session_referrer.referral_account.code)
 
-    response = client.post(
-        "/register",
-        {
-            "name": "Locked Referral Member",
-            "email": "locked-referee@example.com",
-            "password1": "StrongPassword12",
-            "password2": "StrongPassword12",
-            "referral_code": forged_referrer.referral_account.code,
-            "next": continuation,
-        },
-    )
+    payload = {
+        "phone": "0901234567",
+        "name": "Locked Referral Member",
+        "email": "locked-referee@example.com",
+        "password1": "StrongPassword12",
+        "password2": "StrongPassword12",
+        "referral_code": forged_referrer.referral_account.code,
+        "next": continuation,
+    }
+    invalid = client.post("/register", {**payload, "phone": ""})
+    assert invalid.status_code == 200
+    assert "phone" in invalid.context["form"].errors
+    field_html = re.search(rb'<input\b[^>]*\bname="referral_code"[^>]*>', invalid.content)
+    assert field_html and b"readonly" in field_html[0]
+    assert f'value="{session_referrer.referral_account.code}"'.encode() in field_html[0]
+    assert client.session[SIGNUP_REFERRAL_SESSION_KEY] == session_referrer.referral_account.code
+
+    response = client.post("/register", payload)
 
     assert response.status_code == 302
     referral = Referral.objects.get(referee__email="locked-referee@example.com")
@@ -191,6 +210,7 @@ def test_locked_signup_keeps_session_and_does_not_create_user_when_code_is_gone(
     response = client.post(
         reverse("account_signup"),
         {
+            "phone": "0901234567",
             "name": "Invalid Locked Referral",
             "email": "invalid-locked-referee@example.com",
             "password1": "StrongPassword12",
@@ -217,8 +237,7 @@ def test_generic_signup_clears_abandoned_referral_session(client, signup_path):
 
     assert response.status_code == 200
     assert SIGNUP_REFERRAL_SESSION_KEY not in client.session
-    assert response.context["form"]["referral_code"].value() in (None, "")
-    assert "readonly" not in response.context["form"].fields["referral_code"].widget.attrs
+    assert b'name="referral_code"' not in response.content
 
 
 @pytest.mark.django_db
@@ -423,3 +442,37 @@ def test_admin_authorization_search_pagination_detail_and_point_creation(admin_a
 def test_admin_endpoints_require_scope_and_group(access_token):
     client = bearer_client(access_token)
     assert client.get("/api/v1/admin/users").status_code == 403
+
+
+@pytest.mark.django_db
+def test_referral_and_admin_user_projections_accept_user_without_email(admin_api, access_token):
+    owner = access_token.user
+    invitee = User.objects.create_user(
+        login_phone_number="0912345678",
+        name="Phone-only referral",
+        status=AccountStatus.ACTIVE,
+    )
+    assign_referrer(referee=invitee, code=owner.referral_account.code)
+    invitee_token = AccessToken.objects.create(
+        user=invitee,
+        application=access_token.application,
+        token="phone-only-referral-fixture",
+        scope="profile email",
+        expires=timezone.now() + timezone.timedelta(hours=1),
+    )
+
+    referral_account = bearer_client(invitee_token).get("/api/v1/referrals/account")
+    assert referral_account.status_code == 200
+    assert referral_account.json()["data"]["referrer"]["id"] == str(owner.pk)
+
+    public_invitees = admin_api.get("/api/v1/referrals/invited-users").json()["data"]
+    assert public_invitees[0]["id"] == str(invitee.pk)
+    assert {"email", "phone", "login_phone_number"}.isdisjoint(public_invitees[0])
+
+    listed = admin_api.get("/api/v1/admin/users", {"search": "0912345678"}).json()["data"]
+    detail = admin_api.get(f"/api/v1/admin/users/{invitee.pk}").json()["data"]
+    for row in (listed[0], detail):
+        assert row["id"] == str(invitee.pk)
+        assert row["email"] is None and row["email_verified"] is False
+        assert row["login_phone_number"] == "+84912345678"
+        assert row["phone"] == ""

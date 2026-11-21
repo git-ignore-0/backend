@@ -175,7 +175,7 @@ def test_cancelled_orders_never_earn_points(order_factory, referral_pair, paymen
 
 @pytest.mark.django_db
 @pytest.mark.parametrize("target", [0, 1])
-@pytest.mark.parametrize("status", [AccountStatus.SUSPENDED, AccountStatus.PENDING_VERIFICATION])
+@pytest.mark.parametrize("status", [AccountStatus.SUSPENDED, AccountStatus.PENDING_ACTIVATION])
 def test_inactive_accounts_do_not_earn_points(order_factory, referral_pair, target, status):
     from identity.services import transition_account
 

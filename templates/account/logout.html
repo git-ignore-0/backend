@@ -1,13 +1,15 @@
-{% extends "base.html" %}
+{% extends "account/layout.html" %}
 {% load i18n %}
 {% block title %}{% translate "Sign out" %}{% endblock %}
-{% block content %}
-<section class="card">
-    <h1>{% translate "Sign out" %}</h1>
-    <p>{% translate "Are you sure you want to end this session?" %}</p>
-    <form method="post">{% csrf_token %}<button type="submit">{% translate "Sign out" %}</button></form>
-    <div class="links">
-        <a href="{% url 'account' %}">← {% translate "Back to account" %}</a>
-    </div>
-</section>
+{% block panel %}
+<h1>{% translate "Sign out" %}</h1>
+<p class="auth-description">{% translate "Are you sure you want to end this session?" %}</p>
+<form method="post" class="auth-actions">
+    {% csrf_token %}
+    <a class="auth-button auth-button-outline" href="{% url 'account' %}">{% translate "Cancel" %}</a>
+    <c-button type="submit">{% translate "Sign out" %}</c-button>
+</form>
+<div class="auth-footer">
+    <a href="{% url 'account' %}">← {% translate "Back to account" %}</a>
+</div>
 {% endblock %}

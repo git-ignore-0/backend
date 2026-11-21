@@ -1,19 +1,27 @@
-{% extends "base.html" %}
+{% extends "account/layout.html" %}
 {% load i18n %}
 {% block title %}{% translate "Create account" %}{% endblock %}
-{% block content %}
-<section class="card">
-    <p class="eyebrow">{% translate "Shared account" %}</p>
-    <h1>{% translate "Create account" %}</h1>
-    <p>{% translate "After signing up, verify your email before using the website and forum." %}</p>
-    <form method="post" action="{% url 'account_signup' %}">
-        {% csrf_token %}
-        {{ form.as_p }}
-        {% if redirect_field_value %}
-            <input type="hidden" name="{{ redirect_field_name }}" value="{{ redirect_field_value }}">
-        {% endif %}
-        <button type="submit">{% translate "Sign up" %}</button>
-    </form>
-    <div class="links"><a href="{{ login_url }}">{% translate "Already have an account?" %}</a></div>
-</section>
+{% block panel %}
+<h1>{% translate "Create account" %}</h1>
+<form method="post" action="{% url 'account_signup' %}">
+    {% csrf_token %}
+    {% include "account/partials/form_errors.html" %}
+    {% translate "Email" as email_label %}
+    <div class="auth-fields">
+        {% for field in form.visible_fields %}
+            {% if field.name == "email" %}
+                {% include "account/partials/field.html" with label_override=email_label mark_required=True %}
+            {% else %}
+                {% include "account/partials/field.html" with mark_required=True %}
+            {% endif %}
+        {% endfor %}
+    </div>
+    {% if redirect_field_value %}
+        <input type="hidden" name="{{ redirect_field_name }}" value="{{ redirect_field_value }}">
+    {% endif %}
+    <c-button type="submit">{% translate "Sign up" %}</c-button>
+</form>
+<div class="auth-footer auth-footer-inline">
+    <span>{% translate "Already have an account?" %} <a href="{{ login_url }}">{% translate "Sign in" %}</a></span>
+</div>
 {% endblock %}
