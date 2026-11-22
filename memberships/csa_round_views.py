@@ -24,6 +24,10 @@ class RoundPageQuery(LocalePageQuerySerializer):
     page_size = serializers.IntegerField(min_value=1, max_value=100, default=20)
 
 
+class AdminRoundPageQuery(RoundPageQuery):
+    status = serializers.ChoiceField(choices=domain.ROUND_STATUSES, required=False)
+
+
 def paged_rows(rows, query):
     page, size = query["page"], query["page_size"]
     return rows[(page - 1) * size : page * size], {
@@ -33,8 +37,8 @@ def paged_rows(rows, query):
     }
 
 
-def page_query(request):
-    serializer = RoundPageQuery(data=request.query_params.dict())
+def page_query(request, serializer_class=RoundPageQuery):
+    serializer = serializer_class(data=request.query_params.dict())
     serializer.is_valid(raise_exception=True)
     return serializer.validated_data
 
@@ -93,9 +97,13 @@ class AdminRounds(PrivateView):
     permission_classes = [IsWebsiteAdmin]
 
     def get(self, request):
-        query = page_query(request)
-        rows, meta = paged_rows(CSARound.objects.order_by("-sequence"), query)
-        return Response({"data": [round_payload(r) for r in rows], "meta": meta})
+        query = page_query(request, AdminRoundPageQuery)
+        now = timezone.now()
+        rounds = CSARound.objects.order_by("-sequence")
+        if status := query.get("status"):
+            rounds = domain.filter_rounds_by_status(rounds, status, now=now)
+        rows, meta = paged_rows(rounds, query)
+        return Response({"data": [round_payload(row, now=now) for row in rows], "meta": meta})
 
     def post(self, request):
         row = domain.create_round(actor=request.user, **validated(RoundInput, request))

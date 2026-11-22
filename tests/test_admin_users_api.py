@@ -230,6 +230,29 @@ def test_reset_eligibility_preserves_status(cms, mailoutbox, state, evidence):
     assert not mailoutbox
 
 
+def test_list_filters_status_before_pagination_and_combines_search(cms):
+    suspended = User.objects.create_user(
+        "locked@example.com",
+        name="Garden Locked",
+        status="suspended",
+        is_active=False,
+        date_joined=timezone.now() - timezone.timedelta(days=1),
+    )
+    User.objects.bulk_create(
+        [User(email=f"pending-{index}@example.com", name="Garden Pending") for index in range(30)]
+    )
+    User.objects.create_user("other@example.com", name="Other", status="suspended", is_active=False)
+    unfiltered = cms.get(USERS, {"search": "Garden"}).json()
+    assert len(unfiltered["data"]) == 30
+    assert str(suspended.pk) not in [row["id"] for row in unfiltered["data"]]
+
+    response = cms.get(USERS, {"status": "suspended", "search": "Garden"})
+    assert response.status_code == 200
+    assert [row["id"] for row in response.json()["data"]] == [str(suspended.pk)]
+    assert response.json()["meta"]["total"] == 1
+    assert cms.get(USERS, {"status": "invalid"}).status_code == 400
+
+
 def test_projection_search_and_batch_verification(cms, django_assert_max_num_queries):
     from members.models import MemberProfile
 
@@ -343,6 +366,31 @@ def credentials(user, application):
         user=user, application=application, code=f"code-{user.pk}", expires=expires
     )
     return access, refresh, grant
+
+
+def test_verified_email_recovery_preserves_existing_credentials(cms, client, oauth_application):
+    user = target("active", email="reset-verified@example.com")
+    EmailAddress.objects.create(user=user, email=user.email, verified=True)
+    original_hash = user.password
+    access, refresh, grant = credentials(user, oauth_application)
+    client.force_login(user, backend="identity.backends.CoreAuthenticationBackend")
+
+    response = cms.post(
+        f"{USERS}/{user.pk}/reset-password",
+        {"password1": PASSWORD, "password2": PASSWORD},
+        format="json",
+    )
+
+    assert response.status_code == 409
+    assert response.json()["errors"][0]["code"] == "email_recovery_required"
+    user.refresh_from_db()
+    assert user.password == original_hash
+    assert client.get("/account").status_code == 200
+    access.refresh_from_db()
+    refresh.refresh_from_db()
+    grant.refresh_from_db()
+    assert refresh.revoked is None
+    assert not AuditLog.objects.filter(user=user, action="user.password_reset").exists()
 
 
 @pytest.mark.parametrize("failure", [None, "revoke", "audit"])

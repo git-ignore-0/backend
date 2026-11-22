@@ -470,6 +470,8 @@ class AdminUserListView(AdminAccountPasswordAPIView):
             else:
                 matches |= Q(login_phone_number=phone)
             queryset = queryset.filter(matches)
+        if account_status := query.validated_data["status"]:
+            queryset = queryset.filter(status=account_status)
         queryset = queryset.order_by("-date_joined", "-id")
         items, meta = paginate(queryset, query.validated_data["page"], page_size=ADMIN_PAGE_SIZE)
         return no_store(

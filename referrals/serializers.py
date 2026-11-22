@@ -1,6 +1,7 @@
 from rest_framework import serializers
 
 from content.models import MediaAsset
+from identity.models import AccountStatus
 from referrals.models import PointDirection, RedemptionStatus, Referral
 
 
@@ -21,6 +22,7 @@ class PageQuerySerializer(serializers.Serializer):
 
 class AdminUserQuerySerializer(PageQuerySerializer):
     search = serializers.CharField(max_length=254, allow_blank=True, default="")
+    status = serializers.ChoiceField(choices=AccountStatus.choices, allow_blank=True, default="")
 
 
 class LocalePageQuerySerializer(PageQuerySerializer):

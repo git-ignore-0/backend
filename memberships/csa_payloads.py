@@ -5,7 +5,8 @@ from django.utils import timezone
 from memberships import csa_rounds as domain
 
 
-def round_payload(row):
+def round_payload(row, *, now=None):
+    now = now or timezone.now()
     return {
         "id": str(row.pk),
         "sequence": row.sequence,
@@ -13,8 +14,8 @@ def round_payload(row):
         "opens_at": row.opens_at.isoformat(),
         "closes_at": row.closes_at.isoformat(),
         "delivery_date": row.delivery_date.isoformat(),
-        "status": domain.round_status(row),
-        "server_time": timezone.now().isoformat(),
+        "status": domain.round_status(row, now=now),
+        "server_time": now.isoformat(),
         "cancellation_reason": row.cancellation_reason or None,
         "cancelled_by_id": str(row.cancelled_by_id) if row.cancelled_by_id else None,
     }

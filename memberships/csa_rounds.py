@@ -36,6 +36,7 @@ from memberships.models import (
 )
 from memberships.services import ensure_due_cycles, quota_availability_rows
 
+ROUND_STATUSES = ("draft", "scheduled", "open", "closed", "delivery", "cancelled")
 TERMINAL = ("cancelled", "delivered")
 VIETNAM = ZoneInfo("Asia/Ho_Chi_Minh")
 
@@ -73,6 +74,25 @@ def round_status(round_, now=None):
     if now.astimezone(VIETNAM).date() < round_.delivery_date:
         return "closed"
     return "delivery"
+
+
+def filter_rounds_by_status(rounds, status, *, now):
+    """Filter by the same lifecycle boundaries used in round_status."""
+    if status == "cancelled":
+        return rounds.filter(cancelled_at__isnull=False)
+
+    rounds = rounds.filter(cancelled_at__isnull=True)
+    if status == "draft":
+        return rounds.filter(published_at__isnull=True)
+
+    today = now.astimezone(VIETNAM).date()
+    lifecycle = {
+        "scheduled": Q(opens_at__gt=now),
+        "open": Q(opens_at__lte=now, closes_at__gt=now),
+        "closed": Q(closes_at__lte=now, delivery_date__gt=today),
+        "delivery": Q(closes_at__lte=now, delivery_date__lte=today),
+    }
+    return rounds.filter(lifecycle[status], published_at__isnull=False)
 
 
 def _validate_schedule(round_):

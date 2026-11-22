@@ -2,7 +2,7 @@
 
 import copy
 import uuid
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -111,6 +111,71 @@ def test_round_lists_are_paginated_with_validated_bounds(context, admin_client):
     assert response.json()["meta"] == {"page": 1, "page_size": 20, "total": 24}
     assert len(admin_client.get("/api/v1/admin/csa-rounds?page=2").json()["data"]) == 4
     assert admin_client.get("/api/v1/admin/csa-rounds?page_size=101").status_code == 400
+
+
+def test_admin_round_status_filter_matches_display_at_time_boundaries(
+    context, admin_client, monkeypatch
+):
+    existing = context[3]
+    existing.delete()
+    now = datetime(2026, 1, 10, 17, tzinfo=UTC)
+    monkeypatch.setattr(timezone, "now", lambda: now)
+    local_today = now.astimezone(service.VIETNAM).date()
+    tomorrow = local_today + timedelta(days=1)
+    earlier = now - timedelta(hours=1)
+    later = now + timedelta(hours=1)
+    before_boundary = now - timedelta(microseconds=1)
+    published = now - timedelta(days=1)
+    rows = [
+        ("draft", earlier, later, tomorrow, None, None),
+        ("scheduled", now + timedelta(microseconds=1), later, tomorrow, published, None),
+        ("open", now, later, tomorrow, published, None),
+        ("closed", earlier, now, tomorrow, published, None),
+        ("delivery", earlier, before_boundary, local_today, published, None),
+        ("cancelled", earlier, later, tomorrow, None, now),
+        ("closed", earlier, before_boundary, tomorrow, published, None),
+    ]
+    CSARound.objects.bulk_create(
+        [
+            CSARound(
+                sequence=index,
+                name=f"{state} {index}",
+                opens_at=opens,
+                closes_at=closes,
+                delivery_date=delivery,
+                published_at=published_at,
+                cancelled_at=cancelled_at,
+            )
+            for index, (state, opens, closes, delivery, published_at, cancelled_at) in enumerate(
+                rows, start=1
+            )
+        ]
+    )
+
+    path = "/api/v1/admin/csa-rounds"
+    for status, sequences in {
+        "draft": [1],
+        "scheduled": [2],
+        "open": [3],
+        "closed": [7, 4],
+        "delivery": [5],
+        "cancelled": [6],
+    }.items():
+        response = admin_client.get(path, {"status": status})
+        assert response.status_code == 200, response.json()
+        data = response.json()
+        assert data["meta"]["total"] == len(sequences)
+        assert [row["sequence"] for row in data["data"]] == sequences
+        assert all(
+            row["status"] == status and row["server_time"] == now.isoformat()
+            for row in data["data"]
+        )
+
+    response = admin_client.get(path, {"status": "closed", "page": 2, "page_size": 1})
+    assert response.status_code == 200
+    assert response.json()["meta"] == {"page": 2, "page_size": 1, "total": 2}
+    assert [row["sequence"] for row in response.json()["data"]] == [4]
+    assert admin_client.get(path, {"status": "finished"}).status_code == 400
 
 
 def test_participants_are_paged_demand_is_whole_round_and_history_is_lazy(context, admin_client):

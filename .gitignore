@@ -27,6 +27,7 @@ htmlcov/
 # Runtime-generated data
 *.sqlite
 *.sqlite3
+/:memory:
 media/
 private/
 staticfiles/
