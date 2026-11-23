@@ -15,6 +15,7 @@ from commerce.public_catalog import (
     public_product_queryset,
 )
 from commerce.serializers import (
+    AdminShippingAddressSerializer,
     CategoryQuerySerializer,
     CategoryWriteSerializer,
     ProductQuerySerializer,
@@ -36,9 +37,11 @@ from commerce.services import (
     update_product,
 )
 from commerce.shipping import (
+    ShippingAddressBusy,
     UnsupportedShippingArea,
     active_shipping_area,
     public_shipping_area_payloads,
+    save_admin_shipping_address,
     save_shipping_address,
     save_shipping_settings,
     shipping_address_payload,
@@ -49,6 +52,7 @@ from content.permissions import IsWebsiteAdmin
 from content.serializers import media_payload
 from content.services import delete_orphan_media_asset
 from content.views import AdminMediaUploadView
+from identity.admin_api import AdminAccountAPIView
 from members.administrative_units import province_exists
 from memberships.permissions import HasMembershipSelfScopes
 
@@ -218,20 +222,54 @@ class SelfShippingAddressView(APIView):
         try:
             item = save_shipping_address(user=request.user, data=serializer.validated_data)
         except UnsupportedShippingArea:
-            return no_store(
-                Response(
-                    {
-                        "errors": [
-                            {
-                                "code": "shipping_area_unsupported",
-                                "detail": "The selected shipping area is not supported.",
-                            }
-                        ]
-                    },
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-            )
+            return no_store(unsupported_shipping_area_response())
+        except ShippingAddressBusy:
+            return no_store(shipping_address_busy_response())
         return no_store(Response({"data": shipping_address_payload(item)}))
+
+
+def unsupported_shipping_area_response():
+    return Response(
+        {
+            "errors": [
+                {
+                    "code": "shipping_area_unsupported",
+                    "detail": "The selected shipping area is not supported.",
+                }
+            ]
+        },
+        status=status.HTTP_400_BAD_REQUEST,
+    )
+
+
+class AdminUserShippingAddressView(AdminAccountAPIView):
+    def finalize_response(self, request, response, *args, **kwargs):
+        return no_store(super().finalize_response(request, response, *args, **kwargs))
+
+    def put(self, request, user_id):
+        serializer = AdminShippingAddressSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = dict(serializer.validated_data)
+        expected_updated_at = data.pop("expected_updated_at")
+        try:
+            item = save_admin_shipping_address(
+                actor=request.user,
+                user_id=user_id,
+                data=data,
+                expected_updated_at=expected_updated_at,
+            )
+        except UnsupportedShippingArea:
+            return unsupported_shipping_area_response()
+        except ShippingAddressBusy:
+            return shipping_address_busy_response()
+        return Response({"data": shipping_address_payload(item)})
+
+
+def shipping_address_busy_response():
+    return Response(
+        {"errors": [{"code": "shipping_address_busy"}]},
+        status=status.HTTP_503_SERVICE_UNAVAILABLE,
+    )
 
 
 class AdminShippingSettingsView(APIView):

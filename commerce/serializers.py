@@ -97,6 +97,10 @@ class ShippingAddressSerializer(StrictSerializer):
         return attrs
 
 
+class AdminShippingAddressSerializer(ShippingAddressSerializer):
+    expected_updated_at = serializers.DateTimeField(allow_null=True)
+
+
 class TranslationSerializer(StrictSerializer):
     locale = serializers.ChoiceField(choices=["vi", "en"])
     name = serializers.CharField(max_length=200, trim_whitespace=True)

@@ -6,8 +6,8 @@ from allauth.account.models import EmailAddress
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.db import IntegrityError, OperationalError, connection, transaction
-from django.db.models import Q
 
+from identity.locks import lock_user_for_shared_read
 from identity.models import AccountStatus, AuditLog, User
 from identity.passwords import revoke_core_credentials
 from identity.services import activate_account, transition_account
@@ -17,11 +17,25 @@ class AccountConflict(Exception):
     pass
 
 
-def _lock_accounts(*, actor, user_id=None):
+def lock_admin_accounts(*, actor, user_id=None, shared_actor=False):
     ids = {actor.pk} if user_id is None else {actor.pk, user_id}
-    accounts = {
-        user.pk: user for user in User.objects.select_for_update().filter(pk__in=ids).order_by("pk")
-    }
+    if shared_actor:
+        # Keep UUID order across CMS writers. The actor is read-only in this transaction.
+        accounts = {}
+        for account_id in sorted(ids):
+            try:
+                if account_id == actor.pk:
+                    lock_user_for_shared_read(account_id)
+                    accounts[account_id] = User.objects.get(pk=account_id)
+                else:
+                    accounts[account_id] = User.objects.select_for_update().get(pk=account_id)
+            except User.DoesNotExist:
+                continue
+    else:
+        accounts = {
+            user.pk: user
+            for user in User.objects.select_for_update().filter(pk__in=ids).order_by("pk")
+        }
     current_actor = accounts.get(actor.pk)
     if (
         current_actor is None
@@ -65,7 +79,7 @@ def create_account(*, actor, name, login_phone_number, password, email=None, loc
     for attempt in range(5):
         try:
             with transaction.atomic():
-                current_actor, _ = _lock_accounts(actor=actor)
+                current_actor, _ = lock_admin_accounts(actor=actor)
                 duplicates = _duplicate_identifiers(email=email, phone=login_phone_number)
                 if duplicates:
                     raise ValidationError(duplicates)
@@ -92,9 +106,18 @@ def create_account(*, actor, name, login_phone_number, password, email=None, loc
             sleep(0.025 * (attempt + 1))
 
 
-def _protect_target(user, actor):
-    if user.pk == actor.pk or user.is_superuser:
-        raise AccountConflict("account_target_protected")
+def is_protected_account_target(user, *, actor):
+    return (
+        user.pk == actor.pk
+        or user.is_superuser
+        or user.is_staff
+        or user.groups.filter(name="website_admin").exists()
+    )
+
+
+def _has_custom_django_permissions(user):
+    # Inactive users can still hold grants even when Django reports no effective permissions.
+    return user.user_permissions.exists() or user.groups.filter(permissions__isnull=False).exists()
 
 
 STATE_ACTIONS = {
@@ -102,13 +125,32 @@ STATE_ACTIONS = {
     "suspend": (AccountStatus.ACTIVE, AccountStatus.SUSPENDED),
     "reactivate": (AccountStatus.SUSPENDED, AccountStatus.ACTIVE),
 }
+PASSWORD_RESET_STATUSES = {
+    AccountStatus.ACTIVE,
+    AccountStatus.PENDING_ACTIVATION,
+    AccountStatus.SUSPENDED,
+}
+
+
+def admin_account_actions(user, *, actor, email_verified):
+    if is_protected_account_target(user, actor=actor):
+        return []
+
+    actions = [action for action, (start, _) in STATE_ACTIONS.items() if user.status == start]
+    if (
+        user.status in PASSWORD_RESET_STATUSES
+        and not email_verified
+        and not _has_custom_django_permissions(user)
+    ):
+        actions.append("reset-password")
+    return actions
 
 
 @transaction.atomic
 def change_account_state(*, actor, user_id, action):
-    current_actor, user = _lock_accounts(actor=actor, user_id=user_id)
-    if action == "suspend":
-        _protect_target(user, current_actor)
+    current_actor, user = lock_admin_accounts(actor=actor, user_id=user_id)
+    if is_protected_account_target(user, actor=current_actor):
+        raise AccountConflict("account_target_protected")
     start, end = STATE_ACTIONS[action]
     if user.status == end:
         return user
@@ -125,20 +167,12 @@ def change_account_state(*, actor, user_id, action):
 
 @transaction.atomic
 def reset_account_password(*, actor, user_id, password):
-    current_actor, user = _lock_accounts(actor=actor, user_id=user_id)
-    _protect_target(user, current_actor)
-    # Inspect grants directly: Django returns no effective permissions for inactive users.
-    if (
-        user.is_staff
-        or user.user_permissions.exists()
-        or user.groups.filter(Q(name="website_admin") | Q(permissions__isnull=False)).exists()
+    current_actor, user = lock_admin_accounts(actor=actor, user_id=user_id)
+    if is_protected_account_target(user, actor=current_actor) or _has_custom_django_permissions(
+        user
     ):
         raise AccountConflict("account_target_protected")
-    if user.status not in {
-        AccountStatus.ACTIVE,
-        AccountStatus.PENDING_ACTIVATION,
-        AccountStatus.SUSPENDED,
-    }:
+    if user.status not in PASSWORD_RESET_STATUSES:
         raise AccountConflict("account_state_conflict")
     if user.email_verified:
         raise AccountConflict("email_recovery_required")

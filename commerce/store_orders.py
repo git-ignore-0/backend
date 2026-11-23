@@ -6,7 +6,7 @@ from collections import defaultdict
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-from django.db import connection, transaction
+from django.db import transaction
 from django.db.models import Q, Sum
 from django.db.models.functions import Round
 from django.utils import timezone
@@ -35,7 +35,7 @@ from commerce.store_delivery import (
     validate_delivery_date,
 )
 from farms.models import Farm, FarmProduct, FarmProductStockBatch
-from identity.models import User
+from identity.locks import lock_user_for_shared_read
 from members.administrative_units import province_exists, ward_choices
 from memberships.coupons import (
     CouponError,
@@ -404,19 +404,7 @@ def _lock_checkout_identity(user):
     Quota mutations may already hold Membership when writing an actor FK. An
     exclusive User lock here would invert those locks. Store does not update User.
     """
-    if connection.vendor not in {"mysql", "postgresql"}:
-        # SQLite has no row locks; retain the existence check used by checkout.
-        User.objects.only("pk").get(pk=user.pk)
-        return
-    pk = User._meta.pk
-    quote = connection.ops.quote_name
-    table, column = quote(User._meta.db_table), quote(pk.column)
-    clause = "LOCK IN SHARE MODE" if connection.vendor == "mysql" else "FOR SHARE"
-    value = pk.get_db_prep_value(user.pk, connection)
-    with connection.cursor() as cursor:
-        cursor.execute(f"SELECT {column} FROM {table} WHERE {column} = %s {clause}", [value])
-        if cursor.fetchone() is None:
-            raise User.DoesNotExist("Checkout user no longer exists")
+    lock_user_for_shared_read(user.pk)
 
 
 def calculate_store_quote(*, user, payload, lock=False, check_expected=False, draft_coupon=None):

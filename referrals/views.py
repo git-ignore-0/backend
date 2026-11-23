@@ -12,10 +12,12 @@ from rest_framework.permissions import AllowAny, BasePermission
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from commerce.shipping import can_edit_admin_shipping_address, shipping_address_payload
 from content.permissions import IsWebsiteAdmin
 from content.serializers import media_payload
 from content.services import audit, store_reward_image
 from identity.admin_api import AdminAccountPasswordAPIView, create_admin_user
+from identity.admin_services import admin_account_actions
 from identity.models import User
 from identity.phones import normalize_login_phone
 from referrals.models import (
@@ -498,7 +500,7 @@ class AdminUserListView(AdminAccountPasswordAPIView):
         )
 
 
-def admin_user_payload(user, invited_page: int = 1) -> tuple[dict, dict]:
+def admin_user_payload(user, *, actor, invited_page: int = 1) -> tuple[dict, dict]:
     account = ensure_referral_account(user)
     source = Referral.objects.select_related("referrer").filter(referee=user).first()
     invited, invited_meta = paginate(
@@ -507,15 +509,25 @@ def admin_user_payload(user, invited_page: int = 1) -> tuple[dict, dict]:
         page_size=ADMIN_PAGE_SIZE,
     )
     profile = getattr(user, "member_profile", None)
+    email_verified = user.email_verified
+    can_edit_address = can_edit_admin_shipping_address(user, actor=actor)
+    shipping_address = getattr(user, "shipping_address", None) if can_edit_address else None
     return (
         {
             "id": str(user.pk),
             "name": user.name,
             "email": user.email,
             "login_phone_number": user.login_phone_number,
-            "email_verified": user.email_verified,
+            "email_verified": email_verified,
             "phone": profile.phone_number if profile else "",
             **admin_user_csa_fields(user),
+            "account_actions": admin_account_actions(
+                user, actor=actor, email_verified=email_verified
+            ),
+            "can_edit_shipping_address": can_edit_address,
+            "shipping_address": shipping_address_payload(shipping_address)
+            if shipping_address
+            else None,
             "date_joined": user.date_joined.isoformat(),
             "status": user.status,
             "referral_code": account.code,
@@ -545,9 +557,12 @@ class AdminUserDetailView(APIView):
         query = PageQuerySerializer(data={"page": request.query_params.get("invited_page", 1)})
         query.is_valid(raise_exception=True)
         user = get_object_or_404(
-            User.objects.select_related("member_profile", "csa_customer"), pk=user_id
+            User.objects.select_related("member_profile", "csa_customer", "shipping_address"),
+            pk=user_id,
         )
-        data, invited_meta = admin_user_payload(user, query.validated_data["page"])
+        data, invited_meta = admin_user_payload(
+            user, actor=request.user, invited_page=query.validated_data["page"]
+        )
         return no_store(Response({"data": data, "meta": {"invited": invited_meta}}))
 
 

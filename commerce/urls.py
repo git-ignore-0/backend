@@ -75,6 +75,10 @@ urlpatterns = [
     path("public/shipping-quotes", views.PublicShippingQuoteView.as_view()),
     path("shipping-address", views.SelfShippingAddressView.as_view()),
     path(
+        "admin/users/<uuid:user_id>/shipping-address",
+        views.AdminUserShippingAddressView.as_view(),
+    ),
+    path(
         "admin/shipping-settings/<str:province_code>",
         views.AdminShippingSettingsView.as_view(),
     ),

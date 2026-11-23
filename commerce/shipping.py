@@ -1,13 +1,28 @@
 from dataclasses import dataclass
+from sqlite3 import SQLITE_BUSY, SQLITE_LOCKED
+from time import sleep
 
-from django.db import transaction
+from django.db import OperationalError, connection, transaction
 
 from commerce.models import ShippingAddress, ShippingArea, ShippingProvinceRule
+from identity.admin_services import (
+    AccountConflict,
+    is_protected_account_target,
+    lock_admin_accounts,
+)
+from identity.models import AccountStatus, User
 from members.administrative_units import province_choices, ward_choices
 
 
 class UnsupportedShippingArea(Exception):
     pass
+
+
+class ShippingAddressBusy(Exception):
+    pass
+
+
+_UNCONDITIONAL_WRITE = object()
 
 
 def _unit_names(province_code, ward_code):
@@ -167,12 +182,67 @@ def shipping_address_payload(item):
     }
 
 
-@transaction.atomic
-def save_shipping_address(*, user, data):
+def can_edit_admin_shipping_address(user, *, actor):
+    return user.status not in {
+        AccountStatus.DELETION_REQUESTED,
+        AccountStatus.ANONYMIZED,
+    } and not is_protected_account_target(user, actor=actor)
+
+
+def _write_shipping_address(*, user, data, expected_updated_at=_UNCONDITIONAL_WRITE):
     if (
         active_shipping_area(province_code=data["province_code"], ward_code=data["ward_code"])
         is None
     ):
         raise UnsupportedShippingArea
-    item, _created = ShippingAddress.objects.update_or_create(user=user, defaults=data)
+    item = ShippingAddress.objects.select_for_update().filter(user=user).first()
+    if item is not None and all(getattr(item, field) == value for field, value in data.items()):
+        return item
+    current_version = item.updated_at if item is not None else None
+    if expected_updated_at is not _UNCONDITIONAL_WRITE and expected_updated_at != current_version:
+        raise AccountConflict("shipping_address_changed")
+    if item is None:
+        return ShippingAddress.objects.create(user=user, **data)
+    for field, value in data.items():
+        setattr(item, field, value)
+    item.save(update_fields=[*data, "updated_at"])
     return item
+
+
+def _retry_address_write(write):
+    for attempt in range(5):
+        try:
+            with transaction.atomic():
+                return write()
+        except OperationalError as error:
+            sqlite_code = getattr(error.__cause__, "sqlite_errorcode", 0)
+            if connection.vendor != "sqlite" or sqlite_code & 0xFF not in {
+                SQLITE_BUSY,
+                SQLITE_LOCKED,
+            }:
+                raise
+            if attempt == 4:
+                raise ShippingAddressBusy from error
+            # Retry after rollback so the next attempt observes the winner's address version.
+            sleep(0.025 * (attempt + 1))
+
+
+def save_shipping_address(*, user, data):
+    def write():
+        # Use the same User -> ShippingAddress order as CMS and checkout.
+        locked_user = User.objects.select_for_update().only("id").get(pk=user.pk)
+        return _write_shipping_address(user=locked_user, data=data)
+
+    return _retry_address_write(write)
+
+
+def save_admin_shipping_address(*, actor, user_id, data, expected_updated_at):
+    def write():
+        current_actor, user = lock_admin_accounts(actor=actor, user_id=user_id, shared_actor=True)
+        if not can_edit_admin_shipping_address(user, actor=current_actor):
+            raise AccountConflict("account_target_protected")
+        return _write_shipping_address(
+            user=user, data=data, expected_updated_at=expected_updated_at
+        )
+
+    return _retry_address_write(write)

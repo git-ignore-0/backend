@@ -557,6 +557,7 @@ def test_checkout_identity_uses_shared_lock(active_user, monkeypatch, vendor, cl
     from unittest.mock import MagicMock
 
     from commerce import store_orders
+    from identity import locks
 
     cursor = MagicMock()
     cursor.fetchone.return_value = (active_user.pk,)
@@ -567,7 +568,7 @@ def test_checkout_identity_uses_shared_lock(active_user, monkeypatch, vendor, cl
         cursor=MagicMock(),
     )
     db.cursor.return_value.__enter__.return_value = cursor
-    monkeypatch.setattr(store_orders, "connection", db)
+    monkeypatch.setattr(locks, "connection", db)
     store_orders._lock_checkout_identity(active_user)
     sql, params = cursor.execute.call_args.args
     assert sql.endswith(clause)

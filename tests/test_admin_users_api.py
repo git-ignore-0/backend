@@ -553,12 +553,59 @@ def test_cms_reset_protects_privileged_targets_and_leaves_credentials_intact(
     assert user.password == original_hash
     assert refresh.revoked is None
     assert not AuditLog.objects.filter(user=user, action="user.password_reset").exists()
+    detail = cms.get(f"{USERS}/{user.pk}").json()["data"]
+    assert "reset-password" not in detail["account_actions"]
 
 
-def test_staff_suspension_remains_allowed(cms):
-    user = target("active", is_staff=True)
-    response = cms.post(f"{USERS}/{user.pk}/suspend")
-    assert response.status_code == 200 and response.json()["data"]["status"] == "suspended"
+@pytest.mark.parametrize("role", ["website_admin", "staff", "superuser"])
+@pytest.mark.parametrize(
+    ("action", "state"),
+    [
+        ("activate", "pending_activation"),
+        ("suspend", "active"),
+        ("reactivate", "suspended"),
+        ("reset-password", "active"),
+    ],
+)
+def test_admin_targets_are_read_only(cms, role, action, state):
+    user = target(state, **({f"is_{role}": True} if role != "website_admin" else {}))
+    if role == "website_admin":
+        user.groups.add(Group.objects.get(name="website_admin"))
+    original_hash = user.password
+    endpoint = f"{USERS}/{user.pk}"
+    body = {"password1": PASSWORD, "password2": PASSWORD} if action == "reset-password" else {}
+    response = cms.post(f"{endpoint}/{action}", body, format="json")
+    assert response.status_code == 409
+    assert response.json() == {"errors": [{"code": "account_target_protected"}]}
+    user.refresh_from_db()
+    assert (user.status, user.password) == (state, original_hash)
+    assert not AuditLog.objects.filter(user=user).exists()
+    assert not IdentityEvent.objects.filter(user=user).exists()
+    detail = cms.get(endpoint)
+    assert detail.status_code == 200
+    assert detail.json()["data"]["account_actions"] == []
+    assert detail.json()["data"]["status"] == state
+
+
+@pytest.mark.parametrize(
+    ("state", "verified", "actions"),
+    [
+        ("pending_activation", False, ["activate", "reset-password"]),
+        ("active", False, ["suspend", "reset-password"]),
+        ("suspended", False, ["reactivate", "reset-password"]),
+        ("active", True, ["suspend"]),
+        ("deletion_requested", False, []),
+        ("anonymized", False, []),
+    ],
+)
+def test_detail_reports_account_actions_for_regular_users(cms, state, verified, actions):
+    user = target(state, email="capabilities@example.com" if verified else None)
+    if verified:
+        EmailAddress.objects.create(user=user, email=user.email, verified=True)
+
+    detail = cms.get(f"{USERS}/{user.pk}")
+    assert detail.status_code == 200
+    assert detail.json()["data"]["account_actions"] == actions
 
 
 def test_verification_projection_matches_only_the_current_email(cms):
