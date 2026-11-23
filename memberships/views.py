@@ -429,7 +429,7 @@ def membership_payment_settings_payload(item=None):
     }
 
 
-def customer_payload(item, *, include_memberships=False):
+def customer_payload(item, *, include_memberships=False, include_note=False):
     user = item.user
     today = timezone.localdate()
     memberships = list(item.memberships.all())
@@ -461,6 +461,8 @@ def customer_payload(item, *, include_memberships=False):
         "created_at": item.created_at.isoformat(),
         "updated_at": item.updated_at.isoformat(),
     }
+    if include_note:
+        data["note"] = item.note
     data["current_membership"] = (
         {"id": str(current.pk), "status": current.status} if current else None
     )
@@ -2568,12 +2570,13 @@ class AdminCSACustomerViewSet(viewsets.ViewSet):
                 province_code=data.get("province_code", ""),
                 ward_code=data.get("ward_code", ""),
                 address=data.get("address", ""),
+                note=data["note"],
             )
         except CSACustomerError as error:
             return csa_customer_error(error)
         return no_store(
             Response(
-                {"data": customer_payload(customer_queryset().get(pk=item.pk))},
+                {"data": customer_payload(customer_queryset().get(pk=item.pk), include_note=True)},
                 status=status.HTTP_201_CREATED,
             )
         )
@@ -2581,7 +2584,9 @@ class AdminCSACustomerViewSet(viewsets.ViewSet):
     def retrieve(self, request, pk=None):
         refresh_membership_statuses()
         item = get_object_or_404(customer_queryset(), pk=pk)
-        return no_store(Response({"data": customer_payload(item, include_memberships=True)}))
+        return no_store(
+            Response({"data": customer_payload(item, include_memberships=True, include_note=True)})
+        )
 
     @action(detail=True, methods=["post"], url_path="link-user")
     def link_user(self, request, pk=None):

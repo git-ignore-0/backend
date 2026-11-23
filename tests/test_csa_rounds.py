@@ -31,14 +31,14 @@ def context(active_user, store_product, monkeypatch):
     membership = attach_active_membership(active_user, store_product)
     store_product.csa_quota_cost = Decimal("1")
     store_product.save(update_fields=["csa_quota_cost"])
-    round_ = service.create_round(
+    round_ = service.create_round_configuration(
         name="CSA",
         opens_at=now - timedelta(hours=1),
         closes_at=now + timedelta(hours=1),
         delivery_date=timezone.localdate(now) + timedelta(days=1),
         actor=active_user,
     )
-    round_ = service.publish_round(round_id=round_.pk, actor=active_user)
+    round_ = service.publish_round_configuration(configuration_id=round_.pk).rounds.get()
     return active_user, store_product, membership, round_, now
 
 
@@ -54,14 +54,14 @@ def save(context, quantity=2, **kwargs):
 
 def publish_overlapping_round(context):
     user, _, _, round_, now = context
-    later = service.create_round(
+    later = service.create_round_configuration(
         name="Next",
         opens_at=now,
         closes_at=now + timedelta(hours=2),
         delivery_date=round_.delivery_date,
         actor=user,
     )
-    return service.publish_round(round_id=later.pk, actor=user)
+    return service.publish_round_configuration(configuration_id=later.pk).rounds.get()
 
 
 @pytest.fixture(params=["quota", "stock"])
@@ -296,14 +296,14 @@ def test_freeze_preserves_old_round_until_delivery_day_and_blocks_new_round(cont
     service.confirm_selection(selection_id=selection.pk, user=user)
     quota.refresh_from_db()
     assert quota.remaining_units == 1
-    next_ = service.create_round(
+    next_ = service.create_round_configuration(
         name="Next",
         opens_at=later,
         closes_at=later + timedelta(hours=1),
         delivery_date=round_.delivery_date,
         actor=user,
     )
-    service.publish_round(round_id=next_.pk, actor=user)
+    next_ = service.publish_round_configuration(configuration_id=next_.pk).rounds.get()
     with pytest.raises(service.CSARoundError, match="csa_membership_unavailable"):
         service.save_selection(
             round_id=next_.pk, user=user, lines=[{"product_id": product.pk, "quantity": 1}]
@@ -357,7 +357,9 @@ def test_member_cannot_administer_or_access_another_selection(context, access_to
     selected = save(context)
     client = APIClient()
     client.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token.token}")
-    assert client.post("/api/v1/admin/csa-rounds", {}, format="json").status_code == 403
+    assert (
+        client.post("/api/v1/admin/csa-round-configurations", {}, format="json").status_code == 403
+    )
     access_token.scope = "profile"
     access_token.save(update_fields=["scope"])
     assert client.get("/api/v1/csa-rounds").status_code == 403
@@ -430,19 +432,24 @@ def test_admin_api_round_crud_publish_cancel_and_private_contract(context, acces
         "closes_at": (round_.closes_at + timedelta(hours=1)).isoformat(),
         "delivery_date": round_.delivery_date.isoformat(),
     }
-    response = client.post("/api/v1/admin/csa-rounds", {**request, "products": []}, format="json")
+    response = client.post(
+        "/api/v1/admin/csa-round-configurations", {**request, "products": []}, format="json"
+    )
     assert response.status_code == 400
-    response = client.post("/api/v1/admin/csa-rounds", request, format="json")
+    response = client.post("/api/v1/admin/csa-round-configurations", request, format="json")
     assert response.status_code == 201, response.json()
     pk = response.json()["data"]["id"]
     assert (
         client.patch(
-            f"/api/v1/admin/csa-rounds/{pk}", {"name": "Edited"}, format="json"
+            f"/api/v1/admin/csa-round-configurations/{pk}", {"name": "Edited"}, format="json"
         ).status_code
         == 200
     )
     assert (
-        client.post(f"/api/v1/admin/csa-rounds/{pk}/publish", {}, format="json").status_code == 200
+        client.post(
+            f"/api/v1/admin/csa-round-configurations/{pk}/publish", {}, format="json"
+        ).status_code
+        == 200
     )
     response = client.get(f"/api/v1/csa-rounds/{round_.pk}/products")
     assert response.status_code == 200, response.json()

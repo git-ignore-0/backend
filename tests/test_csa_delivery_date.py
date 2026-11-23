@@ -27,12 +27,23 @@ def admin_client(active_user):
 
 
 def make_round(actor, *, closes_at=None, delivery_date=date(2027, 1, 1)):
-    return csa_rounds.create_round(
+    configuration = csa_rounds.create_round_configuration(
         name="Date only",
         opens_at=datetime(2026, 12, 30, 2, tzinfo=UTC),
         closes_at=closes_at or datetime(2026, 12, 31, 16, 59, tzinfo=UTC),
         delivery_date=delivery_date,
         actor=actor,
+    )
+
+    return csa_rounds._create_round(
+        name=configuration.name,
+        opens_at=configuration.opens_at,
+        closes_at=configuration.closes_at,
+        delivery_date=configuration.delivery_date,
+        configuration=configuration,
+        recurrence_week=0,
+        sequence=1,
+        created_by=actor,
     )
 
 
@@ -104,7 +115,7 @@ def test_companion_cutoff_boundary_and_disable_after_cutoff(active_user, monkeyp
 
 def test_round_api_rejects_timestamp_delivery_date(admin_client):
     response = admin_client.post(
-        "/api/v1/admin/csa-rounds",
+        "/api/v1/admin/csa-round-configurations",
         {
             "name": "No synthetic delivery hour",
             "opens_at": "2026-12-30T09:00:00+07:00",
@@ -119,22 +130,22 @@ def test_round_api_rejects_timestamp_delivery_date(admin_client):
 
 def test_same_delivery_date_rounds_allowed(active_user, monkeypatch):
     monkeypatch.setattr(timezone, "now", lambda: datetime(2026, 12, 29, tzinfo=UTC))
-    first = csa_rounds.create_round(
+    first = csa_rounds.create_round_configuration(
         name="First",
         opens_at=datetime(2026, 12, 30, 1, tzinfo=UTC),
         closes_at=datetime(2026, 12, 30, 2, tzinfo=UTC),
         delivery_date=date(2027, 1, 1),
         actor=active_user,
     )
-    second = csa_rounds.create_round(
+    second = csa_rounds.create_round_configuration(
         name="Second",
         opens_at=datetime(2026, 12, 30, 3, tzinfo=UTC),
         closes_at=datetime(2026, 12, 30, 4, tzinfo=UTC),
         delivery_date=date(2027, 1, 1),
         actor=active_user,
     )
-    csa_rounds.publish_round(round_id=first.pk, actor=active_user)
-    csa_rounds.publish_round(round_id=second.pk, actor=active_user)
+    csa_rounds.publish_round_configuration(configuration_id=first.pk)
+    csa_rounds.publish_round_configuration(configuration_id=second.pk)
     assert CSARound.objects.filter(published_at__isnull=False).count() == 2
 
 
@@ -167,6 +178,7 @@ def test_migration_converts_vietnam_day_and_keeps_order_snapshot(instant, expect
         old = OldRound.objects.create(
             sequence=1,
             name="Old round",
+            published_at=instant - timedelta(days=3),
             opens_at=instant - timedelta(days=3),
             closes_at=instant - timedelta(days=2),
             delivery_at=instant,

@@ -98,6 +98,8 @@ def test_round_lists_are_paginated_with_validated_bounds(context, admin_client):
             CSARound(
                 name=f"Round {i}",
                 sequence=i,
+                configuration=round_.configuration,
+                recurrence_week=i,
                 opens_at=now,
                 closes_at=now + timedelta(hours=1),
                 delivery_date=timezone.localdate(now) + timedelta(days=1),
@@ -117,6 +119,7 @@ def test_admin_round_status_filter_matches_display_at_time_boundaries(
     context, admin_client, monkeypatch
 ):
     existing = context[3]
+    configuration = existing.configuration
     existing.delete()
     now = datetime(2026, 1, 10, 17, tzinfo=UTC)
     monkeypatch.setattr(timezone, "now", lambda: now)
@@ -139,6 +142,8 @@ def test_admin_round_status_filter_matches_display_at_time_boundaries(
         [
             CSARound(
                 sequence=index,
+                configuration=configuration,
+                recurrence_week=index - 1,
                 name=f"{state} {index}",
                 opens_at=opens,
                 closes_at=closes,

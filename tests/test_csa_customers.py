@@ -237,6 +237,7 @@ def test_admin_customer_create_list_and_delete_rejection(admin_api):
     assert managed["province_code"] == "66"
     assert managed["ward_code"] == "22015"
     assert managed["address"] == "Số 12, ngõ 5"
+    assert managed["note"] == ""
 
     listed = admin_api.get(
         "/api/v1/admin/csa-customers",
@@ -247,6 +248,28 @@ def test_admin_customer_create_list_and_delete_rejection(admin_api):
     assert listed.json()["meta"]["page_size"] == 10
 
     assert admin_api.delete(f"/api/v1/admin/csa-customers/{managed['id']}").status_code == 405
+
+
+@pytest.mark.django_db
+def test_admin_customer_note_is_saved_and_returned_only_in_create_and_detail(admin_api):
+    ShippingArea.objects.create(
+        province_code="66", ward_code="22015", shipping_fee_vnd=30_000, is_active=True
+    )
+    path = "/api/v1/admin/csa-customers"
+    body = {"name": "Khách cửa hàng", "phone": "0901234567", **VALID_CUSTOMER_FIELDS}
+    rejected = admin_api.post(path, {**body, "note": "a" * 1001}, format="json")
+    assert rejected.status_code == 400
+    assert "note" in rejected.json()
+    assert not CSACustomer.objects.exists()
+
+    note = "Gọi trước khi giao.\nKhách nhận vào buổi sáng."
+    response = admin_api.post(path, {**body, "note": f"  {note}  "}, format="json")
+    assert response.status_code == 201, response.json()
+    item = response.json()["data"]
+    assert item["note"] == note
+    assert CSACustomer.objects.get(pk=item["id"]).note == note
+    assert admin_api.get(f"{path}/{item['id']}").json()["data"]["note"] == note
+    assert "note" not in admin_api.get(path).json()["data"][0]
 
 
 @pytest.mark.django_db
@@ -284,6 +307,8 @@ def test_customer_api_requires_scope_and_group(active_user, access_token):
 @pytest.mark.django_db
 def test_admin_can_link_user_once_with_audit_and_cannot_unlink(admin_api, active_user):
     customer = create_complete_managed_customer()
+    customer.note = "Gọi trước khi giao."
+    customer.save(update_fields=["note"])
     ShippingArea.objects.create(
         province_code="66",
         ward_code="22045",
@@ -311,6 +336,8 @@ def test_admin_can_link_user_once_with_audit_and_cannot_unlink(admin_api, active
     assert customer.province_code == "66"
     assert customer.ward_code == "22045"
     assert customer.address == "Địa chỉ giao hàng mới"
+    profile = admin_api.get(f"/api/v1/admin/csa-customers/{customer.pk}").json()["data"]
+    assert profile["note"] == "Gọi trước khi giao."
     audit = AuditLog.objects.get(action="csa_customer.link_user")
     assert audit.user_id == active_user.pk
     assert audit.context == {

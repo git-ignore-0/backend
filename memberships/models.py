@@ -219,6 +219,7 @@ class CSACustomer(models.Model):
     province_code = models.CharField(max_length=2, blank=True)
     ward_code = models.CharField(max_length=5, blank=True)
     address = models.CharField(max_length=500, blank=True)
+    note = models.CharField(max_length=1000, blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -2083,6 +2084,54 @@ class CouponUsage(models.Model):
         ]
 
 
+class CSARoundConfiguration(models.Model):
+    class Mode(models.TextChoices):
+        DRAFT = "draft", "Draft"
+        AUTO = "auto", "Automatic publishing"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=200)
+    opens_at = models.DateTimeField()
+    closes_at = models.DateTimeField()
+    delivery_date = models.DateField()
+    draft_companion_delivery_enabled = models.BooleanField(default=False)
+    draft_companion_delivery_cutoff = models.DateTimeField(null=True, blank=True)
+    recurrence_mode = models.CharField(max_length=5, choices=Mode.choices, null=True, blank=True)
+    published_at = models.DateTimeField(null=True, blank=True)
+    cancelled_at = models.DateTimeField(null=True, blank=True)
+    next_week = models.PositiveIntegerField(default=1)
+    next_create_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(recurrence_mode__isnull=True)
+                | Q(recurrence_mode__in=["draft", "auto"]),
+                name="csa_configuration_mode_valid",
+            ),
+            models.CheckConstraint(
+                condition=Q(next_create_at__isnull=True)
+                | Q(
+                    recurrence_mode__isnull=False,
+                    published_at__isnull=False,
+                    cancelled_at__isnull=True,
+                ),
+                name="csa_configuration_can_generate",
+            ),
+            models.CheckConstraint(
+                condition=Q(next_week__gt=0), name="csa_configuration_week_positive"
+            ),
+        ]
+
+    @property
+    def status(self):
+        if self.cancelled_at is not None:
+            return "cancelled"
+        return "published" if self.published_at is not None else "draft"
+
+
 class CSARound(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     sequence = models.PositiveIntegerField(unique=True)
@@ -2103,14 +2152,10 @@ class CSARound(models.Model):
         related_name="cancelled_csa_rounds",
     )
     created_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL)
-    recurrence = models.ForeignKey(
-        "CSARoundRecurrence",
-        related_name="generated_rounds",
-        null=True,
-        blank=True,
-        on_delete=models.PROTECT,
+    configuration = models.ForeignKey(
+        CSARoundConfiguration, related_name="rounds", on_delete=models.PROTECT
     )
-    recurrence_week = models.PositiveIntegerField(null=True, blank=True)
+    recurrence_week = models.PositiveIntegerField()
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -2143,64 +2188,8 @@ class CSARound(models.Model):
                 name="csa_companion_enabled_has_cutoff",
             ),
             models.UniqueConstraint(
-                fields=["recurrence", "recurrence_week"], name="csa_round_unique_recurrence_week"
-            ),
-            models.CheckConstraint(
-                condition=Q(recurrence__isnull=True, recurrence_week__isnull=True)
-                | Q(recurrence__isnull=False, recurrence_week__isnull=False, recurrence_week__gt=0),
-                name="csa_round_recurrence_link_consistent",
-            ),
-        ]
-
-
-class CSARoundRecurrence(models.Model):
-    class Mode(models.TextChoices):
-        DRAFT = "draft", "Draft"
-        AUTO = "auto", "Automatic publishing"
-
-    root_round = models.OneToOneField(
-        CSARound, related_name="recurrence_schedule", on_delete=models.CASCADE
-    )
-    mode = models.CharField(max_length=5, choices=Mode.choices)
-    anchor_name = models.CharField(max_length=200, null=True, blank=True)
-    anchor_opens_at = models.DateTimeField(null=True, blank=True)
-    anchor_closes_at = models.DateTimeField(null=True, blank=True)
-    anchor_delivery_date = models.DateField(null=True, blank=True)
-    next_week = models.PositiveIntegerField(default=1)
-    next_create_at = models.DateTimeField(null=True, blank=True, db_index=True)
-    stopped_at = models.DateTimeField(null=True, blank=True)
-
-    class Meta:
-        constraints = [
-            models.CheckConstraint(
-                condition=Q(mode__in=["draft", "auto"]), name="csa_recurrence_mode_valid"
-            ),
-            models.CheckConstraint(
-                condition=Q(next_week__gt=0), name="csa_recurrence_week_positive"
-            ),
-            models.CheckConstraint(
-                condition=Q(
-                    anchor_name__isnull=True,
-                    anchor_opens_at__isnull=True,
-                    anchor_closes_at__isnull=True,
-                    anchor_delivery_date__isnull=True,
-                    next_create_at__isnull=True,
-                    stopped_at__isnull=True,
-                    next_week=1,
-                )
-                | (
-                    Q(
-                        anchor_name__isnull=False,
-                        anchor_opens_at__isnull=False,
-                        anchor_closes_at__isnull=False,
-                        anchor_delivery_date__isnull=False,
-                    )
-                    & (
-                        Q(next_create_at__isnull=False, stopped_at__isnull=True)
-                        | Q(next_create_at__isnull=True, stopped_at__isnull=False)
-                    )
-                ),
-                name="csa_recurrence_state_consistent",
+                fields=["configuration", "recurrence_week"],
+                name="csa_round_unique_configuration_week",
             ),
         ]
 

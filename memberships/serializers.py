@@ -468,6 +468,7 @@ class CSACustomerCreateSerializer(StrictSerializer):
     province_code = serializers.CharField(max_length=2, allow_blank=True, required=False)
     ward_code = serializers.CharField(max_length=5, allow_blank=True, required=False)
     address = serializers.CharField(max_length=500, allow_blank=True, required=False)
+    note = serializers.CharField(max_length=1000, allow_blank=True, required=False, default="")
 
 
 class CSACustomerLinkUserSerializer(StrictSerializer):

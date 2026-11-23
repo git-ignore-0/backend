@@ -26,15 +26,19 @@ router.register(
 urlpatterns = [
     path("admin/csa-round-configurations", configurations.AdminRoundConfigurations.as_view()),
     path(
-        "admin/csa-round-configurations/<uuid:round_id>",
+        "admin/csa-round-configurations/<uuid:configuration_id>",
         configurations.AdminRoundConfiguration.as_view(),
     ),
     path(
-        "admin/csa-round-configurations/<uuid:round_id>/rounds",
+        "admin/csa-round-configurations/<uuid:configuration_id>/rounds",
         configurations.AdminConfigurationOccurrences.as_view(),
     ),
     path(
-        "admin/csa-round-configurations/<uuid:round_id>/stop",
+        "admin/csa-round-configurations/<uuid:configuration_id>/publish",
+        configurations.AdminPublishRoundConfiguration.as_view(),
+    ),
+    path(
+        "admin/csa-round-configurations/<uuid:configuration_id>/stop",
         configurations.AdminStopRoundConfiguration.as_view(),
     ),
     path("admin/csa-rounds", rounds.AdminRounds.as_view()),

@@ -232,6 +232,8 @@ def test_multiple_rounds_same_day_checks_all_sources(companion):
     other = CSARound.objects.create(
         sequence=round_.sequence + 1,
         name="Second",
+        configuration=round_.configuration,
+        recurrence_week=1,
         opens_at=round_.opens_at,
         closes_at=round_.closes_at,
         delivery_date=round_.delivery_date,
@@ -716,7 +718,7 @@ def test_frozen_only_blocked_but_renewal_can_use_original_csa_trip(context, monk
 
 
 @pytest.mark.django_db(transaction=True)
-def test_additive_migrations_keep_legacy_orders_and_rounds_unconfigured():
+def test_migrations_keep_legacy_orders_and_rounds_without_companion_settings():
     from django.db import connection
     from django.db.migrations.executor import MigrationExecutor
 
@@ -735,6 +737,7 @@ def test_additive_migrations_keep_legacy_orders_and_rounds_unconfigured():
         legacy_round = historical.get_model("memberships", "CSARound").objects.create(
             sequence=1,
             name="Legacy",
+            published_at=datetime(2026, 11, 10, 1, tzinfo=UTC),
             opens_at=datetime(2026, 11, 10, 1, tzinfo=UTC),
             closes_at=datetime(2026, 11, 11, 1, tzinfo=UTC),
             delivery_at=datetime(2026, 11, 12, 17, 30, tzinfo=UTC),

@@ -11,8 +11,9 @@ from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
 from memberships import csa_rounds as service
+from memberships.csa_admin_payloads import admin_round_payload
 from memberships.management.commands import process_csa_rounds as command
-from memberships.models import CSARound, CSARoundRecurrence
+from memberships.models import CSARound, CSARoundConfiguration
 
 pytestmark = pytest.mark.django_db
 
@@ -34,7 +35,7 @@ def clock(monkeypatch):
 
 
 def create_root(*, actor, mode="draft"):
-    return service.create_round(
+    return service.create_round_configuration(
         name="Weekly CSA",
         opens_at=OPENING,
         closes_at=CLOSING,
@@ -53,9 +54,9 @@ def create_root(*, actor, mode="draft"):
 )
 def test_worker_generates_each_week_once_at_mode_boundary(active_user, clock, mode, due_at):
     root = create_root(actor=active_user, mode=mode)
-    assert root.recurrence_schedule.next_create_at is None
-    root = service.publish_round(round_id=root.pk, actor=active_user)
-    assert root.recurrence_schedule.next_create_at == due_at
+    assert root.next_create_at is None
+    root = service.publish_round_configuration(configuration_id=root.pk)
+    assert root.next_create_at == due_at
 
     clock(due_at - timedelta(microseconds=1))
     call_command("process_csa_rounds")
@@ -66,71 +67,70 @@ def test_worker_generates_each_week_once_at_mode_boundary(active_user, clock, mo
     assert CSARound.objects.count() == 1
     call_command("process_csa_rounds")
     call_command("process_csa_rounds")
-    generated = CSARound.objects.exclude(pk=root.pk).get()
-    assert generated.recurrence.root_round_id == root.pk
+    generated = root.rounds.get(recurrence_week__gt=0)
+    assert generated.configuration_id == root.pk
     assert generated.recurrence_week == 1
     assert generated.opens_at == datetime(2027, 1, 11, 1, tzinfo=UTC)
     assert generated.closes_at == datetime(2027, 1, 16, 15, tzinfo=UTC)
     assert generated.delivery_date == date(2027, 1, 17)
     assert generated.published_at == (due_at if mode == "auto" else None)
-    assert generated.recurrence.next_create_at == due_at + timedelta(days=7)
+    root.refresh_from_db()
+    assert root.next_create_at == due_at + timedelta(days=7)
 
 
 def test_activation_uses_last_draft_edit_and_future_rounds_use_frozen_anchor(active_user, clock):
     root = create_root(actor=active_user, mode=None)
-    service.update_round(round_id=root.pk, actor=active_user, recurrence_mode="auto")
-    service.update_round(round_id=root.pk, actor=active_user, recurrence_mode=None)
-    assert not hasattr(CSARound.objects.get(pk=root.pk), "recurrence_schedule")
-    service.update_round(round_id=root.pk, actor=active_user, recurrence_mode="draft")
-    service.update_round(
-        round_id=root.pk,
-        actor=active_user,
+    service.update_round_configuration(configuration_id=root.pk, recurrence_mode="auto")
+    updated = service.update_round_configuration(configuration_id=root.pk, recurrence_mode=None)
+    assert updated.recurrence_mode is None
+    assert not root.rounds.exists()
+    service.update_round_configuration(
+        configuration_id=root.pk,
+        recurrence_mode="draft",
         name="CSA at publication",
         opens_at=OPENING + timedelta(hours=3),
         closes_at=CLOSING + timedelta(hours=1),
     )
+    first = service.publish_round_configuration(configuration_id=root.pk).rounds.get()
     service.configure_companion_delivery(
-        round_id=root.pk,
+        round_id=first.pk,
         actor=active_user,
         companion_delivery_enabled=True,
         companion_delivery_cutoff=CLOSING,
     )
-    service.publish_round(round_id=root.pk, actor=active_user)
     service.update_round(
-        round_id=root.pk,
+        round_id=first.pk,
         actor=active_user,
         name="Renamed",
         opens_at=OPENING - timedelta(hours=2),
         closes_at=CLOSING - timedelta(hours=2),
     )
-    service.publish_round(round_id=root.pk, actor=active_user)
-    service.cancel_round(round_id=root.pk, actor=active_user, reason="Rain")
+    service.publish_round(round_id=first.pk, actor=active_user)
+    service.cancel_round(round_id=first.pk, actor=active_user, reason="Rain")
 
     clock(datetime(2027, 1, 10, 4, tzinfo=UTC))
     call_command("process_csa_rounds")
-    generated = CSARound.objects.exclude(pk=root.pk).get()
+    generated = root.rounds.get(recurrence_week__gt=0)
     assert generated.name == "CSA at publication"
     assert generated.opens_at == datetime(2027, 1, 11, 4, tzinfo=UTC)
     assert generated.closes_at == datetime(2027, 1, 16, 16, tzinfo=UTC)
     assert generated.companion_delivery_enabled is False
     assert generated.companion_delivery_cutoff is None
-    with pytest.raises(service.CSARoundError, match="csa_recurrence_immutable"):
-        service.update_round(round_id=generated.pk, actor=active_user, recurrence_mode="auto")
 
 
 @pytest.mark.parametrize("mode", ["draft", "auto"])
 def test_worker_skips_closed_weeks_and_catches_up_before_close(active_user, clock, mode):
     root = create_root(actor=active_user, mode=mode)
-    service.publish_round(round_id=root.pk, actor=active_user)
+    service.publish_round_configuration(configuration_id=root.pk)
     clock(datetime(2027, 1, 23, 15, tzinfo=UTC))
     call_command("process_csa_rounds")
-    recurrence = CSARound.objects.get(pk=root.pk).recurrence_schedule
-    assert not recurrence.generated_rounds.exists()
+    recurrence = CSARoundConfiguration.objects.get(pk=root.pk)
+    assert not recurrence.rounds.filter(recurrence_week__gt=0).exists()
     assert recurrence.next_week == 3
 
     clock(datetime(2027, 1, 30, 14, 59, 59, tzinfo=UTC))
     call_command("process_csa_rounds")
-    generated = recurrence.generated_rounds.get()
+    generated = recurrence.rounds.filter(recurrence_week__gt=0).get()
     assert generated.recurrence_week == 3
     assert generated.delivery_date == date(2027, 1, 31)
     if mode == "auto":
@@ -141,7 +141,7 @@ def test_worker_skips_closed_weeks_and_catches_up_before_close(active_user, cloc
 
 @pytest.mark.parametrize("opening", [OPENING, datetime(9999, 12, 28, 1, tzinfo=UTC)])
 def test_publish_rejects_recurrence_when_the_first_week_cannot_fit(active_user, clock, opening):
-    root = service.create_round(
+    root = service.create_round_configuration(
         name="Upper date boundary",
         opens_at=opening,
         closes_at=datetime(9999, 12, 30, 1, tzinfo=UTC),
@@ -151,11 +151,11 @@ def test_publish_rejects_recurrence_when_the_first_week_cannot_fit(active_user, 
     )
 
     with pytest.raises(service.CSARoundError, match="csa_round_schedule_invalid"):
-        service.publish_round(round_id=root.pk, actor=active_user)
+        service.publish_round_configuration(configuration_id=root.pk)
 
     root.refresh_from_db()
     assert root.published_at is None
-    assert root.recurrence_schedule.next_create_at is None
+    assert root.next_create_at is None
 
 
 def test_worker_stops_exhausted_dates_and_still_generates_other_schedules(active_user, clock):
@@ -163,11 +163,11 @@ def test_worker_stops_exhausted_dates_and_still_generates_other_schedules(active
     last_week = create_root(actor=active_user, mode="auto")
     normal = create_root(actor=active_user, mode="auto")
     for round_ in (legacy, last_week, normal):
-        service.publish_round(round_id=round_.pk, actor=active_user)
+        service.publish_round_configuration(configuration_id=round_.pk)
     # Existing active schedules may have been saved before date-bound validation.
-    CSARoundRecurrence.objects.filter(root_round=legacy).update(anchor_delivery_date=date.max)
-    CSARoundRecurrence.objects.filter(root_round=last_week).update(
-        anchor_delivery_date=date.max - timedelta(weeks=1)
+    CSARoundConfiguration.objects.filter(pk=legacy.pk).update(delivery_date=date.max)
+    CSARoundConfiguration.objects.filter(pk=last_week.pk).update(
+        delivery_date=date.max - timedelta(weeks=1)
     )
     due_at = OPENING + timedelta(weeks=1)
     clock(due_at)
@@ -176,17 +176,21 @@ def test_worker_stops_exhausted_dates_and_still_generates_other_schedules(active
     call_command("process_csa_rounds")
 
     schedules = {
-        schedule.root_round_id: schedule
-        for schedule in CSARoundRecurrence.objects.filter(
-            root_round__in=[legacy, last_week, normal]
+        schedule.pk: schedule
+        for schedule in CSARoundConfiguration.objects.filter(
+            pk__in=[legacy.pk, last_week.pk, normal.pk]
         )
     }
-    assert not schedules[legacy.pk].generated_rounds.exists()
-    assert schedules[last_week.pk].generated_rounds.get().delivery_date == date.max
+    assert not schedules[legacy.pk].rounds.filter(recurrence_week__gt=0).exists()
+    assert (
+        schedules[last_week.pk].rounds.filter(recurrence_week__gt=0).get().delivery_date == date.max
+    )
     for pk in (legacy.pk, last_week.pk):
-        assert schedules[pk].stopped_at == due_at
+        assert schedules[pk].status == "published"
         assert schedules[pk].next_create_at is None
-    assert schedules[normal.pk].generated_rounds.count() == 1
+        first_round = schedules[pk].rounds.get(recurrence_week=0)
+        assert admin_round_payload(first_round.pk)["recurrence"]["status"] == "stopped"
+    assert schedules[normal.pk].rounds.filter(recurrence_week__gt=0).count() == 1
     assert schedules[normal.pk].next_create_at == due_at + timedelta(weeks=1)
 
 
@@ -194,13 +198,13 @@ def test_worker_reports_failed_schedule_and_processes_the_rest(active_user, cloc
     failing = create_root(actor=active_user, mode="auto")
     healthy = create_root(actor=active_user, mode="auto")
     for round_ in (failing, healthy):
-        service.publish_round(round_id=round_.pk, actor=active_user)
+        service.publish_round_configuration(configuration_id=round_.pk)
     due_at = OPENING + timedelta(weeks=1)
     clock(due_at)
     create = service._create_round
 
     def create_with_failure(**kwargs):
-        if kwargs["recurrence"].root_round_id == failing.pk:
+        if kwargs["configuration"].pk == failing.pk:
             raise IntegrityError("simulated insert failure")
         return create(**kwargs)
 
@@ -209,18 +213,18 @@ def test_worker_reports_failed_schedule_and_processes_the_rest(active_user, cloc
         with pytest.raises(CommandError, match="1 CSA recurrence"):
             call_command("process_csa_rounds")
 
-    failed_schedule = CSARoundRecurrence.objects.get(root_round=failing)
+    failed_schedule = CSARoundConfiguration.objects.get(pk=failing.pk)
     assert failed_schedule.next_create_at == due_at
-    assert not failed_schedule.generated_rounds.exists()
-    assert healthy.recurrence_schedule.generated_rounds.count() == 1
+    assert not failed_schedule.rounds.filter(recurrence_week__gt=0).exists()
+    assert healthy.rounds.filter(recurrence_week__gt=0).count() == 1
     call_command("process_csa_rounds")
-    assert failed_schedule.generated_rounds.count() == 1
-    assert healthy.recurrence_schedule.generated_rounds.count() == 1
+    assert failed_schedule.rounds.filter(recurrence_week__gt=0).count() == 1
+    assert healthy.rounds.filter(recurrence_week__gt=0).count() == 1
 
 
 def test_reconciliation_failure_does_not_prevent_an_opening(active_user, clock, monkeypatch):
     root = create_root(actor=active_user, mode="auto")
-    service.publish_round(round_id=root.pk, actor=active_user)
+    service.publish_round_configuration(configuration_id=root.pk)
     due_at = OPENING + timedelta(weeks=1)
     clock(due_at)
 
@@ -231,14 +235,14 @@ def test_reconciliation_failure_does_not_prevent_an_opening(active_user, clock, 
     with pytest.raises(CommandError, match="CSA selection reconciliation"):
         call_command("process_csa_rounds")
 
-    assert root.recurrence_schedule.generated_rounds.get().published_at == due_at
+    assert root.rounds.filter(recurrence_week__gt=0).get().published_at == due_at
 
 
 def test_worker_skips_a_round_that_closes_while_waiting_for_sequence(
     active_user, clock, monkeypatch
 ):
     root = create_root(actor=active_user, mode="auto")
-    service.publish_round(round_id=root.pk, actor=active_user)
+    service.publish_round_configuration(configuration_id=root.pk)
     cutoff = CLOSING + timedelta(weeks=1)
     clock(cutoff - timedelta(seconds=1))
     allocate = service._next_round_sequence
@@ -250,21 +254,20 @@ def test_worker_skips_a_round_that_closes_while_waiting_for_sequence(
     monkeypatch.setattr(service, "_next_round_sequence", allocate_after_cutoff)
     call_command("process_csa_rounds")
 
-    schedule = CSARoundRecurrence.objects.get(root_round=root)
-    assert not schedule.generated_rounds.exists()
+    schedule = CSARoundConfiguration.objects.get(pk=root.pk)
+    assert not schedule.rounds.filter(recurrence_week__gt=0).exists()
     assert schedule.next_week == 2
     assert schedule.next_create_at == OPENING + timedelta(weeks=2)
 
 
 def test_worker_bounds_generation_per_schedule_and_resumes_next_run(active_user, clock):
     root = create_root(actor=active_user, mode="auto")
-    service.update_round(
-        round_id=root.pk,
-        actor=active_user,
+    service.update_round_configuration(
+        configuration_id=root.pk,
         closes_at=datetime(2027, 3, 31, 15, tzinfo=UTC),
         delivery_date=date(2027, 4, 1),
     )
-    root = service.publish_round(round_id=root.pk, actor=active_user)
+    root = service.publish_round_configuration(configuration_id=root.pk)
     clock(datetime(2027, 3, 15, 1, tzinfo=UTC))
 
     with CaptureQueriesContext(connection) as queries:
@@ -275,40 +278,42 @@ def test_worker_bounds_generation_per_schedule_and_resumes_next_run(active_user,
         if "memberships_csaround" in query["sql"] and "DESC LIMIT 1" in query["sql"]
     ]
     assert len(sequence_lookups) == 1
-    schedule = root.recurrence_schedule
-    assert list(schedule.generated_rounds.values_list("recurrence_week", flat=True)) == list(
-        range(1, 9)
-    )
+    schedule = CSARoundConfiguration.objects.get(pk=root.pk)
+    assert list(
+        schedule.rounds.filter(recurrence_week__gt=0).values_list("recurrence_week", flat=True)
+    ) == list(range(1, 9))
     assert schedule.next_create_at == datetime(2027, 3, 8, 1, tzinfo=UTC)
 
     call_command("process_csa_rounds")
     schedule.refresh_from_db()
-    assert list(schedule.generated_rounds.values_list("recurrence_week", flat=True)) == list(
-        range(1, 11)
-    )
+    assert list(
+        schedule.rounds.filter(recurrence_week__gt=0).values_list("recurrence_week", flat=True)
+    ) == list(range(1, 11))
     assert schedule.next_create_at == datetime(2027, 3, 22, 1, tzinfo=UTC)
 
 
 def test_stop_is_idempotent_and_preserves_existing_rounds(active_user, clock):
     root = create_root(actor=active_user, mode="auto")
     with pytest.raises(service.CSARoundError, match="csa_recurrence_not_active"):
-        service.stop_round_recurrence(round_id=root.pk)
-    service.publish_round(round_id=root.pk, actor=active_user)
-    with pytest.raises(service.CSARoundError, match="csa_recurrence_immutable"):
-        service.update_round(round_id=root.pk, actor=active_user, recurrence_mode=None)
+        service.stop_round_recurrence(configuration_id=root.pk)
+    service.publish_round_configuration(configuration_id=root.pk)
+    with pytest.raises(service.CSARoundError, match="csa_configuration_not_draft"):
+        service.update_round_configuration(configuration_id=root.pk, recurrence_mode=None)
 
     clock(datetime(2027, 1, 11, 1, tzinfo=UTC))
     call_command("process_csa_rounds")
-    stopped = service.stop_round_recurrence(round_id=root.pk)
-    assert stopped.recurrence_schedule.next_create_at is None
-    assert stopped.recurrence_schedule.stopped_at == datetime(2027, 1, 11, 1, tzinfo=UTC)
+    stopped = service.stop_round_recurrence(configuration_id=root.pk)
+    assert stopped.next_create_at is None
+    assert stopped.cancelled_at == datetime(2027, 1, 11, 1, tzinfo=UTC)
 
     clock(datetime(2027, 1, 18, 1, tzinfo=UTC))
-    service.stop_round_recurrence(round_id=root.pk)
+    service.stop_round_recurrence(configuration_id=root.pk)
     call_command("process_csa_rounds")
-    recurrence = CSARound.objects.get(pk=root.pk).recurrence_schedule
-    assert recurrence.stopped_at == stopped.recurrence_schedule.stopped_at
-    assert recurrence.generated_rounds.get().published_at == datetime(2027, 1, 11, 1, tzinfo=UTC)
+    recurrence = CSARoundConfiguration.objects.get(pk=root.pk)
+    assert recurrence.cancelled_at == stopped.cancelled_at
+    assert recurrence.rounds.filter(recurrence_week__gt=0).get().published_at == datetime(
+        2027, 1, 11, 1, tzinfo=UTC
+    )
 
 
 @pytest.mark.skipif(
@@ -318,7 +323,7 @@ def test_stop_is_idempotent_and_preserves_existing_rounds(active_user, clock):
 @pytest.mark.django_db(transaction=True)
 def test_concurrent_workers_generate_one_round(active_user, clock):
     root = create_root(actor=active_user, mode="auto")
-    service.publish_round(round_id=root.pk, actor=active_user)
+    service.publish_round_configuration(configuration_id=root.pk)
     clock(datetime(2027, 1, 11, 1, tzinfo=UTC))
     barrier = Barrier(2)
 
@@ -335,4 +340,29 @@ def test_concurrent_workers_generate_one_round(active_user, clock):
         for result in results:
             result.result(timeout=15)
 
-    assert CSARound.objects.filter(recurrence__root_round=root).get().recurrence_week == 1
+    assert root.rounds.get(recurrence_week__gt=0).recurrence_week == 1
+
+
+@pytest.mark.skipif(
+    not connection.features.has_select_for_update,
+    reason="Row-lock concurrency requires a database with SELECT FOR UPDATE",
+)
+@pytest.mark.django_db(transaction=True)
+def test_concurrent_publication_creates_one_first_round(active_user, clock):
+    configuration = create_root(actor=active_user)
+    barrier = Barrier(2)
+
+    def publish():
+        close_old_connections()
+        try:
+            barrier.wait(timeout=5)
+            published = service.publish_round_configuration(configuration_id=configuration.pk)
+            return published.rounds.get().pk
+        finally:
+            close_old_connections()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(publish)
+        second = pool.submit(publish)
+        assert first.result(timeout=15) == second.result(timeout=15)
+    assert configuration.rounds.count() == 1

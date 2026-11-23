@@ -268,13 +268,14 @@ def create_csa_customer_for_user(
 
 
 def _create_managed_csa_customer(
-    *, customer_name, normalized_phone, delivery_address
+    *, customer_name, normalized_phone, delivery_address, note=""
 ) -> CSACustomer:
     try:
         with transaction.atomic():
             return CSACustomer.objects.create(
                 name=customer_name,
                 phone_e164=normalized_phone,
+                note=note,
                 **delivery_address,
             )
     except IntegrityError as error:
@@ -298,11 +299,12 @@ def create_managed_csa_customer(
 
 @transaction.atomic
 def create_supported_managed_csa_customer(
-    *, name, phone, province_code="", ward_code="", address=""
+    *, name, phone, province_code="", ward_code="", address="", note=""
 ) -> CSACustomer:
     return _create_managed_csa_customer(
         customer_name=_required_name(name),
         normalized_phone=_normalized_required_phone(phone),
+        note=note,
         delivery_address=_validated_supported_address(
             province_code=province_code,
             ward_code=ward_code,

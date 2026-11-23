@@ -4,12 +4,12 @@ from django.db.models import Count, Exists, OuterRef
 from django.utils import timezone
 
 from memberships.csa_payloads import round_payload
-from memberships.csa_rounds import can_edit_round, recurrence_status
+from memberships.csa_rounds import can_edit_round
 from memberships.models import CSARound, CSASelection
 
 
 def admin_round_queryset():
-    return CSARound.objects.select_related("recurrence", "recurrence_schedule").annotate(
+    return CSARound.objects.select_related("configuration").annotate(
         has_csa_selections=Exists(CSASelection.objects.filter(round_id=OuterRef("pk")))
     )
 
@@ -19,23 +19,18 @@ def admin_round_payload(round_id):
     return admin_round_payloads([round_])[0]
 
 
-def admin_round_payloads(rows, *, now=None, configurations=False, participants=False):
+def admin_round_payloads(rows, *, now=None, participants=False):
     rows = list(rows)
     now = now or timezone.now()
-    schedules = [
-        row.recurrence if row.recurrence_id else getattr(row, "recurrence_schedule", None)
-        for row in rows
-    ]
-    schedule_ids = {schedule.pk for schedule in schedules if schedule is not None}
-    counts = (
-        dict(
-            CSARound.objects.filter(recurrence_id__in=schedule_ids)
-            .values("recurrence_id")
-            .annotate(total=Count("pk"))
-            .values_list("recurrence_id", "total")
-        )
-        if schedule_ids
-        else {}
+    weekly_ids = {row.configuration_id for row in rows if row.configuration.recurrence_mode}
+    weekly_rounds = CSARound.objects.filter(configuration_id__in=weekly_ids)
+    first_rounds = dict(
+        weekly_rounds.filter(recurrence_week=0).values_list("configuration_id", "pk")
+    )
+    counts = dict(
+        weekly_rounds.values("configuration_id")
+        .annotate(total=Count("pk"))
+        .values_list("configuration_id", "total")
     )
     participant_counts = (
         dict(
@@ -48,27 +43,26 @@ def admin_round_payloads(rows, *, now=None, configurations=False, participants=F
         else {}
     )
     result = []
-    for row, schedule in zip(rows, schedules, strict=True):
+    for row in rows:
+        configuration = row.configuration
         payload = {
             **round_payload(row, now=now),
+            "configuration_id": str(configuration.pk),
+            "configuration_name": configuration.name,
             "can_edit": can_edit_round(row),
             "recurrence": None,
         }
-        if schedule is not None:
-            status = recurrence_status(schedule, row)
+        if configuration.recurrence_mode:
             payload["recurrence"] = {
-                "root_round_id": str(schedule.root_round_id),
-                "mode": schedule.mode,
-                "status": status,
-                "next_create_at": schedule.next_create_at.isoformat()
-                if status == "active" and schedule.next_create_at
+                "root_round_id": str(first_rounds[configuration.pk]),
+                "configuration_name": configuration.name,
+                "mode": configuration.recurrence_mode,
+                "status": "active" if configuration.next_create_at else "stopped",
+                "next_create_at": configuration.next_create_at.isoformat()
+                if configuration.next_create_at
                 else None,
-                "occurrence_count": counts.get(schedule.pk, 0) + 1,
+                "occurrence_count": counts[configuration.pk],
             }
-        if configurations:
-            payload["type"] = "weekly" if schedule is not None else "standalone"
-            if schedule is not None and schedule.anchor_name:
-                payload["name"] = schedule.anchor_name
         if participants:
             payload["participant_count"] = participant_counts.get(row.pk, 0)
         result.append(payload)

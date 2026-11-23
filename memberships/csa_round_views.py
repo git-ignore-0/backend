@@ -16,7 +16,7 @@ from content.permissions import IsWebsiteAdmin
 from memberships import csa_rounds as domain
 from memberships.csa_admin_payloads import admin_round_payload
 from memberships.csa_payloads import event_payload, round_payload, selection_payload
-from memberships.models import CSARound, CSARoundRecurrence, CSASelection, Membership
+from memberships.models import CSARound, CSARoundConfiguration, CSASelection, Membership
 from memberships.permissions import HasMembershipSelfScopes
 from memberships.serializers import LocalePageQuerySerializer, ReasonSerializer, StrictSerializer
 
@@ -49,9 +49,6 @@ class RoundInput(StrictSerializer):
     opens_at = serializers.DateTimeField()
     closes_at = serializers.DateTimeField()
     delivery_date = serializers.DateField()
-    recurrence_mode = serializers.ChoiceField(
-        choices=CSARoundRecurrence.Mode.choices, required=False, allow_null=True
-    )
 
 
 class LineInput(StrictSerializer):
@@ -93,7 +90,8 @@ class PrivateView(APIView):
         if isinstance(exc, (domain.CSARoundError, StoreOrderError)):
             return Response({"errors": [{"code": exc.code}]}, status=409)
         if isinstance(
-            exc, (CSARound.DoesNotExist, CSARoundRecurrence.DoesNotExist, CSASelection.DoesNotExist)
+            exc,
+            (CSARound.DoesNotExist, CSARoundConfiguration.DoesNotExist, CSASelection.DoesNotExist),
         ):
             return Response({"errors": [{"code": "not_found"}]}, status=404)
         return super().handle_exception(exc)
@@ -110,10 +108,6 @@ class AdminRounds(PrivateView):
             rounds = domain.filter_rounds_by_status(rounds, status, now=now)
         rows, meta = paged_rows(rounds, query)
         return Response({"data": [round_payload(row, now=now) for row in rows], "meta": meta})
-
-    def post(self, request):
-        row = domain.create_round(actor=request.user, **validated(RoundInput, request))
-        return Response({"data": admin_round_payload(row.pk)}, status=201)
 
 
 class AdminRound(PrivateView):

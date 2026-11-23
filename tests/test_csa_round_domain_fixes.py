@@ -160,6 +160,8 @@ def test_reserved_quota_bulk_credits_need_one_aggregate(context):
         round_ = CSARound.objects.create(
             sequence=sequence,
             name="Other",
+            configuration=context[3].configuration,
+            recurrence_week=sequence - 1,
             opens_at=context[3].opens_at,
             closes_at=context[3].closes_at,
             delivery_date=context[3].delivery_date,
