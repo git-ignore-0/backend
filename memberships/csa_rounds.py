@@ -1,5 +1,6 @@
 """CSA round lifecycle using shared Store product, identity, address and member locks."""
 
+import logging
 import uuid
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta
@@ -22,6 +23,7 @@ from commerce.store_orders import (
 )
 from memberships.models import (
     CSARound,
+    CSARoundRecurrence,
     CSARoundScheduleLock,
     CSASelection,
     CSASelectionEvent,
@@ -36,9 +38,15 @@ from memberships.models import (
 )
 from memberships.services import ensure_due_cycles, quota_availability_rows
 
+logger = logging.getLogger(__name__)
+
 ROUND_STATUSES = ("draft", "scheduled", "open", "closed", "delivery", "cancelled")
 TERMINAL = ("cancelled", "delivered")
 VIETNAM = ZoneInfo("Asia/Ho_Chi_Minh")
+WEEK = timedelta(weeks=1)
+DRAFT_LEAD_TIME = timedelta(days=1)
+RECURRENCE_GENERATION_LIMIT = 8
+RECURRENCE_SCAN_PAGE_SIZE = 100
 
 
 def delivery_start(round_):
@@ -56,9 +64,11 @@ def _fail(code):
     raise CSARoundError(code)
 
 
-def _schedule_lock():
+def _next_round_sequence():
     CSARoundScheduleLock.objects.get_or_create(pk=1)
     CSARoundScheduleLock.objects.select_for_update().get(pk=1)
+    last = CSARound.objects.order_by("-sequence").values_list("sequence", flat=True).first()
+    return (last or 0) + 1
 
 
 def round_status(round_, now=None):
@@ -96,47 +106,64 @@ def filter_rounds_by_status(rounds, status, *, now):
 
 
 def _validate_schedule(round_):
-    if not round_.name.strip() or not round_.opens_at < round_.closes_at < delivery_start(round_):
-        _fail("csa_round_schedule_invalid")
-    published = CSARound.objects.filter(published_at__isnull=False, cancelled_at__isnull=True)
-    before = published.filter(sequence__lt=round_.sequence).order_by("-sequence").first()
-    after = published.filter(sequence__gt=round_.sequence).order_by("sequence").first()
-    if (before and round_.opens_at <= before.closes_at) or (
-        after and after.opens_at <= round_.closes_at
+    if (
+        type(round_.delivery_date) is not date
+        or not round_.name.strip()
+        or not round_.opens_at < round_.closes_at < delivery_start(round_)
     ):
-        _fail("csa_round_schedule_conflict")
+        _fail("csa_round_schedule_invalid")
+
+
+def _create_round(*, name, opens_at, closes_at, delivery_date, sequence, **fields):
+    round_ = CSARound(
+        name=name,
+        opens_at=opens_at,
+        closes_at=closes_at,
+        delivery_date=delivery_date,
+        sequence=sequence,
+        **fields,
+    )
+    _validate_schedule(round_)
+    round_.save()
+    return round_
+
+
+def _set_draft_recurrence(round_, mode):
+    if mode is None:
+        CSARoundRecurrence.objects.filter(root_round=round_).delete()
+    elif mode in CSARoundRecurrence.Mode.values:
+        CSARoundRecurrence.objects.update_or_create(root_round=round_, defaults={"mode": mode})
+    else:
+        _fail("csa_recurrence_mode_invalid")
 
 
 @transaction.atomic
-def create_round(*, name, opens_at, closes_at, delivery_date, actor):
-    if type(delivery_date) is not date:
-        _fail("csa_round_schedule_invalid")
-    _schedule_lock()
-    last = CSARound.objects.order_by("-sequence").first()
-    row = CSARound(
+def create_round(*, name, opens_at, closes_at, delivery_date, actor, recurrence_mode=None):
+    row = _create_round(
         name=name.strip(),
         opens_at=opens_at,
         closes_at=closes_at,
         delivery_date=delivery_date,
+        sequence=_next_round_sequence(),
         created_by=actor,
-        sequence=last.sequence + 1 if last else 1,
     )
-    if not row.opens_at < row.closes_at < delivery_start(row) or not row.name:
-        _fail("csa_round_schedule_invalid")
-    row.save()
+    if recurrence_mode is not None:
+        _set_draft_recurrence(row, recurrence_mode)
     return row
 
 
 def can_edit_round(round_):
     """Published participation makes the round's dates immutable."""
-    return not round_.cancelled_at and (
-        round_.published_at is None or not round_.selections.exists()
-    )
+    if round_.cancelled_at:
+        return False
+    if round_.published_at is None:
+        return True
+    has_selections = getattr(round_, "has_csa_selections", None)
+    return not (round_.selections.exists() if has_selections is None else has_selections)
 
 
 @transaction.atomic
 def update_round(*, round_id, actor, **values):
-    _schedule_lock()
     row = CSARound.objects.select_for_update().get(pk=round_id)
     # Once public, dates define entitlement and reservations; create drafts freely.
     if not can_edit_round(row):
@@ -144,33 +171,83 @@ def update_round(*, round_id, actor, **values):
     for key in ("name", "opens_at", "closes_at", "delivery_date"):
         if key in values:
             setattr(row, key, values[key])
-    if type(row.delivery_date) is not date:
-        _fail("csa_round_schedule_invalid")
-    if not row.opens_at < row.closes_at < delivery_start(row) or not row.name.strip():
-        _fail("csa_round_schedule_invalid")
+    _validate_schedule(row)
     if row.companion_delivery_cutoff and row.companion_delivery_cutoff >= delivery_start(row):
         _fail("csa_companion_deadline_invalid")
-    if row.published_at:
-        _validate_schedule(row)
-        if row.closes_at <= timezone.now():
-            _fail("csa_round_already_closed")
+    if row.published_at and row.closes_at <= timezone.now():
+        _fail("csa_round_already_closed")
+    if "recurrence_mode" in values:
+        if row.published_at or row.recurrence_id:
+            _fail("csa_recurrence_immutable")
+        _set_draft_recurrence(row, values["recurrence_mode"])
     row.save()
     return row
 
 
+def _recurrence_due_at(schedule, week):
+    opens_at = schedule.anchor_opens_at + WEEK * week
+    if schedule.mode == CSARoundRecurrence.Mode.DRAFT:
+        return opens_at - DRAFT_LEAD_TIME
+    return opens_at
+
+
+def _last_recurrence_week(delivery_date):
+    # The delivery date comes after both timestamps, so its bound also protects those shifts.
+    return (date.max - delivery_date) // WEEK
+
+
+def recurrence_status(schedule, round_):
+    if schedule.stopped_at or (schedule.anchor_opens_at is None and round_.cancelled_at):
+        return "stopped"
+    return "pending" if schedule.anchor_opens_at is None else "active"
+
+
 @transaction.atomic
 def publish_round(*, round_id, actor):
-    _schedule_lock()
     row = CSARound.objects.select_for_update().get(pk=round_id)
     if row.cancelled_at:
         _fail("csa_round_cancelled")
     if row.published_at:
         return row
     _validate_schedule(row)
-    if row.closes_at <= timezone.now():
+    now = timezone.now()
+    if row.closes_at <= now:
         _fail("csa_round_already_closed")
-    row.published_at = timezone.now()
+    schedule = CSARoundRecurrence.objects.filter(root_round=row).first()
+    if schedule is not None and _last_recurrence_week(row.delivery_date) < 1:
+        _fail("csa_round_schedule_invalid")
+    row.published_at = now
     row.save(update_fields=["published_at", "updated_at"])
+    if schedule is not None:
+        schedule.anchor_name = row.name
+        schedule.anchor_opens_at = row.opens_at
+        schedule.anchor_closes_at = row.closes_at
+        schedule.anchor_delivery_date = row.delivery_date
+        schedule.next_create_at = _recurrence_due_at(schedule, schedule.next_week)
+        schedule.save(
+            update_fields=[
+                "anchor_name",
+                "anchor_opens_at",
+                "anchor_closes_at",
+                "anchor_delivery_date",
+                "next_create_at",
+            ]
+        )
+    return row
+
+
+@transaction.atomic
+def stop_round_recurrence(*, round_id):
+    row = CSARound.objects.select_for_update().get(pk=round_id)
+    schedule = CSARoundRecurrence.objects.select_for_update().get(root_round=row)
+    status = recurrence_status(schedule, row)
+    if status == "stopped":
+        return row
+    if status == "pending":
+        _fail("csa_recurrence_not_active")
+    schedule.stopped_at = timezone.now()
+    schedule.next_create_at = None
+    schedule.save(update_fields=["stopped_at", "next_create_at"])
     return row
 
 
@@ -753,7 +830,6 @@ def process_round(round_id, *, now=None, user=None, selection_ids=None):
 
 @transaction.atomic
 def cancel_round(*, round_id, actor, reason):
-    _schedule_lock()
     round_ = CSARound.objects.select_for_update().get(pk=round_id)
     if round_.cancelled_at:
         return round_
@@ -786,6 +862,86 @@ def cancel_round(*, round_id, actor, reason):
     round_.cancelled_by = actor
     round_.save(update_fields=["cancelled_at", "cancellation_reason", "cancelled_by", "updated_at"])
     return round_
+
+
+def _due_recurrence_weeks(schedule, now, last_week):
+    # Jump past closed weeks, including a week that closed exactly at the worker timestamp.
+    first_unclosed_week = (now - schedule.anchor_closes_at) // WEEK + 1
+    week = max(schedule.next_week, first_unclosed_week)
+    if week > last_week:
+        return range(week, week)
+    due_weeks = (now - _recurrence_due_at(schedule, week)) // WEEK + 1
+    count = min(max(0, due_weeks), last_week - week + 1, RECURRENCE_GENERATION_LIMIT)
+    return range(week, week + count)
+
+
+@transaction.atomic
+def _process_recurrence(root_id, *, now=None):
+    root = CSARound.objects.select_for_update().filter(pk=root_id).first()
+    if root is None:
+        return 0
+    schedule = CSARoundRecurrence.objects.select_for_update().get(root_round=root)
+    current_time = now or timezone.now()
+    if schedule.next_create_at is None or schedule.next_create_at > current_time:
+        return 0
+
+    last_week = _last_recurrence_week(schedule.anchor_delivery_date)
+    weeks = _due_recurrence_weeks(schedule, current_time, last_week)
+    if weeks:
+        # Allocate one contiguous range while the sequence lock and cursor share a transaction.
+        sequence = _next_round_sequence()
+        if now is None:
+            # The sequence lock may have waited past the closing time of a due round.
+            current_time = timezone.now()
+            weeks = _due_recurrence_weeks(schedule, current_time, last_week)
+        published_at = current_time if schedule.mode == CSARoundRecurrence.Mode.AUTO else None
+        for index, occurrence_week in enumerate(weeks):
+            offset = WEEK * occurrence_week
+            _create_round(
+                name=schedule.anchor_name,
+                opens_at=schedule.anchor_opens_at + offset,
+                closes_at=schedule.anchor_closes_at + offset,
+                delivery_date=schedule.anchor_delivery_date + offset,
+                sequence=sequence + index,
+                created_by_id=root.created_by_id,
+                published_at=published_at,
+                recurrence=schedule,
+                recurrence_week=occurrence_week,
+            )
+    schedule.next_week = weeks.stop
+    if schedule.next_week <= last_week:
+        schedule.next_create_at = _recurrence_due_at(schedule, schedule.next_week)
+    else:
+        schedule.next_create_at = None
+        schedule.stopped_at = current_time
+        logger.warning(
+            "CSA recurring configuration %s reached the maximum supported delivery date",
+            root_id,
+        )
+    schedule.save(update_fields=["next_week", "next_create_at", "stopped_at"])
+    return len(weeks)
+
+
+def process_round_recurrences(*, now=None):
+    due_schedules = (
+        CSARoundRecurrence.objects.filter(next_create_at__lte=now or timezone.now())
+        .order_by("pk")
+        .values_list("pk", "root_round_id")
+    )
+    count = 0
+    failed = 0
+    last_id = 0
+    # Page by a stable key so generation and cursor updates can commit between reads.
+    while page := list(due_schedules.filter(pk__gt=last_id)[:RECURRENCE_SCAN_PAGE_SIZE]):
+        for recurrence_id, root_id in page:
+            try:
+                count += _process_recurrence(root_id, now=now)
+            except Exception:
+                # The transaction rolled back this configuration. Leave it due for retry.
+                failed += 1
+                logger.exception("Could not generate CSA rounds for configuration %s", root_id)
+            last_id = recurrence_id
+    return count, failed
 
 
 def process_due_rounds(*, now=None, user=None):

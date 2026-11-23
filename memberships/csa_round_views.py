@@ -14,8 +14,9 @@ from commerce.public_catalog import _translation, public_product_payload, public
 from commerce.store_orders import StoreOrderError
 from content.permissions import IsWebsiteAdmin
 from memberships import csa_rounds as domain
+from memberships.csa_admin_payloads import admin_round_payload
 from memberships.csa_payloads import event_payload, round_payload, selection_payload
-from memberships.models import CSARound, CSASelection, Membership
+from memberships.models import CSARound, CSARoundRecurrence, CSASelection, Membership
 from memberships.permissions import HasMembershipSelfScopes
 from memberships.serializers import LocalePageQuerySerializer, ReasonSerializer, StrictSerializer
 
@@ -48,6 +49,9 @@ class RoundInput(StrictSerializer):
     opens_at = serializers.DateTimeField()
     closes_at = serializers.DateTimeField()
     delivery_date = serializers.DateField()
+    recurrence_mode = serializers.ChoiceField(
+        choices=CSARoundRecurrence.Mode.choices, required=False, allow_null=True
+    )
 
 
 class LineInput(StrictSerializer):
@@ -88,7 +92,9 @@ class PrivateView(APIView):
     def handle_exception(self, exc):
         if isinstance(exc, (domain.CSARoundError, StoreOrderError)):
             return Response({"errors": [{"code": exc.code}]}, status=409)
-        if isinstance(exc, (CSARound.DoesNotExist, CSASelection.DoesNotExist)):
+        if isinstance(
+            exc, (CSARound.DoesNotExist, CSARoundRecurrence.DoesNotExist, CSASelection.DoesNotExist)
+        ):
             return Response({"errors": [{"code": "not_found"}]}, status=404)
         return super().handle_exception(exc)
 
@@ -107,21 +113,20 @@ class AdminRounds(PrivateView):
 
     def post(self, request):
         row = domain.create_round(actor=request.user, **validated(RoundInput, request))
-        return Response({"data": round_payload(row)}, status=201)
+        return Response({"data": admin_round_payload(row.pk)}, status=201)
 
 
 class AdminRound(PrivateView):
     permission_classes = [IsWebsiteAdmin]
 
     def get(self, request, round_id):
-        row = get_object_or_404(CSARound, pk=round_id)
-        return Response({"data": {**round_payload(row), "can_edit": domain.can_edit_round(row)}})
+        return Response({"data": admin_round_payload(round_id)})
 
     def patch(self, request, round_id):
         row = domain.update_round(
             round_id=round_id, actor=request.user, **validated(RoundInput, request, partial=True)
         )
-        return Response({"data": round_payload(row)})
+        return Response({"data": admin_round_payload(row.pk)})
 
 
 class CompanionCutoffField(serializers.DateTimeField):
@@ -166,24 +171,18 @@ class AdminRoundPublish(PrivateView):
 
     def post(self, request, round_id):
         validated(StrictSerializer, request)
-        return Response(
-            {"data": round_payload(domain.publish_round(round_id=round_id, actor=request.user))}
-        )
+        row = domain.publish_round(round_id=round_id, actor=request.user)
+        return Response({"data": admin_round_payload(row.pk)})
 
 
 class AdminRoundCancel(PrivateView):
     permission_classes = [IsWebsiteAdmin]
 
     def post(self, request, round_id):
-        return Response(
-            {
-                "data": round_payload(
-                    domain.cancel_round(
-                        round_id=round_id, actor=request.user, **validated(ReasonInput, request)
-                    )
-                )
-            }
+        row = domain.cancel_round(
+            round_id=round_id, actor=request.user, **validated(ReasonInput, request)
         )
+        return Response({"data": admin_round_payload(row.pk)})
 
 
 class AdminRoundSelections(PrivateView):

@@ -1,6 +1,7 @@
 from django.urls import path
 from rest_framework.routers import SimpleRouter
 
+from memberships import csa_configuration_views as configurations
 from memberships import csa_round_views as rounds
 from memberships import views
 
@@ -23,6 +24,19 @@ router.register(
 )
 
 urlpatterns = [
+    path("admin/csa-round-configurations", configurations.AdminRoundConfigurations.as_view()),
+    path(
+        "admin/csa-round-configurations/<uuid:round_id>",
+        configurations.AdminRoundConfiguration.as_view(),
+    ),
+    path(
+        "admin/csa-round-configurations/<uuid:round_id>/rounds",
+        configurations.AdminConfigurationOccurrences.as_view(),
+    ),
+    path(
+        "admin/csa-round-configurations/<uuid:round_id>/stop",
+        configurations.AdminStopRoundConfiguration.as_view(),
+    ),
     path("admin/csa-rounds", rounds.AdminRounds.as_view()),
     path("admin/csa-rounds/<uuid:round_id>", rounds.AdminRound.as_view()),
     path(

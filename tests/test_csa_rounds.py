@@ -1,13 +1,18 @@
 """CSA rounds: shared-resource holds, deadlines and membership entitlement."""
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, timedelta
 from decimal import Decimal
+from threading import Barrier
 
 import pytest
+from django.db import close_old_connections, connection
 from django.utils import timezone
 from rest_framework.test import APIClient
 
 from commerce.models import StoreOrder
+from farms.models import FarmProductStockBatch
+from identity.models import AccountStatus, User
 from memberships import csa_rounds as service
 from memberships.models import CSASelection, MembershipCycleQuota
 from tests.test_store_orders import attach_active_membership
@@ -47,7 +52,7 @@ def save(context, quantity=2, **kwargs):
     )
 
 
-def test_round_schedule_no_overlapping_published_windows(context):
+def publish_overlapping_round(context):
     user, _, _, round_, now = context
     later = service.create_round(
         name="Next",
@@ -56,8 +61,84 @@ def test_round_schedule_no_overlapping_published_windows(context):
         delivery_date=round_.delivery_date,
         actor=user,
     )
-    with pytest.raises(service.CSARoundError, match="csa_round_schedule_conflict"):
-        service.publish_round(round_id=later.pk, actor=user)
+    return service.publish_round(round_id=later.pk, actor=user)
+
+
+@pytest.fixture(params=["quota", "stock"])
+def overlapping_reservation_case(context, request):
+    user, product, membership, round_, _ = context
+    later = publish_overlapping_round(context)
+    second_buyer = user  # Both rounds draw from this member's quota in the quota case.
+    if request.param == "stock":
+        # Give each buyer independent membership and address locks in the stock case.
+        second_buyer = User.objects.create_user(
+            email="second-buyer@example.com", name="Second buyer", status=AccountStatus.ACTIVE
+        )
+        membership.customer.phone_e164 = "+84909876543"
+        membership.customer.save(update_fields=["phone_e164"])
+        attach_active_membership(second_buyer, product)
+        membership.product_snapshots.update(product=product.csa_quota_group)
+        product.csa_quota_cost = Decimal("1")
+        product.save(update_fields=["csa_quota_cost"])
+        FarmProductStockBatch.objects.filter(farm_product__product=product).update(quantity_units=4)
+    return round_, later, second_buyer, f"csa_{request.param}_insufficient"
+
+
+def test_overlapping_rounds_can_open_and_share_quota_and_stock(
+    context, overlapping_reservation_case
+):
+    _, product, _, _, _ = context
+    round_, later, second_buyer, error_code = overlapping_reservation_case
+    assert service.round_status(round_) == service.round_status(later) == "open"
+    first = save(context, quantity=3)
+    with pytest.raises(service.CSARoundError, match=error_code):
+        service.save_selection(
+            round_id=later.pk, user=second_buyer, lines=[{"product_id": product.pk, "quantity": 2}]
+        )
+    second = service.save_selection(
+        round_id=later.pk, user=second_buyer, lines=[{"product_id": product.pk, "quantity": 1}]
+    )
+    assert first.pk != second.pk
+    assert service.reserved_stock([product.pk]) == {product.pk: 4}
+
+
+@pytest.mark.skipif(
+    not connection.features.has_select_for_update,
+    reason="Row-lock concurrency requires a database with SELECT FOR UPDATE",
+)
+@pytest.mark.django_db(transaction=True)
+def test_concurrent_overlapping_selections_respect_shared_limits(
+    context, overlapping_reservation_case
+):
+    user, product, _, _, now = context
+    first, second, second_buyer, error_code = overlapping_reservation_case
+    barrier = Barrier(2)
+
+    def reserve(round_id, buyer):
+        close_old_connections()
+        try:
+            barrier.wait(timeout=5)
+            service.save_selection(
+                round_id=round_id,
+                user=buyer,
+                lines=[{"product_id": product.pk, "quantity": 3}],
+                now=now,
+            )
+            return "reserved"
+        except service.CSARoundError as error:
+            return error.code
+        finally:
+            close_old_connections()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = [
+            pool.submit(reserve, first.pk, user),
+            pool.submit(reserve, second.pk, second_buyer),
+        ]
+        assert {result.result(timeout=15) for result in results} == {"reserved", error_code}
+
+    assert CSASelection.objects.count() == 1
+    assert service.reserved_stock([product.pk]) == {product.pk: 3}
 
 
 def test_save_holds_points_and_stock_then_close_creates_order_once(context):
@@ -282,8 +363,6 @@ def test_member_cannot_administer_or_access_another_selection(context, access_to
     assert client.get("/api/v1/csa-rounds").status_code == 403
     access_token.scope = "profile email"
     access_token.save(update_fields=["scope"])
-    from identity.models import AccountStatus, User
-
     other = User.objects.create_user(
         email="other@example.com",
         name="Other",
