@@ -3,6 +3,7 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from django.db.models import Case, F, IntegerField, Prefetch, Q, Sum, Value, When
 from django.db.models.functions import Coalesce
+from django.http import Http404
 from django.shortcuts import get_object_or_404
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
@@ -12,19 +13,24 @@ from rest_framework.permissions import AllowAny, BasePermission
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from commerce.shipping import can_edit_admin_shipping_address, shipping_address_payload
+from commerce.shipping import admin_shipping_address_payload, can_edit_admin_shipping_address
 from content.permissions import IsWebsiteAdmin
 from content.serializers import media_payload
 from content.services import audit, store_reward_image
 from identity.admin_api import AdminAccountPasswordAPIView, create_admin_user
-from identity.admin_services import admin_account_actions
-from identity.models import User
+from identity.admin_services import (
+    admin_account_actions,
+    is_protected_account_target,
+    lock_admin_accounts,
+)
+from identity.models import AccountStatus, User
 from identity.phones import normalize_login_phone
 from referrals.models import (
     PointDirection,
     PointTransaction,
     RedemptionRequest,
     Referral,
+    ReferralAccount,
     Reward,
     RewardTranslation,
 )
@@ -462,7 +468,7 @@ class AdminUserListView(AdminAccountPasswordAPIView):
             matches = (
                 Q(name__icontains=search)
                 | Q(email__icontains=search)
-                | Q(member_profile__phone_number__icontains=search)
+                | Q(login_phone_number__isnull=True, member_profile__phone_number__icontains=search)
                 | Q(login_phone_number__icontains=search)
             )
             try:
@@ -486,7 +492,7 @@ class AdminUserListView(AdminAccountPasswordAPIView):
                             "email": user.email,
                             "login_phone_number": user.login_phone_number,
                             "email_verified": user.email_verified,
-                            "phone": user_phone(user),
+                            "phone": user.login_phone_number or user_phone(user),
                             **admin_user_csa_fields(user),
                             "status": user.status,
                             "date_joined": user.date_joined.isoformat(),
@@ -508,10 +514,13 @@ def admin_user_payload(user, *, actor, invited_page: int = 1) -> tuple[dict, dic
         invited_page,
         page_size=ADMIN_PAGE_SIZE,
     )
-    profile = getattr(user, "member_profile", None)
     email_verified = user.email_verified
     can_edit_address = can_edit_admin_shipping_address(user, actor=actor)
-    shipping_address = getattr(user, "shipping_address", None) if can_edit_address else None
+    shipping_address = (
+        getattr(user, "shipping_address", None)
+        if user.status not in {AccountStatus.DELETION_REQUESTED, AccountStatus.ANONYMIZED}
+        else None
+    )
     return (
         {
             "id": str(user.pk),
@@ -519,13 +528,13 @@ def admin_user_payload(user, *, actor, invited_page: int = 1) -> tuple[dict, dic
             "email": user.email,
             "login_phone_number": user.login_phone_number,
             "email_verified": email_verified,
-            "phone": profile.phone_number if profile else "",
+            "phone": user.login_phone_number or user_phone(user),
             **admin_user_csa_fields(user),
             "account_actions": admin_account_actions(
                 user, actor=actor, email_verified=email_verified
             ),
             "can_edit_shipping_address": can_edit_address,
-            "shipping_address": shipping_address_payload(shipping_address)
+            "shipping_address": admin_shipping_address_payload(shipping_address)
             if shipping_address
             else None,
             "date_joined": user.date_joined.isoformat(),
@@ -585,20 +594,44 @@ class AdminPointHistoryView(APIView):
                         }
                         for item in items
                     ],
-                    "meta": {**meta, "balance": point_balance(user)},
+                    "meta": {
+                        **meta,
+                        "balance": point_balance(user),
+                        "can_adjust_points": not is_protected_account_target(
+                            user, actor=request.user
+                        ),
+                    },
                 }
             )
         )
 
+    @transaction.atomic
     def post(self, request, user_id):
-        user = get_object_or_404(User, pk=user_id)
+        get_object_or_404(User.objects.only("id"), pk=user_id)
         serializer = PointTransactionWriteSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
+
+        # Ledger writers take the ReferralAccount before inserts check the User FKs.
+        # Locking the target User first can deadlock with redemptions or store rewards.
+        get_object_or_404(ReferralAccount.objects.select_for_update(), user_id=user_id)
+        try:
+            actor, user = lock_admin_accounts(
+                actor=request.user, user_id=user_id, shared_actor=True
+            )
+        except User.DoesNotExist as error:
+            raise Http404 from error
+        if is_protected_account_target(user, actor=actor):
+            return no_store(
+                Response(
+                    {"errors": [{"code": "account_target_protected"}]},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            )
         try:
             item, balance = create_point_transaction(
                 user=user,
-                actor=request.user,
+                actor=actor,
                 direction=data["direction"],
                 amount=data["amount"],
                 message=data["message"],

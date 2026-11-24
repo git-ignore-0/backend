@@ -508,7 +508,7 @@ def save_selection(*, round_id, user, lines, locale="vi", now=None, expected_rev
     address = None
     if existing is None:
         _lock_checkout_identity(user)
-        address, _area, _updated = _address_for_checkout(user, None)
+        address, _area, _saved_address = _address_for_checkout(user, None)
     now = supplied_now or timezone.now()
     member = _entitled_membership(user, round_, existing, now)
     now = supplied_now or timezone.now()

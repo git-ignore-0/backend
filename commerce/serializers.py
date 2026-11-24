@@ -77,18 +77,10 @@ class ShippingQuoteSerializer(StrictSerializer):
         return attrs
 
 
-class ShippingAddressSerializer(StrictSerializer):
-    recipient_name = serializers.CharField(max_length=200, trim_whitespace=True)
-    phone_number = serializers.CharField(max_length=32, trim_whitespace=True)
+class ShippingLocationSerializer(StrictSerializer):
     province_code = serializers.CharField(max_length=2, trim_whitespace=True)
     ward_code = serializers.CharField(max_length=5, trim_whitespace=True)
     address = serializers.CharField(max_length=500, trim_whitespace=True)
-
-    def validate_phone_number(self, value):
-        try:
-            return normalize_vietnam_phone(value)
-        except InvalidPhoneNumber as error:
-            raise serializers.ValidationError("Phone number is invalid.") from error
 
     def validate(self, attrs):
         validate_administrative_codes(
@@ -97,7 +89,29 @@ class ShippingAddressSerializer(StrictSerializer):
         return attrs
 
 
-class AdminShippingAddressSerializer(ShippingAddressSerializer):
+class ShippingAddressSerializer(ShippingLocationSerializer):
+    recipient_name = serializers.CharField(max_length=200, trim_whitespace=True)
+    phone_number = serializers.CharField(max_length=32, trim_whitespace=True)
+
+    def validate_phone_number(self, value):
+        try:
+            return normalize_vietnam_phone(value)
+        except InvalidPhoneNumber as error:
+            raise serializers.ValidationError("Phone number is invalid.") from error
+
+
+class AccountShippingAddressSerializer(ShippingLocationSerializer):
+    # Older storefront and CMS clients still send contact fields with the address.
+    recipient_name = serializers.CharField(max_length=200, required=False, allow_blank=True)
+    phone_number = serializers.CharField(max_length=32, required=False, allow_blank=True)
+
+    def validate(self, attrs):
+        attrs.pop("recipient_name", None)
+        attrs.pop("phone_number", None)
+        return super().validate(attrs)
+
+
+class AdminShippingAddressSerializer(AccountShippingAddressSerializer):
     expected_updated_at = serializers.DateTimeField(allow_null=True)
 
 
@@ -271,6 +285,9 @@ class StoreCheckoutSerializer(StrictSerializer):
     )
     expected_total_vnd = serializers.IntegerField(min_value=0, max_value=MAX_POSITIVE_BIG_INTEGER)
     shipping_address_updated_at = serializers.DateTimeField(required=False)
+    shipping_address_version = serializers.RegexField(
+        r"\A[a-f0-9]{64}\Z", max_length=64, required=False, trim_whitespace=False
+    )
 
 
 class StoreOrderAccessSerializer(StrictSerializer):

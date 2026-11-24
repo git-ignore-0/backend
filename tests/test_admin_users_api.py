@@ -259,15 +259,16 @@ def test_projection_search_and_batch_verification(cms, django_assert_max_num_que
     user = target("active", email="projected@example.com")
     EmailAddress.objects.create(user=user, email=user.email, verified=True)
     MemberProfile.objects.create(user=user, phone_number="0987654321")
-    for query in ("091 234 5678", "+84912345678", "123456", "0987654321", "projected"):
+    for query in ("091 234 5678", "+84912345678", "123456", "projected"):
         result = cms.get(USERS, {"search": query}).json()
         row = next(item for item in result["data"] if item["id"] == str(user.pk))
-        assert row["phone"] == "0987654321" and row["login_phone_number"] == "+84912345678"
+        assert row["phone"] == row["login_phone_number"] == "+84912345678"
         assert row["email_verified"] is True
         assert "points_balance" in row and "has_csa_customer" in row
     details = cms.get(f"{USERS}/{user.pk}").json()["data"]
     assert details["login_phone_number"] == "+84912345678" and details["email_verified"]
-    assert details["phone"] == "0987654321" and "referral_code" in details
+    assert details["phone"] == details["login_phone_number"] and "referral_code" in details
+    assert cms.get(USERS, {"search": "0987654321"}).json()["data"] == []
     for i in range(10):
         member = User.objects.create_user(f"batch{i}@example.com", name="Batch")
         EmailAddress.objects.create(user=member, email=member.email, verified=True)

@@ -354,6 +354,9 @@ def test_legacy_paid_order_report_transfer_is_idempotent_and_starts_eight_hour_d
 
 
 def attach_active_membership(user, product):
+    if not user.login_phone_number:
+        user.login_phone_number = "0901234567"
+        user.save(update_fields=["login_phone_number"])
     group = QuotaGroup.objects.create(
         name="Rau", unit_size=Decimal("1.000"), unit_label_vi="kg", unit_label_en="kg"
     )
@@ -363,7 +366,7 @@ def attach_active_membership(user, product):
     customer = CSACustomer.objects.create(
         user=user,
         name=user.name,
-        phone_e164="+84901234567",
+        phone_e164=user.login_phone_number,
         province_code=PROVINCE,
         ward_code=WARD,
         address="Số 12 Nguyễn Huệ",
@@ -412,7 +415,7 @@ def attach_active_membership(user, product):
     ShippingAddress.objects.create(
         user=user,
         recipient_name=user.name,
-        phone_number="+84901234567",
+        phone_number=user.login_phone_number,
         province_code=PROVINCE,
         ward_code=WARD,
         address="Số 12 Nguyễn Huệ",
@@ -585,15 +588,15 @@ def test_admin_approval_uses_fefo_and_is_replay_safe(
 def test_user_list_is_owner_scoped(
     active_user, access_token, store_product, payment_settings, has_email, mailoutbox
 ):
+    active_user.login_phone_number = "0901234567" if has_email else "0987654321"
     if not has_email:
         active_user.emailaddress_set.all().delete()
         active_user.email = None
-        active_user.login_phone_number = "0987654321"
-        active_user.save(update_fields=["email", "login_phone_number"])
+    active_user.save(update_fields=["email", "login_phone_number"])
     ShippingAddress.objects.create(
         user=active_user,
         recipient_name=active_user.name,
-        phone_number="+84901234567",
+        phone_number=active_user.login_phone_number,
         province_code=PROVINCE,
         ward_code=WARD,
         address="Số 12 Nguyễn Huệ",
@@ -628,7 +631,7 @@ def test_user_list_is_owner_scoped(
 
     order = StoreOrder.objects.get(pk=created.json()["data"]["id"])
     assert order.buyer_user_id == active_user.pk
-    assert order.phone_e164_snapshot == "+84901234567"
+    assert order.phone_e164_snapshot == ("+84901234567" if has_email else "+84987654321")
     assert not mailoutbox
 
     listed = member.get("/api/v1/store-orders")
@@ -1731,6 +1734,8 @@ def test_farm_inventory_excludes_invalid_source(
 def test_public_store_user_branch_accepts_complete_self_scopes(
     operation, active_user, access_token, store_product, payment_settings
 ):
+    active_user.login_phone_number = "0901234567"
+    active_user.save(update_fields=["login_phone_number"])
     address = ShippingAddress.objects.create(
         user=active_user,
         recipient_name=active_user.name,
@@ -3416,11 +3421,178 @@ def test_buy_again_batches_all_lines_in_original_order_and_respects_category_vis
 
 
 @pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("account_change", "confirmed_name", "confirmed_phone"),
+    [
+        ({"name": "Tên đã đổi"}, "Tên đã đổi", "+84901234567"),
+        ({"login_phone_number": "0987654321"}, "Nông Dân Xanh", "+84987654321"),
+    ],
+)
+def test_checkout_requires_confirmation_after_saved_contact_changes(
+    active_user,
+    access_token,
+    store_product,
+    payment_settings,
+    account_change,
+    confirmed_name,
+    confirmed_phone,
+):
+    active_user.login_phone_number = "0901234567"
+    active_user.save(update_fields=["login_phone_number"])
+    address = ShippingAddress.objects.create(
+        user=active_user,
+        recipient_name="Tên cũ",
+        phone_number="+84901234566",
+        province_code=PROVINCE,
+        ward_code=WARD,
+        address="Số 12 Nguyễn Huệ",
+    )
+    client = APIClient()
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token.token}")
+    quote_url = "/api/v1/public/store-quotes"
+    checkout_url = "/api/v1/public/store-checkouts"
+    request = {
+        "delivery_date": timezone.localdate(),
+        "lines": [{"product_id": str(store_product.pk), "quantity": 1, "use_quota": False}],
+    }
+    saved_address = client.get("/api/v1/shipping-address").json()["data"]
+    quote = client.post(quote_url, request, format="json").json()["data"]
+    assert saved_address["shipping_address_version"] == quote["shipping_address_version"]
+    body = {
+        "delivery_date": request["delivery_date"],
+        "idempotency_key": str(uuid.uuid4()),
+        "lines": quote["lines"],
+        "shipping_address_updated_at": quote["shipping_address_updated_at"],
+        "shipping_address_version": quote["shipping_address_version"],
+        "expected_shipping_fee_vnd": quote["shipping_fee_vnd"],
+        "expected_total_vnd": quote["total_vnd"],
+    }
+
+    type(active_user).objects.filter(pk=active_user.pk).update(**account_change)
+    stale = client.post(checkout_url, body, format="json")
+    assert stale.status_code == 409, stale.json()
+    assert stale.json()["errors"] == [
+        {"code": "store_requote_required", "context": {"reason": "shipping_address_changed"}}
+    ]
+    assert not StoreOrder.objects.exists()
+    address.refresh_from_db()
+    assert address.updated_at.isoformat() == body["shipping_address_updated_at"]
+
+    fresh_address = client.get("/api/v1/shipping-address").json()["data"]
+    fresh_quote = client.post(quote_url, request, format="json").json()["data"]
+    assert fresh_address["recipient_name"] == confirmed_name
+    assert fresh_address["phone_number"] == confirmed_phone
+    assert fresh_address["shipping_address_version"] == fresh_quote["shipping_address_version"]
+    assert fresh_quote["shipping_address_version"] != body["shipping_address_version"]
+    body["shipping_address_version"] = fresh_quote["shipping_address_version"]
+    created = client.post(checkout_url, body, format="json")
+    assert created.status_code == 201, created.json()
+    shipping_snapshot = created.json()["data"]["shipping_address"]
+    assert shipping_snapshot["recipient_name"] == confirmed_name
+    assert shipping_snapshot["phone_number"] == confirmed_phone
+
+    type(active_user).objects.filter(pk=active_user.pk).update(name="Tên đổi sau đặt hàng")
+    replay = client.post(checkout_url, body, format="json")
+    assert replay.status_code == 200, replay.json()
+    assert replay.json()["data"]["id"] == created.json()["data"]["id"]
+    assert replay.json()["data"]["shipping_address"] == shipping_snapshot
+    assert StoreOrder.objects.count() == 1
+
+
+@pytest.mark.django_db
+def test_timestamp_only_checkout_requires_legacy_contact_to_match_account(
+    active_user, access_token, store_product, payment_settings
+):
+    active_user.login_phone_number = "0901234567"
+    active_user.save(update_fields=["login_phone_number"])
+    address = ShippingAddress.objects.create(
+        user=active_user,
+        recipient_name=active_user.name,
+        phone_number="0901234567",
+        province_code=PROVINCE,
+        ward_code=WARD,
+        address="Số 12 Nguyễn Huệ",
+    )
+    client = APIClient()
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token.token}")
+    url = "/api/v1/public/store-checkouts"
+
+    def attempt(expected_available):
+        body = guest_payload(store_product, expected_available=expected_available)
+        del body["guest"]
+        return {**body, "shipping_address_updated_at": address.updated_at.isoformat()}
+
+    first_body = attempt(expected_available=10)
+    created = client.post(url, first_body, format="json")
+    assert created.status_code == 201, created.json()
+    snapshot = created.json()["data"]["shipping_address"]
+    assert snapshot["phone_number"] == "+84901234567"
+
+    unsubmitted_body = attempt(expected_available=8)
+    type(active_user).objects.filter(pk=active_user.pk).update(login_phone_number="0987654321")
+    stale = client.post(url, unsubmitted_body, format="json")
+    assert stale.status_code == 409, stale.json()
+    assert stale.json()["errors"] == [
+        {"code": "store_requote_required", "context": {"reason": "shipping_address_changed"}}
+    ]
+    assert StoreOrder.objects.count() == 1
+
+    replay = client.post(url, first_body, format="json")
+    assert replay.status_code == 200, replay.json()
+    assert replay.json()["data"]["id"] == created.json()["data"]["id"]
+    assert replay.json()["data"]["shipping_address"] == snapshot
+
+
+@pytest.mark.django_db
+def test_store_quote_and_checkout_require_account_login_phone(
+    active_user, access_token, store_product, payment_settings
+):
+    address = ShippingAddress.objects.create(
+        user=active_user,
+        recipient_name=active_user.name,
+        phone_number="0901234567",
+        province_code=PROVINCE,
+        ward_code=WARD,
+        address="Số 12 Nguyễn Huệ",
+    )
+    client = APIClient()
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token.token}")
+    quote = client.post(
+        "/api/v1/public/store-quotes",
+        {
+            "delivery_date": timezone.localdate(),
+            "lines": [{"product_id": str(store_product.pk), "quantity": 1, "use_quota": False}],
+        },
+        format="json",
+    )
+    body = guest_payload(store_product)
+    del body["guest"]
+    body["shipping_address_updated_at"] = address.updated_at.isoformat()
+    checkout = client.post("/api/v1/public/store-checkouts", body, format="json")
+
+    for response in [quote, checkout]:
+        assert response.status_code == 400, response.json()
+        assert response.json()["errors"] == [{"code": "store_shipping_address_required"}]
+    assert not StoreOrder.objects.exists()
+
+
+@pytest.mark.django_db
+def test_guest_checkout_cannot_supply_saved_address_version(store_product, payment_settings):
+    body = {**guest_payload(store_product), "shipping_address_version": "a" * 64}
+    response = APIClient().post("/api/v1/public/store-checkouts", body, format="json")
+    assert response.status_code == 400, response.json()
+    assert response.json()["errors"][0]["code"] == "store_shipping_address_invalid"
+    assert not StoreOrder.objects.exists()
+
+
+@pytest.mark.django_db
 def test_voucher_preview_checkout_replay_and_cancel(
     store_product, payment_settings, active_user, access_token
 ):
     from memberships.models import CouponUsage, CSACoupon
 
+    active_user.login_phone_number = "0901234567"
+    active_user.save(update_fields=["login_phone_number"])
     ShippingAddress.objects.create(
         user=active_user,
         recipient_name="Voucher",
@@ -3463,6 +3635,7 @@ def test_voucher_preview_checkout_replay_and_cancel(
         "expected_voucher_quote": quote["voucher_quote"],
         "lines": quote["lines"],
         "shipping_address_updated_at": quote["shipping_address_updated_at"],
+        "shipping_address_version": quote["shipping_address_version"],
         "expected_shipping_fee_vnd": 30_000,
         "expected_total_vnd": 90_000,
     }

@@ -84,41 +84,22 @@ def expire_csa_purchase_request_if_due(*, request_id, now=None) -> bool:
 
 
 @transaction.atomic
-def expire_open_csa_purchase_request_for_phone(
-    *, phone_e164, now=None, additional_coupon_ids=()
-) -> bool:
-    now = now or timezone.now()
-    item = (
-        CSAPurchaseRequest.objects.select_for_update()
-        .filter(
-            phone_e164=phone_e164,
-            status__in=OPEN_CSA_PURCHASE_REQUEST_STATUSES,
-            expires_at__isnull=False,
-            expires_at__lte=now,
-        )
-        .first()
-    )
-    # A confirmation can release an old voucher and consume a different one.
-    # Lock both before release, rather than old -> new in request-specific order.
-    lock_coupons((*additional_coupon_ids, item.coupon_id if item else None))
-    return bool(item and _expire_locked_request(item, now=now))
-
-
-@transaction.atomic
-def expire_open_csa_purchase_requests_for_user(*, user_id, now=None) -> int:
+def expire_due_csa_purchase_requests(queryset, *, now=None, additional_coupon_ids=()) -> int:
     now = now or timezone.now()
     items = list(
-        CSAPurchaseRequest.objects.select_for_update()
-        .filter(
-            user_id=user_id,
-            status__in=OPEN_CSA_PURCHASE_REQUEST_STATUSES,
-            expires_at__isnull=False,
-            expires_at__lte=now,
-        )
+        queryset.select_for_update()
+        .filter(open_slot=True, expires_at__lte=now)
         .order_by("expires_at", "id")
     )
-    lock_coupons(item.coupon_id for item in items)
+    # Lock the vouchers in one ordered set before releasing any existing usage.
+    lock_coupons((*additional_coupon_ids, *(item.coupon_id for item in items)))
     return sum(int(_expire_locked_request(item, now=now)) for item in items)
+
+
+def expire_open_csa_purchase_requests_for_user(*, user_id, now=None) -> int:
+    return expire_due_csa_purchase_requests(
+        CSAPurchaseRequest.objects.filter(user_id=user_id), now=now
+    )
 
 
 def expire_csa_purchase_requests(*, now=None, batch_size=DEFAULT_BATCH_SIZE, dry_run=False) -> int:

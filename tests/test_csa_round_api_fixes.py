@@ -12,6 +12,7 @@ from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 from rest_framework.test import APIClient
 
+from farms.models import FarmProductStockBatch
 from identity.models import AccountStatus, User
 from memberships import csa_rounds as service
 from memberships.models import (
@@ -44,6 +45,9 @@ def admin_client(context):
 
 def test_catalog_own_hold_is_added_before_clamping_availability(context, monkeypatch):
     user, product, _, round_, now = context
+    FarmProductStockBatch.objects.filter(farm_product__product=product).update(
+        end_date=timezone.localdate(now) + timedelta(days=2)
+    )
     round_.closes_at = now + timedelta(days=5)
     round_.delivery_date = timezone.localdate(now) + timedelta(days=6)
     round_.save()

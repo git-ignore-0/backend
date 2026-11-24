@@ -10,7 +10,7 @@ from django.urls import reverse
 from django.utils import timezone
 
 from identity.models import IdentityEvent, User
-from identity.navigation import LOGIN_NEXT_SESSION_KEY
+from identity.navigation import LOGIN_NEXT_SESSION_KEY, PUBLIC_RETURN_TO_SESSION_KEY
 from identity.services import activate_account, transition_account
 from members.models import MemberProfile
 
@@ -296,6 +296,55 @@ def test_add_phone_requires_password_and_cannot_replace_existing_number(
     assert active_user.login_phone_number in dashboard
     assert "Contact phone" not in dashboard
     assert "/account/complete#phone" not in dashboard
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("return_to", "destination"),
+    [
+        (
+            "https://site.example.test/csa/purchase/vi?package=second&page=3",
+            "https://site.example.test/csa/purchase/vi?package=second&page=3",
+        ),
+        ("https://attacker.example/csa/purchase/vi?package=second&page=3", "/account"),
+    ],
+)
+def test_active_phone_add_consumes_validated_website_return(
+    client, active_user, settings, return_to, destination
+):
+    settings.PUBLIC_SITE_ORIGINS = ("https://site.example.test",)
+    login(client, active_user)
+    assert client.get("/account", {"return_to": return_to}).status_code == 200
+
+    response = client.post(
+        "/account/phone/add", {"login_phone_number": "0901234567", "current_password": PASSWORD}
+    )
+
+    assert response.status_code == 302 and response.url == destination
+    assert PUBLIC_RETURN_TO_SESSION_KEY not in client.session
+    active_user.refresh_from_db()
+    assert active_user.login_phone_number == "+84901234567"
+
+
+@pytest.mark.django_db
+def test_pending_phone_add_with_website_return_stays_in_completion(client, settings):
+    settings.PUBLIC_SITE_ORIGINS = ("https://site.example.test",)
+    pending_without_phone = User.objects.create_user(
+        email="pending@example.test", name="Pending", password=PASSWORD
+    )
+    login(client, pending_without_phone)
+    return_to = "https://site.example.test/csa/purchase/vi?package=second&page=3"
+    assert client.get("/account", {"return_to": return_to}).url == "/account/complete"
+
+    response = client.post(
+        "/account/phone/add", {"login_phone_number": "0901234567", "current_password": PASSWORD}
+    )
+
+    assert response.status_code == 302 and response.url == "/account/complete"
+    assert client.session[PUBLIC_RETURN_TO_SESSION_KEY] == return_to
+    pending_without_phone.refresh_from_db()
+    assert pending_without_phone.login_phone_number == "+84901234567"
+    assert not pending_without_phone.can_access_core()
 
 
 @pytest.mark.django_db

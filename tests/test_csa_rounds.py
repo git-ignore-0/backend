@@ -11,6 +11,7 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 
 from commerce.models import StoreOrder
+from commerce.store_orders import StoreOrderError
 from farms.models import FarmProductStockBatch
 from identity.models import AccountStatus, User
 from memberships import csa_rounds as service
@@ -52,6 +53,28 @@ def save(context, quantity=2, **kwargs):
     )
 
 
+def test_first_selection_reads_fresh_account_contact_and_edits_keep_snapshot(context):
+    user, *_ = context
+    User.objects.filter(pk=user.pk).update(name="Tên đã đổi", login_phone_number="0987654321")
+
+    selected = save(context)
+    assert selected.address_snapshot["recipient_name_snapshot"] == "Tên đã đổi"
+    assert selected.address_snapshot["phone_e164_snapshot"] == "+84987654321"
+
+    User.objects.filter(pk=user.pk).update(name="Tên đổi tiếp", login_phone_number="0912345678")
+    edited = save(context, quantity=1)
+    assert edited.pk == selected.pk
+    assert edited.address_snapshot == selected.address_snapshot
+
+
+def test_first_selection_requires_login_phone_even_with_legacy_delivery_phone(context):
+    user, *_ = context
+    User.objects.filter(pk=user.pk).update(login_phone_number=None)
+    with pytest.raises(StoreOrderError, match="store_shipping_address_required"):
+        save(context)
+    assert not CSASelection.objects.exists()
+
+
 def publish_overlapping_round(context):
     user, _, _, round_, now = context
     later = service.create_round_configuration(
@@ -72,7 +95,10 @@ def overlapping_reservation_case(context, request):
     if request.param == "stock":
         # Give each buyer independent membership and address locks in the stock case.
         second_buyer = User.objects.create_user(
-            email="second-buyer@example.com", name="Second buyer", status=AccountStatus.ACTIVE
+            email="second-buyer@example.com",
+            name="Second buyer",
+            login_phone_number="0987654321",
+            status=AccountStatus.ACTIVE,
         )
         membership.customer.phone_e164 = "+84909876543"
         membership.customer.save(update_fields=["phone_e164"])

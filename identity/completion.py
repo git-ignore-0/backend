@@ -18,7 +18,11 @@ from django.views.decorators.http import require_GET, require_http_methods, requ
 
 from identity.forms import PASSWORD_LOGIN_SESSION_KEY, AddPhoneForm, CurrentPasswordForm
 from identity.models import User
-from identity.navigation import pending_oauth_destination
+from identity.navigation import (
+    PUBLIC_RETURN_TO_SESSION_KEY,
+    pending_oauth_destination,
+    safe_public_return_to,
+)
 from identity.verification import (
     claim_account_verification,
     send_account_verification,
@@ -135,7 +139,10 @@ def _add_identifier(request, *, kind):
             else:
                 messages.success(request, _("Account identifier added."))
             if kind == "phone" and user.can_access_core():
-                return redirect("account")
+                return_to = safe_public_return_to(
+                    request.session.pop(PUBLIC_RETURN_TO_SESSION_KEY, None)
+                )
+                return redirect(return_to or "account")
             return redirect("account_complete")
     if kind == "phone":
         user = User.objects.get(pk=request.user.pk)

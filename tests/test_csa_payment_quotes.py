@@ -1,8 +1,13 @@
+import hashlib
+import hmac
+import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from decimal import Decimal
 
 import pytest
+from django.conf import settings
+from django.core import signing
 from django.core.cache import cache
 from django.core.exceptions import ValidationError
 from django.db import close_old_connections, connection
@@ -101,6 +106,49 @@ def guest_identity():
         "ward_code": "22015",
         "address": "Số 12, ngõ 5",
     }
+
+
+@pytest.fixture
+def legacy_member_address(active_user):
+    active_user.login_phone_number = "0987654321"
+    active_user.save(update_fields=["login_phone_number"])
+    return ShippingAddress.objects.create(
+        user=active_user,
+        recipient_name="Previous recipient",
+        phone_number="+84901234567",
+        province_code="66",
+        ward_code="22015",
+        address="Delivery address",
+    )
+
+
+def legacy_member_quote_token(quote, address):
+    # Capture the v1 wire format and the fingerprint over the original address row.
+    canonical = json.dumps(
+        {
+            "address": address.address,
+            "name": address.recipient_name,
+            "phone": address.phone_number,
+            "province_code": address.province_code,
+            "ward_code": address.ward_code,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    signed_quote = {
+        **quote,
+        "v": 1,
+        "subject": {
+            "kind": "user",
+            "user_id": quote["subject"]["user_id"],
+            "shipping_address_updated_at": quote["subject"]["shipping_address_updated_at"],
+            "fingerprint": hmac.new(
+                settings.SECRET_KEY.encode("utf-8"), canonical, hashlib.sha256
+            ).hexdigest(),
+        },
+    }
+    return signing.dumps(signed_quote, salt="memberships.csa-payment-quote.v1", compress=True)
 
 
 def make_plan(option, *, payment_type):
@@ -363,6 +411,8 @@ def test_member_confirm_and_replay_return_the_saved_recipient_phone(
 ):
     package, option = catalog
     plan = make_plan(option, payment_type=MembershipPaymentType.FULL)
+    active_user.login_phone_number = "+84922222222"
+    active_user.save(update_fields=["login_phone_number"])
     address = ShippingAddress.objects.create(
         user=active_user,
         recipient_name=guest_identity["name"],
@@ -388,8 +438,7 @@ def test_member_confirm_and_replay_return_the_saved_recipient_phone(
     assert data["recipient_phone"] == item.phone_e164 == "+84922222222"
     assert confirmed.headers["Cache-Control"] == "private, no-store"
 
-    address.phone_number = "+84933333333"
-    address.save(update_fields=["phone_number", "updated_at"])
+    User.objects.filter(pk=active_user.pk).update(login_phone_number="+84933333333")
     replay = client.post(CONFIRM_URL, confirm_payload, format="json")
     assert replay.status_code == 200
     assert replay.json()["data"]["id"] == data["id"]
@@ -442,6 +491,8 @@ def test_member_csa_checks_access_before_new_writes_and_preserves_saved_replays(
 ):
     package, option = catalog
     plan = make_plan(option, payment_type=MembershipPaymentType.FULL)
+    active_user.login_phone_number = "+84922222222"
+    active_user.save(update_fields=["login_phone_number"])
     ShippingAddress.objects.create(
         user=active_user,
         recipient_name=guest_identity["name"],
@@ -517,8 +568,8 @@ def test_authenticated_quote_is_bound_to_the_current_user(
     if not has_email:
         active_user.emailaddress_set.all().delete()
         active_user.email = None
-        active_user.login_phone_number = "0987654321"
-        active_user.save(update_fields=["email", "login_phone_number"])
+    active_user.login_phone_number = "0987654321"
+    active_user.save(update_fields=["email", "login_phone_number"])
     package, option = catalog
     plan = make_plan(option, payment_type=MembershipPaymentType.FULL)
     ShippingAddress.objects.create(
@@ -555,11 +606,266 @@ def test_authenticated_quote_is_bound_to_the_current_user(
     address.save(update_fields=["address", "updated_at"])
     item, guest_token = confirm_csa_payment_quote(quote_token=token, user=active_user)
     assert item.user_id == active_user.pk
-    assert item.name_snapshot == "Nguyễn Văn An"
+    assert item.name_snapshot == active_user.name
     assert item.address_snapshot == "Delivery address"
     assert item.email_snapshot == active_user.email
-    assert item.phone_e164 == "+84901234567"
+    assert item.phone_e164 == "+84987654321"
     assert guest_token is None
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("account_name", ["Current account name", ""], ids=["name", "blank-name"])
+def test_unexpired_v1_member_quote_preserves_the_transferred_request_code(
+    catalog, payment_settings, active_user, access_token, legacy_member_address, account_name
+):
+    package, option = catalog
+    _, quote = create_csa_payment_quote(
+        package_id=package.pk, price_option_id=option.pk, user=active_user
+    )
+    token = legacy_member_quote_token(quote, legacy_member_address)
+    User.objects.filter(pk=active_user.pk).update(name=account_name, login_phone_number=None)
+    client = APIClient()
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token.token}")
+
+    response = client.post(CONFIRM_URL, {"quote_token": token}, format="json")
+
+    assert response.status_code == 200, response.json()
+    data = response.json()["data"]
+    item = CSAPurchaseRequest.objects.get(pk=data["id"])
+    assert data["request_code"] == data["transfer_content"] == quote["request_code"]
+    assert data["recipient_phone"] == item.phone_e164 == "+84901234567"
+    assert item.name_snapshot == "Previous recipient"
+    assert item.user_id == active_user.pk
+    replay = client.post(CONFIRM_URL, {"quote_token": token}, format="json")
+    assert replay.status_code == 200
+    assert replay.json()["data"]["id"] == data["id"]
+    assert CSAPurchaseRequest.objects.count() == 1
+
+
+@pytest.mark.django_db
+def test_v1_member_quote_rejects_changed_delivery_location(
+    catalog, payment_settings, active_user, legacy_member_address
+):
+    package, option = catalog
+    _, quote = create_csa_payment_quote(
+        package_id=package.pk, price_option_id=option.pk, user=active_user
+    )
+    token = legacy_member_quote_token(quote, legacy_member_address)
+    legacy_member_address.address = "Changed delivery address"
+    legacy_member_address.save(update_fields=["address", "updated_at"])
+
+    with pytest.raises(PaymentQuoteIdentityMismatch):
+        confirm_csa_payment_quote(quote_token=token, user=active_user)
+
+    assert not CSAPurchaseRequest.objects.exists()
+
+
+@pytest.mark.django_db
+def test_new_member_quote_does_not_fall_back_to_the_historical_recipient(
+    catalog, payment_settings, active_user, legacy_member_address
+):
+    package, option = catalog
+    _, quote = create_csa_payment_quote(
+        package_id=package.pk, price_option_id=option.pk, user=active_user
+    )
+    assert quote["v"] == 2
+    legacy_quote = legacy_member_quote_token(quote, legacy_member_address)
+    signed_quote = signing.loads(legacy_quote, salt="memberships.csa-payment-quote.v1")
+    invalid_token = _quote_token(
+        {
+            **quote,
+            "subject": {**quote["subject"], "fingerprint": signed_quote["subject"]["fingerprint"]},
+        }
+    )
+
+    with pytest.raises(PaymentQuoteIdentityMismatch):
+        confirm_csa_payment_quote(quote_token=invalid_token, user=active_user)
+
+    assert not CSAPurchaseRequest.objects.exists()
+
+
+@pytest.mark.django_db
+def test_member_quote_shipping_version_matches_current_saved_contact(
+    catalog, payment_settings, active_user, access_token, legacy_member_address
+):
+    package, option = catalog
+    plan = make_plan(option, payment_type=MembershipPaymentType.FULL)
+    client = APIClient()
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token.token}")
+    payload = quote_payload(package, option, plan, None)
+    payload.pop("guest_identity")
+
+    original_version = None
+    for name in (active_user.name, "Updated delivery contact"):
+        User.objects.filter(pk=active_user.pk).update(name=name)
+        address_response = client.get("/api/v1/shipping-address")
+        quote_response = client.post(QUOTE_URL, payload, format="json")
+
+        assert address_response.status_code == quote_response.status_code == 200
+        address_data = address_response.json()["data"]
+        quote_data = quote_response.json()["data"]
+        assert quote_data["shipping_address_updated_at"] == address_data["updated_at"]
+        assert address_data["updated_at"] == legacy_member_address.updated_at.isoformat()
+        version = quote_data["shipping_address_version"]
+        assert version == address_data["shipping_address_version"]
+        subject = signing.loads(quote_data["quote_token"], salt="memberships.csa-payment-quote.v1")[
+            "subject"
+        ]
+        assert subject["shipping_address_version"] == version
+        assert version != original_version
+        original_version = version
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("member", [False, True], ids=["guest", "member"])
+@pytest.mark.parametrize("prior_expired", [False, True], ids=["open", "expired"])
+def test_quote_checks_existing_request_for_canonical_phone_without_changing_it(
+    member,
+    prior_expired,
+    catalog,
+    payment_settings,
+    active_user,
+    access_token,
+    guest_identity,
+    legacy_member_address,
+):
+    package, option = catalog
+    plan = make_plan(option, payment_type=MembershipPaymentType.FULL)
+    identity = {**guest_identity, "phone": "0987654321"}
+    previous, _ = create_public_csa_purchase_request(
+        package_id=package.pk,
+        price_option_id=option.pk,
+        payment_plan_id=plan.pk,
+        **identity,
+    )
+    assert previous.phone_e164 == "+84987654321"
+    if prior_expired:
+        CSAPurchaseRequest.objects.filter(pk=previous.pk).update(
+            expires_at=timezone.now() - timedelta(seconds=1)
+        )
+    client = APIClient()
+    payload = quote_payload(package, option, plan, {**identity, "phone": "+84987654321"})
+    if member:
+        client.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token.token}")
+        payload.pop("guest_identity")
+
+    response = client.post(QUOTE_URL, payload, format="json")
+
+    if prior_expired:
+        assert response.status_code == 200, response.json()
+        assert "qr_payload" in response.json()["data"]
+    else:
+        assert response.status_code == 409, response.json()
+        assert response.json() == {"errors": [{"code": "csa_purchase_request_open_exists"}]}
+    previous.refresh_from_db()
+    assert previous.status == CSAPurchaseRequestStatus.PENDING
+    assert CSAPurchaseRequest.objects.count() == 1
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("route", ["direct", "quote", "confirm"])
+@pytest.mark.parametrize("prior_expired", [False, True], ids=["open", "expired"])
+def test_member_purchase_checks_prior_request_with_a_different_phone(
+    route,
+    prior_expired,
+    catalog,
+    payment_settings,
+    active_user,
+    access_token,
+    legacy_member_address,
+):
+    package, option = catalog
+    selection = {"package_id": str(package.pk), "price_option_id": str(option.pk)}
+    token, _ = create_csa_payment_quote(**selection, user=active_user)
+    previous, _ = create_public_csa_purchase_request(
+        **selection,
+        phone=legacy_member_address.phone_number,
+        name=legacy_member_address.recipient_name,
+        province_code=legacy_member_address.province_code,
+        ward_code=legacy_member_address.ward_code,
+        address=legacy_member_address.address,
+    )
+    CSAPurchaseRequest.objects.filter(pk=previous.pk).update(user=active_user, guest_token_hash="")
+    if prior_expired:
+        CSAPurchaseRequest.objects.filter(pk=previous.pk).update(
+            expires_at=timezone.now() - timedelta(seconds=1)
+        )
+    client = APIClient()
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token.token}")
+    terms = get_current_csa_terms("vi")
+    selected = {
+        **selection,
+        "terms_accepted": True,
+        "terms_version": terms["version"],
+        "terms_hash": terms["hash"],
+    }
+    if route == "direct":
+        response = client.post("/api/v1/public/csa-purchase-requests", selected, format="json")
+    elif route == "quote":
+        response = client.post(QUOTE_URL, selected, format="json")
+    else:
+        response = client.post(CONFIRM_URL, {"quote_token": token}, format="json")
+
+    if not prior_expired:
+        assert response.status_code == 409, response.json()
+        assert response.json()["errors"] == [{"code": "csa_purchase_request_open_exists"}]
+        assert CSAPurchaseRequest.objects.filter(user=active_user, open_slot=True).count() == 1
+    elif route == "quote":
+        assert response.status_code == 200, response.json()
+        assert CSAPurchaseRequest.objects.count() == 1
+    else:
+        assert response.status_code == (201 if route == "direct" else 200), response.json()
+        previous.refresh_from_db()
+        assert previous.status == CSAPurchaseRequestStatus.EXPIRED
+        assert previous.open_slot is None
+        current = CSAPurchaseRequest.objects.get(user=active_user, open_slot=True)
+        assert current.phone_e164 == "+84987654321"
+
+
+@pytest.mark.django_db
+def test_legacy_recovery_lookup_returns_the_owned_request_using_only_its_code(
+    catalog, payment_settings, active_user, access_token, legacy_member_address
+):
+    package, option = catalog
+    token, quote = create_csa_payment_quote(
+        package_id=package.pk, price_option_id=option.pk, user=active_user
+    )
+    item, _ = confirm_csa_payment_quote(quote_token=token, user=active_user)
+    CSAPurchaseRequest.objects.filter(pk=item.pk).update(
+        phone_e164=legacy_member_address.phone_number
+    )
+    with pytest.raises(PaymentQuoteExpired):
+        confirm_csa_payment_quote(
+            quote_token=token, user=active_user, now=timezone.now() + timedelta(minutes=5)
+        )
+    assert item.request_code == quote["request_code"]
+    url = f"/api/v1/csa-purchase-requests/{item.request_code}"
+    access_token.user = User.objects.create_user(
+        login_phone_number="0987654322", name="Different account", status=AccountStatus.ACTIVE
+    )
+    access_token.save(update_fields=["user"])
+    client = APIClient()
+    assert client.get(url).status_code in {401, 403}
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token.token}")
+    denied = client.get(url)
+    assert denied.status_code == 404
+    assert denied.json()["errors"] == [{"code": "csa_purchase_request_not_found"}]
+
+    access_token.user = active_user
+    access_token.scope = "profile"
+    access_token.save(update_fields=["user", "scope"])
+    assert client.get(url).status_code == 403
+
+    access_token.scope = "profile email"
+    access_token.save(update_fields=["scope"])
+    recovered = client.get(url)
+    assert recovered.status_code == 200, recovered.json()
+    assert recovered.headers["Cache-Control"] == "private, no-store"
+    data = recovered.json()["data"]
+    assert data["reference_code"] == item.request_code
+    assert data["status"] == "payment_confirmed"
+    assert "recipient_phone" not in data
+    assert "guest_confirmation_token" not in data
 
 
 @pytest.mark.django_db
@@ -642,6 +948,8 @@ def test_coupon_code_normalizes_and_rejects_case_insensitive_duplicate():
 
 @pytest.fixture
 def coupon_user(active_user, guest_identity):
+    active_user.login_phone_number = guest_identity["phone"]
+    active_user.save(update_fields=["login_phone_number"])
     ShippingAddress.objects.create(
         user=active_user,
         recipient_name=guest_identity["name"],
@@ -987,7 +1295,10 @@ def test_concurrent_coupon_confirms_do_not_exceed_usage_limit(
 
     coupon = make_coupon(value="100000", usage_limit=1)
     second = User.objects.create_user(
-        email="second-csa-voucher@example.com", name="Second", status=AccountStatus.ACTIVE
+        email="second-csa-voucher@example.com",
+        login_phone_number="0987654321",
+        name="Second",
+        status=AccountStatus.ACTIVE,
     )
     ShippingAddress.objects.create(
         user=second,

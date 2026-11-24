@@ -11,7 +11,9 @@ from oauth2_provider.models import AccessToken
 from rest_framework.test import APIClient
 
 from commerce.models import ShippingAddress
+from commerce.store_orders import StoreOrderError, _address_for_checkout
 from identity.models import User
+from members.models import MemberProfile
 
 PROVINCE_CODE = "66"
 WARD_CODE = "22015"
@@ -56,17 +58,31 @@ def address_payload(**overrides):
 
 
 def admin_address_payload(expected_updated_at=None, **overrides):
-    return {**address_payload(**overrides), "expected_updated_at": expected_updated_at}
+    return {
+        "province_code": PROVINCE_CODE,
+        "ward_code": WARD_CODE,
+        "address": "Số 12, đường Nguyễn Huệ",
+        "expected_updated_at": expected_updated_at,
+        **overrides,
+    }
 
 
 @pytest.fixture
 def customer(db):
-    return User.objects.create_user(email="customer@example.com", name="Customer", status="active")
+    user = User.objects.create_user(
+        email="customer@example.com",
+        name="Customer",
+        login_phone_number="0912345678",
+        status="active",
+    )
+    MemberProfile.objects.create(user=user, phone_number="0901234567")
+    return user
 
 
 @pytest.mark.django_db
+@pytest.mark.parametrize("first_writer", ["admin", "customer"])
 def test_admin_and_customer_update_the_same_shipping_address(
-    admin_api, customer, oauth_application, default_supported_shipping_area
+    admin_api, customer, oauth_application, default_supported_shipping_area, first_writer
 ):
     detail_url = f"/api/v1/admin/users/{customer.pk}"
     admin_url = f"{detail_url}/shipping-address"
@@ -85,13 +101,27 @@ def test_admin_and_customer_update_the_same_shipping_address(
     assert empty["can_edit_shipping_address"] is True and empty["shipping_address"] is None
     assert "shipping_address" not in admin_api.get("/api/v1/admin/users").json()["data"][0]
 
-    added = admin_api.put(admin_url, admin_address_payload(), format="json")
+    if first_writer == "admin":
+        added = admin_api.put(admin_url, admin_address_payload(), format="json")
+        expected_name, expected_phone = "Customer", "+84912345678"
+    else:
+        body = admin_address_payload()
+        del body["expected_updated_at"]
+        added = customer_api.put(self_url, body, format="json")
+        expected_name, expected_phone = "Customer", "+84912345678"
     assert added.status_code == 200
     assert added["Cache-Control"] == "private, no-store"
     first = added.json()["data"]
-    assert first["phone_number"] == "+84901234567"
+    assert first["recipient_name"] == expected_name
+    assert first["phone_number"] == expected_phone
     assert first["shipping_fee_vnd"] == "30000"
-    assert customer_api.get(self_url).json()["data"] == first
+    self_read = customer_api.get(self_url).json()["data"]
+    version = self_read["shipping_address_version"]
+    assert len(version) == 64
+    assert self_read == {**first, "shipping_address_version": version}
+    admin_address = admin_api.get(detail_url).json()["data"]["shipping_address"]
+    assert "shipping_address_version" not in admin_address
+    assert self_read == {**admin_address, "shipping_address_version": version}
 
     edited = admin_api.put(
         admin_url,
@@ -103,24 +133,157 @@ def test_admin_and_customer_update_the_same_shipping_address(
     assert customer_api.get(self_url).json()["data"]["address"] == "Địa chỉ từ CMS"
 
     self_edit = customer_api.put(
-        self_url, address_payload(address="Địa chỉ từ tài khoản"), format="json"
+        self_url,
+        address_payload(address="Địa chỉ từ tài khoản", phone_number="0987654321"),
+        format="json",
     )
     assert self_edit.status_code == 200
+    assert self_edit.json()["data"]["phone_number"] == customer.login_phone_number
+    assert self_edit.json()["data"]["recipient_name"] == customer.name
+    customer.refresh_from_db()
+    assert customer.login_phone_number == "+84912345678"
     detail = admin_api.get(detail_url)
     assert detail["Cache-Control"] == "private, no-store"
-    assert detail.json()["data"]["shipping_address"] == self_edit.json()["data"]
+    self_address = self_edit.json()["data"]
+    assert self_address["shipping_address_version"] != version
+    assert self_address == {
+        **detail.json()["data"]["shipping_address"],
+        "shipping_address_version": self_address["shipping_address_version"],
+    }
     assert detail.json()["data"]["shipping_address"]["address"] == "Địa chỉ từ tài khoản"
     assert detail.json()["data"]["address"] == ""
     assert ShippingAddress.objects.filter(user=customer).count() == 1
 
     stale = admin_api.put(
         admin_url,
-        admin_address_payload(edited.json()["data"]["updated_at"], recipient_name="Người nhận mới"),
+        admin_address_payload(edited.json()["data"]["updated_at"], address="Địa chỉ cũ từ CMS"),
         format="json",
     )
     assert stale.status_code == 409
     assert stale.json() == {"errors": [{"code": "shipping_address_changed"}]}
     assert customer_api.get(self_url).json()["data"] == self_edit.json()["data"]
+
+    saved = admin_api.put(
+        admin_url,
+        admin_address_payload(self_edit.json()["data"]["updated_at"], address="Đã đổi địa chỉ"),
+        format="json",
+    )
+    assert saved.status_code == 200
+    assert saved.json()["data"]["recipient_name"] == "Customer"
+    assert saved.json()["data"]["phone_number"] == "+84912345678"
+
+
+@pytest.mark.django_db
+def test_self_address_ignores_legacy_contacts_when_login_phone_is_missing(
+    member_api, active_user, default_supported_shipping_area
+):
+    MemberProfile.objects.create(user=active_user, phone_number="0987654321")
+    address = ShippingAddress.objects.create(user=active_user, **address_payload())
+    url = "/api/v1/shipping-address"
+
+    for response in [
+        member_api.get(url),
+        member_api.put(url, address_payload(address="Địa chỉ mới"), format="json"),
+    ]:
+        assert response.status_code == 200, response.json()
+        payload = response.json()["data"]
+        assert payload["recipient_name"] == active_user.name
+        assert payload["phone_number"] == ""
+
+    address.refresh_from_db()
+    assert address.address == "Địa chỉ mới"
+    assert address.recipient_name == "Nguyễn Văn An"
+    assert address.phone_number == "0901234567"
+
+
+@pytest.mark.django_db
+def test_account_address_uses_login_phone_over_old_recipient_phone(member_api, active_user):
+    active_user.login_phone_number = "0912345678"
+    active_user.save(update_fields=["login_phone_number"])
+    ShippingAddress.objects.create(user=active_user, **address_payload(phone_number="0987654321"))
+
+    response = member_api.get("/api/v1/shipping-address")
+    assert response.status_code == 200
+    assert response.json()["data"]["phone_number"] == "+84912345678"
+    assert response.json()["data"]["recipient_name"] == active_user.name
+
+    rejected = member_api.put(
+        "/api/v1/shipping-address", address_payload(login_phone_number="0987654321"), format="json"
+    )
+    assert rejected.status_code == 400
+    active_user.refresh_from_db()
+    assert active_user.login_phone_number == "+84912345678"
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("contact_phone", ["", "123", "0987654321"])
+def test_admin_saves_location_for_accounts_without_a_valid_phone(
+    admin_api, customer, oauth_application, default_supported_shipping_area, contact_phone
+):
+    User.objects.filter(pk=customer.pk).update(login_phone_number=None)
+    customer.refresh_from_db()
+    MemberProfile.objects.filter(user=customer).update(phone_number=contact_phone)
+    response = admin_api.put(
+        f"/api/v1/admin/users/{customer.pk}/shipping-address",
+        admin_address_payload(),
+        format="json",
+    )
+
+    assert response.status_code == 200
+    saved = response.json()["data"]
+    assert saved["phone_number"] == "—"
+    assert ShippingAddress.objects.get(user=customer).phone_number == ""
+    assert saved["address"] == admin_address_payload()["address"]
+    assert (
+        admin_api.get(f"/api/v1/admin/users/{customer.pk}").json()["data"]["shipping_address"]
+        == saved
+    )
+
+    token = AccessToken.objects.create(
+        user=customer,
+        application=oauth_application,
+        token="customer-location-only-test-token",
+        expires=timezone.now() + timezone.timedelta(hours=1),
+        scope="profile email",
+    )
+    customer_api = APIClient()
+    customer_api.credentials(HTTP_AUTHORIZATION=f"Bearer {token.token}")
+    self_url = "/api/v1/shipping-address"
+    self_read = customer_api.get(self_url).json()["data"]
+    version = self_read["shipping_address_version"]
+    assert len(version) == 64
+    assert self_read == {**saved, "phone_number": "", "shipping_address_version": version}
+    with pytest.raises(StoreOrderError) as error:
+        _address_for_checkout(customer, None, lock=False)
+    assert error.value.code == "store_shipping_address_required"
+
+    customer.login_phone_number = "0912345678"
+    customer.save(update_fields=["login_phone_number"])
+    saved_contact = customer_api.get(self_url).json()["data"]
+    assert saved_contact["address"] == saved["address"]
+    assert saved_contact["phone_number"] == "+84912345678"
+    assert saved_contact["shipping_address_version"] != version
+    assert (
+        _address_for_checkout(customer, None, lock=False)[0]["phone_e164_snapshot"]
+        == "+84912345678"
+    )
+
+    changed = customer_api.put(
+        self_url,
+        address_payload(address="Địa chỉ người dùng sửa"),
+        format="json",
+    )
+    assert changed.status_code == 200
+    changed_address = changed.json()["data"]
+    assert changed_address["id"] == saved["id"]
+    assert changed_address["shipping_address_version"] != saved_contact["shipping_address_version"]
+    admin_address = admin_api.get(f"/api/v1/admin/users/{customer.pk}").json()["data"][
+        "shipping_address"
+    ]
+    assert changed_address == {
+        **admin_address,
+        "shipping_address_version": changed_address["shipping_address_version"],
+    }
 
 
 @pytest.mark.django_db
@@ -128,7 +291,9 @@ def test_admin_shipping_address_requires_version_and_preserves_identical_retries
     admin_api, customer, default_supported_shipping_area
 ):
     url = f"/api/v1/admin/users/{customer.pk}/shipping-address"
-    missing_version = admin_api.put(url, address_payload(), format="json")
+    missing_version = admin_address_payload()
+    del missing_version["expected_updated_at"]
+    missing_version = admin_api.put(url, missing_version, format="json")
     assert missing_version.status_code == 400
     assert "expected_updated_at" in missing_version.json()
 
@@ -170,7 +335,7 @@ def test_concurrent_sqlite_admin_shipping_writes_retry_transaction(
             client.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token.token}")
             return client.put(
                 f"/api/v1/admin/users/{customer.pk}/shipping-address",
-                admin_address_payload(recipient_name=f"Người nhận {index}"),
+                admin_address_payload(address=f"Địa chỉ {index}"),
                 format="json",
             ).status_code
         finally:
@@ -190,6 +355,7 @@ def test_mysql_shipping_write_locks_actor_shared_before_later_target(
     customer = User.objects.create_user(
         id=UUID(int=active_user.pk.int + 1), email="lock-review@example.com", status="active"
     )
+    MemberProfile.objects.create(user=customer, phone_number="0901234567")
     with CaptureQueriesContext(connection) as queries:
         response = admin_api.put(
             f"/api/v1/admin/users/{customer.pk}/shipping-address",
@@ -254,7 +420,11 @@ def test_admin_shipping_address_rejects_protected_targets(admin_api, customer, p
     assert saved.address == "Số 12, đường Nguyễn Huệ"
     detail = admin_api.get(url).json()["data"]
     assert detail["can_edit_shipping_address"] is False
-    assert detail["shipping_address"] is None
+    if protected in {"deletion_requested", "anonymized"}:
+        assert detail["shipping_address"] is None
+    else:
+        assert detail["shipping_address"]["id"] == str(saved.pk)
+        assert detail["shipping_address"]["address"] == saved.address
 
 
 @pytest.mark.django_db
@@ -269,6 +439,53 @@ def test_admin_shipping_address_returns_not_found_for_unknown_uuid(admin_api):
 
 
 @pytest.mark.django_db
+def test_legacy_cms_can_save_location_without_replacing_account_contact(
+    admin_api, customer, default_supported_shipping_area
+):
+    url = f"/api/v1/admin/users/{customer.pk}/shipping-address"
+    legacy_contact = {"recipient_name": "Tên từ CMS cũ", "phone_number": "0987654321"}
+
+    created = admin_api.put(url, admin_address_payload(**legacy_contact), format="json")
+    assert created.status_code == 200, created.json()
+    first = created.json()["data"]
+    assert first["recipient_name"] == customer.name
+    assert first["phone_number"] == customer.login_phone_number
+
+    updated = admin_api.put(
+        url,
+        admin_address_payload(first["updated_at"], address="Địa chỉ mới", **legacy_contact),
+        format="json",
+    )
+    assert updated.status_code == 200, updated.json()
+    assert updated.json()["data"]["id"] == first["id"]
+    saved = ShippingAddress.objects.get(user=customer)
+    assert saved.address == "Địa chỉ mới"
+    assert saved.recipient_name == customer.name
+    assert saved.phone_number == customer.login_phone_number
+    customer.refresh_from_db()
+    assert customer.login_phone_number == "+84912345678"
+
+
+@pytest.mark.django_db
+def test_legacy_cms_can_read_its_saved_location_when_the_account_has_no_contact(
+    admin_api, customer, default_supported_shipping_area
+):
+    User.objects.filter(pk=customer.pk).update(login_phone_number=None, name="")
+    MemberProfile.objects.filter(user=customer).update(phone_number="")
+    user_url = f"/api/v1/admin/users/{customer.pk}"
+    payload = admin_address_payload(recipient_name="Old CMS name", phone_number="0987654321")
+    saved = admin_api.put(f"{user_url}/shipping-address", payload, format="json")
+
+    assert saved.status_code == 200, saved.json()
+    address = saved.json()["data"]
+    assert address["recipient_name"] == address["phone_number"] == "—"
+    assert admin_api.get(user_url).json()["data"]["shipping_address"] == address
+    row = ShippingAddress.objects.get(user=customer)
+    assert row.address == payload["address"]
+    assert row.recipient_name == row.phone_number == ""
+
+
+@pytest.mark.django_db
 def test_admin_shipping_address_validates_updates_and_preserves_the_saved_address(
     admin_api, customer, default_supported_shipping_area
 ):
@@ -277,7 +494,11 @@ def test_admin_shipping_address_validates_updates_and_preserves_the_saved_addres
     assert added.status_code == 200
     first = added.json()["data"]
 
-    for field, invalid in [("phone_number", "123"), ("ward_code", "00004"), ("user_id", "other")]:
+    for field, invalid in [
+        ("login_phone_number", "+84987654321"),
+        ("ward_code", "00004"),
+        ("user_id", "other"),
+    ]:
         response = admin_api.put(
             url,
             admin_address_payload(
@@ -403,7 +624,11 @@ def test_public_shipping_areas_only_returns_active_wards_and_quotes_server_fee(a
 
 
 @pytest.mark.django_db
-def test_user_has_one_shipping_address_and_backend_validates_supported_area(admin_api, member_api):
+def test_user_has_one_shipping_address_and_backend_validates_supported_area(
+    admin_api, member_api, active_user
+):
+    active_user.login_phone_number = "0901234567"
+    active_user.save(update_fields=["login_phone_number"])
     empty = member_api.get("/api/v1/shipping-address")
     assert empty.status_code == 200
     assert empty.json()["data"] is None
@@ -423,22 +648,22 @@ def test_user_has_one_shipping_address_and_backend_validates_supported_area(admi
     created = member_api.put("/api/v1/shipping-address", address_payload(), format="json")
     assert created.status_code == 200, created.json()
     first = created.json()["data"]
-    assert first["recipient_name"] == "Nguyễn Văn An"
+    assert first["recipient_name"] == active_user.name
     assert first["phone_number"] == "+84901234567"
     assert first["is_supported"] is True
     assert first["shipping_fee_vnd"] == "30000"
 
     updated = member_api.put(
         "/api/v1/shipping-address",
-        address_payload(recipient_name="Nguyễn Văn Bình"),
+        address_payload(address="Địa chỉ mới"),
         format="json",
     )
     assert updated.status_code == 200
     assert updated.json()["data"]["id"] == first["id"]
-    assert updated.json()["data"]["recipient_name"] == "Nguyễn Văn Bình"
+    assert updated.json()["data"]["address"] == "Địa chỉ mới"
     repeated = member_api.put(
         "/api/v1/shipping-address",
-        address_payload(recipient_name="Nguyễn Văn Bình"),
+        address_payload(address="Địa chỉ mới"),
         format="json",
     )
     assert repeated.status_code == 200

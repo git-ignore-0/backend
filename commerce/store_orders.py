@@ -28,7 +28,11 @@ from commerce.models import (
     StoreStockMovementKind,
     StoreStockReservation,
 )
-from commerce.shipping import active_shipping_area
+from commerce.shipping import (
+    active_shipping_area,
+    shipping_address_version,
+    shipping_recipient_details,
+)
 from commerce.store_delivery import (
     companion_benefits,
     lock_companion_sources,
@@ -337,22 +341,26 @@ def _validate_address(payload):
 
 def _address_for_checkout(user, guest, *, lock=True):
     if user and user.is_authenticated:
+        addresses = ShippingAddress.objects
+        # The locking callers already hold a shared User lock. Fetch the
+        # related User separately so FOR UPDATE applies to the address only.
+        addresses = addresses.select_for_update() if lock else addresses.select_related("user")
         try:
-            address = (
-                ShippingAddress.objects.select_for_update() if lock else ShippingAddress.objects
-            ).get(user=user)
+            address = addresses.get(user=user)
         except ShippingAddress.DoesNotExist as error:
             raise StoreOrderError("store_shipping_address_required") from error
+        contact = shipping_recipient_details(address)
+        if not all(contact.values()):
+            raise StoreOrderError("store_shipping_address_required")
         address_values, area = _validate_address(
             {
-                "recipient_name": address.recipient_name,
-                "phone_number": address.phone_number,
+                **contact,
                 "province_code": address.province_code,
                 "ward_code": address.ward_code,
                 "address": address.address,
             }
         )
-        return address_values, area, address.updated_at
+        return address_values, area, address
     if not guest:
         raise StoreOrderError("store_guest_address_required")
     address_values, area = _validate_address(guest)
@@ -442,13 +450,36 @@ def calculate_store_quote(*, user, payload, lock=False, check_expected=False, dr
         # Match Product -> identity -> address/quota, but keep actor FK writes
         # compatible while cancellation/approval already holds Membership.
         _lock_checkout_identity(user)
-    address, area, address_updated_at = _address_for_checkout(user, payload.get("guest"), lock=lock)
-    if check_expected and user and user.is_authenticated:
-        expected_address_updated_at = payload.get("shipping_address_updated_at")
-        if expected_address_updated_at is None or expected_address_updated_at != address_updated_at:
-            raise StoreOrderError(
-                "store_requote_required", context={"reason": "shipping_address_changed"}
-            )
+    address, area, saved_address = _address_for_checkout(user, payload.get("guest"), lock=lock)
+    address_updated_at = saved_address.updated_at if saved_address else None
+    address_version = (
+        shipping_address_version(
+            saved_address,
+            recipient_name=address["recipient_name_snapshot"],
+            phone_number=address["phone_e164_snapshot"],
+        )
+        if saved_address
+        else None
+    )
+    if check_expected:
+        expected_version = payload.get("shipping_address_version")
+        if saved_address is None and expected_version is not None:
+            raise StoreOrderError("store_shipping_address_invalid")
+        if saved_address is not None:
+            if expected_version is None:
+                # Timestamp-only attempts reviewed the recipient stored on the address.
+                expected_version = shipping_address_version(
+                    saved_address,
+                    recipient_name=saved_address.recipient_name,
+                    phone_number=saved_address.phone_number,
+                )
+            if (
+                payload.get("shipping_address_updated_at") != address_updated_at
+                or expected_version != address_version
+            ):
+                raise StoreOrderError(
+                    "store_requote_required", context={"reason": "shipping_address_changed"}
+                )
     membership = _active_membership_for_user(user, lock=lock)
 
     if lock:
@@ -615,6 +646,7 @@ def calculate_store_quote(*, user, payload, lock=False, check_expected=False, dr
     return {
         "address": address,
         "address_updated_at": address_updated_at,
+        "address_version": address_version,
         "line_values": line_values,
         "subtotal": subtotal,
         "shipping_fee": shipping_fee,
@@ -646,6 +678,7 @@ def preview_store_voucher(*, user, payload, draft_coupon=None):
         "shipping_address_updated_at": quote["address_updated_at"].isoformat()
         if quote["address_updated_at"]
         else None,
+        "shipping_address_version": quote["address_version"],
         "lines": [
             {
                 "product_id": str(product.pk),

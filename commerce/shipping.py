@@ -1,8 +1,10 @@
+import json
 from dataclasses import dataclass
 from sqlite3 import SQLITE_BUSY, SQLITE_LOCKED
 from time import sleep
 
 from django.db import OperationalError, connection, transaction
+from django.utils.crypto import salted_hmac
 
 from commerce.models import ShippingAddress, ShippingArea, ShippingProvinceRule
 from identity.admin_services import (
@@ -12,6 +14,7 @@ from identity.admin_services import (
 )
 from identity.models import AccountStatus, User
 from members.administrative_units import province_choices, ward_choices
+from memberships.phones import InvalidPhoneNumber, normalize_vietnam_phone
 
 
 class UnsupportedShippingArea(Exception):
@@ -166,12 +169,33 @@ def public_shipping_area_payloads(locale):
     return result
 
 
-def shipping_address_payload(item):
+def shipping_address_version(item, *, recipient_name, phone_number):
+    try:
+        phone_number = normalize_vietnam_phone(phone_number)
+    except InvalidPhoneNumber:
+        pass  # A saved address with incomplete contact remains readable.
+    values = [
+        str(item.pk),
+        item.updated_at.isoformat(),
+        recipient_name.strip(),
+        phone_number.strip(),
+        item.province_code.strip(),
+        item.ward_code.strip(),
+        item.address.strip(),
+    ]
+    return salted_hmac(
+        "commerce.shipping-address-version",
+        json.dumps(values, ensure_ascii=False, separators=(",", ":")),
+        algorithm="sha256",
+    ).hexdigest()
+
+
+def shipping_address_payload(item, *, include_checkout_version=False):
     area = active_shipping_area(province_code=item.province_code, ward_code=item.ward_code)
-    return {
+    contact = shipping_recipient_details(item)
+    payload = {
         "id": str(item.pk),
-        "recipient_name": item.recipient_name,
-        "phone_number": item.phone_number,
+        **contact,
         "province_code": item.province_code,
         "ward_code": item.ward_code,
         "address": item.address,
@@ -180,6 +204,17 @@ def shipping_address_payload(item):
         "created_at": item.created_at.isoformat(),
         "updated_at": item.updated_at.isoformat(),
     }
+    if include_checkout_version:
+        payload["shipping_address_version"] = shipping_address_version(item, **contact)
+    return payload
+
+
+def admin_shipping_address_payload(item):
+    payload = shipping_address_payload(item)
+    # Older CMS clients require nonempty legacy display fields even for location-only records.
+    for field in ("recipient_name", "phone_number"):
+        payload[field] = payload[field] or "—"
+    return payload
 
 
 def can_edit_admin_shipping_address(user, *, actor):
@@ -187,6 +222,18 @@ def can_edit_admin_shipping_address(user, *, actor):
         AccountStatus.DELETION_REQUESTED,
         AccountStatus.ANONYMIZED,
     } and not is_protected_account_target(user, actor=actor)
+
+
+def _shipping_contact_from_account(user):
+    try:
+        phone = normalize_vietnam_phone(user.login_phone_number or "")
+    except InvalidPhoneNumber:
+        phone = ""
+    return {"recipient_name": user.name.strip(), "phone_number": phone}
+
+
+def shipping_recipient_details(item, *, user=None):
+    return _shipping_contact_from_account(user if user is not None else item.user)
 
 
 def _write_shipping_address(*, user, data, expected_updated_at=_UNCONDITIONAL_WRITE):
@@ -202,7 +249,9 @@ def _write_shipping_address(*, user, data, expected_updated_at=_UNCONDITIONAL_WR
     if expected_updated_at is not _UNCONDITIONAL_WRITE and expected_updated_at != current_version:
         raise AccountConflict("shipping_address_changed")
     if item is None:
-        return ShippingAddress.objects.create(user=user, **data)
+        return ShippingAddress.objects.create(
+            user=user, **data, **_shipping_contact_from_account(user)
+        )
     for field, value in data.items():
         setattr(item, field, value)
     item.save(update_fields=[*data, "updated_at"])

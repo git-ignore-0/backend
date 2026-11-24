@@ -100,15 +100,26 @@ def resolve_tracker_request(token) -> CSAPurchaseRequest:
 
 
 def lookup_tracker_request(*, reference_code: str, phone_e164: str) -> CSAPurchaseRequest:
+    return _lookup_tracker_request(
+        CSAPurchaseRequest.objects.filter(request_code=reference_code, phone_e164=phone_e164)
+    )
+
+
+def lookup_owned_tracker_request(*, reference_code: str, user_id) -> CSAPurchaseRequest:
+    return _lookup_tracker_request(
+        CSAPurchaseRequest.objects.filter(request_code=reference_code, user_id=user_id)
+    )
+
+
+def _lookup_tracker_request(queryset) -> CSAPurchaseRequest:
     item = (
-        CSAPurchaseRequest.objects.select_related(
+        queryset.select_related(
             "membership",
             "csa_contract",
             "csa_contract__membership",
             "csa_contract__current_version",
         )
         .prefetch_related("csa_contract__versions", "payments")
-        .filter(request_code=reference_code, phone_e164=phone_e164)
         .first()
     )
     if item is None:
@@ -136,7 +147,7 @@ def _available_pdf_locales(contract: CSAContract) -> list[str]:
     ]
 
 
-def tracker_request_payload(item: CSAPurchaseRequest) -> dict:
+def tracker_request_payload(item: CSAPurchaseRequest, *, owner_lookup=False) -> dict:
     data = {
         "reference_code": item.request_code,
         "reference_type": "request",
@@ -177,7 +188,11 @@ def tracker_request_payload(item: CSAPurchaseRequest) -> dict:
                 "versions": contract_versions_payload(contract),
                 "available_pdf_locales": locales,
                 "pdf_available": bool(locales),
-                "pdf_action": "/api/v1/public/csa-contract-tracker/contract/pdf",
+                "pdf_action": (
+                    f"/api/v1/memberships/{item.membership_id}/contract/pdf"
+                    if owner_lookup
+                    else "/api/v1/public/csa-contract-tracker/contract/pdf"
+                ),
             }
         )
     elif item.status == CSAPurchaseRequestStatus.REJECTED:

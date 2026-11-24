@@ -54,8 +54,8 @@ class ShippingAddress(models.Model):
         related_name="shipping_address",
         on_delete=models.CASCADE,
     )
-    recipient_name = models.CharField(max_length=200)
-    phone_number = models.CharField(max_length=32)
+    recipient_name = models.CharField(max_length=200, blank=True)
+    phone_number = models.CharField(max_length=32, blank=True)
     province_code = models.CharField(max_length=2)
     ward_code = models.CharField(max_length=5)
     address = models.CharField(max_length=500)

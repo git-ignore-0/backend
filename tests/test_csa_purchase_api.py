@@ -87,6 +87,8 @@ def payment_settings():
 
 @pytest.fixture
 def complete_member_profile(active_user):
+    active_user.login_phone_number = "0901234567"
+    active_user.save(update_fields=["login_phone_number"])
     MemberProfile.objects.create(
         user=active_user,
         phone_number="0901234567",
@@ -473,8 +475,8 @@ def test_authenticated_user_creates_only_their_own_request(
     data = response.json()["data"]
     purchase = CSAPurchaseRequest.objects.get(pk=data["id"])
     assert purchase.user == active_user
-    assert purchase.name_snapshot == complete_member_profile.recipient_name
-    assert purchase.phone_e164 == "+84901234567"
+    assert purchase.name_snapshot == active_user.name
+    assert purchase.phone_e164 == active_user.login_phone_number
     assert purchase.province_code_snapshot == complete_member_profile.province_code
     assert purchase.ward_code_snapshot == complete_member_profile.ward_code
     assert purchase.address_snapshot == complete_member_profile.address
@@ -494,7 +496,6 @@ def test_authenticated_request_snapshots_without_updating_auth_or_live_data(
 ):
     package, option = package_and_option
     original_user_name = active_user.name
-    original_recipient_name = complete_member_profile.recipient_name
     original_profile_values = (
         complete_member_profile.phone_number,
         complete_member_profile.province_code,
@@ -537,7 +538,7 @@ def test_authenticated_request_snapshots_without_updating_auth_or_live_data(
     payment_settings.save(update_fields=["account_number", "updated_at"])
     purchase.refresh_from_db()
 
-    assert purchase.name_snapshot == original_recipient_name
+    assert purchase.name_snapshot == original_user_name
     assert purchase.email_snapshot != active_user.email
     assert purchase.phone_e164 == "+84901234567"
     assert purchase.address_snapshot == original_profile_values[3]
@@ -577,7 +578,7 @@ def test_authenticated_identity_payload_is_ignored_in_favor_of_locked_profile(
 
     assert response.status_code == 201
     purchase = CSAPurchaseRequest.objects.get(pk=response.json()["data"]["id"])
-    assert purchase.name_snapshot == complete_member_profile.recipient_name
+    assert purchase.name_snapshot == active_user.name
     assert purchase.phone_e164 == "+84901234567"
     assert purchase.province_code_snapshot == "66"
     assert purchase.ward_code_snapshot == "22015"
@@ -588,7 +589,7 @@ def test_authenticated_identity_payload_is_ignored_in_favor_of_locked_profile(
 
 @pytest.mark.parametrize(
     "missing_field",
-    ["address_record", "recipient_name", "phone_number", "province_code", "ward_code", "address"],
+    ["address_record", "name", "login_phone_number", "province_code", "ward_code", "address"],
 )
 @pytest.mark.django_db
 def test_authenticated_user_with_incomplete_delivery_address_is_rejected(
@@ -602,6 +603,9 @@ def test_authenticated_user_with_incomplete_delivery_address_is_rejected(
     package, option = package_and_option
     if missing_field == "address_record":
         complete_member_profile.delete()
+    elif missing_field in {"name", "login_phone_number"}:
+        setattr(active_user, missing_field, "")
+        active_user.save(update_fields=[missing_field])
     else:
         setattr(complete_member_profile, missing_field, "")
         complete_member_profile.save(update_fields=[missing_field, "updated_at"])
@@ -621,6 +625,35 @@ def test_authenticated_user_with_incomplete_delivery_address_is_rejected(
     assert response.json()["errors"][0]["code"] == "csa_purchase_auth_account_incomplete"
     assert "delivery address" in response.json()["errors"][0]["message"].lower()
     assert CSAPurchaseRequest.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_csa_uses_account_contact_when_shared_address_has_only_location(
+    package_and_option, payment_settings, active_user, complete_member_profile, access_token
+):
+    package, option = package_and_option
+    ShippingAddress.objects.filter(pk=complete_member_profile.pk).update(
+        recipient_name="", phone_number=""
+    )
+    active_user.login_phone_number = "0987654321"
+    active_user.save(update_fields=["login_phone_number"])
+
+    response = bearer_client(access_token).post(
+        CREATE_URL,
+        {
+            "package_id": str(package.pk),
+            "price_option_id": str(option.pk),
+            "terms_accepted": True,
+            **terms_acceptance(),
+        },
+        format="json",
+    )
+
+    assert response.status_code == 201
+    purchase = CSAPurchaseRequest.objects.get(pk=response.json()["data"]["id"])
+    assert purchase.name_snapshot == active_user.name
+    assert purchase.phone_e164 == "+84987654321"
+    assert purchase.address_snapshot == complete_member_profile.address
 
 
 @pytest.mark.django_db

@@ -7,6 +7,7 @@ from allauth.account.models import EmailAddress
 from django.apps import apps
 from django.conf import settings
 from django.contrib.auth.models import Group
+from django.db import connection
 from django.urls import reverse
 from django.utils import timezone
 from oauth2_provider.models import AccessToken
@@ -426,6 +427,9 @@ def test_admin_authorization_search_pagination_detail_and_point_creation(admin_a
     )
     assert created.status_code == 201
     assert created.json()["data"]["balance"] == 50
+    history = admin_api.get(f"/api/v1/admin/users/{target.pk}/points").json()
+    assert history["meta"]["can_adjust_points"] is True
+    assert history["meta"]["balance"] == 50
     too_large = admin_api.post(
         f"/api/v1/admin/users/{target.pk}/points",
         {
@@ -436,6 +440,64 @@ def test_admin_authorization_search_pagination_detail_and_point_creation(admin_a
         format="json",
     )
     assert too_large.status_code == 400
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("protected_as", ["self", "staff", "superuser", "website_admin"])
+def test_admin_point_history_is_read_only_for_protected_targets(
+    admin_api, active_user, protected_as
+):
+    target = active_user
+    if protected_as != "self":
+        target = create_active_user("protected@example.com")
+        if protected_as == "website_admin":
+            target.groups.add(Group.objects.get(name="website_admin"))
+        else:
+            field = f"is_{protected_as}"
+            setattr(target, field, True)
+            target.save(update_fields=[field])
+    existing, _ = create_point_transaction(
+        user=target, actor=active_user, direction="credit", amount=25, message="Existing points"
+    )
+    url = f"/api/v1/admin/users/{target.pk}/points"
+    rejected = admin_api.post(
+        url, {"direction": "debit", "amount": 10, "message": "Adjust points"}, format="json"
+    )
+    assert rejected.status_code == 409
+    assert rejected.json()["errors"][0]["code"] == "account_target_protected"
+    assert point_balance(target) == 25
+    assert PointTransaction.objects.filter(user=target).count() == 1
+
+    history = admin_api.get(url)
+    assert history.status_code == 200
+    assert history.json()["meta"]["can_adjust_points"] is False
+    assert history.json()["meta"]["balance"] == 25
+    assert [item["id"] for item in history.json()["data"]] == [str(existing.pk)]
+
+
+@pytest.mark.django_db
+def test_admin_point_write_locks_the_ledger_account_before_the_target_user(admin_api, monkeypatch):
+    target = create_active_user("point-target@example.com")
+    locking_queries = []
+
+    def capture(execute, sql, params, many, context):
+        if "FOR UPDATE" in sql:
+            locking_queries.append(sql)
+            if connection.vendor == "sqlite":
+                sql = sql.replace(" FOR UPDATE", "")
+        return execute(sql, params, many, context)
+
+    monkeypatch.setattr(connection.features, "has_select_for_update", True)
+    with connection.execute_wrapper(capture):
+        response = admin_api.post(
+            f"/api/v1/admin/users/{target.pk}/points",
+            {"direction": "credit", "amount": 20, "message": "Adjust points"},
+            format="json",
+        )
+
+    assert response.status_code == 201
+    assert ReferralAccount._meta.db_table in locking_queries[0]
+    assert User._meta.db_table in locking_queries[1]
 
 
 @pytest.mark.django_db
@@ -474,5 +536,4 @@ def test_referral_and_admin_user_projections_accept_user_without_email(admin_api
     for row in (listed[0], detail):
         assert row["id"] == str(invitee.pk)
         assert row["email"] is None and row["email_verified"] is False
-        assert row["login_phone_number"] == "+84912345678"
-        assert row["phone"] == ""
+        assert row["phone"] == row["login_phone_number"] == "+84912345678"

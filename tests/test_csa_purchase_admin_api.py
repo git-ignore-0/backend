@@ -14,6 +14,7 @@ from pypdf import PdfReader
 from rest_framework.test import APIClient
 
 from commerce.models import ShippingAddress, ShippingArea
+from identity.locks import lock_user_for_shared_read
 from identity.models import AccountStatus, AuditLog, User
 from members.models import MemberProfile
 from memberships.models import (
@@ -42,6 +43,7 @@ from memberships.purchases import (
     confirm_csa_payment_quote,
     create_csa_payment_quote,
     create_public_csa_purchase_request,
+    mark_csa_purchase_request_refunded,
     reject_csa_purchase_request,
     update_membership_payment_settings,
 )
@@ -127,10 +129,12 @@ def request_factory(package_and_option, payment_settings):
         address="Số 12, ngõ 5",
         user=None,
         terms_locale="vi",
+        payment_plan_id=None,
     ):
         item, _token = create_public_csa_purchase_request(
             package_id=package.pk,
             price_option_id=option.pk,
+            payment_plan_id=payment_plan_id,
             phone=phone,
             name=name,
             province_code=province_code,
@@ -160,7 +164,10 @@ def coupon_snapshot_user(identity):
     from identity.models import User
 
     user = User.objects.create_user(
-        email="coupon-snapshot@example.com", name=identity["name"], status=AccountStatus.ACTIVE
+        email="coupon-snapshot@example.com",
+        login_phone_number=identity["phone"],
+        name=identity["name"],
+        status=AccountStatus.ACTIVE,
     )
     ShippingAddress.objects.create(
         user=user,
@@ -233,6 +240,7 @@ def customer_from_request(item, *, user=None, **overrides):
 def create_purchase_user(*, phone="0901234567"):
     user = User.objects.create_user(
         email=f"buyer-{phone}@example.com",
+        login_phone_number=phone,
         name="Nguyễn Văn An",
         password="StrongPassword12",
         status=AccountStatus.ACTIVE,
@@ -416,6 +424,137 @@ def test_admin_cannot_approve_pending_request(admin_api, request_factory):
     assert response.json()["errors"] == [{"code": "csa_purchase_request_state_conflict"}]
     assert not CSACustomer.objects.exists()
     assert not Membership.objects.exists()
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("customer_state", ["new", "unmanaged"])
+def test_member_approval_locks_owner_before_purchase_request(
+    admin_api, active_user, request_factory, monkeypatch, customer_state
+):
+    from django.db.models.query import QuerySet
+
+    from memberships import purchases
+    from memberships.models import CSAPurchaseRequest
+
+    item = request_factory(user=create_purchase_user())
+    if customer_state == "unmanaged":
+        customer_from_request(item)
+    fetch = QuerySet._fetch_all
+    locked = []
+
+    def observe_locks(queryset):
+        if queryset.query.select_for_update and queryset.model in {User, CSAPurchaseRequest}:
+            locked.append(("exclusive", queryset.model))
+        return fetch(queryset)
+
+    def observe_shared_lock(user_id):
+        locked.append(("shared", user_id))
+        lock_user_for_shared_read(user_id)
+
+    # The standalone expiry check finishes before the approval transaction starts.
+    monkeypatch.setattr(
+        "memberships.purchases.expire_csa_purchase_request_if_due", lambda **_: False
+    )
+    monkeypatch.setattr(purchases, "lock_user_for_shared_read", observe_shared_lock)
+    monkeypatch.setattr(QuerySet, "_fetch_all", observe_locks)
+    response = admin_api.post(
+        request_url(item, "approve"), {"start_date": str(timezone.localdate())}, format="json"
+    )
+    assert response.status_code == 200, response.json()
+    # Serialize customer creation when two historical requests share an owner.
+    assert locked[:3] == [
+        *(
+            ("exclusive", User) if user_id == item.user_id else ("shared", user_id)
+            for user_id in sorted([active_user.pk, item.user_id])
+        ),
+        ("exclusive", CSAPurchaseRequest),
+    ]
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "operation", ["reject_request", "refund", "confirm_payment", "reject_payment"]
+)
+def test_admin_csa_mutations_share_actor_lock_before_locking_purchase_request(
+    monkeypatch, request_factory, package_and_option, operation
+):
+    from django.db.models.query import QuerySet
+
+    from memberships import payments, purchases
+    from memberships.models import CSAPurchaseRequest
+    from tests.test_csa_payment_quotes import make_plan
+
+    actor = create_purchase_user()
+    if operation in {"confirm_payment", "reject_payment"}:
+        _, option = package_and_option
+        plan = make_plan(option, payment_type=MembershipPaymentType.INSTALLMENT)
+        item = request_factory(user=actor, payment_plan_id=plan.pk)
+        approve_csa_purchase_request(
+            request_id=item.pk, start_date=timezone.localdate(), actor=actor
+        )
+    else:
+        item = request_factory(user=actor)
+        if operation == "refund":
+            reject_csa_purchase_request(request_id=item.pk, reason="Cancelled", actor=actor)
+
+    fetch = QuerySet._fetch_all
+    locked = []
+
+    def observe_request_lock(queryset):
+        if queryset.query.select_for_update and queryset.model is CSAPurchaseRequest:
+            locked.append(("exclusive", item.pk))
+        return fetch(queryset)
+
+    def observe_actor_lock(user_id):
+        locked.append(("shared", user_id))
+        lock_user_for_shared_read(user_id)
+
+    # Expiry uses its own transaction and writes no actor FK.
+    monkeypatch.setattr(purchases, "expire_csa_purchase_request_if_due", lambda **_: False)
+    monkeypatch.setattr(purchases, "lock_user_for_shared_read", observe_actor_lock)
+    monkeypatch.setattr(payments, "lock_user_for_shared_read", observe_actor_lock)
+    monkeypatch.setattr(QuerySet, "_fetch_all", observe_request_lock)
+    if operation == "reject_request":
+        reject_csa_purchase_request(request_id=item.pk, reason="Cancelled", actor=actor)
+    elif operation == "refund":
+        mark_csa_purchase_request_refunded(request_id=item.pk, actor=actor)
+    elif operation == "confirm_payment":
+        payments.confirm_csa_payment(
+            request_id=item.pk, installment_sequence=2, amount_paid="800000", actor=actor
+        )
+    else:
+        payments.reject_csa_payment(
+            request_id=item.pk, installment_sequence=2, reason="No transfer", actor=actor
+        )
+
+    assert locked[:2] == [("shared", actor.pk), ("exclusive", item.pk)]
+
+
+@pytest.mark.django_db
+def test_approved_owner_recovery_offers_a_pdf_download_without_tracker_cookie(
+    admin_api, active_user, request_factory
+):
+    active_user.login_phone_number = "+84901234567"
+    active_user.save(update_fields=["login_phone_number"])
+    ShippingAddress.objects.create(
+        user=active_user, province_code="66", ward_code="22015", address="Số 12, ngõ 5"
+    )
+    item = request_factory(user=active_user)
+    approved = admin_api.post(
+        request_url(item, "approve"), {"start_date": str(timezone.localdate())}, format="json"
+    )
+    assert approved.status_code == 200, approved.json()
+
+    recovered = admin_api.get(f"/api/v1/csa-purchase-requests/{item.request_code}")
+
+    assert recovered.status_code == 200, recovered.json()
+    assert not recovered.cookies
+    data = recovered.json()["data"]
+    assert data["pdf_available"] is True
+    pdf = admin_api.get(data["pdf_action"], {"locale": "vi"})
+    assert pdf.status_code == 200
+    assert pdf["Content-Type"] == "application/pdf"
+    assert b"".join(pdf.streaming_content).startswith(b"%PDF-")
 
 
 @pytest.mark.parametrize("inactive_target", ["package", "option"])

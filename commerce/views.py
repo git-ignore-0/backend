@@ -15,6 +15,7 @@ from commerce.public_catalog import (
     public_product_queryset,
 )
 from commerce.serializers import (
+    AccountShippingAddressSerializer,
     AdminShippingAddressSerializer,
     CategoryQuerySerializer,
     CategoryWriteSerializer,
@@ -22,7 +23,6 @@ from commerce.serializers import (
     ProductWriteSerializer,
     PublicStoreLocaleSerializer,
     PublicStoreProductQuerySerializer,
-    ShippingAddressSerializer,
     ShippingLocaleSerializer,
     ShippingQuoteSerializer,
     ShippingSettingsSerializer,
@@ -40,6 +40,7 @@ from commerce.shipping import (
     ShippingAddressBusy,
     UnsupportedShippingArea,
     active_shipping_area,
+    admin_shipping_address_payload,
     public_shipping_area_payloads,
     save_admin_shipping_address,
     save_shipping_address,
@@ -214,10 +215,11 @@ class SelfShippingAddressView(APIView):
 
     def get(self, request):
         item = ShippingAddress.objects.filter(user=request.user).first()
-        return no_store(Response({"data": shipping_address_payload(item) if item else None}))
+        payload = shipping_address_payload(item, include_checkout_version=True) if item else None
+        return no_store(Response({"data": payload}))
 
     def put(self, request):
-        serializer = ShippingAddressSerializer(data=request.data)
+        serializer = AccountShippingAddressSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         try:
             item = save_shipping_address(user=request.user, data=serializer.validated_data)
@@ -225,7 +227,9 @@ class SelfShippingAddressView(APIView):
             return no_store(unsupported_shipping_area_response())
         except ShippingAddressBusy:
             return no_store(shipping_address_busy_response())
-        return no_store(Response({"data": shipping_address_payload(item)}))
+        return no_store(
+            Response({"data": shipping_address_payload(item, include_checkout_version=True)})
+        )
 
 
 def unsupported_shipping_area_response():
@@ -262,7 +266,7 @@ class AdminUserShippingAddressView(AdminAccountAPIView):
             return unsupported_shipping_area_response()
         except ShippingAddressBusy:
             return shipping_address_busy_response()
-        return Response({"data": shipping_address_payload(item)})
+        return Response({"data": admin_shipping_address_payload(item)})
 
 
 def shipping_address_busy_response():

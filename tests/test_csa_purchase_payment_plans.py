@@ -343,6 +343,8 @@ def test_authenticated_create_accepts_only_selected_plan_and_server_identity(
 ):
     package, option = catalog
     plan = make_plan(option)
+    active_user.login_phone_number = "+84901234567"
+    active_user.save(update_fields=["login_phone_number"])
     ShippingAddress.objects.create(
         user=active_user,
         recipient_name="Delivery recipient",
@@ -370,7 +372,7 @@ def test_authenticated_create_accepts_only_selected_plan_and_server_identity(
     assert response.status_code == 201
     item = CSAPurchaseRequest.objects.get(pk=response.json()["data"]["id"])
     assert item.user_id == active_user.pk
-    assert item.name_snapshot == "Delivery recipient"
+    assert item.name_snapshot == active_user.name
     assert item.phone_e164 == "+84901234567"
     assert item.payment_plan_id == plan.pk
     assert "guest_confirmation_token" not in response.json()["data"]

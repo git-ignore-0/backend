@@ -7,6 +7,7 @@ from django.db import transaction
 from django.db.models import Sum
 from django.utils import timezone
 
+from identity.locks import lock_user_for_shared_read
 from identity.models import AuditLog
 from memberships.coupons import CouponError, calculate_coupon_discount, normalize_coupon_code
 from memberships.models import (
@@ -358,6 +359,8 @@ def confirm_csa_payment(*, request_id, installment_sequence, amount_paid, actor,
     documents = None
     try:
         with transaction.atomic():
+            if actor is not None:
+                lock_user_for_shared_read(actor.pk)
             try:
                 item = CSAPurchaseRequest.objects.select_for_update().get(pk=request_id)
             except CSAPurchaseRequest.DoesNotExist as error:
@@ -414,6 +417,8 @@ def reject_csa_payment(*, request_id, installment_sequence, reason, actor):
     reason = str(reason or "").strip()
     if not reason:
         raise CSAPaymentStateConflict("Payment rejection reason is required")
+    if actor is not None:
+        lock_user_for_shared_read(actor.pk)
     try:
         item = CSAPurchaseRequest.objects.select_for_update().get(pk=request_id)
     except CSAPurchaseRequest.DoesNotExist as error:

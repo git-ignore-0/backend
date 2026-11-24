@@ -160,7 +160,10 @@ def test_mysql_last_voucher_use_across_csa_and_store(context, catalog, active_us
     CSACoupon.objects.filter(pk=voucher.pk).update(usage_limit=1)
     voucher.refresh_from_db()
     second = User.objects.create_user(
-        email="second-voucher@example.com", name="Second", status=AccountStatus.ACTIVE
+        email="second-voucher@example.com",
+        login_phone_number="0987654321",
+        name="Second",
+        status=AccountStatus.ACTIVE,
     )
     ShippingAddress.objects.create(
         user=second,
@@ -423,10 +426,10 @@ def test_csa_confirm_locks_expiring_and_new_vouchers_in_uuid_order(
     old, _ = confirm_csa_payment_quote(
         quote_token=csa_quote(catalog, active_user, high), user=active_user
     )
-    token = csa_quote(catalog, active_user, low)
     CSAPurchaseRequest.objects.filter(pk=old.pk).update(
         expires_at=timezone.now() - timedelta(seconds=1)
     )
+    token = csa_quote(catalog, active_user, low)
     locked = []
     fetch = QuerySet._fetch_all
 
@@ -462,10 +465,25 @@ def test_csa_bulk_expiry_locks_vouchers_in_uuid_order(
     first, _ = confirm_csa_payment_quote(
         quote_token=csa_quote(catalog, active_user, high), user=active_user
     )
-    ShippingAddress.objects.filter(user=active_user).update(phone_number="0987654321")
-    second, _ = confirm_csa_payment_quote(
-        quote_token=csa_quote(catalog, active_user, low), user=active_user
+    second_user = User.objects.create_user(
+        email="legacy-voucher-holder@example.com",
+        login_phone_number="0987654321",
+        name="Legacy buyer",
+        status=AccountStatus.ACTIVE,
     )
+    ShippingAddress.objects.create(
+        user=second_user,
+        recipient_name=second_user.name,
+        phone_number="0987654321",
+        province_code="66",
+        ward_code="22015",
+        address="Second address",
+    )
+    second, _ = confirm_csa_payment_quote(
+        quote_token=csa_quote(catalog, second_user, low), user=second_user
+    )
+    # Recreate pre-upgrade records with one owner and two recipient numbers.
+    CSAPurchaseRequest.objects.filter(pk=second.pk).update(user=active_user)
     now = timezone.now()
     CSAPurchaseRequest.objects.filter(pk=first.pk).update(expires_at=now - timedelta(seconds=2))
     CSAPurchaseRequest.objects.filter(pk=second.pk).update(expires_at=now - timedelta(seconds=1))
@@ -498,7 +516,10 @@ def test_mysql_concurrent_csa_confirms_swap_vouchers_while_expiring_old_requests
 
     low, high = ordered_coupon_pair()
     second = User.objects.create_user(
-        email="swap-voucher@example.com", name="Second", status=AccountStatus.ACTIVE
+        email="swap-voucher@example.com",
+        login_phone_number="0987654321",
+        name="Second",
+        status=AccountStatus.ACTIVE,
     )
     ShippingAddress.objects.create(
         user=second,
@@ -519,13 +540,13 @@ def test_mysql_concurrent_csa_confirms_swap_vouchers_while_expiring_old_requests
     second_old, _ = confirm_csa_payment_quote(
         quote_token=csa_quote(second_catalog, second, low), user=second
     )
+    CSAPurchaseRequest.objects.filter(pk__in=[first_old.pk, second_old.pk]).update(
+        expires_at=timezone.now() - timedelta(seconds=1)
+    )
     operations = [
         (active_user, csa_quote(catalog, active_user, low)),
         (second, csa_quote(second_catalog, second, high)),
     ]
-    CSAPurchaseRequest.objects.filter(pk__in=[first_old.pk, second_old.pk]).update(
-        expires_at=timezone.now() - timedelta(seconds=1)
-    )
     barrier = Barrier(2)
 
     def confirm(operation):

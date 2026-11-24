@@ -35,6 +35,8 @@ pytestmark = pytest.mark.django_db
 
 @pytest.fixture
 def context(active_user, access_token, store_product, payment_settings, supported_area):
+    active_user.login_phone_number = "0901234567"
+    active_user.save(update_fields=["login_phone_number"])
     ShippingAddress.objects.create(
         user=active_user,
         recipient_name="Owner",
@@ -71,6 +73,7 @@ def checkout_body(quote, code):
         "expected_voucher_quote": quote["voucher_quote"],
         "lines": quote["lines"],
         "shipping_address_updated_at": quote["shipping_address_updated_at"],
+        "shipping_address_version": quote["shipping_address_version"],
         "expected_shipping_fee_vnd": int(quote["shipping_fee_vnd"]),
         "expected_total_vnd": int(quote["total_vnd"]),
     }

@@ -110,6 +110,7 @@ urlpatterns = [
     path("public/membership-packages", views.PublicPackageListView.as_view()),
     path("public/csa-terms", views.PublicCSATermsView.as_view()),
     path("csa-voucher-preview", views.CSAVoucherPreviewView.as_view()),
+    path("csa-purchase-requests/<str:request_code>", views.SelfCSAPurchaseRequestView.as_view()),
     path(
         "public/csa-payment-quotes",
         views.PublicCSAPaymentQuoteView.as_view(),

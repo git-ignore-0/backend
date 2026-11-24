@@ -16,7 +16,12 @@ from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
 from commerce.models import ShippingAddress
-from commerce.shipping import active_shipping_area
+from commerce.shipping import (
+    active_shipping_area,
+    shipping_address_version,
+    shipping_recipient_details,
+)
+from identity.locks import lock_user_for_shared_read
 from identity.models import AuditLog, User
 from members.administrative_units import province_exists, ward_choices
 from memberships.contract_pdfs import (
@@ -35,7 +40,7 @@ from memberships.coupons import (
 )
 from memberships.expiry import (
     expire_csa_purchase_request_if_due,
-    expire_open_csa_purchase_request_for_phone,
+    expire_due_csa_purchase_requests,
     purchase_request_expires_at,
 )
 from memberships.models import (
@@ -199,6 +204,8 @@ DUMMY_GUEST_TOKEN_HASH = make_password(secrets.token_urlsafe(32))
 CUSTOMER_RESOLUTIONS = {"keep_existing", "use_request_data", "reject_conflict"}
 PAYMENT_QUOTE_TTL = timedelta(minutes=5)
 PAYMENT_QUOTE_SALT = "memberships.csa-payment-quote.v1"
+LEGACY_PAYMENT_QUOTE_VERSION = 1
+PAYMENT_QUOTE_VERSION = 2
 
 
 def _required_snapshot(value, label: str) -> str:
@@ -237,7 +244,9 @@ def _locked_authenticated_identity(user) -> dict:
     return _purchase_identity_from_locked_user(locked_user)
 
 
-def _purchase_identity_from_locked_user(locked_user) -> dict:
+def _purchase_identity_from_locked_user(
+    locked_user, *, quote_version=PAYMENT_QUOTE_VERSION
+) -> dict:
     if locked_user is None or not locked_user.can_access_core():
         raise AuthAccountInactive("The account cannot access Core")
     try:
@@ -245,9 +254,17 @@ def _purchase_identity_from_locked_user(locked_user) -> dict:
     except ShippingAddress.DoesNotExist as error:
         raise AuthAccountIncomplete("Delivery address is missing") from error
 
+    if quote_version == LEGACY_PAYMENT_QUOTE_VERSION:
+        # V1 fingerprints bind to the contact stored on the address row.
+        contact = {
+            "recipient_name": shipping_address.recipient_name.strip(),
+            "phone_number": shipping_address.phone_number.strip(),
+        }
+    else:
+        contact = shipping_recipient_details(shipping_address, user=locked_user)
     values = {
-        "name": str(shipping_address.recipient_name or "").strip(),
-        "phone": str(shipping_address.phone_number or "").strip(),
+        "name": contact["recipient_name"],
+        "phone": contact["phone_number"],
         "province_code": str(shipping_address.province_code or "").strip(),
         "ward_code": str(shipping_address.ward_code or "").strip(),
         "address": str(shipping_address.address or "").strip(),
@@ -270,6 +287,7 @@ def _purchase_identity_from_locked_user(locked_user) -> dict:
     values["email"] = locked_user.email
     values["user"] = locked_user
     values["shipping_address_updated_at"] = shipping_address.updated_at.isoformat()
+    values["shipping_address_version"] = shipping_address_version(shipping_address, **contact)
     return values
 
 
@@ -319,6 +337,20 @@ def _locked_payment_settings() -> MembershipPaymentSettings:
     except ValidationError as error:
         raise PaymentSettingsUnavailable("CSA payment settings are invalid") from error
     return settings
+
+
+def _matching_purchase_requests(*, user, phone_e164):
+    match = Q(phone_e164=phone_e164)
+    if user is not None:
+        match |= Q(user_id=user.pk)
+    return CSAPurchaseRequest.objects.filter(match)
+
+
+def _require_available_purchase_slot(*, user, phone_e164, now, coupon_id=None):
+    requests = _matching_purchase_requests(user=user, phone_e164=phone_e164)
+    expire_due_csa_purchase_requests(requests, now=now, additional_coupon_ids=(coupon_id,))
+    if requests.filter(open_slot=True).exists():
+        raise PurchaseRequestConflict("Customer already has an open CSA purchase request")
 
 
 @transaction.atomic
@@ -415,9 +447,7 @@ def _create_csa_purchase_request(
         else None
     )
 
-    expire_open_csa_purchase_request_for_phone(phone_e164=normalized_phone)
-    if CSAPurchaseRequest.objects.filter(phone_e164=normalized_phone, open_slot=True).exists():
-        raise PurchaseRequestConflict("Phone already has an open CSA purchase request")
+    _require_available_purchase_slot(user=user, phone_e164=normalized_phone, now=timezone.now())
 
     payment = _locked_payment_settings()
     request_code = generate_csa_purchase_request_code()
@@ -614,7 +644,11 @@ def _quote_positive_amount(value) -> bool:
 
 def _validate_payment_quote(quote: dict, *, now) -> dict:
     """Validate every signed quote field before it is used to create a request."""
-    if quote.get("v") != 1 or not isinstance(quote.get("nonce"), str) or len(quote["nonce"]) < 32:
+    if (
+        quote.get("v") not in (LEGACY_PAYMENT_QUOTE_VERSION, PAYMENT_QUOTE_VERSION)
+        or not isinstance(quote.get("nonce"), str)
+        or len(quote["nonce"]) < 32
+    ):
         raise PaymentQuoteUnavailable("Payment quote is unavailable")
     if not isinstance(quote.get("request_code"), str) or not quote["request_code"].startswith(
         "CSA-"
@@ -865,6 +899,7 @@ def create_csa_payment_quote(
             "user_id": str(identity["user"].pk),
             "fingerprint": _guest_identity_fingerprint(identity),
             "shipping_address_updated_at": identity["shipping_address_updated_at"],
+            "shipping_address_version": identity["shipping_address_version"],
         }
     else:
         identity = _guest_identity(identity=guest_identity or {})
@@ -891,10 +926,16 @@ def create_csa_payment_quote(
             plan={**plan, "contract_total": str(option.total_price_vnd)},
             now=now,
         )
+    if (
+        _matching_purchase_requests(user=identity["user"], phone_e164=identity["phone"])
+        .filter(Q(expires_at__isnull=True) | Q(expires_at__gt=now), open_slot=True)
+        .exists()
+    ):
+        raise PurchaseRequestConflict("Customer already has an open CSA purchase request")
     expires_at = now + PAYMENT_QUOTE_TTL
     request_code = generate_csa_purchase_request_code()
     quote = {
-        "v": 1,
+        "v": PAYMENT_QUOTE_VERSION,
         "nonce": secrets.token_hex(32),
         "created_at": now.isoformat(),
         "expires_at": expires_at.isoformat(),
@@ -960,8 +1001,9 @@ def csa_payment_quote_payload(quote_token: str, quote: dict) -> dict:
             "template": "compact2",
         },
     }
-    if address_version := quote["subject"].get("shipping_address_updated_at"):
-        result["shipping_address_updated_at"] = address_version
+    for key in ("shipping_address_updated_at", "shipping_address_version"):
+        if value := quote["subject"].get(key):
+            result[key] = value
     return result
 
 
@@ -988,7 +1030,7 @@ def confirm_csa_payment_quote(*, quote_token, user=None, guest_identity=None, no
             if existing.user_id != user.pk:
                 raise PaymentQuoteIdentityMismatch("Payment quote is unavailable")
             return existing, None
-        identity = _purchase_identity_from_locked_user(locked_user)
+        identity = _purchase_identity_from_locked_user(locked_user, quote_version=quote["v"])
         if not hmac.compare_digest(
             str(subject.get("fingerprint") or ""), _guest_identity_fingerprint(identity)
         ):
@@ -1042,11 +1084,12 @@ def confirm_csa_payment_quote(*, quote_token, user=None, guest_identity=None, no
     if not hmac.compare_digest(str(terms_data.get("hash") or ""), terms["hash"]):
         raise PaymentQuoteUnavailable("Payment quote is unavailable")
 
-    expire_open_csa_purchase_request_for_phone(
-        phone_e164=identity["phone"], now=now, additional_coupon_ids=(quote.get("coupon_id"),)
+    _require_available_purchase_slot(
+        user=identity["user"],
+        phone_e164=identity["phone"],
+        now=now,
+        coupon_id=quote.get("coupon_id"),
     )
-    if CSAPurchaseRequest.objects.filter(phone_e164=identity["phone"], open_slot=True).exists():
-        raise PurchaseRequestConflict("Phone already has an open CSA purchase request")
     coupon = None
     coupon_snapshot = quote.get("coupon")
     if coupon_snapshot is not None:
@@ -1235,6 +1278,8 @@ def _reject_locked_purchase_request(*, item, actor, reason, customer_resolution=
 
 @transaction.atomic
 def _reject_csa_purchase_request(*, request_id, reason, actor) -> CSAPurchaseRequest:
+    if actor is not None:
+        lock_user_for_shared_read(actor.pk)
     try:
         item = CSAPurchaseRequest.objects.select_for_update().get(pk=request_id)
     except CSAPurchaseRequest.DoesNotExist as error:
@@ -1265,6 +1310,8 @@ def _mark_csa_purchase_request_refunded(*, request_id, actor, note="") -> CSAPur
     note = str(note or "").strip()
     if len(note) > 1000:
         raise CSAPurchaseError("Refund note is too long")
+    if actor is not None:
+        lock_user_for_shared_read(actor.pk)
     try:
         item = CSAPurchaseRequest.objects.select_for_update().get(pk=request_id)
     except CSAPurchaseRequest.DoesNotExist as error:
@@ -1371,15 +1418,16 @@ def _audit_conflict_resolution(*, item, actor, customer, resolution, old_data, n
     )
 
 
-def _resolve_purchase_customer(*, item, actor, customer_resolution, rejection_reason=None):
-    locked_user = None
+def _resolve_purchase_customer(
+    *, item, locked_user, actor, customer_resolution, rejection_reason=None
+):
     query = Q(phone_e164=item.phone_e164)
     if item.user_id:
-        try:
-            locked_user = User.objects.select_for_update().get(pk=item.user_id)
-        except User.DoesNotExist as error:
-            raise PurchaseCustomerConflict("Purchase request user no longer exists") from error
+        if locked_user is None or locked_user.pk != item.user_id:
+            raise PurchaseCustomerConflict("Purchase request user no longer exists")
         query |= Q(user=locked_user)
+    else:
+        locked_user = None
 
     customers = list(CSACustomer.objects.select_for_update().filter(query).order_by("id"))
     user_customer = next(
@@ -1517,6 +1565,23 @@ def approve_csa_purchase_request(
     documents = None
     try:
         with transaction.atomic():
+            # Account changes and request creation lock User before touching the request.
+            # Serialize approvals for the same buyer and order both account locks by UUID.
+            owner_id = (
+                CSAPurchaseRequest.objects.filter(pk=request_id)
+                .values_list("user_id", flat=True)
+                .first()
+            )
+            actor_id = actor.pk if actor is not None else None
+            locked_user = None
+            for user_id in sorted({owner_id, actor_id} - {None}):
+                if user_id == owner_id:
+                    locked_user = User.objects.select_for_update().filter(pk=user_id).first()
+                    continue
+                try:
+                    lock_user_for_shared_read(user_id)
+                except User.DoesNotExist:
+                    raise PurchaseAdminNotFound("Approving account does not exist") from None
             try:
                 item = CSAPurchaseRequest.objects.select_for_update().get(pk=request_id)
             except CSAPurchaseRequest.DoesNotExist as error:
@@ -1552,6 +1617,7 @@ def approve_csa_purchase_request(
 
             customer, rejected = _resolve_purchase_customer(
                 item=item,
+                locked_user=locked_user,
                 actor=actor,
                 customer_resolution=customer_resolution,
                 rejection_reason=rejection_reason,

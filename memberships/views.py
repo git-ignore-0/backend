@@ -214,6 +214,7 @@ from memberships.tracker import (
     CSATrackerLookupUnavailable,
     CSATrackerSessionExpired,
     create_tracker_session,
+    lookup_owned_tracker_request,
     lookup_tracker_request,
     resolve_tracker_request,
     tracker_contract,
@@ -1381,6 +1382,24 @@ class PublicCSAPurchasePaymentConfirmView(APIView):
         except CSAPurchaseError as error:
             return csa_purchase_error(error)
         return no_store(Response({"data": csa_purchase_payload(item)}))
+
+
+class SelfCSAPurchaseRequestView(APIView):
+    permission_classes = [HasMembershipSelfScopes]
+
+    def get(self, request, request_code):
+        try:
+            item = lookup_owned_tracker_request(
+                reference_code=request_code, user_id=request.user.pk
+            )
+        except CSATrackerLookupUnavailable:
+            return no_store(
+                Response(
+                    {"errors": [{"code": "csa_purchase_request_not_found"}]},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+            )
+        return no_store(Response({"data": tracker_request_payload(item, owner_lookup=True)}))
 
 
 class PublicCSAContractTrackerLookupView(APIView):
