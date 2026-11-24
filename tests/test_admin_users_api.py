@@ -5,6 +5,7 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 
 from identity.models import AuditLog, IdentityEvent, User
+from memberships.models import CSACustomer
 
 pytestmark = pytest.mark.django_db
 USERS = "/api/v1/admin/users"
@@ -251,6 +252,34 @@ def test_list_filters_status_before_pagination_and_combines_search(cms):
     assert [row["id"] for row in response.json()["data"]] == [str(suspended.pk)]
     assert response.json()["meta"]["total"] == 1
     assert cms.get(USERS, {"status": "invalid"}).status_code == 400
+
+
+def test_admin_users_filters_csa_customer_before_pagination(cms):
+    User.objects.bulk_create(
+        [User(email=f"csa-{index}@example.com", name="CSA Garden") for index in range(31)]
+    )
+    linked = User.objects.create_user(
+        "csa-linked@example.com", name="CSA Garden linked", login_phone_number="0912345678"
+    )
+    CSACustomer.objects.create(name="Linked", user=linked)
+
+    for page, size in ((1, 30), (2, 1)):
+        response = cms.get(
+            USERS, {"search": "CSA Garden", "has_csa_customer": "false", "page": page}
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["meta"] == {"page": page, "page_size": 30, "total": 31}
+        assert len(data["data"]) == size
+        assert all(row["has_csa_customer"] is False for row in data["data"])
+
+    for search in ("CSA Garden", "csa-linked@example.com", "0912345678"):
+        response = cms.get(USERS, {"search": search, "has_csa_customer": "true"})
+        assert response.status_code == 200
+        assert [row["id"] for row in response.json()["data"]] == [str(linked.pk)]
+
+    assert cms.get(USERS, {"search": "CSA Garden"}).json()["meta"]["total"] == 32
+    assert cms.get(USERS, {"has_csa_customer": "invalid"}).status_code == 400
 
 
 def test_projection_search_and_batch_verification(cms, django_assert_max_num_queries):

@@ -473,6 +473,15 @@ class CSACustomerCreateSerializer(StrictSerializer):
 
 class CSACustomerLinkUserSerializer(StrictSerializer):
     user_id = serializers.UUIDField()
+    expected_shipping_address_updated_at = serializers.DateTimeField(required=False)
+
+
+class CSACustomerLookupSerializer(StrictSerializer):
+    phone = serializers.CharField(max_length=32, allow_blank=True)
+
+
+class CSACustomerFromUserSerializer(StrictSerializer):
+    user_id = serializers.UUIDField()
 
 
 class ProductTranslationWriteSerializer(StrictSerializer):

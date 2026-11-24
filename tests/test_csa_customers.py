@@ -1,5 +1,6 @@
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 
 import pytest
@@ -11,6 +12,8 @@ from rest_framework.test import APIClient
 
 from commerce.models import ShippingAddress, ShippingArea
 from identity.models import AccountStatus, AuditLog, User
+from identity.services import transition_account
+from members.models import MemberProfile
 from memberships.models import (
     CSACustomer,
     Membership,
@@ -36,6 +39,7 @@ VALID_CUSTOMER_FIELDS = {
     "ward_code": "22015",
     "address": "Số 12, ngõ 5",
 }
+CUSTOMERS = "/api/v1/admin/csa-customers"
 
 
 def create_complete_managed_customer(*, name="Managed", phone="0901234567"):
@@ -67,6 +71,17 @@ def admin_api(active_user, access_token):
     access_token.scope = "profile email content:manage"
     access_token.save(update_fields=["scope"])
     return bearer_client(access_token)
+
+
+@pytest.fixture
+def supported_customer_address():
+    ShippingArea.objects.create(
+        province_code=VALID_CUSTOMER_FIELDS["province_code"],
+        ward_code=VALID_CUSTOMER_FIELDS["ward_code"],
+        shipping_fee_vnd=30_000,
+        is_active=True,
+    )
+    return VALID_CUSTOMER_FIELDS.copy()
 
 
 @pytest.fixture
@@ -292,6 +307,196 @@ def test_admin_customer_create_maps_duplicate_phone_to_stable_conflict(admin_api
 
 
 @pytest.mark.django_db
+def test_admin_customer_lookup_classifies_normalized_phone(admin_api):
+    user = User.objects.create_user("lookup@example.com", name="Core name")
+    MemberProfile.objects.create(user=user, phone_number="0912345678")
+
+    def lookup(phone):
+        response = admin_api.post(f"{CUSTOMERS}/lookup", {"phone": phone}, format="json")
+        assert response.status_code == 200
+        assert {"private", "no-store"} <= set(response["Cache-Control"].split(", "))
+        return response.json()["data"]
+
+    expected = {"phone": "+84912345678", "status": "available"}
+    for phone in ("0912345678", "84912345678", "+84912345678"):
+        assert lookup(phone) == expected
+
+    user.login_phone_number = "0912345678"
+    user.save(update_fields=["login_phone_number"])
+    assert lookup("0912345678") == {
+        "phone": "+84912345678",
+        "status": "account_found",
+        "user": {"id": str(user.pk), "name": "Core name"},
+    }
+    assert not CSACustomer.objects.exists()
+
+    linked = create_complete_customer_for_user(user, phone="0971234567")
+    assert lookup("0912345678") == {
+        "phone": "+84912345678",
+        "status": "customer_exists",
+        "customer": {"id": str(linked.pk), "is_linked": True},
+    }
+
+    managed = create_complete_managed_customer(phone="0912345678")
+    assert lookup("0912345678") == {
+        "phone": "+84912345678",
+        "status": "customer_exists",
+        "customer": {"id": str(managed.pk), "is_linked": False},
+    }
+    assert CSACustomer.objects.count() == 2
+    invalid = admin_api.post(f"{CUSTOMERS}/lookup", {"phone": "0123"}, format="json")
+    assert invalid.status_code == 400
+    assert invalid.json()["errors"] == [{"code": "invalid_csa_customer_phone"}]
+
+
+@pytest.mark.django_db
+def test_admin_customer_create_rechecks_account_after_lookup(admin_api, supported_customer_address):
+    payload = {"name": "Managed", "phone": "0912345678", **supported_customer_address}
+    lookup = admin_api.post(f"{CUSTOMERS}/lookup", {"phone": payload["phone"]}, format="json")
+    assert lookup.json()["data"]["status"] == "available"
+
+    user = User.objects.create_user(
+        "new-account@example.com", name="Core name", login_phone_number="0912345678"
+    )
+    response = admin_api.post(CUSTOMERS, payload, format="json")
+    assert response.status_code == 409
+    assert response.json()["errors"] == [{"code": "csa_customer_phone_has_account"}]
+    assert not CSACustomer.objects.exists()
+
+    linked = create_complete_customer_for_user(user, phone="0971234567")
+    response = admin_api.post(CUSTOMERS, payload, format="json")
+    assert response.status_code == 409
+    assert response.json()["errors"] == [{"code": "csa_customer_user_exists"}]
+    assert list(CSACustomer.objects.values_list("id", flat=True)) == [linked.pk]
+
+
+@pytest.mark.django_db
+def test_admin_customer_create_from_user_uses_core_data(admin_api, supported_customer_address):
+    user = User.objects.create_user(
+        "customer-from-user@example.com", name="Core name", login_phone_number="0912345678"
+    )
+    MemberProfile.objects.create(user=user, phone_number="0931234567", address="Legacy address")
+    ShippingAddress.objects.create(
+        user=user,
+        recipient_name="Old recipient",
+        phone_number="0941234567",
+        **supported_customer_address,
+    )
+    response = admin_api.post(f"{CUSTOMERS}/from-user", {"user_id": user.pk}, format="json")
+
+    assert response.status_code == 201
+    assert {"private", "no-store"} <= set(response["Cache-Control"].split(", "))
+    data = response.json()["data"]
+    assert data["user"]["id"] == str(user.pk)
+    assert data["name"] == "Core name" and data["phone"] == "+84912345678"
+    assert {key: data[key] for key in supported_customer_address} == supported_customer_address
+    customer = CSACustomer.objects.get(pk=data["id"])
+    assert customer.user_id == user.pk
+    assert customer.phone_e164 == user.login_phone_number
+    assert customer.address == supported_customer_address["address"]
+
+    duplicate = admin_api.post(f"{CUSTOMERS}/from-user", {"user_id": user.pk}, format="json")
+    assert duplicate.status_code == 409
+    assert duplicate.json()["errors"] == [{"code": "csa_customer_user_exists"}]
+    assert CSACustomer.objects.count() == 1
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("case", "code"),
+    [
+        ("missing_address", "csa_customer_shipping_address_unavailable"),
+        ("unsupported_address", "csa_customer_shipping_address_unavailable"),
+        ("hidden_address", "csa_customer_shipping_address_unavailable"),
+        ("missing_phone", "csa_customer_phone_required"),
+        ("missing_name", "csa_customer_name_required"),
+        ("existing_phone", "csa_customer_phone_exists"),
+    ],
+)
+def test_admin_customer_create_from_user_rejects_invalid_core_data(
+    admin_api, supported_customer_address, case, code
+):
+    user = User.objects.create_user(
+        "invalid-customer-source@example.com",
+        name=" " if case == "missing_name" else "Core name",
+        login_phone_number=None if case == "missing_phone" else "0912345678",
+        **(
+            {"status": AccountStatus.DELETION_REQUESTED, "is_active": False}
+            if case == "hidden_address"
+            else {}
+        ),
+    )
+    if case != "missing_address":
+        address = supported_customer_address.copy()
+        if case == "unsupported_address":
+            address["ward_code"] = "22045"
+        ShippingAddress.objects.create(user=user, **address)
+    if case == "existing_phone":
+        create_complete_managed_customer(phone="0912345678")
+
+    response = admin_api.post(f"{CUSTOMERS}/from-user", {"user_id": user.pk}, format="json")
+
+    assert response.status_code == (409 if case == "existing_phone" else 400)
+    assert response.json()["errors"] == [{"code": code}]
+    assert not CSACustomer.objects.filter(user=user).exists()
+
+
+@pytest.mark.django_db
+def test_admin_customer_create_from_user_validates_payload_and_target(admin_api):
+    path = f"{CUSTOMERS}/from-user"
+    missing = admin_api.post(path, {"user_id": uuid.uuid4()}, format="json")
+    assert missing.status_code == 404
+    assert missing.json()["errors"] == [{"code": "csa_customer_user_not_found"}]
+    response = admin_api.post(
+        path, {"user_id": uuid.uuid4(), "name": "Override", "address": "Override"}, format="json"
+    )
+    assert response.status_code == 400
+    assert response["Cache-Control"] == "private, no-store"
+    assert set(response.json()) == {"name", "address"}
+    assert not CSACustomer.objects.exists()
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("action", ["lookup", "from-user"])
+def test_new_customer_actions_require_scope_and_group(action, active_user, access_token):
+    path = f"{CUSTOMERS}/{action}"
+    response = APIClient().post(path, {}, format="json")
+    assert response.status_code == 401
+    assert response["Cache-Control"] == "private, no-store"
+    client = bearer_client(access_token)
+    active_user.groups.add(Group.objects.get_or_create(name="website_admin")[0])
+    assert client.post(path, {}, format="json").status_code == 403
+    access_token.scope = "profile email content:manage"
+    access_token.save(update_fields=["scope"])
+    active_user.groups.clear()
+    assert client.post(path, {}, format="json").status_code == 403
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("from_user", [False, True])
+def test_admin_customer_create_does_not_mask_unclassified_integrity_error(
+    admin_api, supported_customer_address, monkeypatch, from_user
+):
+    if from_user:
+        user = User.objects.create_user(
+            "integrity-customer@example.com", name="Core name", login_phone_number="0912345678"
+        )
+        ShippingAddress.objects.create(user=user, **supported_customer_address)
+        path, payload = f"{CUSTOMERS}/from-user", {"user_id": user.pk}
+    else:
+        path = CUSTOMERS
+        payload = {"name": "Managed", "phone": "0912345678", **supported_customer_address}
+
+    def reject_insert(**kwargs):
+        raise IntegrityError("some other database constraint")
+
+    monkeypatch.setattr(CSACustomer.objects, "create", reject_insert)
+    with pytest.raises(IntegrityError, match="some other database constraint"):
+        admin_api.post(path, payload, format="json")
+    assert not CSACustomer.objects.exists()
+
+
+@pytest.mark.django_db
 def test_customer_api_requires_scope_and_group(active_user, access_token):
     assert APIClient().get("/api/v1/admin/csa-customers").status_code == 401
     client = bearer_client(access_token)
@@ -360,6 +565,74 @@ def test_admin_can_link_user_once_with_audit_and_cannot_unlink(admin_api, active
         ).status_code
         == 405
     )
+
+
+@pytest.mark.django_db
+def test_admin_link_rejects_changed_shipping_address(admin_api, supported_customer_address):
+    customer = create_complete_managed_customer(phone="0912345678")
+    customer.note = "Gọi trước khi giao."
+    customer.save(update_fields=["note"])
+    user = User.objects.create_user(
+        "later-account@example.com", name="Core name", login_phone_number="0912345678"
+    )
+    shipping = ShippingAddress.objects.create(user=user, **supported_customer_address)
+    preview = admin_api.get(f"/api/v1/admin/users/{user.pk}").json()["data"]["shipping_address"]
+    shipping.address = "Địa chỉ vừa cập nhật"
+    shipping.save(update_fields=["address", "updated_at"])
+    path = f"{CUSTOMERS}/{customer.pk}/link-user"
+    payload = {"user_id": user.pk, "expected_shipping_address_updated_at": preview["updated_at"]}
+
+    stale = admin_api.post(path, payload, format="json")
+    assert stale.status_code == 409
+    assert stale.json()["errors"] == [{"code": "csa_customer_shipping_address_changed"}]
+    customer.refresh_from_db()
+    assert customer.user_id is None and customer.address == supported_customer_address["address"]
+    assert not AuditLog.objects.filter(action="csa_customer.link_user").exists()
+
+    preview = admin_api.get(f"/api/v1/admin/users/{user.pk}").json()["data"]["shipping_address"]
+    payload["expected_shipping_address_updated_at"] = preview["updated_at"]
+    response = admin_api.post(path, payload, format="json")
+    assert response.status_code == 200
+    assert response.json()["data"]["id"] == str(customer.pk)
+    customer.refresh_from_db()
+    assert customer.user_id == user.pk and customer.address == shipping.address
+    assert customer.name == "Managed" and customer.phone_e164 == "+84912345678"
+    assert customer.note == "Gọi trước khi giao."
+    assert AuditLog.objects.filter(action="csa_customer.link_user").count() == 1
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("include_version", [False, True])
+def test_admin_link_rejects_address_hidden_after_preview(
+    admin_api, supported_customer_address, include_version
+):
+    customer = create_complete_managed_customer(phone="0912345678")
+    user = User.objects.create_user(
+        "deleting-customer@example.com",
+        name="Core name",
+        login_phone_number="0912345678",
+        status=AccountStatus.ACTIVE,
+    )
+    shipping = ShippingAddress.objects.create(
+        user=user, **{**supported_customer_address, "address": "Địa chỉ tài khoản"}
+    )
+    detail_url = f"/api/v1/admin/users/{user.pk}"
+    preview = admin_api.get(detail_url).json()["data"]["shipping_address"]
+    transition_account(user, AccountStatus.DELETION_REQUESTED)
+    shipping.refresh_from_db()
+    assert shipping.updated_at.isoformat() == preview["updated_at"]
+    assert admin_api.get(detail_url).json()["data"]["shipping_address"] is None
+
+    payload = {"user_id": user.pk}
+    if include_version:
+        payload["expected_shipping_address_updated_at"] = preview["updated_at"]
+    response = admin_api.post(f"{CUSTOMERS}/{customer.pk}/link-user", payload, format="json")
+
+    assert response.status_code == 400
+    assert response.json()["errors"] == [{"code": "csa_customer_shipping_address_unavailable"}]
+    customer.refresh_from_db()
+    assert customer.user_id is None and customer.address == supported_customer_address["address"]
+    assert not AuditLog.objects.filter(action="csa_customer.link_user").exists()
 
 
 @pytest.mark.parametrize("has_shipping_address", [False, True])
@@ -590,29 +863,42 @@ def test_assignment_without_customer_never_creates_one(active_user):
     reason="SQLite does not provide row-level SELECT FOR UPDATE semantics",
 )
 @pytest.mark.django_db(transaction=True)
-def test_concurrent_managed_customer_creation_is_unique():
-    barrier = threading.Barrier(3)
-    outcomes = []
+@pytest.mark.parametrize("from_user", [False, True])
+def test_concurrent_customer_creation_is_unique(
+    admin_api, access_token, supported_customer_address, from_user
+):
+    phone = "0912345678"
+    if from_user:
+        user = User.objects.create_user(
+            "concurrent-customer@example.com", name="Core name", login_phone_number=phone
+        )
+        ShippingAddress.objects.create(user=user, **supported_customer_address)
+        path, payload = f"{CUSTOMERS}/from-user", {"user_id": user.pk}
+        error_code = "csa_customer_user_exists"
+    else:
+        path = CUSTOMERS
+        payload = {"name": "Managed", "phone": phone, **supported_customer_address}
+        error_code = "csa_customer_phone_exists"
+    barrier = threading.Barrier(2, timeout=5)
 
     def create_once():
         close_old_connections()
         try:
             barrier.wait()
-            create_complete_managed_customer(name="Concurrent")
-            outcomes.append("created")
-        except DuplicateCSACustomerPhone:
-            outcomes.append("duplicate")
+            return bearer_client(access_token).post(path, payload, format="json")
         finally:
-            close_old_connections()
+            connection.close()
 
-    threads = [threading.Thread(target=create_once) for _ in range(2)]
-    for thread in threads:
-        thread.start()
-    barrier.wait()
-    for thread in threads:
-        thread.join()
-    assert sorted(outcomes) == ["created", "duplicate"]
-    assert CSACustomer.objects.filter(phone_e164="+84901234567").count() == 1
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        requests = [executor.submit(create_once) for _ in range(2)]
+        responses = sorted((request.result() for request in requests), key=lambda r: r.status_code)
+    created, conflict = responses
+    assert created.status_code == 201
+    assert conflict.status_code == 409
+    assert conflict.json()["errors"] == [{"code": error_code}]
+    assert CSACustomer.objects.filter(phone_e164="+84912345678").count() == 1
+    if from_user:
+        assert CSACustomer.objects.filter(user=user).count() == 1
 
 
 @pytest.mark.django_db(transaction=True)

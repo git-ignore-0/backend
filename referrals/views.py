@@ -480,6 +480,8 @@ class AdminUserListView(AdminAccountPasswordAPIView):
             queryset = queryset.filter(matches)
         if account_status := query.validated_data["status"]:
             queryset = queryset.filter(status=account_status)
+        if has_csa_customer := query.validated_data.get("has_csa_customer"):
+            queryset = queryset.filter(csa_customer__isnull=has_csa_customer == "false")
         queryset = queryset.order_by("-date_joined", "-id")
         items, meta = paginate(queryset, query.validated_data["page"], page_size=ADMIN_PAGE_SIZE)
         return no_store(

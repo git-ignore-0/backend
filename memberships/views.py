@@ -146,7 +146,9 @@ from memberships.serializers import (
     AuthenticatedCSAPurchaseRequestCreateSerializer,
     CSAContractVerificationSerializer,
     CSACustomerCreateSerializer,
+    CSACustomerFromUserSerializer,
     CSACustomerLinkUserSerializer,
+    CSACustomerLookupSerializer,
     CSAPaymentConfirmSerializer,
     CSAPaymentQuoteConfirmSerializer,
     CSAPaymentQuoteCreateSerializer,
@@ -177,10 +179,12 @@ from memberships.services import (
     PriceOptionConflict,
     PriceOptionTotalInvalid,
     assign_membership_with_contract,
+    create_admin_csa_customer_from_user,
     create_supported_managed_csa_customer,
     create_usage_order,
     ensure_due_cycles,
     link_csa_customer_to_user,
+    lookup_admin_csa_customer,
     quota_availability_rows,
     refresh_membership_statuses,
     revoke_membership,
@@ -2559,6 +2563,9 @@ class AdminCSAPaymentRejectView(APIView):
 class AdminCSACustomerViewSet(viewsets.ViewSet):
     permission_classes = [IsWebsiteAdmin]
 
+    def finalize_response(self, request, response, *args, **kwargs):
+        return no_store(super().finalize_response(request, response, *args, **kwargs))
+
     def list(self, request):
         query = AdminCSACustomerQuerySerializer(data=request.query_params)
         query.is_valid(raise_exception=True)
@@ -2593,6 +2600,41 @@ class AdminCSACustomerViewSet(viewsets.ViewSet):
             )
         except CSACustomerError as error:
             return csa_customer_error(error)
+        return self._created_response(item)
+
+    @action(detail=False, methods=["post"])
+    def lookup(self, request):
+        serializer = CSACustomerLookupSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            phone, customer, user = lookup_admin_csa_customer(serializer.validated_data["phone"])
+        except CSACustomerError as error:
+            return csa_customer_error(error)
+        data = {"phone": phone, "status": "available"}
+        if customer is not None:
+            data["status"] = "customer_exists"
+            data["customer"] = {"id": str(customer.pk), "is_linked": customer.user_id is not None}
+        elif user is not None:
+            data["status"] = "account_found"
+            data["user"] = {"id": str(user.pk), "name": user.name}
+        return Response({"data": data})
+
+    @action(detail=False, methods=["post"], url_path="from-user")
+    def from_user(self, request):
+        serializer = CSACustomerFromUserSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            item = create_admin_csa_customer_from_user(**serializer.validated_data)
+        except User.DoesNotExist:
+            return Response(
+                {"errors": [{"code": "csa_customer_user_not_found"}]},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        except CSACustomerError as error:
+            return csa_customer_error(error)
+        return self._created_response(item)
+
+    def _created_response(self, item):
         return no_store(
             Response(
                 {"data": customer_payload(customer_queryset().get(pk=item.pk), include_note=True)},
@@ -2614,7 +2656,15 @@ class AdminCSACustomerViewSet(viewsets.ViewSet):
         customer = get_object_or_404(CSACustomer, pk=pk)
         try:
             user = User.objects.get(pk=serializer.validated_data["user_id"])
-            customer = link_csa_customer_to_user(customer=customer, user=user, actor=request.user)
+            customer = link_csa_customer_to_user(
+                customer=customer,
+                user=user,
+                actor=request.user,
+                require_visible_shipping_address=True,
+                expected_shipping_address_updated_at=serializer.validated_data.get(
+                    "expected_shipping_address_updated_at"
+                ),
+            )
         except User.DoesNotExist:
             return Response(status=status.HTTP_404_NOT_FOUND)
         except CSACustomerError as error:

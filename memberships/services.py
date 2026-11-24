@@ -10,7 +10,7 @@ from django.utils import timezone
 
 from commerce.models import ShippingAddress
 from commerce.shipping import active_shipping_area
-from identity.models import AuditLog, User
+from identity.models import AccountStatus, AuditLog, User
 from members.administrative_units import province_exists, ward_choices
 from memberships.contract_pdfs import (
     delete_contract_documents,
@@ -134,6 +134,10 @@ class DuplicateCSACustomerPhone(CSACustomerError):
     code = "csa_customer_phone_exists"
 
 
+class CSACustomerPhoneHasAccount(CSACustomerError):
+    code = "csa_customer_phone_has_account"
+
+
 class CSACustomerPhoneInvalid(CSACustomerError):
     code = "invalid_csa_customer_phone"
 
@@ -168,6 +172,10 @@ class CSACustomerIncomplete(CSACustomerError):
 
 class CSACustomerShippingAddressUnavailable(CSACustomerError):
     code = "csa_customer_shipping_address_unavailable"
+
+
+class CSACustomerShippingAddressChanged(CSACustomerError):
+    code = "csa_customer_shipping_address_changed"
 
 
 class CSACustomerShippingAreaUnsupported(CSACustomerError):
@@ -237,6 +245,44 @@ def _validated_supported_address(*, province_code="", ward_code="", address="") 
     return delivery_address
 
 
+def _find_csa_customer_or_account(phone_e164: str) -> tuple[CSACustomer | None, User | None]:
+    customer = CSACustomer.objects.filter(phone_e164=phone_e164).first()
+    if customer is not None:
+        return customer, None
+    user = User.objects.select_related("csa_customer").filter(login_phone_number=phone_e164).first()
+    return getattr(user, "csa_customer", None), user
+
+
+def lookup_admin_csa_customer(phone: str) -> tuple[str, CSACustomer | None, User | None]:
+    phone_e164 = _normalized_required_phone(phone)
+    customer, user = _find_csa_customer_or_account(phone_e164)
+    return phone_e164, customer, user
+
+
+def _locked_supported_shipping_address(
+    user, *, require_visible=False
+) -> tuple[ShippingAddress, dict]:
+    if require_visible and user.status in {
+        AccountStatus.DELETION_REQUESTED,
+        AccountStatus.ANONYMIZED,
+    }:
+        raise CSACustomerShippingAddressUnavailable(
+            "User does not have a supported shipping address"
+        )
+    try:
+        shipping_address = ShippingAddress.objects.select_for_update().get(user=user)
+        delivery_address = _validated_supported_address(
+            province_code=shipping_address.province_code,
+            ward_code=shipping_address.ward_code,
+            address=shipping_address.address,
+        )
+    except (ShippingAddress.DoesNotExist, CSACustomerError) as error:
+        raise CSACustomerShippingAddressUnavailable(
+            "User does not have a supported shipping address"
+        ) from error
+    return shipping_address, delivery_address
+
+
 @transaction.atomic
 def create_csa_customer_for_user(
     *, user, name=None, phone=None, province_code="", ward_code="", address=""
@@ -260,11 +306,27 @@ def create_csa_customer_for_user(
                 **delivery_address,
             )
     except IntegrityError as error:
-        if normalized_phone and CSACustomer.objects.filter(phone_e164=normalized_phone).exists():
+        if CSACustomer.objects.filter(phone_e164=normalized_phone).exists():
             raise DuplicateCSACustomerPhone(
                 "Phone number already belongs to a CSA customer"
             ) from error
-        raise DuplicateCSACustomerUser("User already has a CSA customer") from error
+        if CSACustomer.objects.filter(user=user).exists():
+            raise DuplicateCSACustomerUser("User already has a CSA customer") from error
+        raise
+
+
+@transaction.atomic
+def create_admin_csa_customer_from_user(*, user_id) -> CSACustomer:
+    user = User.objects.select_for_update().get(pk=user_id)
+    if CSACustomer.objects.filter(user=user).exists():
+        raise DuplicateCSACustomerUser("User already has a CSA customer")
+    _, delivery_address = _locked_supported_shipping_address(user, require_visible=True)
+    return create_csa_customer_for_user(
+        user=user,
+        name=user.name,
+        phone=user.login_phone_number,
+        **delivery_address,
+    )
 
 
 def _create_managed_csa_customer(
@@ -279,7 +341,11 @@ def _create_managed_csa_customer(
                 **delivery_address,
             )
     except IntegrityError as error:
-        raise DuplicateCSACustomerPhone("Phone number already belongs to a CSA customer") from error
+        if CSACustomer.objects.filter(phone_e164=normalized_phone).exists():
+            raise DuplicateCSACustomerPhone(
+                "Phone number already belongs to a CSA customer"
+            ) from error
+        raise
 
 
 @transaction.atomic
@@ -301,15 +367,25 @@ def create_managed_csa_customer(
 def create_supported_managed_csa_customer(
     *, name, phone, province_code="", ward_code="", address="", note=""
 ) -> CSACustomer:
+    customer_name = _required_name(name)
+    normalized_phone = _normalized_required_phone(phone)
+    delivery_address = _validated_supported_address(
+        province_code=province_code,
+        ward_code=ward_code,
+        address=address,
+    )
+    customer, user = _find_csa_customer_or_account(normalized_phone)
+    if customer is not None:
+        if customer.phone_e164 == normalized_phone:
+            raise DuplicateCSACustomerPhone("Phone number already belongs to a CSA customer")
+        raise DuplicateCSACustomerUser("User already has a CSA customer")
+    if user is not None:
+        raise CSACustomerPhoneHasAccount("Phone number already belongs to a user")
     return _create_managed_csa_customer(
-        customer_name=_required_name(name),
-        normalized_phone=_normalized_required_phone(phone),
+        customer_name=customer_name,
+        normalized_phone=normalized_phone,
         note=note,
-        delivery_address=_validated_supported_address(
-            province_code=province_code,
-            ward_code=ward_code,
-            address=address,
-        ),
+        delivery_address=delivery_address,
     )
 
 
@@ -369,39 +445,28 @@ def ensure_csa_customer_complete(customer: CSACustomer) -> None:
 
 
 @transaction.atomic
-def link_csa_customer_to_user(*, customer, user, actor) -> CSACustomer:
+def link_csa_customer_to_user(
+    *,
+    customer,
+    user,
+    actor,
+    expected_shipping_address_updated_at=None,
+    require_visible_shipping_address=False,
+) -> CSACustomer:
     user = User.objects.select_for_update().get(pk=user.pk)
     customer = CSACustomer.objects.select_for_update().get(pk=customer.pk)
     if customer.user_id:
         raise DuplicateCSACustomerUser("CSA customer is already linked to a user")
     if CSACustomer.objects.select_for_update().filter(user=user).exists():
         raise DuplicateCSACustomerUser("User already has a CSA customer")
-    try:
-        shipping_address = ShippingAddress.objects.select_for_update().get(user=user)
-    except ShippingAddress.DoesNotExist as error:
-        raise CSACustomerShippingAddressUnavailable(
-            "User does not have a supported shipping address"
-        ) from error
+    shipping_address, delivery_address = _locked_supported_shipping_address(
+        user, require_visible=require_visible_shipping_address
+    )
     if (
-        active_shipping_area(
-            province_code=shipping_address.province_code,
-            ward_code=shipping_address.ward_code,
-        )
-        is None
+        expected_shipping_address_updated_at is not None
+        and shipping_address.updated_at != expected_shipping_address_updated_at
     ):
-        raise CSACustomerShippingAddressUnavailable(
-            "User does not have a supported shipping address"
-        )
-    try:
-        delivery_address = _validated_required_address(
-            province_code=shipping_address.province_code,
-            ward_code=shipping_address.ward_code,
-            address=shipping_address.address,
-        )
-    except CSACustomerError as error:
-        raise CSACustomerShippingAddressUnavailable(
-            "User does not have a supported shipping address"
-        ) from error
+        raise CSACustomerShippingAddressChanged("The user's shipping address has changed")
     customer.user = user
     for field, value in delivery_address.items():
         setattr(customer, field, value)

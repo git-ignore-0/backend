@@ -23,6 +23,7 @@ class PageQuerySerializer(serializers.Serializer):
 class AdminUserQuerySerializer(PageQuerySerializer):
     search = serializers.CharField(max_length=254, allow_blank=True, default="")
     status = serializers.ChoiceField(choices=AccountStatus.choices, allow_blank=True, default="")
+    has_csa_customer = serializers.ChoiceField(choices=("true", "false"), required=False)
 
 
 class LocalePageQuerySerializer(PageQuerySerializer):
