@@ -33,7 +33,7 @@ from memberships.contract_pdfs import (
     get_contract_pdf_storage,
     render_contract_pdf,
 )
-from memberships.contract_provider import NFV_PROVIDER_V1
+from memberships.contract_provider import NFV_PROVIDER_V1, NFV_PROVIDER_V2
 from memberships.contracts import CSAContractSnapshot, create_manual_contract
 from memberships.models import (
     CSAContractStatus,
@@ -237,27 +237,6 @@ def test_renders_valid_vietnamese_and_english_pdfs_from_contract_snapshot(contra
     assert "Mã hash điều khoản" not in vi_text
     assert "☐" not in vi_text
     assert "ĐÃ THU HỒI" not in vi_text
-
-
-@pytest.mark.django_db
-def test_legacy_provider_keeps_historical_phone_rendering_and_document_hashes(
-    contract, private_storage
-):
-    type(contract).objects.filter(pk=contract.pk).update(provider_version=NFV_PROVIDER_V1)
-    contract.refresh_from_db()
-    documents = generate_contract_documents(contract, storage=private_storage)
-
-    for locale, key, digest in (
-        ("vi", documents.vi_storage_key, documents.vi_sha256),
-        ("en", documents.en_storage_key, documents.en_sha256),
-    ):
-        with private_storage.open(key, "rb") as file:
-            stored = file.read()
-        assert stored == render_contract_pdf(contract, locale, pdf_version=1)
-        assert hashlib.sha256(stored).hexdigest() == digest
-        text, _ = _pdf_text(stored)
-        assert "+84912345678" in text and "(+84) 988.158.285" in text
-    assert generate_contract_documents(contract, storage=private_storage) == documents
 
 
 @pytest.mark.django_db
@@ -524,8 +503,21 @@ def test_active_generation_is_idempotent(contract, private_storage):
 
 
 @pytest.mark.django_db
-def test_revoked_pdf_preserves_original_and_updates_current(contract, private_storage):
-    generate_contract_documents(contract, storage=private_storage)
+@pytest.mark.parametrize(
+    ("provider_version", "provider_phone", "member_phone"),
+    [
+        # d18b776 renders the provider literal and the unchanged canonical member snapshot.
+        (NFV_PROVIDER_V1, "(+84) 988.158.285", "+84912345678"),
+        (NFV_PROVIDER_V2, "0988158285", "0912345678"),
+    ],
+)
+def test_revoked_pdf_preserves_original_and_updates_current(
+    contract, private_storage, provider_version, provider_phone, member_phone
+):
+    if contract.provider_version != provider_version:
+        type(contract).objects.filter(pk=contract.pk).update(provider_version=provider_version)
+    active = generate_contract_documents(contract, storage=private_storage)
+    assert generate_contract_documents(contract, storage=private_storage) == active
     contract.refresh_from_db()
     original_keys = (
         contract.original_pdf_vi_storage_key,
@@ -570,6 +562,25 @@ def test_revoked_pdf_preserves_original_and_updates_current(contract, private_st
     assert contract.pdf_vi_storage_key != contract.original_pdf_vi_storage_key
     assert contract.pdf_en_storage_key != contract.original_pdf_en_storage_key
     assert contract.pdf_vi_sha256 != contract.original_pdf_vi_sha256
+    assert contract.phone_e164_snapshot == "+84912345678"
+    for label, original, revoked in (
+        (
+            "Điện thoại",
+            (active.vi_storage_key, active.vi_sha256),
+            (documents.vi_storage_key, documents.vi_sha256),
+        ),
+        (
+            "Phone",
+            (active.en_storage_key, active.en_sha256),
+            (documents.en_storage_key, documents.en_sha256),
+        ),
+    ):
+        for key, digest in (original, revoked):
+            with private_storage.open(key, "rb") as stored:
+                content = stored.read()
+            assert hashlib.sha256(content).hexdigest() == digest
+            text = _normalized_pdf_text(content)
+            assert text.index(f"{label}: {provider_phone}") < text.index(f"{label}: {member_phone}")
     with private_storage.open(contract.pdf_vi_storage_key, "rb") as stored:
         revoked_content = stored.read()
     revoked_text, _pages = _pdf_text(revoked_content)
@@ -618,7 +629,7 @@ def test_revoked_pdf_preserves_original_and_updates_current(contract, private_st
     contract.refresh_from_db()
 
     repeated = generate_revoked_contract_documents(contract, storage=private_storage)
-    assert repeated.version == 2
+    assert repeated == documents
     with private_storage.open(contract.pdf_vi_storage_key, "rb") as stored:
         current_text, _pages = _pdf_text(stored.read())
     assert "Khách hàng yêu cầu thu hồi" in current_text

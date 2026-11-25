@@ -201,7 +201,7 @@ def admin_redemption_payload(item: RedemptionRequest, *, detail=False) -> dict:
             "id": str(item.user_id),
             "name": item.user.name,
             "email": item.user.email,
-            "phone": user_phone(item.user),
+            "phone": user_phone(item.user) or item.user.login_phone_number or "",
         },
     }
     if detail:

@@ -1,7 +1,5 @@
 from copy import deepcopy
 
-from config.phones import format_vietnam_phone
-
 NFV_PROVIDER_V1 = "NFV_PROVIDER_V1"
 NFV_PROVIDER_V2 = "NFV_PROVIDER_V2"
 CURRENT_NFV_PROVIDER_VERSION = NFV_PROVIDER_V2
@@ -17,11 +15,12 @@ _PROVIDER_V1 = {
         "en": "https://nongnghiepthiennhien.com/en",
     },
 }
+# Provider details are part of the issued PDF. Add a new version for future changes.
 _PROVIDERS = {
     NFV_PROVIDER_V1: _PROVIDER_V1,
     NFV_PROVIDER_V2: {
         **_PROVIDER_V1,
-        "phone_zalo": format_vietnam_phone(_PROVIDER_V1["phone_zalo"]),
+        "phone_zalo": "0988158285",
     },
 }
 

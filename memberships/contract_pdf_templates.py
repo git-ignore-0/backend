@@ -12,7 +12,6 @@ from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import mm
 from reportlab.platypus import Flowable, Paragraph, Spacer, Table, TableStyle
 
-from config.phones import format_vietnam_phone
 from memberships.contract_provider import NFV_PROVIDER_V2
 
 _LABELS = {
@@ -541,9 +540,9 @@ def _confirmation_table(contract, provider, labels, styles):
 
 def build_contract_story(*, contract, locale, provider, payment, terms, styles, version=None, **_):
     member_phone = contract.phone_e164_snapshot
-    # The immutable provider version keeps the original layout for historical PDFs.
-    if contract.provider_version == NFV_PROVIDER_V2:
-        member_phone = format_vietnam_phone(member_phone)
+    # V2 fixes the presentation of the canonical +84 snapshot for future rerenders.
+    if contract.provider_version == NFV_PROVIDER_V2 and member_phone.startswith("+84"):
+        member_phone = f"0{member_phone[3:]}"
     labels = _LABELS[locale]
     status_label = labels["revoked"] if contract.status == "revoked" else labels["active"]
     story = [

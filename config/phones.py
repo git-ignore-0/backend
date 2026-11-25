@@ -57,15 +57,18 @@ def phone_search(query: str, field: str, *, legacy_presentation: bool = False) -
 
     if query.startswith(VIETNAM_LOCAL_PREFIX):
         national = query[1:]
+        # Domestic landlines start with 02 and have one more digit than mobiles.
+        full_length = 11 if national.startswith("2") else 10
+        exact = len(query) >= full_length
         if not legacy_presentation and national:
             candidates = [prefix + national for prefix in _STORED_PREFIXES]
-            if len(query) >= 10:
+            if exact:
                 return Q(**{f"{field}__in": candidates})
             return Q.create(
                 [(f"{field}__startswith", candidate) for candidate in candidates], connector=Q.OR
             )
         pattern = f"^{_STORED_PREFIX_PATTERN}{national}"
-        if len(query) < 10:
+        if not exact:
             pattern += "[0-9]*" if national else "[0-9]+"
         pattern += "$"
     else:

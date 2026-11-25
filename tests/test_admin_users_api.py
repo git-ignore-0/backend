@@ -330,6 +330,26 @@ def test_phone_search_uses_the_domestic_prefix_and_never_searches_country_digits
     assert ids("84") == set()
 
 
+def test_phone_search_matches_domestic_landline_prefix_in_canonical_and_legacy_fields(cms):
+    from members.models import MemberProfile
+
+    canonical = User.objects.create_user(name="Landline", login_phone_number="+842412345678")
+    legacy = User.objects.create_user(email="landline@example.com", name="Legacy")
+    MemberProfile.objects.create(user=legacy, phone_number="(+84) 241-234.6789")
+    for query, expected in (
+        ("0241234567", {canonical.pk}),
+        ("024123456", {canonical.pk}),
+        ("02412345678", {canonical.pk}),
+        ("0241234678", {legacy.pk}),
+        ("02412346789", {legacy.pk}),
+        ("024", {canonical.pk, legacy.pk}),
+        ("8424", set()),
+    ):
+        response = cms.get(USERS, {"search": query})
+        assert response.status_code == 200
+        assert {row["id"] for row in response.json()["data"]} == {str(pk) for pk in expected}
+
+
 @pytest.mark.parametrize("action", ["activate", "suspend", "reactivate", "reset-password"])
 def test_actions_validate_body_and_missing_target(cms, action):
     from uuid import uuid4

@@ -29,6 +29,19 @@ def test_identity_admin_keeps_lifecycle_fields_read_only():
     assert {"email", "status", "is_active"}.issubset(readonly)
 
 
+@pytest.mark.parametrize(
+    ("stored", "displayed"),
+    [("+84 (98) 123-4567", "0981234567"), ("legacy contact", "legacy contact"), ("", "")],
+)
+def test_member_profile_admin_formats_phone_without_changing_profile(rf, stored, displayed):
+    profile_admin = MemberProfileAdmin(MemberProfile, admin.site)
+    profile = MemberProfile(phone_number=stored)
+
+    assert "display_phone_number" in profile_admin.get_list_display(rf.get("/admin/"))
+    assert profile_admin.display_phone_number(profile) == displayed
+    assert profile.phone_number == stored
+
+
 @pytest.mark.django_db
 def test_member_profile_admin_combines_phone_and_text_search_terms(rf):
     garden = User.objects.create_user(email="garden@example.com", name="Garden Member")

@@ -269,6 +269,7 @@ def test_admin_customer_create_list_and_delete_rejection(admin_api):
 def test_admin_customer_search_matches_domestic_phone_before_pagination(admin_api):
     target = CSACustomer.objects.create(name="Target", phone_e164="+84981234567")
     longer = CSACustomer.objects.create(name="Longer", phone_e164="+849812345678")
+    landline = CSACustomer.objects.create(name="Landline", phone_e164="+842412345678")
     CSACustomer.objects.create(name="No Phone", phone_e164=None)
 
     def search(value):
@@ -280,10 +281,19 @@ def test_admin_customer_search_matches_domestic_phone_before_pagination(admin_ap
     assert exact["meta"]["total"] == 1
     assert [row["id"] for row in exact["data"]] == [str(target.pk)]
     assert exact["data"][0]["phone"] == "+84981234567"
-    for fragment in ("098", "098123", "4567"):
+    for fragment in ("098", "098123", "981234"):
         result = search(fragment)
         assert result["meta"]["total"] == 2
         assert result["data"][0]["id"] in {str(target.pk), str(longer.pk)}
+    for value, customer in (
+        ("0241234567", landline),
+        ("02412345678", landline),
+        ("09812345678", longer),
+    ):
+        result = search(value)
+        assert result["meta"]["total"] == 1
+        assert [row["id"] for row in result["data"]] == [str(customer.pk)]
+    assert search("4567")["meta"]["total"] == 3
     assert search("No Phone")["meta"]["total"] == 1
     for value in ("+84981234567", "84981234567", "8498"):
         assert search(value)["data"] == []

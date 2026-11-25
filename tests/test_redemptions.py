@@ -701,6 +701,47 @@ def test_admin_reorders_rewards_atomically_and_rejects_manual_position(admin_api
 
 
 @pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("login_phone", "contact_phone", "expected_phone", "search_queries"),
+    [
+        ("+84981234567", None, "+84981234567", ("0981234567", "098")),
+        (None, "+84 912 345 678", "+84 912 345 678", ("0912345678", "912345")),
+        ("+84981234567", "0912345678", "0912345678", ("0981234567", "0912345678")),
+        ("+84981234567", "", "+84981234567", ("0981234567",)),
+        (None, None, "", ()),
+    ],
+    ids=["phone-only", "contact-only", "both", "blank-contact", "no-phone"],
+)
+def test_admin_redemption_phone_prefers_contact_and_falls_back_to_login(
+    admin_api, reward, login_phone, contact_phone, expected_phone, search_queries
+):
+    user = User.objects.create_user(
+        email=None if login_phone and contact_phone is None else "reward@example.com",
+        login_phone_number=login_phone,
+        name="Reward member",
+        status=AccountStatus.ACTIVE,
+    )
+    if contact_phone is not None:
+        MemberProfile.objects.create(user=user, phone_number=contact_phone)
+    item, _balance = create_open_redemption(user, reward)
+    url = "/api/v1/admin/redemptions"
+
+    detail = admin_api.get(f"{url}/{item.pk}")
+    assert detail.status_code == 200
+    expected = {
+        "id": str(user.pk),
+        "name": user.name,
+        "email": user.email,
+        "phone": expected_phone,
+    }
+    assert detail.json()["data"]["user"] == expected
+    for search in ("", *search_queries):
+        response = admin_api.get(url, {"search": search})
+        assert response.status_code == 200
+        assert [row["user"] for row in response.json()["data"]] == [expected]
+
+
+@pytest.mark.django_db
 def test_admin_permissions_search_filter_pagination_actions_and_private_note(
     admin_api, access_token, active_user, reward
 ):
