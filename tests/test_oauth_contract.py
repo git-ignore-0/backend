@@ -292,7 +292,7 @@ def test_authenticated_signup_renders_account_choice_instead_of_consent(
 @pytest.mark.django_db
 @pytest.mark.parametrize(
     ("email", "label"),
-    [(None, "+84912345678"), ("member-choice@example.com", "member-choice@example.com")],
+    [(None, "0912345678"), ("member-choice@example.com", "member-choice@example.com")],
     ids=["phone-only", "email-and-phone"],
 )
 def test_signup_account_choice_displays_preferred_account_label(

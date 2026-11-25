@@ -1,20 +1,28 @@
 from copy import deepcopy
 
-NFV_PROVIDER_V1 = "NFV_PROVIDER_V1"
-CURRENT_NFV_PROVIDER_VERSION = NFV_PROVIDER_V1
+from config.phones import format_vietnam_phone
 
+NFV_PROVIDER_V1 = "NFV_PROVIDER_V1"
+NFV_PROVIDER_V2 = "NFV_PROVIDER_V2"
+CURRENT_NFV_PROVIDER_VERSION = NFV_PROVIDER_V2
+
+_PROVIDER_V1 = {
+    "name": "Natural Farming Vietnam",
+    "representative": "Lê Thị An Khánh",
+    "address": ("800/2 Ấp Phú Ngãi, Xã Phú An Hòa, Huyện Châu Thành, Tỉnh Bến Tre"),
+    "email": "khanh@nongnghiepthiennhien.com",
+    "phone_zalo": "(+84) 988.158.285",
+    "websites": {
+        "vi": "https://nongnghiepthiennhien.com",
+        "en": "https://nongnghiepthiennhien.com/en",
+    },
+}
 _PROVIDERS = {
-    NFV_PROVIDER_V1: {
-        "name": "Natural Farming Vietnam",
-        "representative": "Lê Thị An Khánh",
-        "address": ("800/2 Ấp Phú Ngãi, Xã Phú An Hòa, Huyện Châu Thành, Tỉnh Bến Tre"),
-        "email": "khanh@nongnghiepthiennhien.com",
-        "phone_zalo": "(+84) 988.158.285",
-        "websites": {
-            "vi": "https://nongnghiepthiennhien.com",
-            "en": "https://nongnghiepthiennhien.com/en",
-        },
-    }
+    NFV_PROVIDER_V1: _PROVIDER_V1,
+    NFV_PROVIDER_V2: {
+        **_PROVIDER_V1,
+        "phone_zalo": format_vietnam_phone(_PROVIDER_V1["phone_zalo"]),
+    },
 }
 
 

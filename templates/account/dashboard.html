@@ -20,7 +20,7 @@
         {% if account_user.login_phone_number %}
             <dl class="auth-field">
                 <dt class="auth-field-caption">{% translate "Phone number" %}</dt>
-                <dd class="auth-profile-value">{{ account_user.login_phone_number }}</dd>
+                <dd class="auth-profile-value">{{ account_user.login_phone_display }}</dd>
                 {% if phone_form.errors %}
                     <dd><c-alert variant="destructive">{{ phone_form.errors }}</c-alert></dd>
                 {% endif %}

@@ -17,6 +17,7 @@ from reportlab.lib.enums import TA_CENTER
 from reportlab.pdfbase import pdfmetrics
 
 import memberships.terms as terms_catalog
+from config.phones import normalize_vietnam_phone
 from identity.models import AccountStatus, User
 from memberships.contract_pdf_templates import _CheckedBox, _terms_story, build_pdf_styles
 from memberships.contract_pdfs import (
@@ -32,6 +33,7 @@ from memberships.contract_pdfs import (
     get_contract_pdf_storage,
     render_contract_pdf,
 )
+from memberships.contract_provider import NFV_PROVIDER_V1
 from memberships.contracts import CSAContractSnapshot, create_manual_contract
 from memberships.models import (
     CSAContractStatus,
@@ -44,7 +46,6 @@ from memberships.models import (
     MembershipStatus,
     QuotaPolicy,
 )
-from memberships.phones import normalize_vietnam_phone
 from memberships.terms import CSA_TERMS_V1, CSA_TERMS_V2, get_csa_terms
 
 
@@ -218,6 +219,10 @@ def test_renders_valid_vietnamese_and_english_pdfs_from_contract_snapshot(contra
     assert "10/09/2026" in vi_text
     assert "09/10/2026" in vi_text
     assert "Nguyễn Văn An" in vi_text
+    assert contract.phone_e164_snapshot == "+84912345678"
+    for text in (vi_text, en_text):
+        assert "0912345678" in text and "0988158285" in text
+        assert "+84912345678" not in text
     assert "123 Đường Vườn Rau, Bến Tre" in vi_text
     assert "Vietcombank" in vi_text
     assert "123456789" in vi_text
@@ -232,6 +237,27 @@ def test_renders_valid_vietnamese_and_english_pdfs_from_contract_snapshot(contra
     assert "Mã hash điều khoản" not in vi_text
     assert "☐" not in vi_text
     assert "ĐÃ THU HỒI" not in vi_text
+
+
+@pytest.mark.django_db
+def test_legacy_provider_keeps_historical_phone_rendering_and_document_hashes(
+    contract, private_storage
+):
+    type(contract).objects.filter(pk=contract.pk).update(provider_version=NFV_PROVIDER_V1)
+    contract.refresh_from_db()
+    documents = generate_contract_documents(contract, storage=private_storage)
+
+    for locale, key, digest in (
+        ("vi", documents.vi_storage_key, documents.vi_sha256),
+        ("en", documents.en_storage_key, documents.en_sha256),
+    ):
+        with private_storage.open(key, "rb") as file:
+            stored = file.read()
+        assert stored == render_contract_pdf(contract, locale, pdf_version=1)
+        assert hashlib.sha256(stored).hexdigest() == digest
+        text, _ = _pdf_text(stored)
+        assert "+84912345678" in text and "(+84) 988.158.285" in text
+    assert generate_contract_documents(contract, storage=private_storage) == documents
 
 
 @pytest.mark.django_db

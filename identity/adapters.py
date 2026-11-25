@@ -99,7 +99,8 @@ class CoreAccountAdapter(DefaultAccountAdapter):
     def phone_form_field(self, **kwargs):
         from identity.forms import LoginPhoneField
 
-        return LoginPhoneField(**kwargs)
+        # allauth calls this field again to classify an already-normalized login.
+        return LoginPhoneField(local_only=False, **kwargs)
 
     def clean_phone(self, phone):
         return normalize_login_phone(phone)

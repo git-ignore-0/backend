@@ -10,6 +10,7 @@ from django.utils import timezone
 
 from commerce.models import ShippingAddress
 from commerce.shipping import active_shipping_area
+from config.phones import InvalidPhoneNumber, normalize_vietnam_phone
 from identity.models import AccountStatus, AuditLog, User
 from members.administrative_units import province_exists, ward_choices
 from memberships.contract_pdfs import (
@@ -49,7 +50,6 @@ from memberships.models import (
     UsageOrderStatus,
 )
 from memberships.payments import confirm_locked_csa_payment, paid_cycle_count, payment_due_at
-from memberships.phones import InvalidPhoneNumber, normalize_vietnam_phone
 from memberships.pricing import calculate_total_price_vnd
 from memberships.quota_points import POINT_INPUT_ERROR, is_allowed_point_input
 

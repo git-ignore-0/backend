@@ -722,9 +722,20 @@ def test_admin_permissions_search_filter_pagination_actions_and_private_note(
     assert contacted.json()["data"]["redemption"]["status"] == "contacted"
     assert contacted.json()["data"]["redemption"]["internal_note"] == "Call after 5 PM"
 
-    searched = admin_api.get("/api/v1/admin/redemptions?search=912%20345&status=contacted")
-    assert searched.status_code == 200
-    assert searched.json()["data"][0]["id"] == str(item.pk)
+    canonical_user = create_active_user("canonical-reward@example.com")
+    canonical_user.login_phone_number = "+84981234567"
+    canonical_user.save(update_fields=["login_phone_number"])
+    canonical_item, _ = create_open_redemption(canonical_user, reward)
+    url = "/api/v1/admin/redemptions"
+    for query in ("0912345678", "912345", "redemption-search"):
+        searched = admin_api.get(url, {"search": query, "status": "contacted"})
+        assert searched.status_code == 200
+        assert [row["id"] for row in searched.json()["data"]] == [str(item.pk)]
+    for query in ("0981234567", "098", "234567"):
+        result = admin_api.get(url, {"search": query, "status": "pending"})
+        assert result.status_code == 200
+        assert [row["id"] for row in result.json()["data"]] == [str(canonical_item.pk)]
+    assert admin_api.get(url, {"search": "+84981234567"}).json()["data"] == []
     assert searched.json()["meta"]["page_size"] == 30
     for _index in range(30):
         RedemptionRequest.objects.create(

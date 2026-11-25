@@ -3,8 +3,8 @@ from decimal import Decimal
 from django.utils.text import slugify
 from rest_framework import serializers
 
+from config.phones import InvalidPhoneNumber, normalize_vietnam_phone
 from members.administrative_units import province_exists, ward_choices
-from memberships.phones import InvalidPhoneNumber, normalize_vietnam_phone
 from memberships.quota_points import POINT_INPUT_ERROR, is_allowed_point_input
 
 MAX_POSITIVE_INTEGER = 2_147_483_647

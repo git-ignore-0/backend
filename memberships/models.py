@@ -9,7 +9,7 @@ from django.db import models
 from django.db.models import Q
 from django.db.models.functions import Round, Trim, TruncDate, Upper
 
-from memberships.phones import InvalidPhoneNumber, normalize_vietnam_phone
+from config.phones import InvalidPhoneNumber, normalize_vietnam_phone
 from memberships.pricing import calculate_total_price_vnd
 
 

@@ -400,7 +400,7 @@ def test_admin_authorization_search_pagination_detail_and_point_creation(admin_a
     for index in range(31):
         create_active_user(f"page-{index:02d}@example.com")
 
-    searched = admin_api.get("/api/v1/admin/users?search=912%20345&page=1")
+    searched = admin_api.get("/api/v1/admin/users", {"search": "912345", "page": 1})
     assert searched.status_code == 200
     assert searched.json()["data"][0]["id"] == str(target.pk)
     summary = searched.json()["data"][0]

@@ -8,6 +8,8 @@ from django.urls import reverse
 from identity.admin import UserAdmin
 from identity.models import AccountStatus, AuditLog, IdentityEvent, User
 from identity.services import transition_account
+from members.admin import MemberProfileAdmin
+from members.models import MemberProfile
 
 
 @pytest.mark.django_db
@@ -25,6 +27,28 @@ def test_identity_admin_keeps_lifecycle_fields_read_only():
     readonly = set(user_admin.readonly_fields)
 
     assert {"email", "status", "is_active"}.issubset(readonly)
+
+
+@pytest.mark.django_db
+def test_member_profile_admin_combines_phone_and_text_search_terms(rf):
+    garden = User.objects.create_user(email="garden@example.com", name="Garden Member")
+    orchard = User.objects.create_user(email="orchard@example.com", name="Orchard Member")
+    MemberProfile.objects.create(user=garden, phone_number="+84 (98) 123-4567")
+    MemberProfile.objects.create(user=orchard, phone_number="0904567890")
+    profile_admin = MemberProfileAdmin(MemberProfile, admin.site)
+    request = rf.get("/admin/members/memberprofile/")
+
+    for term in ('"Garden Member" 4567', "0981234567", "098"):
+        results, may_duplicate = profile_admin.get_search_results(
+            request, MemberProfile.objects.all(), term
+        )
+        assert not may_duplicate
+        assert list(results.values_list("user_id", flat=True)) == [garden.pk]
+
+    results, _ = profile_admin.get_search_results(
+        request, MemberProfile.objects.all(), "+84981234567"
+    )
+    assert not results.exists()
 
 
 @pytest.mark.django_db

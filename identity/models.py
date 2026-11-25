@@ -5,6 +5,7 @@ from django.db import models
 from django.db.models import Q
 from django.utils import timezone
 
+from config.phones import format_vietnam_phone
 from identity.managers import UserManager
 from identity.phones import normalize_login_phone
 
@@ -88,6 +89,10 @@ class User(AbstractBaseUser, PermissionsMixin):
 
     def __str__(self) -> str:
         return self.email or self.login_phone_number or str(self.pk)
+
+    @property
+    def login_phone_display(self) -> str | None:
+        return format_vietnam_phone(self.login_phone_number)
 
     @property
     def email_verified(self) -> bool:

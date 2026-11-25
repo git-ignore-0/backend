@@ -7,7 +7,7 @@
     <h1>{% blocktranslate with application_name=application.name %}Allow {{ application_name }}?{% endblocktranslate %}</h1>
     <dl class="auth-details">
         <div><dt>{% translate "Application" %}</dt><dd>{{ application.name }}</dd></div>
-        <div><dt>{% translate "Account" %}</dt><dd>{{ user.email|default:user.login_phone_number|default:user.name }}</dd></div>
+        <div><dt>{% translate "Account" %}</dt><dd>{{ user.email|default:user.login_phone_display|default:user.name }}</dd></div>
     </dl>
     <h2>{% translate "This application is requesting the following permissions:" %}</h2>
     <ul class="auth-permissions">

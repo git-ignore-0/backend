@@ -21,6 +21,7 @@ from commerce.shipping import (
     shipping_address_version,
     shipping_recipient_details,
 )
+from config.phones import InvalidPhoneNumber, normalize_vietnam_phone
 from identity.locks import lock_user_for_shared_read
 from identity.models import AuditLog, User
 from members.administrative_units import province_exists, ward_choices
@@ -72,7 +73,6 @@ from memberships.payments import (
     ensure_csa_payment_schedule,
     set_csa_payment_due_dates,
 )
-from memberships.phones import InvalidPhoneNumber, normalize_vietnam_phone
 from memberships.services import (
     CSACustomerError,
     CSACustomerShippingAddressUnavailable,

@@ -58,6 +58,7 @@ from commerce.store_orders import (
     verify_order_access,
 )
 from commerce.store_proxy import trusted_store_client_ip
+from config.phones import InvalidPhoneNumber, normalize_vietnam_phone, phone_search
 from content.permissions import IsWebsiteAdmin
 from memberships.coupons import CouponError
 from memberships.csa_payloads import round_payload, selection_payload
@@ -621,7 +622,7 @@ class AdminStoreOrderListView(APIView):
             rows = rows.filter(
                 Q(reference_code__icontains=search)
                 | Q(recipient_name_snapshot__icontains=search)
-                | Q(phone_e164_snapshot__icontains=search)
+                | phone_search(search, "phone_e164_snapshot")
             )
         rows = rows.order_by(
             {
@@ -704,8 +705,6 @@ class PublicStoreOrderLookupView(APIView):
     def post(self, request):
         serializer = StoreGuestLookupSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        from memberships.phones import InvalidPhoneNumber, normalize_vietnam_phone
-
         try:
             phone = normalize_vietnam_phone(serializer.validated_data["phone_number"])
         except InvalidPhoneNumber:

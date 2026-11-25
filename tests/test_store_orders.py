@@ -677,12 +677,18 @@ def test_public_available_quantity_subtracts_live_reservation_and_approved_sale(
 
 
 @pytest.mark.django_db
-def test_guest_lookup_uses_generic_failure_and_http_only_session(store_product, payment_settings):
+@pytest.mark.parametrize("lookup_phone", ["0901234567", "+84901234567"])
+def test_guest_lookup_uses_generic_failure_and_http_only_session(
+    store_product, payment_settings, lookup_phone
+):
+    payload = guest_payload(store_product)
+    payload["guest"]["phone_number"] = "+84901234567"
     created = (
         APIClient()
-        .post("/api/v1/public/store-checkouts", guest_payload(store_product), format="json")
+        .post("/api/v1/public/store-checkouts", payload, format="json")
         .json()["data"]
     )
+    assert created["shipping_address"]["phone_number"] == "+84901234567"
     client = APIClient()
     wrong_code = client.post(
         "/api/v1/public/store-order-lookups",
@@ -701,7 +707,7 @@ def test_guest_lookup_uses_generic_failure_and_http_only_session(store_product, 
 
     found = client.post(
         "/api/v1/public/store-order-lookups",
-        {"reference_code": created["reference_code"], "phone_number": "0901234567"},
+        {"reference_code": created["reference_code"], "phone_number": lookup_phone},
         format="json",
     )
     assert found.status_code == 200
@@ -710,6 +716,30 @@ def test_guest_lookup_uses_generic_failure_and_http_only_session(store_product, 
     current = client.get("/api/v1/public/store-order-lookups/current")
     assert current.status_code == 200
     assert current.json()["data"]["id"] == created["id"]
+
+
+@pytest.mark.django_db
+def test_admin_order_search_matches_domestic_phone_and_business_fields(
+    active_user, access_token, store_product, payment_settings
+):
+    active_user.groups.add(Group.objects.get_or_create(name="website_admin")[0])
+    access_token.scope = "profile email content:manage"
+    access_token.save(update_fields=["scope"])
+    admin = APIClient()
+    admin.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token.token}")
+    response = APIClient().post(
+        "/api/v1/public/store-checkouts", guest_payload(store_product), format="json"
+    )
+    assert response.status_code == 201
+    order = response.json()["data"]
+    path = "/api/v1/admin/store-orders"
+    for value in ("0901234567", "090", "4567", "Nguyễn Văn An", order["reference_code"]):
+        result = admin.get(path, {"search": value, "page_size": 1})
+        assert result.status_code == 200
+        assert result.json()["meta"]["total"] == 1
+        assert [row["id"] for row in result.json()["data"]] == [order["id"]]
+    for value in ("84901234567", "+84901234567", "8490"):
+        assert admin.get(path, {"search": value}).json()["data"] == []
 
 
 @pytest.mark.django_db

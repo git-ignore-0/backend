@@ -278,7 +278,7 @@ def test_add_phone_requires_password_and_cannot_replace_existing_number(
         now += 61
     success = client.post(
         "/account/phone/add",
-        {"login_phone_number": "(090) 123-4567", "current_password": PASSWORD},
+        {"login_phone_number": "0901234567", "current_password": PASSWORD},
     )
     assert success.status_code == 302 and success.url == "/account"
     now += 61
@@ -293,7 +293,8 @@ def test_add_phone_requires_password_and_cannot_replace_existing_number(
     assert active_user.member_profile.phone_number == "Contact phone"
     assert not IdentityEvent.objects.filter(user=active_user).exists()
     dashboard = client.get("/account").content.decode()
-    assert active_user.login_phone_number in dashboard
+    assert "0901234567" in dashboard
+    assert active_user.login_phone_number not in dashboard
     assert "Contact phone" not in dashboard
     assert "/account/complete#phone" not in dashboard
 
@@ -350,7 +351,14 @@ def test_pending_phone_add_with_website_return_stays_in_completion(client, setti
 @pytest.mark.django_db
 @pytest.mark.parametrize(
     ("number", "password", "error_field"),
-    [("0912345678", "bad", "current_password"), ("invalid", PASSWORD, "login_phone_number")],
+    [
+        ("0912345678", "bad", "current_password"),
+        ("invalid", PASSWORD, "login_phone_number"),
+        ("84912345678", PASSWORD, "login_phone_number"),
+        ("+84912345678", PASSWORD, "login_phone_number"),
+        ("(091) 234-5678", PASSWORD, "login_phone_number"),
+        (" 0912345678", PASSWORD, "login_phone_number"),
+    ],
 )
 def test_active_phone_errors_render_inside_open_dashboard_form(
     active_user, number, password, error_field

@@ -288,7 +288,7 @@ def test_projection_search_and_batch_verification(cms, django_assert_max_num_que
     user = target("active", email="projected@example.com")
     EmailAddress.objects.create(user=user, email=user.email, verified=True)
     MemberProfile.objects.create(user=user, phone_number="0987654321")
-    for query in ("091 234 5678", "+84912345678", "123456", "projected"):
+    for query in ("0912345678", "091234", "091", "123456", "5678", "projected"):
         result = cms.get(USERS, {"search": query}).json()
         row = next(item for item in result["data"] if item["id"] == str(user.pk))
         assert row["phone"] == row["login_phone_number"] == "+84912345678"
@@ -297,7 +297,8 @@ def test_projection_search_and_batch_verification(cms, django_assert_max_num_que
     details = cms.get(f"{USERS}/{user.pk}").json()["data"]
     assert details["login_phone_number"] == "+84912345678" and details["email_verified"]
     assert details["phone"] == details["login_phone_number"] and "referral_code" in details
-    assert cms.get(USERS, {"search": "0987654321"}).json()["data"] == []
+    for query in ("0987654321", "+84912345678", "84912345678", "091 234 5678", "84"):
+        assert cms.get(USERS, {"search": query}).json()["data"] == []
     for i in range(10):
         member = User.objects.create_user(f"batch{i}@example.com", name="Batch")
         EmailAddress.objects.create(user=member, email=member.email, verified=True)
@@ -305,6 +306,28 @@ def test_projection_search_and_batch_verification(cms, django_assert_max_num_que
         response = cms.get(USERS)
     assert response.status_code == 200
     assert response.json()["meta"] == {"page": 1, "page_size": 30, "total": 12}
+
+
+def test_phone_search_uses_the_domestic_prefix_and_never_searches_country_digits(cms):
+    from members.models import MemberProfile
+
+    user = User.objects.create_user(name="Prefix", login_phone_number="0981234567")
+    middle = User.objects.create_user(name="Middle", login_phone_number="0909814567")
+    legacy = User.objects.create_user(email="legacy@example.com", name="Legacy")
+    User.objects.filter(pk=legacy.pk).update(login_phone_number="")
+    MemberProfile.objects.create(user=legacy, phone_number="(+84) 982-345.678")
+    blank = User.objects.create_user(email="blank@example.com", name="Blank")
+    MemberProfile.objects.create(user=blank, phone_number="")
+
+    def ids(query):
+        result = cms.get(USERS, {"search": query})
+        assert result.status_code == 200
+        return {item["id"] for item in result.json()["data"]}
+
+    assert ids("098") == {str(user.pk), str(legacy.pk)}
+    assert ids("4567") == {str(user.pk), str(middle.pk), str(legacy.pk)}
+    assert ids("8498") == set()
+    assert ids("84") == set()
 
 
 @pytest.mark.parametrize("action", ["activate", "suspend", "reactivate", "reset-password"])

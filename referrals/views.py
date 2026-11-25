@@ -1,5 +1,4 @@
 from allauth.account.models import EmailAddress
-from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from django.db.models import Case, F, IntegerField, Prefetch, Q, Sum, Value, When
 from django.db.models.functions import Coalesce
@@ -14,6 +13,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from commerce.shipping import admin_shipping_address_payload, can_edit_admin_shipping_address
+from config.phones import phone_search
 from content.permissions import IsWebsiteAdmin
 from content.serializers import media_payload
 from content.services import audit, store_reward_image
@@ -24,7 +24,6 @@ from identity.admin_services import (
     lock_admin_accounts,
 )
 from identity.models import AccountStatus, User
-from identity.phones import normalize_login_phone
 from referrals.models import (
     PointDirection,
     PointTransaction,
@@ -465,19 +464,15 @@ class AdminUserListView(AdminAccountPasswordAPIView):
             )
         )
         if search:
-            matches = (
+            legacy_phone = (
+                Q(login_phone_number__isnull=True) | Q(login_phone_number="")
+            ) & phone_search(search, "member_profile__phone_number", legacy_presentation=True)
+            queryset = queryset.filter(
                 Q(name__icontains=search)
                 | Q(email__icontains=search)
-                | Q(login_phone_number__isnull=True, member_profile__phone_number__icontains=search)
-                | Q(login_phone_number__icontains=search)
+                | phone_search(search, "login_phone_number")
+                | legacy_phone
             )
-            try:
-                phone = normalize_login_phone(search)
-            except DjangoValidationError:
-                pass
-            else:
-                matches |= Q(login_phone_number=phone)
-            queryset = queryset.filter(matches)
         if account_status := query.validated_data["status"]:
             queryset = queryset.filter(status=account_status)
         if has_csa_customer := query.validated_data.get("has_csa_customer"):
@@ -792,7 +787,8 @@ class AdminRedemptionViewSet(viewsets.ViewSet):
         if search:
             queryset = queryset.filter(
                 Q(user__email__icontains=search)
-                | Q(user__member_profile__phone_number__icontains=search)
+                | phone_search(search, "user__login_phone_number")
+                | phone_search(search, "user__member_profile__phone_number", legacy_presentation=True)
             )
         if data["status"]:
             queryset = queryset.filter(status=data["status"])

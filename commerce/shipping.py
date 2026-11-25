@@ -7,6 +7,7 @@ from django.db import OperationalError, connection, transaction
 from django.utils.crypto import salted_hmac
 
 from commerce.models import ShippingAddress, ShippingArea, ShippingProvinceRule
+from config.phones import InvalidPhoneNumber, normalize_vietnam_phone
 from identity.admin_services import (
     AccountConflict,
     is_protected_account_target,
@@ -14,7 +15,6 @@ from identity.admin_services import (
 )
 from identity.models import AccountStatus, User
 from members.administrative_units import province_choices, ward_choices
-from memberships.phones import InvalidPhoneNumber, normalize_vietnam_phone
 
 
 class UnsupportedShippingArea(Exception):

@@ -41,7 +41,7 @@ class CoreAuthorizationView(AuthorizationView):
         signup_requested = request.GET.get("screen_hint") == "signup"
         if request.user.is_authenticated and signup_requested:
             user = request.user
-            account_label = user.email or user.login_phone_number or user.name
+            account_label = user.email or user.login_phone_display or user.name
             response = render(
                 request,
                 "oauth2_provider/signup_account_conflict.html",

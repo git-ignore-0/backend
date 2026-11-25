@@ -301,6 +301,12 @@ def test_admin_list_searches_filters_paginates_and_detail_hides_guest_hash(
     assert str(confirmed.guest_token_hash) not in detail.content.decode()
     newest_first = admin_api.get(LIST_URL).json()["data"]
     assert [row["id"] for row in newest_first[:2]] == [str(confirmed.pk), str(pending.pk)]
+    for value in ("0902222222", "0902", "2222", "Khách mới"):
+        result = admin_api.get(LIST_URL, {"search": value, "page_size": 1})
+        assert result.status_code == 200
+        assert result.json()["meta"]["total"] == 1
+        assert [row["id"] for row in result.json()["data"]] == [str(confirmed.pk)]
+    assert admin_api.get(LIST_URL, {"search": "+84902222222"}).json()["data"] == []
 
 
 @pytest.mark.django_db

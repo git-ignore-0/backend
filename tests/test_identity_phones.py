@@ -2,6 +2,7 @@ import pytest
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, connection, transaction
 
+from config.phones import format_vietnam_phone
 from identity.models import User
 
 
@@ -21,6 +22,21 @@ def test_equivalent_phone_presentations(value):
 
 def test_vietnam_landline():
     assert normalize("024 1234 5678") == "+842412345678"
+
+
+@pytest.mark.parametrize(
+    ("stored", "display"),
+    [
+        ("+84981234567", "0981234567"),
+        ("+842412345678", "02412345678"),
+        ("0981234567", "0981234567"),
+        ("legacy contact", "legacy contact"),
+        (None, None),
+        ("", ""),
+    ],
+)
+def test_format_phone_for_display_preserves_missing_and_legacy_values(stored, display):
+    assert format_vietnam_phone(stored) == display
 
 
 @pytest.mark.parametrize(

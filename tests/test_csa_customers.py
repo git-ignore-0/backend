@@ -11,6 +11,7 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 
 from commerce.models import ShippingAddress, ShippingArea
+from config.phones import InvalidPhoneNumber, normalize_vietnam_phone
 from identity.models import AccountStatus, AuditLog, User
 from identity.services import transition_account
 from members.models import MemberProfile
@@ -20,7 +21,6 @@ from memberships.models import (
     MembershipPaymentSettings,
     MembershipStatus,
 )
-from memberships.phones import InvalidPhoneNumber, normalize_vietnam_phone
 from memberships.services import (
     CSACustomerRequiredForMembership,
     DuplicateCSACustomerPhone,
@@ -263,6 +263,30 @@ def test_admin_customer_create_list_and_delete_rejection(admin_api):
     assert listed.json()["meta"]["page_size"] == 10
 
     assert admin_api.delete(f"/api/v1/admin/csa-customers/{managed['id']}").status_code == 405
+
+
+@pytest.mark.django_db
+def test_admin_customer_search_matches_domestic_phone_before_pagination(admin_api):
+    target = CSACustomer.objects.create(name="Target", phone_e164="+84981234567")
+    longer = CSACustomer.objects.create(name="Longer", phone_e164="+849812345678")
+    CSACustomer.objects.create(name="No Phone", phone_e164=None)
+
+    def search(value):
+        response = admin_api.get(CUSTOMERS, {"search": value, "page_size": 1})
+        assert response.status_code == 200
+        return response.json()
+
+    exact = search("0981234567")
+    assert exact["meta"]["total"] == 1
+    assert [row["id"] for row in exact["data"]] == [str(target.pk)]
+    assert exact["data"][0]["phone"] == "+84981234567"
+    for fragment in ("098", "098123", "4567"):
+        result = search(fragment)
+        assert result["meta"]["total"] == 2
+        assert result["data"][0]["id"] in {str(target.pk), str(longer.pk)}
+    assert search("No Phone")["meta"]["total"] == 1
+    for value in ("+84981234567", "84981234567", "8498"):
+        assert search(value)["data"] == []
 
 
 @pytest.mark.django_db
@@ -695,6 +719,11 @@ def test_managed_customer_assignment_and_self_ownership(
     assert response.status_code == 201
     assert response.json()["data"]["customer"]["user"] is None
     assert not User.objects.filter(email__icontains="managed").exists()
+    membership_id = response.json()["data"]["id"]
+    for value in ("0901234567", "090", "234567", "Managed", "FB-MANAGED"):
+        result = admin_api.get("/api/v1/admin/memberships", {"search": value})
+        assert result.status_code == 200
+        assert [row["id"] for row in result.json()["data"]] == [membership_id]
 
     self_client = bearer_client(access_token)
     assert self_client.get("/api/v1/memberships/current").json()["data"] is None

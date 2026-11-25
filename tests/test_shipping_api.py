@@ -197,8 +197,11 @@ def test_self_address_ignores_legacy_contacts_when_login_phone_is_missing(
 
 
 @pytest.mark.django_db
-def test_account_address_uses_login_phone_over_old_recipient_phone(member_api, active_user):
-    active_user.login_phone_number = "0912345678"
+@pytest.mark.parametrize("login_phone", ["0912345678", "+84912345678"])
+def test_account_address_uses_login_phone_over_old_recipient_phone(
+    member_api, active_user, login_phone
+):
+    active_user.login_phone_number = login_phone
     active_user.save(update_fields=["login_phone_number"])
     ShippingAddress.objects.create(user=active_user, **address_payload(phone_number="0987654321"))
 

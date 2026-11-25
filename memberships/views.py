@@ -14,6 +14,7 @@ from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from config.phones import phone_search
 from content.permissions import IsWebsiteAdmin
 from identity.models import User
 from memberships.admin_coupons import (
@@ -2453,7 +2454,7 @@ class AdminCSAPurchaseRequestViewSet(viewsets.ViewSet):
         if search := data["search"].strip():
             queryset = queryset.filter(
                 Q(request_code__icontains=search)
-                | Q(phone_e164__icontains=search)
+                | phone_search(search, "phone_e164")
                 | Q(name_snapshot__icontains=search)
             )
         if request_status := data.get("status"):
@@ -2573,7 +2574,7 @@ class AdminCSACustomerViewSet(viewsets.ViewSet):
         queryset = customer_queryset().order_by("name", "id")
         data = query.validated_data
         if search := data["search"].strip():
-            queryset = queryset.filter(Q(name__icontains=search) | Q(phone_e164__icontains=search))
+            queryset = queryset.filter(Q(name__icontains=search) | phone_search(search, "phone_e164"))
         if data["linked"] == "linked":
             queryset = queryset.filter(user__isnull=False)
         elif data["linked"] == "managed":
@@ -2686,7 +2687,7 @@ class AdminMembershipViewSet(viewsets.ViewSet):
             queryset = queryset.filter(
                 Q(customer__user__email__icontains=search)
                 | Q(customer__name__icontains=search)
-                | Q(customer__phone_e164__icontains=search)
+                | phone_search(search, "customer__phone_e164")
                 | Q(farmbrite_order_reference__icontains=search)
             )
         items, meta = paginate(queryset, query.validated_data["page"])

@@ -8,11 +8,23 @@ from django.contrib.messages import get_messages
 from django.test import Client
 from django.urls import reverse
 
+from identity.forms import LoginPhoneField
 from identity.models import AuditLog, IdentityEvent, User
 from members.models import MemberProfile
 from referrals.models import ReferralAccount
 
 PASSWORD = "StrongPassword12"
+NON_LOCAL_PHONES = [
+    "84901234567",
+    "+84901234567",
+    " (090) 123-45.67 ",
+    "090 123 4567",
+    "090-123-4567",
+    "090a1234567",
+    "090!1234567",
+    "0901234567 ",
+    "\t0901234567",
+]
 
 
 @pytest.fixture(autouse=True)
@@ -74,13 +86,12 @@ def test_signup_aliases_create_pending_phone_identity_without_login(
 
 
 @pytest.mark.django_db
-@pytest.mark.parametrize(
-    "phone", ["0901234567", "84901234567", "+84901234567", " (090) 123-45.67 "]
-)
-def test_signup_accepts_existing_phone_normalizer_formats(client, phone):
+@pytest.mark.parametrize("phone", NON_LOCAL_PHONES)
+def test_signup_rejects_non_local_phone_input(client, phone):
     response = client.post("/register", signup_data(phone=phone))
-    assert response.status_code == 302
-    assert User.objects.get().login_phone_number == "+84901234567"
+    assert response.status_code == 200
+    assert response.context["form"].errors.as_data()["phone"][0].code == "invalid_phone"
+    assert not User.objects.exists()
 
 
 @pytest.mark.django_db
@@ -119,7 +130,7 @@ def test_signup_duplicate_identifier_creates_no_identity_or_mail(client, mailout
 @pytest.mark.django_db
 def test_adapter_commit_false_only_populates_unsaved_complete_user(rf):
     adapter = get_adapter(rf.post("/register"))
-    form = SimpleNamespace(_has_phone_field=True, cleaned_data=signup_data())
+    form = SimpleNamespace(_has_phone_field=True, cleaned_data=signup_data(phone="+84901234567"))
     user = adapter.save_user(rf.post("/register"), User(), form, commit=False)
     assert user._state.adding and not User.objects.exists()
     assert user.email is None and user.login_phone_number == "+84901234567"
@@ -127,11 +138,17 @@ def test_adapter_commit_false_only_populates_unsaved_complete_user(rf):
     assert adapter.get_phone(user) == ("+84901234567", False)
 
 
+def test_allauth_can_classify_a_canonical_phone_after_form_validation():
+    assert get_adapter().phone_form_field().clean("+84901234567") == "+84901234567"
+
+
+def test_form_accepts_a_domestic_vietnamese_landline():
+    assert LoginPhoneField().clean("02412345678") == "+842412345678"
+
+
 @pytest.mark.django_db
 @pytest.mark.parametrize("status", ["pending_activation", "active"])
-@pytest.mark.parametrize(
-    "login", ["0901234567", "84901234567", "+84 (90) 1234567", "member@example.com"]
-)
+@pytest.mark.parametrize("login", ["0901234567", "member@example.com", " Member@EXAMPLE.com\t"])
 def test_phone_or_email_login_uses_status_not_email_verification(client, status, login):
     user = User.objects.create_user(
         "member@example.com",
@@ -147,6 +164,18 @@ def test_phone_or_email_login_uses_status_not_email_verification(client, status,
     assert not client.session.get_expire_at_browser_close()
     assert AuditLog.objects.filter(user=user, action="auth.login").exists()
     assert get_adapter().get_phone(user) == ("+84901234567", False)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("login", NON_LOCAL_PHONES)
+def test_login_rejects_non_local_phone_input(client, login):
+    User.objects.create_user(
+        name="Phone", login_phone_number="+84901234567", password=PASSWORD, status="active"
+    )
+    response = client.post("/login", {"login": login, "password": PASSWORD})
+    assert response.status_code == 200
+    assert response.context["form"].errors.as_data()["login"][0].code == "invalid_phone"
+    assert "_auth_user_id" not in client.session
 
 
 @pytest.mark.django_db

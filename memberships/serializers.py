@@ -3,7 +3,9 @@ from decimal import Decimal
 
 from django.utils import timezone
 from rest_framework import serializers
+from rest_framework.fields import empty
 
+from config.phones import InvalidPhoneNumber, normalize_vietnam_phone
 from members.administrative_units import province_exists, ward_choices
 from memberships.models import (
     CSAPurchaseRequestStatus,
@@ -11,7 +13,6 @@ from memberships.models import (
     Product,
     QuotaPolicy,
 )
-from memberships.phones import InvalidPhoneNumber, normalize_vietnam_phone
 from memberships.pricing import MAX_POSITIVE_BIG_INTEGER, calculate_total_price_vnd
 from memberships.quota_points import POINT_INPUT_ERROR, is_allowed_point_input
 
@@ -209,18 +210,21 @@ class TermsAcceptedField(serializers.Field):
         return bool(value)
 
 
-class CSAGuestIdentitySerializer(StrictSerializer):
-    name = serializers.CharField(max_length=150, trim_whitespace=True)
-    phone = serializers.CharField(max_length=32, trim_whitespace=True)
-    province_code = serializers.CharField(max_length=2, trim_whitespace=True)
-    ward_code = serializers.CharField(max_length=5, trim_whitespace=True)
-    address = serializers.CharField(max_length=500, trim_whitespace=True)
-
-    def validate_phone(self, value):
+class CSAContactPhoneField(serializers.CharField):
+    def run_validation(self, data=empty):
+        value = super().run_validation(data)
         try:
             return normalize_vietnam_phone(value)
         except InvalidPhoneNumber as error:
             raise serializers.ValidationError(str(error)) from error
+
+
+class CSAGuestIdentitySerializer(StrictSerializer):
+    name = serializers.CharField(max_length=150, trim_whitespace=True)
+    phone = CSAContactPhoneField(max_length=32)
+    province_code = serializers.CharField(max_length=2, trim_whitespace=True)
+    ward_code = serializers.CharField(max_length=5, trim_whitespace=True)
+    address = serializers.CharField(max_length=500, trim_whitespace=True)
 
     def validate(self, attrs):
         province_code = attrs["province_code"]
@@ -291,7 +295,7 @@ class CSAPurchaseRequestCreateSerializer(StrictSerializer):
     price_option_id = serializers.UUIDField()
     payment_plan_id = serializers.UUIDField(required=False)
     name = serializers.CharField(max_length=150, trim_whitespace=True)
-    phone = serializers.CharField(max_length=32, trim_whitespace=True)
+    phone = CSAContactPhoneField(max_length=32)
     province_code = serializers.CharField(max_length=2, trim_whitespace=True)
     ward_code = serializers.CharField(max_length=5, trim_whitespace=True)
     address = serializers.CharField(max_length=500, trim_whitespace=True)
@@ -309,12 +313,6 @@ class CSAPurchaseRequestCreateSerializer(StrictSerializer):
     terms_version = serializers.CharField(max_length=64)
     terms_hash = serializers.RegexField(r"^[0-9a-f]{64}$")
     amount = serializers.JSONField(required=False, write_only=True)
-
-    def validate_phone(self, value):
-        try:
-            return normalize_vietnam_phone(value)
-        except InvalidPhoneNumber as error:
-            raise serializers.ValidationError(str(error)) from error
 
     def validate(self, attrs):
         province_code = attrs["province_code"]
@@ -425,16 +423,10 @@ class CSAPaymentRejectSerializer(StrictSerializer):
 
 class CSATrackerLookupSerializer(StrictSerializer):
     reference_code = serializers.CharField(max_length=20, trim_whitespace=True)
-    phone = serializers.CharField(max_length=32, trim_whitespace=True)
+    phone = CSAContactPhoneField(max_length=32)
 
     def validate_reference_code(self, value):
         return value.upper()
-
-    def validate_phone(self, value):
-        try:
-            return normalize_vietnam_phone(value)
-        except InvalidPhoneNumber as error:
-            raise serializers.ValidationError(str(error)) from error
 
 
 class CSAContractVerificationSerializer(StrictSerializer):

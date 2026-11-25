@@ -15,14 +15,15 @@ from django.utils.translation import gettext_lazy as _
 from identity.models import User
 from identity.navigation import account_destination
 from identity.passwords import set_authenticated_password
-from identity.phones import normalize_login_phone
+from identity.phones import normalize_login_phone, validate_local_login_phone
 from identity.signup import SIGNUP_REFERRAL_SESSION_KEY
 
 PASSWORD_LOGIN_SESSION_KEY = "identity_password_login"
 
 
 class LoginPhoneField(forms.CharField):
-    def __init__(self, **kwargs):
+    def __init__(self, *, local_only=True, **kwargs):
+        self.local_only = local_only
         kwargs.setdefault("label", _("Login phone number"))
         kwargs.setdefault("widget", forms.TextInput(attrs={"type": "tel", "autocomplete": "tel"}))
         kwargs["strip"] = False
@@ -31,8 +32,9 @@ class LoginPhoneField(forms.CharField):
     def clean(self, value):
         value = super().clean(value)
         if value:
+            normalize = validate_local_login_phone if self.local_only else normalize_login_phone
             try:
-                return normalize_login_phone(value)
+                return normalize(value)
             except forms.ValidationError as error:
                 raise forms.ValidationError(
                     _("Enter a valid Vietnamese phone number."), code="invalid_phone"
@@ -56,6 +58,7 @@ class AddPhoneForm(CurrentPasswordForm):
 class CoreLoginForm(LoginForm):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.fields["login"].strip = False
         self.fields["login"].label = _("Phone number or email")
         self.fields["login"].widget.attrs.update(
             {"autocomplete": "username", "placeholder": _("Enter your phone number or email")}
@@ -65,8 +68,9 @@ class CoreLoginForm(LoginForm):
         self.fields["password"].help_text = ""
 
     def clean_login(self):
-        value = self.cleaned_data["login"].strip(" ")
+        value = self.cleaned_data["login"]
         if "@" in value:
+            value = value.strip()
             validate_email(value)
             return User.objects.normalize_email(value)
         return LoginPhoneField().clean(value)
@@ -155,7 +159,7 @@ class CoreSignupForm(NewPasswordHintsMixin, SignupForm):
                 kwargs["data"] = bound_data
 
         super().__init__(*args, **kwargs)
-        self.fields["phone"].label = _("Login phone number")
+        self.fields["phone"] = LoginPhoneField(required=self.fields["phone"].required)
         self.fields["phone"].widget.attrs["placeholder"] = "0912345678"
         self.fields["name"].widget.attrs["placeholder"] = _("Your full name")
         self.fields["email"].widget.attrs["placeholder"] = "you@example.com"

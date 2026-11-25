@@ -4,7 +4,7 @@ import hmac
 from django.conf import settings
 from rest_framework.throttling import SimpleRateThrottle, UserRateThrottle
 
-from memberships.phones import InvalidPhoneNumber, normalize_vietnam_phone
+from config.phones import InvalidPhoneNumber, normalize_vietnam_phone
 
 
 class CSAPurchaseCreateThrottle(UserRateThrottle):

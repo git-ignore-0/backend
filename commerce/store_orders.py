@@ -38,6 +38,7 @@ from commerce.store_delivery import (
     lock_companion_sources,
     validate_delivery_date,
 )
+from config.phones import InvalidPhoneNumber, normalize_vietnam_phone
 from farms.models import Farm, FarmProduct, FarmProductStockBatch
 from identity.locks import lock_user_for_shared_read
 from members.administrative_units import province_exists, ward_choices
@@ -61,7 +62,6 @@ from memberships.models import (
     QuotaPolicy,
     UsageOrderStatus,
 )
-from memberships.phones import InvalidPhoneNumber, normalize_vietnam_phone
 from memberships.services import (
     add_months,
     due_cycle_count,

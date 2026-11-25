@@ -10,6 +10,7 @@ from django.db import close_old_connections, connection
 from django.db.migrations.executor import MigrationExecutor
 from django.utils import timezone
 
+from config.phones import normalize_vietnam_phone
 from identity.models import AccountStatus, User
 from memberships.contracts import (
     CSAContractConflict,
@@ -37,7 +38,6 @@ from memberships.models import (
     MembershipStatus,
     QuotaPolicy,
 )
-from memberships.phones import normalize_vietnam_phone
 from memberships.terms import publish_csa_terms
 
 
