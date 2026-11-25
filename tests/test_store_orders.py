@@ -684,9 +684,7 @@ def test_guest_lookup_uses_generic_failure_and_http_only_session(
     payload = guest_payload(store_product)
     payload["guest"]["phone_number"] = "+84901234567"
     created = (
-        APIClient()
-        .post("/api/v1/public/store-checkouts", payload, format="json")
-        .json()["data"]
+        APIClient().post("/api/v1/public/store-checkouts", payload, format="json").json()["data"]
     )
     assert created["shipping_address"]["phone_number"] == "+84901234567"
     client = APIClient()
