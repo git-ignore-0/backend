@@ -43,6 +43,29 @@ def test_member_profile_admin_formats_phone_without_changing_profile(rf, stored,
 
 
 @pytest.mark.django_db
+def test_member_profile_admin_displays_domestic_login_phone_as_user_label(client):
+    operator = User.objects.create_superuser(
+        email="operator@example.com", name="Operator", password="StrongPassword12"
+    )
+    user = User.objects.create_user(name="Phone member", login_phone_number="+84901234567")
+    profile = MemberProfile.objects.create(user=user)
+    client.force_login(operator)
+
+    changelist = client.get(reverse("admin:members_memberprofile_changelist"))
+    assert changelist.status_code == 200
+    assert b">0901234567</a>" in changelist.content
+    assert b"+84901234567" not in changelist.content
+
+    change = client.get(reverse("admin:members_memberprofile_change", args=[profile.pk]))
+    assert change.status_code == 200
+    user_url = reverse("admin:identity_user_change", args=[user.pk])
+    assert f'<a href="{user_url}">0901234567</a>'.encode() in change.content
+    assert b"+84901234567" not in change.content
+    assert "user" not in change.context["adminform"].form.fields
+    assert str(user) == "+84901234567"
+
+
+@pytest.mark.django_db
 def test_member_profile_admin_combines_phone_and_text_search_terms(rf):
     garden = User.objects.create_user(email="garden@example.com", name="Garden Member")
     orchard = User.objects.create_user(email="orchard@example.com", name="Orchard Member")

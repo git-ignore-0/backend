@@ -2574,7 +2574,8 @@ class AdminCSACustomerViewSet(viewsets.ViewSet):
         queryset = customer_queryset().order_by("name", "id")
         data = query.validated_data
         if search := data["search"].strip():
-            queryset = queryset.filter(Q(name__icontains=search) | phone_search(search, "phone_e164"))
+            matches = Q(name__icontains=search) | phone_search(search, "phone_e164")
+            queryset = queryset.filter(matches)
         if data["linked"] == "linked":
             queryset = queryset.filter(user__isnull=False)
         elif data["linked"] == "managed":

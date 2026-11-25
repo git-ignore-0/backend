@@ -33,6 +33,7 @@
         </div>
     </main>
     {% include "account/partials/messages.html" with messages=messages only %}
+    <script src="{% static 'js/phone-paste.js' %}" defer></script>
     {% block scripts %}{% endblock %}
 </body>
 </html>

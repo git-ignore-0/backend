@@ -785,10 +785,13 @@ class AdminRedemptionViewSet(viewsets.ViewSet):
         queryset = redemption_queryset()
         search = data["search"].strip()
         if search:
+            profile_phone = phone_search(
+                search, "user__member_profile__phone_number", legacy_presentation=True
+            )
             queryset = queryset.filter(
                 Q(user__email__icontains=search)
                 | phone_search(search, "user__login_phone_number")
-                | phone_search(search, "user__member_profile__phone_number", legacy_presentation=True)
+                | profile_phone
             )
         if data["status"]:
             queryset = queryset.filter(status=data["status"])

@@ -161,6 +161,11 @@ def test_auth_templates_keep_native_input_types_and_labels(client, active_user, 
         attrs = controls.field(name, input_type, required=required)
         if input_type == "password":
             assert "value" not in attrs
+        if name in {"login", "phone"}:
+            assert attrs["data-phone-paste"] == ("login" if name == "login" else "phone")
+            assert "defer" in controls.get("script", src="/static/js/phone-paste.js")
+        else:
+            assert "data-phone-paste" not in attrs
     if path == "/login":
         controls.get("input", name="login", autocomplete="username")
 
@@ -451,7 +456,8 @@ def test_completion_uses_bound_email_and_phone_widgets(client, has_email):
     controls = Controls(response)
     if has_email:
         controls.get("form", method="post", action="/account/phone/add")
-        controls.field("login_phone_number", "tel")
+        assert controls.field("login_phone_number", "tel")["data-phone-paste"] == "phone"
+        assert "defer" in controls.get("script", src="/static/js/phone-paste.js")
         controls.field("current_password", "password")
     else:
         controls.get("form", method="post", action="/account/email/add")
@@ -547,7 +553,8 @@ def test_dashboard_renders_account_identifiers_and_targeted_actions(
     add_phone = "Thêm số điện thoại" if language == "vi" else "Add phone number"
     assert f'href="{completion}#phone"' not in text
     if login_phone:
-        assert active_user.login_phone_number in text
+        assert login_phone in text
+        assert active_user.login_phone_number not in text
         assert add_phone not in text
         assert 'name="login_phone_number"' not in text
     else:
@@ -560,6 +567,8 @@ def test_dashboard_renders_account_identifiers_and_targeted_actions(
         phone = controls.field("login_phone_number", "tel")
         password = controls.field("current_password", "password")
         assert phone["autocomplete"] == "tel"
+        assert phone["data-phone-paste"] == "phone"
+        assert "defer" in controls.get("script", src="/static/js/phone-paste.js")
         assert password["autocomplete"] == "current-password"
     if email_state == "missing":
         label = "Thêm email" if language == "vi" else "Add email"

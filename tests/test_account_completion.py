@@ -358,6 +358,8 @@ def test_pending_phone_add_with_website_return_stays_in_completion(client, setti
         ("+84912345678", PASSWORD, "login_phone_number"),
         ("(091) 234-5678", PASSWORD, "login_phone_number"),
         (" 0912345678", PASSWORD, "login_phone_number"),
+        ("091\n2345678", PASSWORD, "login_phone_number"),
+        ("091 2345678", PASSWORD, "login_phone_number"),
     ],
 )
 def test_active_phone_errors_render_inside_open_dashboard_form(

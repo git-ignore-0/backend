@@ -25,7 +25,12 @@ class LoginPhoneField(forms.CharField):
     def __init__(self, *, local_only=True, **kwargs):
         self.local_only = local_only
         kwargs.setdefault("label", _("Login phone number"))
-        kwargs.setdefault("widget", forms.TextInput(attrs={"type": "tel", "autocomplete": "tel"}))
+        kwargs.setdefault(
+            "widget",
+            forms.TextInput(
+                attrs={"type": "tel", "autocomplete": "tel", "data-phone-paste": "phone"}
+            ),
+        )
         kwargs["strip"] = False
         super().__init__(**kwargs)
 
@@ -61,7 +66,11 @@ class CoreLoginForm(LoginForm):
         self.fields["login"].strip = False
         self.fields["login"].label = _("Phone number or email")
         self.fields["login"].widget.attrs.update(
-            {"autocomplete": "username", "placeholder": _("Enter your phone number or email")}
+            {
+                "autocomplete": "username",
+                "placeholder": _("Enter your phone number or email"),
+                "data-phone-paste": "login",
+            }
         )
         self.fields["remember"].label = _("Remember me")
         self.fields["password"].widget.attrs["placeholder"] = _("Enter your password")
