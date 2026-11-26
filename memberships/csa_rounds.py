@@ -20,6 +20,7 @@ from commerce.store_orders import (
     _reference_code,
     _translation,
     active_product_stock,
+    active_product_stock_totals,
 )
 from memberships.models import (
     CSARound,
@@ -356,9 +357,12 @@ def selectable_csa_products():
 
 
 def selection_stock_capacity(product_ids, selection, *, lock=False):
-    stock, _ = active_product_stock(product_ids, lock=lock)
+    if lock:
+        stock, _ = active_product_stock(product_ids, lock=True)
+    else:
+        stock = active_product_stock_totals(product_ids)
     held = _active_reserved_stock(product_ids, exclude_selection=selection)
-    return {pk: max(0, stock[pk] - held.get(pk, 0)) for pk in product_ids}
+    return {pk: max(0, stock.get(pk, 0) - held.get(pk, 0)) for pk in product_ids}
 
 
 def selection_quantity_limit(product, capacity, held_line, own_hold):

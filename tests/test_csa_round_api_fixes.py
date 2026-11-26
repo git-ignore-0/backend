@@ -760,3 +760,118 @@ def test_products_held_projection_queries_are_bounded(context):
         response = client.get(path)
         assert len(response.json()["data"]) == len(product_ids)
     assert len(many) == len(one)
+
+
+def test_products_projects_inventory_without_materializing_batches(context, monkeypatch):
+    from commerce.models import (
+        StoreOrder,
+        StoreOrderLine,
+        StoreStockAllocation,
+        StoreStockMovement,
+        StoreStockReservation,
+    )
+    from farms.models import Farm, FarmProduct
+    from memberships.models import MembershipCycleQuota
+    from tests.test_csa_rounds import publish_overlapping_round
+
+    user, product, member, round_, now = context
+    MembershipCycleQuota.objects.filter(cycle__membership=member).update(
+        granted_units=20, remaining_units=20
+    )
+    own = save(context, quantity=3)
+    overlapping = publish_overlapping_round(context)
+    service.save_selection(
+        round_id=overlapping.pk,
+        user=user,
+        lines=[{"product_id": product.pk, "quantity": 1}],
+    )
+    first = FarmProductStockBatch.objects.get(farm_product__product=product)
+    today = timezone.localdate(now)
+    for units, active, end in [
+        (4, True, today),
+        (6, True, today),
+        (99, False, today),
+        (99, True, today - timedelta(days=1)),
+    ]:
+        farm = Farm.objects.create(name_vi="Vườn", name_en="Farm", is_active=active)
+        offer = FarmProduct.objects.create(farm=farm, product=product)
+        batch = FarmProductStockBatch.objects.create(
+            farm_product=offer,
+            start_date=today - timedelta(days=2),
+            end_date=end,
+            quantity_units=units,
+        )
+        if units == 4:
+            second = batch
+
+    for i, expires_at in enumerate((None, now + timedelta(hours=1), now - timedelta(hours=1))):
+        quantity = 14 if i == 0 else 2
+        order = StoreOrder.objects.create(
+            reference_code=f"STOCK{i}",
+            create_idempotency_key=uuid.uuid4(),
+            locale="vi",
+            status="pending_delivery" if i == 0 else "pending_review",
+            subtotal_vnd=quantity,
+            shipping_fee_vnd=0,
+            total_vnd=quantity,
+            expires_at=expires_at,
+        )
+        line = StoreOrderLine.objects.create(
+            order=order,
+            product=product,
+            position=0,
+            sku_snapshot=product.sku,
+            name_snapshot="Produce",
+            unit_size_snapshot=1,
+            unit_label_snapshot="kg",
+            unit_price_vnd_snapshot=1,
+            quantity=quantity,
+            cash_quantity=quantity,
+            cash_subtotal_vnd=quantity,
+        )
+        if i:
+            StoreStockReservation.objects.create(line=line, product=product, quantity=2)
+            continue
+        for batch, sold in [(first, 12), (second, 2)]:
+            # An anomalous legacy batch can be oversold. Its deficit must not
+            # cancel stock in the other batches.
+            allocation = StoreStockAllocation.objects.create(line=line, batch=batch, quantity=sold)
+            for kind, units in [("sale", sold), ("restock", 1)]:
+                StoreStockMovement.objects.create(
+                    allocation=allocation,
+                    batch=batch,
+                    line=line,
+                    quantity=units,
+                    kind=kind,
+                    idempotency_key=uuid.uuid4(),
+                )
+
+    client = APIClient()
+    client.force_authenticate(user, token=SimpleNamespace(scope="profile email"))
+    url = f"/api/v1/csa-rounds/{round_.pk}"
+    hydrated = []
+    original = FarmProductStockBatch.from_db
+
+    def record(*args, **kwargs):
+        hydrated.append(True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(FarmProductStockBatch, "from_db", record)
+    response = client.get(f"{url}/products")
+    assert response.status_code == 200, response.json()
+    row = response.json()["data"][0]
+    # Per-batch remaining 0 + 3 + 6, less 2 Store and 1 other CSA.
+    assert row["available_quantity"] == 6
+    assert not hydrated
+    for quantity, expected_status in [(7, 409), (6, 200)]:
+        result = client.put(
+            f"{url}/selection",
+            {
+                "locale": "vi",
+                "expected_revision": own.revision,
+                "lines": [{"product_id": str(product.pk), "quantity": quantity}],
+            },
+            format="json",
+        )
+        assert result.status_code == expected_status, result.json()
+    assert own.stock_holds.get().quantity == 6

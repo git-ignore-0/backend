@@ -7,8 +7,8 @@ from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from django.db import transaction
-from django.db.models import Sum
-from django.db.models.functions import Round
+from django.db.models import BigIntegerField, Case, OuterRef, Subquery, Sum, Value, When
+from django.db.models.functions import Cast, Coalesce, Greatest, Round
 from django.utils import timezone
 from django.utils.crypto import salted_hmac
 
@@ -191,17 +191,26 @@ def _translation(product, locale):
     return translations.get(locale) or translations.get("vi") or translations.get("en")
 
 
-def _net_sold_by_batch(batch_ids):
-    result = defaultdict(int)
-    rows = (
-        StoreStockMovement.objects.filter(batch_id__in=batch_ids)
-        .values("batch_id", "kind")
-        .annotate(total=Sum("quantity"))
+def _stock_movement_totals(movements):
+    units = Cast("quantity", BigIntegerField())
+    return (
+        movements.order_by()
+        .values("batch_id")
+        .annotate(
+            net_sold=Sum(
+                Case(
+                    When(kind=StoreStockMovementKind.SALE, then=units),
+                    default=-units,
+                    output_field=BigIntegerField(),
+                )
+            )
+        )
     )
-    for row in rows:
-        sign = 1 if row["kind"] == StoreStockMovementKind.SALE else -1
-        result[row["batch_id"]] += sign * row["total"]
-    return result
+
+
+def _net_sold_by_batch(batch_ids):
+    rows = _stock_movement_totals(StoreStockMovement.objects.filter(batch_id__in=batch_ids))
+    return defaultdict(int, rows.values_list("batch_id", "net_sold"))
 
 
 def active_stock_batches():
@@ -230,6 +239,26 @@ def active_product_stock(product_ids, *, lock=False):
     for batch in batches:
         totals[batch.farm_product.product_id] += max(0, batch.quantity_units - net_sold[batch.pk])
     return totals, batches
+
+
+def active_product_stock_totals(product_ids):
+    """Read inventory totals without loading batch or supplier models."""
+    net_sold = _stock_movement_totals(StoreStockMovement.objects.filter(batch_id=OuterRef("pk")))
+    remaining = Greatest(
+        Value(0),
+        Cast("quantity_units", BigIntegerField())
+        - Coalesce(Subquery(net_sold.values("net_sold")), Value(0)),
+        output_field=BigIntegerField(),
+    )
+    # Clamp each batch before summing, just as in the locked stock read.
+    stock = (
+        active_stock_batches()
+        .filter(farm_product__product_id__in=product_ids)
+        .order_by()
+        .values("farm_product__product_id")
+        .annotate(total=Sum(remaining))
+    )
+    return dict(stock.values_list("farm_product__product_id", "total"))
 
 
 def _active_reserved_stock(product_ids, *, exclude_order=None, exclude_selection=None):
