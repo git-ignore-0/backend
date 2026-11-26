@@ -204,17 +204,21 @@ def _net_sold_by_batch(batch_ids):
     return result
 
 
-def active_product_stock(product_ids, *, lock=False):
+def active_stock_batches():
     today = timezone.localdate()
+    return FarmProductStockBatch.objects.filter(
+        farm_product__farm__is_active=True,
+        farm_product__is_active=True,
+        cancelled_at__isnull=True,
+        start_date__lte=today,
+        end_date__gte=today,
+    )
+
+
+def active_product_stock(product_ids, *, lock=False):
     batches = (
-        FarmProductStockBatch.objects.filter(
-            farm_product__product_id__in=product_ids,
-            farm_product__farm__is_active=True,
-            farm_product__is_active=True,
-            cancelled_at__isnull=True,
-            start_date__lte=today,
-            end_date__gte=today,
-        )
+        active_stock_batches()
+        .filter(farm_product__product_id__in=product_ids)
         .select_related("farm_product__farm")
         .order_by("farm_product__product_id", "end_date", "start_date", "id")
     )

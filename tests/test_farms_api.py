@@ -81,6 +81,7 @@ def test_farm_product_and_first_stock_batch_are_scoped_to_farm(farm_admin_api):
     category = Category.objects.create(slug="greens", is_active=True)
     product = Product.objects.create(
         status="active",
+        is_published=True,
         category=category,
         sku="GREEN-500G",
         slug="green-500g",
@@ -129,13 +130,15 @@ def test_farm_cannot_link_product_deactivated_after_catalog_selection(farm_admin
         unit_label_en="pack",
         retail_price_vnd=25000,
         status="active",
+        is_published=True,
     )
     base = f"/api/v1/admin/farms/{farm.pk}"
     available = farm_admin_api.get(f"{base}/available-products")
     assert any(row["id"] == str(product.pk) for row in available.json()["data"])
 
-    product.status = "discontinued"
-    product.save(update_fields=["status"])
+    Product.objects.filter(pk=product.pk).update(
+        status="discontinued", is_active=False, is_published=False
+    )
     response = farm_admin_api.post(
         f"{base}/products",
         {
@@ -159,6 +162,7 @@ def test_farm_product_list_is_paginated_searchable_and_contains_display_summary(
     for index in range(21):
         product = Product.objects.create(
             status="active",
+            is_published=True,
             category=category,
             sku=f"FARM-PRODUCT-{index:02d}",
             slug=f"farm-product-{index:02d}",
@@ -194,6 +198,7 @@ def test_available_products_excludes_all_farm_links_across_pages(farm_admin_api)
     for index in range(31):
         product = Product.objects.create(
             status="active",
+            is_published=True,
             category=category,
             sku=f"AVAILABLE-{index:02d}",
             slug=f"available-{index:02d}",
@@ -299,6 +304,7 @@ def test_farm_api_handles_records_removed_after_preflight(farm_admin_api):
     category = Category.objects.create(slug="farm-race", is_active=True)
     product = Product.objects.create(
         status="active",
+        is_published=True,
         category=category,
         sku="FARM-RACE",
         slug="farm-race",
@@ -341,6 +347,7 @@ def test_batch_write_returns_conflict_if_link_disappears_after_initial_lookup(fa
     category = Category.objects.create(slug="farm-product-race", is_active=True)
     product = Product.objects.create(
         status="active",
+        is_published=True,
         category=category,
         sku="RACE-500G",
         slug="race-500g",
@@ -437,7 +444,15 @@ def test_product_sale_unit_cannot_change_after_stock_batch_exists(farm_admin_api
     capabilities = detail["capabilities"]
     assert capabilities["edit_identity"] == {
         "allowed": False,
-        "reasons": [{"code": "stock_batch", "id": str(batch.pk), "farm_id": str(farm.pk)}],
+        "reasons": [
+            {
+                "code": "stock_batch",
+                "id": str(batch.pk),
+                "farm_id": str(farm.pk),
+                "farm_name_vi": farm.name_vi,
+                "farm_name_en": farm.name_en,
+            }
+        ],
     }
     assert capabilities["edit_csa"]["allowed"] is True
     assert capabilities["delete"]["allowed"] is False

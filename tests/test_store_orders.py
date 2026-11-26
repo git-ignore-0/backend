@@ -1188,6 +1188,7 @@ def test_multiple_lines_share_quota_in_checkout_position_order(
         csa_quota_cost=2,
         primary_image=store_product.primary_image,
         status="active",
+        is_published=True,
     )
     ProductTranslation.objects.bulk_create(
         [
@@ -2979,6 +2980,7 @@ def test_admin_detail_allocation_query_count_is_constant(
             unit_label_en="kg",
             retail_price_vnd=45000,
             status="active",
+            is_published=True,
         )
         offer = FarmProduct.objects.create(farm=original_batch.farm_product.farm, product=product)
         FarmProductStockBatch.objects.create(
@@ -3236,6 +3238,7 @@ def test_approve_products_sharing_cycle_quota_aggregates_usage(
         csa_quota_cost=second_cost,
         primary_image=store_product.primary_image,
         status="active",
+        is_published=True,
     )
     ProductTranslation.objects.bulk_create(
         [
@@ -3384,8 +3387,9 @@ def test_buy_again_prepare_is_owner_scoped_and_uses_live_catalog(
     assert row["reason"] == "insufficient_stock"
     assert row["product"]["available_quantity"] == 1
     assert row["quantity"] == 2
-    store_product.status = "discontinued"
-    store_product.save(update_fields=["status"])
+    Product.objects.filter(pk=store_product.pk).update(
+        status="discontinued", is_active=False, is_published=False
+    )
     row = client.get(url).json()["data"]["lines"][0]
     assert row["reason"] == "unavailable"
     assert row["product"] is None
@@ -3751,10 +3755,13 @@ def test_selling_unit_can_change_before_first_stock_but_stale_checkout_cannot_su
 
 
 @pytest.mark.django_db
-def test_store_quota_reservation_consumes_snapshot_after_product_cost_change(
-    zero_shipping_fee, active_user, access_token, store_product
+@pytest.mark.parametrize("approve_first", [False, True])
+def test_store_quota_reservation_uses_snapshot_after_product_cost_change(
+    zero_shipping_fee, active_user, access_token, store_product, approve_first
 ):
     from commerce.services import update_product
+    from commerce.store_orders import cancel_store_order
+    from memberships.models import MembershipUsageReversal
 
     membership = attach_active_membership(active_user, store_product)
     address = ShippingAddress.objects.get(user=active_user)
@@ -3773,14 +3780,32 @@ def test_store_quota_reservation_consumes_snapshot_after_product_cost_change(
     update_product(
         actor=active_user, product=store_product, payload={"csa_quota_cost": Decimal("3")}
     )
-    approve_review_order(response.json()["data"], active_user)
+    quota = MembershipCycleQuota.objects.get(cycle__membership=membership)
+    if approve_first:
+        approve_review_order(response.json()["data"], active_user)
+        reserved.refresh_from_db()
+        quota.refresh_from_db()
+        assert reserved.consumed_at is not None
+        assert quota.remaining_units == quota.granted_units - reserved.units
+    cancellation_key = uuid.uuid4()
+    for _ in range(2):
+        cancel_store_order(
+            order_id=order.pk,
+            actor=active_user,
+            idempotency_key=cancellation_key,
+            reason="Cancelled",
+        )
     reserved.refresh_from_db()
     line.refresh_from_db()
-    quota = MembershipCycleQuota.objects.get(cycle__membership=membership)
-    assert reserved.consumed_at is not None
-    assert quota.remaining_units == quota.granted_units - reserved.units
+    quota.refresh_from_db()
+    assert (reserved.released_at is not None) is not approve_first
+    assert MembershipUsageReversal.objects.filter(order__store_order=order).count() == int(
+        approve_first
+    )
+    assert (reserved.consumed_at is not None) is approve_first
     assert line.quota_cost_snapshot == original_cost
     assert reserved.units == original_cost
+    assert quota.remaining_units == quota.granted_units
 
 
 @pytest.mark.django_db(transaction=True)

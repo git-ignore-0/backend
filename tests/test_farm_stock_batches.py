@@ -43,6 +43,8 @@ def make_product(sku="TOMATO-500G", *, active=True, published=True):
         unit_label_en="kg",
         retail_price_vnd=25000,
         status="active" if published else "draft" if active else "discontinued",
+        is_active=active,
+        is_published=published,
     )
     ProductTranslation.objects.create(
         product=product,
@@ -413,7 +415,9 @@ def test_creating_an_additional_batch_locks_product_unit_definition(farm_admin_a
 def test_non_selling_product_cannot_extend_inventory(farm_admin_api, status):
     farm = make_farm()
     product = make_product()
-    Product.objects.filter(pk=product.pk).update(status=status)
+    Product.objects.filter(pk=product.pk).update(
+        status=status, is_active=status == "draft", is_published=False
+    )
     today = timezone.localdate()
     products_url = f"/api/v1/admin/farms/{farm.pk}/products"
     values = batch_payload(start_date=today, end_date=today + timedelta(days=2))

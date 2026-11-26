@@ -175,6 +175,14 @@ class Product(models.Model):
                 condition=Q(status__in=ProductStatus.values),
                 name="commerce_product_status_valid",
             ),
+            models.CheckConstraint(
+                condition=(
+                    Q(status=ProductStatus.DRAFT, is_active=True, is_published=False)
+                    | Q(status=ProductStatus.ACTIVE, is_active=True, is_published=True)
+                    | Q(status=ProductStatus.DISCONTINUED, is_active=False, is_published=False)
+                ),
+                name="commerce_product_status_legacy_flags_match",
+            ),
         ]
 
     def __str__(self):

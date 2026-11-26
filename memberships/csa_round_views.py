@@ -1,22 +1,29 @@
 """Scoped Admin and OAuth member endpoints for CSA rounds."""
 
+import uuid
 from decimal import Decimal
 
-from django.db.models import Q, Sum
+from django.db.models import Exists, OuterRef, Q, Sum
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import serializers
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from commerce.models import Product, ProductStatus
-from commerce.public_catalog import _translation, public_product_payload, public_product_queryset
-from commerce.store_orders import StoreOrderError
+from commerce.models import Product
+from commerce.public_catalog import (
+    _translation,
+    public_product_payload,
+    public_quota_group_payload,
+    with_public_product_details,
+)
+from commerce.store_orders import StoreOrderError, active_stock_batches
 from content.permissions import IsWebsiteAdmin
 from memberships import csa_rounds as domain
 from memberships.csa_admin_payloads import admin_round_payload
 from memberships.csa_payloads import event_payload, round_payload, selection_payload
 from memberships.models import CSARound, CSARoundConfiguration, CSASelection, Membership
+from memberships.models import Product as QuotaGroup
 from memberships.permissions import HasMembershipSelfScopes
 from memberships.serializers import LocalePageQuerySerializer, ReasonSerializer, StrictSerializer
 
@@ -348,49 +355,53 @@ class MemberProducts(PrivateView):
             }
             for group_id, rows in quota_rows.items()
         ]
-        products = public_product_queryset(csa_selection=existing).filter(
-            csa_quota_group__is_active=True, csa_quota_cost__gt=0
-        )
-        if existing:
-            products = products.filter(
-                Q(available_quantity__gt=0) | Q(pk__in=existing.lines.values("product_id"))
-            )
-        else:
-            products = products.filter(available_quantity__gt=0)
-        live_products = {product.pk: product for product in products}
         held_lines = domain.selection_held_lines(existing, now=timezone.now())
+        products = domain.selectable_csa_products().filter(
+            Q(Exists(active_stock_batches().filter(farm_product__product_id=OuterRef("pk"))))
+            | Q(pk__in=held_lines)
+        )
+        live_products = {product.pk: product for product in with_public_product_details(products)}
+        capacity = domain.selection_stock_capacity(live_products, existing)
+        snapshot_group_ids = {
+            uuid.UUID(line.snapshot["quota_group_id"]) for line, _ in held_lines.values()
+        }
+        snapshot_groups = QuotaGroup.objects.prefetch_related("translations").in_bulk(
+            snapshot_group_ids
+        )
         data = []
-        for product in live_products.values():
-            row = public_product_payload(product, request, locale)
-            if held := held_lines.get(product.pk):
-                line, _quantity = held
-                row.update(
-                    name=line.snapshot["name"],
-                    unit_label=line.snapshot["unit_label"],
-                    unit_size=line.snapshot["unit_size"],
-                )
-            data.append(row)
-        for line, quantity in held_lines.values():
-            if line.product_id in live_products or line.product.status == ProductStatus.ACTIVE:
+        for product_id in dict.fromkeys((*live_products, *held_lines)):
+            product = live_products.get(product_id)
+            line, own = held_lines.get(product_id, (None, 0))
+            limit = domain.selection_quantity_limit(product, capacity.get(product_id, 0), line, own)
+            if not limit:
                 continue
-            snapshot = line.snapshot
-            group = line.product.csa_quota_group
-            data.append(
-                {
-                    "id": str(line.product_id),
-                    "name": snapshot["name"],
-                    "unit_size": snapshot["unit_size"],
-                    "unit_label": snapshot["unit_label"],
-                    "primary_image": None,
-                    "available_quantity": quantity,
-                    "selection_mode": "held_only",
-                    "csa_quota_group": {
+            if product is not None:
+                product.available_quantity = limit
+                row = public_product_payload(product, request, locale)
+            else:
+                row = {"id": str(product_id), "primary_image": None, "available_quantity": limit}
+            if line is not None:
+                snapshot = line.snapshot
+                group = snapshot_groups.get(uuid.UUID(snapshot["quota_group_id"]))
+                group_payload = (
+                    public_quota_group_payload(group, snapshot["quota_cost"], locale)
+                    if group
+                    else {
                         "id": snapshot["quota_group_id"],
-                        "name": group.name if group else snapshot["quota_group_id"],
+                        "name": snapshot["quota_group_id"],
                         "cost": snapshot["quota_cost"],
-                    },
-                }
-            )
+                    }
+                )
+                row.update(
+                    name=snapshot["name"],
+                    unit_size=snapshot["unit_size"],
+                    unit_label=snapshot["unit_label"],
+                    retail_price_vnd=snapshot["unit_price_vnd"],
+                    csa_quota_group=group_payload,
+                )
+                if limit == own:
+                    row["selection_mode"] = "held_only"
+            data.append(row)
         return Response(
             {
                 "data": data,

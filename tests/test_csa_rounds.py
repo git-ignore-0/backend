@@ -10,7 +10,7 @@ from django.db import close_old_connections, connection
 from django.utils import timezone
 from rest_framework.test import APIClient
 
-from commerce.models import StoreOrder
+from commerce.models import Product, StoreOrder
 from commerce.store_orders import StoreOrderError
 from farms.models import FarmProductStockBatch
 from identity.models import AccountStatus, User
@@ -676,9 +676,13 @@ def test_csa_catalog_uses_actual_hold_and_legacy_snapshot(context, target):
     user, product, _, round_, _ = context
     selected = save(context)
     original = selected.lines.get().snapshot
-    product.status = target
     product.retail_price_vnd += 1000
-    product.save(update_fields=["status", "retail_price_vnd"])
+    Product.objects.filter(pk=product.pk).update(
+        status=target,
+        is_active=target == "draft",
+        is_published=False,
+        retail_price_vnd=product.retail_price_vnd,
+    )
     client = APIClient()
     client.force_authenticate(user, token=SimpleNamespace(scope="profile email"))
     path = f"/api/v1/csa-rounds/{round_.pk}/products"
@@ -734,7 +738,7 @@ def test_held_selection_keeps_terms_after_resale_and_cannot_recreate_hold_after_
 def test_reselection_protects_held_quota_across_cycles_without_duplicating_old_credit(
     context, monkeypatch
 ):
-    from commerce.models import Product, ProductTranslation
+    from commerce.models import ProductTranslation
     from farms.models import FarmProduct
     from memberships.models import MembershipCycle
 
@@ -761,6 +765,7 @@ def test_reselection_protects_held_quota_across_cycles_without_duplicating_old_c
         sku="SECOND",
         slug="second",
         status="active",
+        is_published=True,
         unit_size=1,
         unit_label_vi="kg",
         unit_label_en="kg",
@@ -797,8 +802,9 @@ def test_reselection_protects_held_quota_across_cycles_without_duplicating_old_c
         quota.pk: 4,
         new_quota.pk: 1,
     }
-    product.status = "discontinued"
-    product.save(update_fields=["status"])
+    Product.objects.filter(pk=product.pk).update(
+        status="discontinued", is_active=False, is_published=False
+    )
     later = now + timedelta(days=1)
     monkeypatch.setattr(timezone, "now", lambda: later)
     updated = choose(2, 3, later)

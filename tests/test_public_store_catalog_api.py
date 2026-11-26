@@ -61,6 +61,8 @@ def make_product(
         csa_quota_cost=2 if quota_group else 0,
         primary_image=image or make_image(slug),
         status="active" if published else "draft" if active else "discontinued",
+        is_active=active,
+        is_published=published,
     )
     ProductTranslation.objects.bulk_create(
         [

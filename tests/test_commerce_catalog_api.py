@@ -1053,3 +1053,162 @@ def test_product_lifecycle_requires_explicit_transition(admin_api, tmp_path):
         admin_api.patch(url, {"retail_price_vnd": 39000}, format="json").json()["data"]["status"]
         == "active"
     )
+
+
+@pytest.mark.django_db
+def test_transition_rejects_unprivileged_and_stale_requests(
+    active_user, access_token, admin_api, tmp_path
+):
+    category = admin_api.post("/api/v1/admin/store-categories", category_payload(), format="json")
+    with override_settings(MEDIA_ROOT=tmp_path):
+        image = admin_api.post(
+            "/api/v1/admin/store-products/media", {"image": image_upload()}, format="multipart"
+        ).json()["data"]
+    body = product_payload(category.json()["data"]["id"], image_id=image["id"])
+    created = admin_api.post("/api/v1/admin/store-products", body, format="json").json()["data"]
+    url = f"/api/v1/admin/store-products/{created['id']}/transition"
+    command = {"expected_status": "draft", "target_status": "active"}
+    website_admin = active_user.groups.get(name="website_admin")
+    active_user.groups.remove(website_admin)
+    assert admin_api.post(url, command, format="json").status_code == 403
+    assert APIClient().post(url, command, format="json").status_code in (401, 403)
+    active_user.groups.add(website_admin)
+    access_token.scope = "profile email"
+    access_token.save(update_fields=["scope"])
+    assert admin_api.post(url, command, format="json").status_code == 403
+    access_token.scope = "profile email content:manage"
+    access_token.save(update_fields=["scope"])
+    assert admin_api.post(url, command, format="json").status_code == 200
+    stale = admin_api.post(url, command, format="json")
+    assert stale.status_code == 409
+    assert stale.json()["errors"][0]["code"] == "product_status_changed"
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("expected", ["draft", "discontinued"])
+@pytest.mark.parametrize(
+    ("invalid", "field"),
+    [
+        ("category", "category_id"),
+        ("ancestor", "category_id"),
+        ("group", "csa_quota_group_id"),
+        ("price", "retail_price_vnd"),
+        ("image", "primary_image_id"),
+        ("translation", "translations"),
+    ],
+)
+def test_sell_transition_rechecks_current_validation(admin_api, tmp_path, expected, invalid, field):
+    from commerce.models import PUBLIC_STORE_MAX_PRICE_VND
+
+    root = admin_api.post(
+        "/api/v1/admin/store-categories", category_payload(), format="json"
+    ).json()["data"]
+    leaf = admin_api.post(
+        "/api/v1/admin/store-categories",
+        category_payload("leaf", parent_id=root["id"]),
+        format="json",
+    ).json()["data"]
+    with override_settings(MEDIA_ROOT=tmp_path):
+        image = admin_api.post(
+            "/api/v1/admin/store-products/media", {"image": image_upload()}, format="multipart"
+        ).json()["data"]
+    group = MembershipProduct.objects.create(name="CSA", unit_size=1)
+    created = admin_api.post(
+        "/api/v1/admin/store-products",
+        product_payload(leaf["id"], image_id=image["id"], group_id=str(group.pk), cost=1),
+        format="json",
+    )
+    assert created.status_code == 201, created.json()
+    id_ = created.json()["data"]["id"]
+    product = Product.objects.get(pk=id_)
+    url = f"/api/v1/admin/store-products/{id_}/transition"
+    if expected == "discontinued":
+        for before, target in [("draft", "active"), ("active", "discontinued")]:
+            response = admin_api.post(
+                url, {"expected_status": before, "target_status": target}, format="json"
+            )
+            assert response.status_code == 200, response.json()
+    if invalid in {"category", "ancestor"}:
+        category_id = leaf["id"] if invalid == "category" else root["id"]
+        Category.objects.filter(pk=category_id).update(is_active=False)
+    elif invalid == "group":
+        MembershipProduct.objects.filter(pk=group.pk).update(is_active=False)
+    elif invalid == "price":
+        Product.objects.filter(pk=id_).update(retail_price_vnd=PUBLIC_STORE_MAX_PRICE_VND + 1)
+    elif invalid == "image":
+        Product.objects.filter(pk=id_).update(primary_image=None)
+    else:
+        product.translations.filter(locale="en").delete()
+    response = admin_api.post(
+        url, {"expected_status": expected, "target_status": "active"}, format="json"
+    )
+    assert response.status_code == 400, response.json()
+    assert field in response.json()
+    assert Product.objects.get(pk=id_).status == expected
+
+
+@pytest.mark.django_db
+def test_active_edit_and_transition_rollback_protect_catalog(
+    active_user, admin_api, django_capture_on_commit_callbacks, tmp_path
+):
+    from unittest.mock import patch
+
+    from django.db import transaction
+
+    from commerce.models import PUBLIC_STORE_MAX_PRICE_VND
+    from commerce.services import transition_product
+    from content.models import ContentAuditLog
+
+    category = admin_api.post("/api/v1/admin/store-categories", category_payload(), format="json")
+    with override_settings(MEDIA_ROOT=tmp_path):
+        image = admin_api.post(
+            "/api/v1/admin/store-products/media", {"image": image_upload()}, format="multipart"
+        ).json()["data"]
+    product = admin_api.post(
+        "/api/v1/admin/store-products",
+        product_payload(category.json()["data"]["id"], image_id=image["id"]),
+        format="json",
+    ).json()["data"]
+    pk = product["id"]
+    with patch("commerce.services.request_frontend_revalidation") as revalidate:
+        with django_capture_on_commit_callbacks(execute=True):
+            with pytest.raises(RuntimeError, match="rollback"):
+                with transaction.atomic():
+                    transition_product(
+                        actor=active_user,
+                        product_id=pk,
+                        expected_status="draft",
+                        target_status="active",
+                    )
+                    assert not revalidate.called
+                    assert ContentAuditLog.objects.filter(
+                        action="store_product.transition", entity_id=pk
+                    ).exists()
+                    raise RuntimeError("rollback")
+        assert not revalidate.called
+        assert not ContentAuditLog.objects.filter(
+            action="store_product.transition", entity_id=pk
+        ).exists()
+        assert Product.objects.get(pk=pk).status == "draft"
+        with django_capture_on_commit_callbacks(execute=True):
+            transition_product(
+                actor=active_user, product_id=pk, expected_status="draft", target_status="active"
+            )
+            assert not revalidate.called
+        revalidate.assert_called_once()
+    assert (
+        ContentAuditLog.objects.filter(action="store_product.transition", entity_id=pk).count() == 1
+    )
+    original = Product.objects.get(pk=pk)
+    for payload in (
+        {"retail_price_vnd": PUBLIC_STORE_MAX_PRICE_VND + 1},
+        {"primary_image_id": None},
+        {"translations": [{"locale": "vi", "name": "Rau"}]},
+    ):
+        response = admin_api.patch(f"/api/v1/admin/store-products/{pk}", payload, format="json")
+        assert response.status_code == 400, response.json()
+    product = Product.objects.get(pk=pk)
+    assert product.status == "active"
+    assert product.retail_price_vnd == original.retail_price_vnd
+    assert product.primary_image_id == original.primary_image_id
+    assert product.translations.count() == 2

@@ -28,7 +28,7 @@ def _public_product_filter():
     )
 
 
-def public_product_queryset(*, detail=False, csa_selection=None):
+def public_product_queryset(*, detail=False):
     current_date = timezone.localdate()
     current_stock = (
         FarmProductStockBatch.objects.filter(
@@ -80,45 +80,45 @@ def public_product_queryset(*, detail=False, csa_selection=None):
     csa_reserved = (
         CSAStockHold.objects.filter(
             product_id=OuterRef("pk"),
-            selection__in=active_stock_holds(exclude_selection=csa_selection),
+            selection__in=active_stock_holds(),
         )
         .values("product_id")
         .annotate(total=Sum("quantity"))
         .values("total")[:1]
     )
+    products = Product.objects.filter(_public_product_filter()).annotate(
+        available_quantity=Greatest(
+            Value(0),
+            Coalesce(Subquery(current_stock, output_field=IntegerField()), Value(0))
+            - Coalesce(Subquery(sold, output_field=IntegerField()), Value(0))
+            + Coalesce(Subquery(restocked, output_field=IntegerField()), Value(0))
+            - Coalesce(Subquery(reserved, output_field=IntegerField()), Value(0))
+            - Coalesce(Subquery(csa_reserved, output_field=IntegerField()), Value(0)),
+        )
+    )
+    return with_public_product_details(products, detail=detail)
+
+
+def with_public_product_details(products, *, detail=False):
     active_suppliers = FarmProduct.objects.filter(
         is_active=True, farm__is_active=True
     ).select_related("farm")
-    return (
-        Product.objects.filter(_public_product_filter())
-        .select_related(
-            "category",
-            "category__parent",
-            "category__parent__parent",
-            "primary_image",
-            "csa_quota_group",
-        )
-        .annotate(
-            available_quantity=Greatest(
-                Value(0),
-                Coalesce(Subquery(current_stock, output_field=IntegerField()), Value(0))
-                - Coalesce(Subquery(sold, output_field=IntegerField()), Value(0))
-                + Coalesce(Subquery(restocked, output_field=IntegerField()), Value(0))
-                - Coalesce(Subquery(reserved, output_field=IntegerField()), Value(0))
-                - Coalesce(Subquery(csa_reserved, output_field=IntegerField()), Value(0)),
-            )
-        )
-        .prefetch_related(
-            Prefetch(
-                "translations",
-                queryset=ProductTranslation.objects.all()
-                if detail
-                else ProductTranslation.objects.defer("description", "description_document"),
-            ),
-            "category__translations",
-            "csa_quota_group__translations",
-            Prefetch("farm_offers", queryset=active_suppliers, to_attr="public_farm_offers"),
-        )
+    return products.select_related(
+        "category",
+        "category__parent",
+        "category__parent__parent",
+        "primary_image",
+        "csa_quota_group",
+    ).prefetch_related(
+        Prefetch(
+            "translations",
+            queryset=ProductTranslation.objects.all()
+            if detail
+            else ProductTranslation.objects.defer("description", "description_document"),
+        ),
+        "category__translations",
+        "csa_quota_group__translations",
+        Prefetch("farm_offers", queryset=active_suppliers, to_attr="public_farm_offers"),
     )
 
 
@@ -209,11 +209,15 @@ def _public_csa_quota_group_payload(product, locale):
     group = product.csa_quota_group
     if group is None or not group.is_active or product.csa_quota_cost <= 0:
         return None
+    return public_quota_group_payload(group, product.csa_quota_cost, locale)
+
+
+def public_quota_group_payload(group, cost, locale):
     translation, _available_locales = _translation(group, locale)
     return {
         "id": str(group.pk),
         "name": translation.name if translation else group.name,
-        "cost": product.csa_quota_cost,
+        "cost": cost,
     }
 
 

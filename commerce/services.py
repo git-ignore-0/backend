@@ -1,6 +1,7 @@
 from decimal import Decimal, InvalidOperation
 
 from django.db import IntegrityError, transaction
+from django.db.models import F
 from django.db.models.deletion import ProtectedError
 from django.utils.text import slugify
 from rest_framework.exceptions import ValidationError
@@ -336,12 +337,17 @@ def _identity_lock_references(product):
         ref = (
             model.objects.filter(farm_product__product=product)
             .order_by("pk")
-            .values("id", "farm_product__farm_id")
+            .values(
+                "id",
+                farm_id=F("farm_product__farm_id"),
+                farm_name_vi=F("farm_product__farm__name_vi"),
+                farm_name_en=F("farm_product__farm__name_en"),
+            )
             .first()
         )
         if ref:
             reasons.append(
-                {"code": code, "id": str(ref["id"]), "farm_id": str(ref["farm_product__farm_id"])}
+                {**ref, "code": code, "id": str(ref["id"]), "farm_id": str(ref["farm_id"])}
             )
     order = (
         StoreOrderLine.objects.filter(product=product)
@@ -360,41 +366,51 @@ def _identity_lock_references(product):
     return reasons
 
 
+def _csa_round_reason(rows, code):
+    ref = rows.order_by("pk").values("selection__round_id", "selection__round__name").first()
+    if ref is None:
+        return None
+    return {
+        "code": code,
+        "id": str(ref["selection__round_id"]),
+        "label": ref["selection__round__name"],
+    }
+
+
 def product_capabilities(product):
-    hold = (
-        _product_stock_holds(product)
-        .order_by("pk")
-        .values("selection__round_id", "selection__round__name")
-        .first()
-    )
-    csa = []
-    if hold:
-        csa.append(
-            {
-                "code": "csa_hold",
-                "id": str(hold["selection__round_id"]),
-                "label": hold["selection__round__name"],
-            }
-        )
+    hold = _csa_round_reason(_product_stock_holds(product), "csa_hold")
+    csa = [hold] if hold else []
     identity = _identity_lock_references(product)
     deletion = [*identity, *csa]
-    offer = product.farm_offers.order_by("pk").values("id", "farm_id").first()
+    offer = (
+        product.farm_offers.order_by("pk")
+        .values("id", "farm_id", farm_name_vi=F("farm__name_vi"), farm_name_en=F("farm__name_en"))
+        .first()
+    )
     if offer:
         deletion.append(
-            {"code": "farm_link", "id": str(offer["id"]), "farm_id": str(offer["farm_id"])}
+            {**offer, "code": "farm_link", "id": str(offer["id"]), "farm_id": str(offer["farm_id"])}
         )
     if not csa:
-        line = (
-            product.csaselectionline_set.order_by("pk")
-            .values_list("selection__round_id", flat=True)
+        history = _csa_round_reason(
+            product.csaselectionline_set, "csa_history"
+        ) or _csa_round_reason(product.csastockhold_set, "csa_history")
+        if history:
+            deletion.append(history)
+    if not deletion:
+        reservation = (
+            product.store_stock_reservations.order_by("pk")
+            .values("line__order_id", "line__order__reference_code")
             .first()
         )
-        if line:
-            deletion.append({"code": "csa_history", "id": str(line)})
-        elif product.csastockhold_set.exists():
-            deletion.append({"code": "csa_history"})
-    if not deletion and product.store_stock_reservations.exists():
-        deletion.append({"code": "store_reservation"})
+        if reservation:
+            deletion.append(
+                {
+                    "code": "store_reservation",
+                    "id": str(reservation["line__order_id"]),
+                    "label": reservation["line__order__reference_code"],
+                }
+            )
     return {
         "edit_identity": {"allowed": not (identity or csa), "reasons": [*identity, *csa]},
         "edit_csa": {"allowed": not csa, "reasons": csa},

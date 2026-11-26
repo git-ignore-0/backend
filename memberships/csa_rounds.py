@@ -11,7 +11,7 @@ from django.db import transaction
 from django.db.models import Q, Sum
 from django.utils import timezone
 
-from commerce.models import Product, ProductStatus, StoreOrder, StoreOrderLine
+from commerce.models import Product, StoreOrder, StoreOrderLine
 from commerce.public_catalog import _public_product_filter
 from commerce.store_orders import (
     _active_reserved_stock,
@@ -345,10 +345,32 @@ def selection_held_lines(selection, *, now):
     )
     return {
         line.product_id: (line, min(line.quantity, holds[line.product_id]))
-        for line in selection.lines.filter(product_id__in=holds).select_related(
-            "product__csa_quota_group"
-        )
+        for line in selection.lines.filter(product_id__in=holds)
     }
+
+
+def selectable_csa_products():
+    return Product.objects.filter(
+        _public_product_filter(), csa_quota_group__is_active=True, csa_quota_cost__gt=0
+    )
+
+
+def selection_stock_capacity(product_ids, selection, *, lock=False):
+    stock, _ = active_product_stock(product_ids, lock=lock)
+    held = _active_reserved_stock(product_ids, exclude_selection=selection)
+    return {pk: max(0, stock[pk] - held.get(pk, 0)) for pk in product_ids}
+
+
+def selection_quantity_limit(product, capacity, held_line, own_hold):
+    if product is None or (
+        held_line is not None
+        and (
+            uuid.UUID(held_line.snapshot["quota_group_id"]) != product.csa_quota_group_id
+            or Decimal(held_line.snapshot["quota_cost"]) != product.csa_quota_cost
+        )
+    ):
+        return own_hold
+    return max(own_hold, capacity)
 
 
 def reserved_stock(product_ids, *, exclude_selection=None):
@@ -540,16 +562,10 @@ def save_selection(*, round_id, user, lines, locale="vi", now=None, expected_rev
     ensure_due_cycles(member)
     products = {
         p.pk: p
-        for p in Product.objects.filter(
-            _public_product_filter(),
-            pk__in=requested,
-            csa_quota_group__is_active=True,
-            csa_quota_cost__gt=0,
-        ).prefetch_related("translations")
+        for p in selectable_csa_products().filter(pk__in=requested).prefetch_related("translations")
     }
     previous = selection_held_lines(existing, now=now)
-    stock, _batches = active_product_stock(products, lock=True)
-    held = _active_reserved_stock(products, exclude_selection=existing)
+    capacity = selection_stock_capacity(products, existing, lock=True)
     draft = []
     protected_points = defaultdict(Decimal)
     new_points = defaultdict(Decimal)
@@ -560,22 +576,19 @@ def save_selection(*, round_id, user, lines, locale="vi", now=None, expected_rev
             _fail("csa_selection_invalid")
         product = products.get(product_id)
         old_line, own = previous.get(product_id, (None, 0))
-        if product is None:
-            product = locked_products.get(product_id)
-            if product is None or product.status == ProductStatus.ACTIVE or qty > own:
+        available = capacity.get(product_id, 0)
+        limit = selection_quantity_limit(product, available, old_line, own)
+        if qty > limit:
+            if product is None or limit < available:
                 _fail("csa_product_unavailable")
-        elif qty > stock[product_id] - held.get(product_id, 0):
             _fail("csa_stock_insufficient")
+        product = product or locked_products[product_id]
         if old_line:
             # A retained quantity keeps the terms already committed, including
             # when the product comes back on sale or its retail price changes.
             snapshot = old_line.snapshot
             group_id = uuid.UUID(snapshot["quota_group_id"])
             cost = Decimal(snapshot["quota_cost"])
-            if qty > own and (
-                group_id != product.csa_quota_group_id or cost != product.csa_quota_cost
-            ):
-                _fail("csa_product_unavailable")
         else:
             group_id = product.csa_quota_group_id
             cost = product.csa_quota_cost

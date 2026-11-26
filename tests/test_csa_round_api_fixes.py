@@ -3,6 +3,7 @@
 import copy
 import uuid
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
@@ -43,7 +44,7 @@ def admin_client(context):
     return client
 
 
-def test_catalog_own_hold_is_added_before_clamping_availability(context, monkeypatch):
+def test_catalog_preserves_own_hold_after_supply_expires(context, monkeypatch):
     user, product, _, round_, now = context
     FarmProductStockBatch.objects.filter(farm_product__product=product).update(
         end_date=timezone.localdate(now) + timedelta(days=2)
@@ -58,7 +59,8 @@ def test_catalog_own_hold_is_added_before_clamping_availability(context, monkeyp
     response = client.get(f"/api/v1/csa-rounds/{round_.pk}/products")
     assert response.status_code == 200
     product_data = next(p for p in response.json()["data"] if p["id"] == str(product.pk))
-    assert product_data["available_quantity"] == 0
+    assert product_data["available_quantity"] == 2
+    assert product_data["selection_mode"] == "held_only"
     assert response.json()["selection"]["lines"][0]["quantity"] == 2
 
 
@@ -493,3 +495,268 @@ def test_confirmation_invalidates_old_deadline_command_and_allows_safe_retries(
     old_command["expected_revision"] = selected.revision
     assert admin_client.post(reopen, old_command, format="json").status_code == 200
     assert admin_client.post(confirm, payload, format="json").status_code == 409
+
+
+@pytest.mark.parametrize(
+    ("capacity", "relist", "held_only"),
+    [(0, False, True), (2, False, True), (10, False, False), (0, True, True)],
+)
+def test_active_hold_floor_matches_catalog_and_save(
+    context, monkeypatch, capacity, relist, held_only
+):
+    from commerce.services import transition_product
+    from memberships.models import MembershipCycleQuota
+
+    user, product, member, round_, now = context
+    round_.closes_at = now + timedelta(days=2)
+    round_.delivery_date = timezone.localdate(now) + timedelta(days=3)
+    round_.save(update_fields=["closes_at", "delivery_date"])
+    MembershipCycleQuota.objects.filter(cycle__membership=member).update(
+        granted_units=20, remaining_units=20
+    )
+    original = save(context, quantity=3)
+    if capacity < 10:
+        today = timezone.localdate(now)
+        batch = FarmProductStockBatch.objects.get(farm_product__product=product)
+        batch.end_date = today
+        batch.save(update_fields=["end_date"])
+        if capacity:
+            FarmProductStockBatch.objects.create(
+                farm_product=batch.farm_product,
+                start_date=today + timedelta(days=1),
+                end_date=today + timedelta(days=2),
+                quantity_units=capacity,
+            )
+        if relist:
+            transition_product(
+                actor=user,
+                product_id=product.pk,
+                expected_status="active",
+                target_status="discontinued",
+            )
+        monkeypatch.setattr(timezone, "now", lambda: now + timedelta(days=1))
+        if relist:
+            transition_product(
+                actor=user,
+                product_id=product.pk,
+                expected_status="discontinued",
+                target_status="active",
+            )
+
+    client = APIClient()
+    client.force_authenticate(user, token=SimpleNamespace(scope="profile email"))
+    path = f"/api/v1/csa-rounds/{round_.pk}"
+    limit = max(3, capacity)
+
+    def submit(quantity, revision):
+        return client.put(
+            f"{path}/selection",
+            {
+                "expected_revision": revision,
+                "locale": "vi",
+                "lines": [
+                    {"product_id": str(product.pk), "quantity": quantity},
+                ],
+            },
+            format="json",
+        )
+
+    read = client.get(f"{path}/products")
+    assert read.status_code == 200, read.json()
+    row = next(row for row in read.json()["data"] if row["id"] == str(product.pk))
+    assert row["available_quantity"] == limit
+    assert (row.get("selection_mode") == "held_only") is held_only
+    assert submit(limit + 1, original.revision).status_code == 409
+    accepted = submit(limit, original.revision)
+    assert accepted.status_code == 200, accepted.json()
+    reduced = submit(2, accepted.json()["data"]["revision"])
+    assert reduced.status_code == 200, reduced.json()
+    row = next(
+        row for row in client.get(f"{path}/products").json()["data"] if row["id"] == str(product.pk)
+    )
+    assert row["available_quantity"] == max(2, capacity)
+
+
+def test_held_catalog_uses_snapshot_quota_and_localizes_original_group(context):
+    from memberships.models import Product as QuotaGroup
+    from memberships.models import ProductTranslation
+
+    user, product, _, round_, _ = context
+    selected = save(context, quantity=3)
+    historical = product.csa_quota_group
+    snapshot = selected.lines.get().snapshot
+    ProductTranslation.objects.bulk_create(
+        [
+            ProductTranslation(product=historical, locale="vi", name="Nhóm cũ"),
+            ProductTranslation(product=historical, locale="en", name="Original group"),
+        ]
+    )
+    other = QuotaGroup.objects.create(name="New group", unit_size=1)
+    # Model the legacy data that predates application locks on an effective hold.
+    product.csa_quota_group = other
+    product.csa_quota_cost = Decimal("2")
+    product.retail_price_vnd += 1000
+    product.save(update_fields=["csa_quota_group", "csa_quota_cost", "retail_price_vnd"])
+
+    client = APIClient()
+    client.force_authenticate(user, token=SimpleNamespace(scope="profile email"))
+    path = f"/api/v1/csa-rounds/{round_.pk}"
+    for locale, name in [("vi", "Nhóm cũ"), ("en", "Original group")]:
+        response = client.get(f"{path}/products?locale={locale}")
+        assert response.status_code == 200, response.json()
+        row = response.json()["data"][0]
+        assert row["selection_mode"] == "held_only"
+        assert row["available_quantity"] == 3
+        for field in ("name", "unit_size", "unit_label", "retail_price_vnd"):
+            snapshot_field = "unit_price_vnd" if field == "retail_price_vnd" else field
+            assert row[field] == snapshot[snapshot_field]
+        assert row["csa_quota_group"] == {
+            "id": snapshot["quota_group_id"],
+            "name": name,
+            "cost": snapshot["quota_cost"],
+        }
+    body = {
+        "locale": "en",
+        "expected_revision": selected.revision,
+        "lines": [{"product_id": str(product.pk), "quantity": 4}],
+    }
+    response = client.put(f"{path}/selection", body, format="json")
+    assert response.status_code == 409, response.json()
+    body["lines"][0]["quantity"] = 2
+    updated = client.put(f"{path}/selection", body, format="json")
+    assert updated.status_code == 200, updated.json()
+    assert selected.lines.get().snapshot == snapshot
+
+
+def test_active_hold_survives_catalog_ineligibility_but_is_private(context):
+    from tests.test_store_orders import attach_active_membership
+
+    user, product, _, round_, _ = context
+    other = User.objects.create_user(
+        email="other-hold@example.com",
+        name="Other member",
+        login_phone_number="0987654321",
+        status=AccountStatus.ACTIVE,
+    )
+    group_id = product.csa_quota_group_id
+    attach_active_membership(other, product)
+    product.csa_quota_group_id = group_id
+    product.csa_quota_cost = Decimal("1")
+    product.save(update_fields=["csa_quota_group", "csa_quota_cost"])
+    selected = save(context, quantity=3)
+    # Simulate an already-invalid ancestor/category in legacy data.
+    product.category.is_active = False
+    product.category.save(update_fields=["is_active"])
+    client = APIClient()
+    client.force_authenticate(user, token=SimpleNamespace(scope="profile email"))
+    path = f"/api/v1/csa-rounds/{round_.pk}"
+    read = client.get(f"{path}/products").json()["data"]
+    assert len(read) == 1
+    assert (read[0]["selection_mode"], read[0]["available_quantity"]) == ("held_only", 3)
+    body = {
+        "locale": "vi",
+        "expected_revision": selected.revision,
+        "lines": [
+            {"product_id": str(product.pk), "quantity": 2},
+        ],
+    }
+    assert client.put(f"{path}/selection", body, format="json").status_code == 200
+    client.force_authenticate(other, token=SimpleNamespace(scope="profile email"))
+    assert client.get(f"{path}/products").json()["data"] == []
+    body["expected_revision"] = 0
+    denied = client.put(f"{path}/selection", body, format="json")
+    assert denied.status_code == 409
+    assert denied.json()["errors"][0]["code"] == "csa_product_unavailable"
+    assert selected.stock_holds.get().quantity == 2
+
+
+def test_expired_reselection_hold_cannot_be_reused_by_put(context, monkeypatch):
+    from commerce.services import transition_product
+
+    user, product, _, round_, _ = context
+    selected = save(context, quantity=3)
+    service.process_round(round_.pk, now=round_.closes_at)
+    deadline = service.delivery_start(round_) - timedelta(hours=1)
+    service.reopen_selection(
+        selection_id=selected.pk,
+        actor=user,
+        deadline=deadline,
+        now=round_.closes_at,
+    )
+    selected = save(context, quantity=3, now=round_.closes_at)
+    transition_product(
+        actor=user, product_id=product.pk, expected_status="active", target_status="discontinued"
+    )
+    client = APIClient()
+    client.force_authenticate(user, token=SimpleNamespace(scope="profile email"))
+    path = f"/api/v1/csa-rounds/{round_.pk}"
+    monkeypatch.setattr(timezone, "now", lambda: deadline)
+    assert client.get(f"{path}/products").json()["data"] == []
+    denied = client.put(
+        f"{path}/selection",
+        {
+            "expected_revision": selected.revision,
+            "locale": "vi",
+            "lines": [{"product_id": str(product.pk), "quantity": 3}],
+        },
+        format="json",
+    )
+    assert denied.status_code == 409
+    selected.refresh_from_db()
+    assert selected.state == "cancelled"
+    assert not selected.stock_holds.exists()
+    assert not selected.quota_holds.exists()
+
+
+def test_products_held_projection_queries_are_bounded(context):
+    from commerce.models import Product, ProductTranslation
+    from farms.models import FarmProduct
+    from memberships.models import MembershipCycleQuota
+
+    user, product, member, round_, now = context
+    originals = save(context, quantity=1)
+    client = APIClient()
+    client.force_authenticate(user, token=SimpleNamespace(scope="profile email"))
+    path = f"/api/v1/csa-rounds/{round_.pk}/products"
+    with CaptureQueriesContext(connection) as one:
+        assert len(client.get(path).json()["data"]) == 1
+
+    quota = MembershipCycleQuota.objects.get(cycle__membership=member)
+    quota.granted_units = quota.remaining_units = 10
+    quota.save(update_fields=["granted_units", "remaining_units"])
+    farm = product.farm_offers.get().farm
+    today = timezone.localdate(now)
+    product_ids = [product.pk]
+    for i in range(5):
+        added = Product.objects.create(
+            category=product.category,
+            csa_quota_group=product.csa_quota_group,
+            csa_quota_cost=product.csa_quota_cost,
+            sku=f"TEST-{i}",
+            slug=f"test-{i}",
+            unit_size=product.unit_size,
+            unit_label_vi="kg",
+            unit_label_en="kg",
+            retail_price_vnd=45000,
+            status="active",
+            is_published=True,
+        )
+        ProductTranslation.objects.create(product=added, locale="vi", name=added.sku)
+        relation = FarmProduct.objects.create(farm=farm, product=added)
+        FarmProductStockBatch.objects.create(
+            farm_product=relation,
+            start_date=today,
+            end_date=today,
+            quantity_units=1,
+        )
+        product_ids.append(added.pk)
+    service.save_selection(
+        round_id=round_.pk,
+        user=user,
+        expected_revision=originals.revision,
+        lines=[{"product_id": pk, "quantity": 1} for pk in product_ids],
+    )
+    with CaptureQueriesContext(connection) as many:
+        response = client.get(path)
+        assert len(response.json()["data"]) == len(product_ids)
+    assert len(many) == len(one)
