@@ -3,6 +3,7 @@ from decimal import Decimal
 from django.utils.text import slugify
 from rest_framework import serializers
 
+from commerce.models import ProductStatus
 from config.phones import InvalidPhoneNumber, normalize_vietnam_phone
 from members.administrative_units import province_exists, ward_choices
 from memberships.quota_points import POINT_INPUT_ERROR, is_allowed_point_input
@@ -199,13 +200,24 @@ class ProductWriteSerializer(StrictSerializer):
         return validate_unique_locales(value)
 
 
+class ProductTransitionSerializer(StrictSerializer):
+    target_status = serializers.ChoiceField(choices=ProductStatus.choices)
+    expected_status = serializers.ChoiceField(choices=ProductStatus.choices)
+
+
 class ProductQuerySerializer(StrictSerializer):
     search = serializers.CharField(max_length=200, allow_blank=True, required=False, default="")
     category_id = serializers.UUIDField(required=False)
     is_active = serializers.BooleanField(required=False)
     is_published = serializers.BooleanField(required=False)
+    status = serializers.ChoiceField(choices=ProductStatus.choices, required=False)
     csa_eligible = serializers.BooleanField(required=False)
     page = serializers.IntegerField(min_value=1, max_value=10000, required=False, default=1)
+
+    def validate(self, attrs):
+        if "status" in attrs and {"is_active", "is_published"} & attrs.keys():
+            raise serializers.ValidationError({"status": "Use one status filter format."})
+        return attrs
 
 
 class PublicStoreLocaleSerializer(StrictSerializer):

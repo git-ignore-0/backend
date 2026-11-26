@@ -9,7 +9,7 @@ from rest_framework import serializers
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from commerce.models import Product
+from commerce.models import Product, ProductStatus
 from commerce.public_catalog import _translation, public_product_payload, public_product_queryset
 from commerce.store_orders import StoreOrderError
 from content.permissions import IsWebsiteAdmin
@@ -357,9 +357,40 @@ class MemberProducts(PrivateView):
             )
         else:
             products = products.filter(available_quantity__gt=0)
+        live_products = {product.pk: product for product in products}
+        held_lines = domain.selection_held_lines(existing, now=timezone.now())
         data = []
-        for product in products:
-            data.append(public_product_payload(product, request, locale))
+        for product in live_products.values():
+            row = public_product_payload(product, request, locale)
+            if held := held_lines.get(product.pk):
+                line, _quantity = held
+                row.update(
+                    name=line.snapshot["name"],
+                    unit_label=line.snapshot["unit_label"],
+                    unit_size=line.snapshot["unit_size"],
+                )
+            data.append(row)
+        for line, quantity in held_lines.values():
+            if line.product_id in live_products or line.product.status == ProductStatus.ACTIVE:
+                continue
+            snapshot = line.snapshot
+            group = line.product.csa_quota_group
+            data.append(
+                {
+                    "id": str(line.product_id),
+                    "name": snapshot["name"],
+                    "unit_size": snapshot["unit_size"],
+                    "unit_label": snapshot["unit_label"],
+                    "primary_image": None,
+                    "available_quantity": quantity,
+                    "selection_mode": "held_only",
+                    "csa_quota_group": {
+                        "id": snapshot["quota_group_id"],
+                        "name": group.name if group else snapshot["quota_group_id"],
+                        "cost": snapshot["quota_cost"],
+                    },
+                }
+            )
         return Response(
             {
                 "data": data,

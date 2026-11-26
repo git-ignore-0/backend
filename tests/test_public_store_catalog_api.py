@@ -60,8 +60,7 @@ def make_product(
         retail_price_vnd=price,
         csa_quota_cost=2 if quota_group else 0,
         primary_image=image or make_image(slug),
-        is_active=active,
-        is_published=published,
+        status="active" if published else "draft" if active else "discontinued",
     )
     ProductTranslation.objects.bulk_create(
         [

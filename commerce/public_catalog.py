@@ -6,6 +6,7 @@ from commerce.models import (
     PUBLIC_STORE_MAX_PRICE_VND,
     Category,
     Product,
+    ProductStatus,
     ProductTranslation,
     StoreStockMovement,
     StoreStockMovementKind,
@@ -18,8 +19,7 @@ from farms.models import FarmProduct, FarmProductStockBatch
 def _public_product_filter():
     return (
         Q(
-            is_active=True,
-            is_published=True,
+            status=ProductStatus.ACTIVE,
             retail_price_vnd__lte=PUBLIC_STORE_MAX_PRICE_VND,
             category__is_active=True,
         )

@@ -499,8 +499,9 @@ def test_delayed_save_rechecks_cutoff_after_waiting_for_locks(context, monkeypat
     original = service._lock_resources
 
     def wait_then_lock(selection, products):
-        original(selection, products)
+        locked = original(selection, products)
         monkeypatch.setattr(timezone, "now", lambda: context[3].closes_at)
+        return locked
 
     monkeypatch.setattr(service, "_lock_resources", wait_then_lock)
     with pytest.raises(service.CSARoundError, match="csa_selection_locked"):
@@ -638,3 +639,178 @@ def test_native_csa_buy_again_is_rejected_by_api_as_well_as_projection(context):
     response = client.get(f"/api/v1/store-orders/{selected.order_id}/buy-again?locale=vi")
     assert response.status_code == 404
     assert StoreOrder.objects.count() == before
+
+
+def test_discontinued_selection_retains_snapshot_then_reduces_hold(context):
+    user, product, _, round_, _ = context
+    first = save(context, quantity=3)
+    snapshot = first.lines.get().snapshot
+    from commerce.services import transition_product
+
+    transition_product(
+        actor=user, product_id=product.pk, expected_status="active", target_status="discontinued"
+    )
+    product.retail_price_vnd += 1000
+    product.save(update_fields=["retail_price_vnd"])
+    kept = save(context, quantity=3, expected_revision=first.revision)
+    assert kept.lines.get().snapshot == snapshot
+    reduced = save(context, quantity=2, expected_revision=kept.revision)
+    assert reduced.lines.get().snapshot == snapshot
+    assert reduced.stock_holds.get().quantity == 2
+    assert reduced.quota_holds.get().units == Decimal("2")
+    with pytest.raises(service.CSARoundError, match="csa_product_unavailable"):
+        save(context, quantity=3, expected_revision=reduced.revision)
+    empty = service.save_selection(
+        round_id=round_.pk, user=user, lines=[], expected_revision=reduced.revision
+    )
+    assert not empty.stock_holds.exists()
+    assert not empty.quota_holds.exists()
+    with pytest.raises(service.CSARoundError, match="csa_product_unavailable"):
+        save(context, quantity=1, expected_revision=empty.revision)
+
+
+@pytest.mark.parametrize("target", ["draft", "discontinued"])
+def test_csa_catalog_uses_actual_hold_and_legacy_snapshot(context, target):
+    from types import SimpleNamespace
+
+    user, product, _, round_, _ = context
+    selected = save(context)
+    original = selected.lines.get().snapshot
+    product.status = target
+    product.retail_price_vnd += 1000
+    product.save(update_fields=["status", "retail_price_vnd"])
+    client = APIClient()
+    client.force_authenticate(user, token=SimpleNamespace(scope="profile email"))
+    path = f"/api/v1/csa-rounds/{round_.pk}/products"
+    rows = client.get(path).json()["data"]
+    assert len(rows) == 1
+    assert rows[0]["selection_mode"] == "held_only"
+    assert rows[0]["available_quantity"] == 2
+    assert rows[0]["unit_size"] == original["unit_size"]
+    assert rows[0]["csa_quota_group"]["cost"] == original["quota_cost"]
+    assert save(context, quantity=2).lines.get().snapshot == original
+    selected.stock_holds.all().delete()
+    assert client.get(path).json()["data"] == []
+    with pytest.raises(service.CSARoundError, match="csa_product_unavailable"):
+        save(context)
+
+
+def test_held_selection_keeps_terms_after_resale_and_cannot_recreate_hold_after_reopen(context):
+    from commerce.services import CatalogConflict, transition_product, update_product
+
+    user, product, membership, round_, _ = context
+    selection = save(context)
+    original = selection.lines.get().snapshot
+    transition_product(
+        actor=user, product_id=product.pk, expected_status="active", target_status="discontinued"
+    )
+    with pytest.raises(CatalogConflict, match="product_csa_hold_in_use"):
+        update_product(actor=user, product=product, payload={"csa_quota_cost": Decimal("2")})
+    update_product(actor=user, product=product, payload={"retail_price_vnd": 50000})
+    transition_product(
+        actor=user, product_id=product.pk, expected_status="discontinued", target_status="active"
+    )
+    assert save(context).lines.get().snapshot == original
+    transition_product(
+        actor=user, product_id=product.pk, expected_status="active", target_status="discontinued"
+    )
+
+    service.process_round(round_.pk, now=round_.closes_at)
+    selection.refresh_from_db()
+    assert selection.order.lines.get().unit_price_vnd_snapshot == original["unit_price_vnd"]
+    deadline = service.delivery_start(round_) - timedelta(hours=1)
+    service.reopen_selection(
+        selection_id=selection.pk, actor=user, deadline=deadline, now=round_.closes_at
+    )
+    assert not selection.stock_holds.exists()
+    assert not selection.lines.exists()
+    with pytest.raises(service.CSARoundError, match="csa_product_unavailable"):
+        save(context, now=round_.closes_at)
+    service.process_round(round_.pk, now=deadline)
+    service.process_round(round_.pk, now=deadline)
+    assert MembershipCycleQuota.objects.get(cycle__membership=membership).remaining_units == 4
+
+
+def test_reselection_protects_held_quota_across_cycles_without_duplicating_old_credit(
+    context, monkeypatch
+):
+    from commerce.models import Product, ProductTranslation
+    from farms.models import FarmProduct
+    from memberships.models import MembershipCycle
+
+    user, product, membership, round_, now = context
+    today = timezone.localdate(now)
+    quota = MembershipCycleQuota.objects.get(cycle__membership=membership)
+    # Two overlapping quota rows in the test let the selection span both cycles,
+    # then the first expires while the reselection is still open.
+    quota.cycle.end_date = today + timedelta(days=1)
+    quota.cycle.save(update_fields=["end_date"])
+    cycle = MembershipCycle.objects.create(
+        membership=membership, sequence=2, start_date=today, end_date=today + timedelta(days=25)
+    )
+    new_quota = MembershipCycleQuota.objects.create(
+        cycle=cycle, product_snapshot=quota.product_snapshot, granted_units=4, remaining_units=4
+    )
+    round_.delivery_date = today + timedelta(days=3)
+    round_.save(update_fields=["delivery_date"])
+    FarmProductStockBatch.objects.filter(farm_product__product=product).update(
+        end_date=today + timedelta(days=3)
+    )
+    other = Product.objects.create(
+        category=product.category,
+        sku="SECOND",
+        slug="second",
+        status="active",
+        unit_size=1,
+        unit_label_vi="kg",
+        unit_label_en="kg",
+        retail_price_vnd=40000,
+        csa_quota_group=product.csa_quota_group,
+        csa_quota_cost=1,
+    )
+    ProductTranslation.objects.create(product=other, locale="vi", name="Second")
+    offer = FarmProduct.objects.create(farm=product.farm_offers.get().farm, product=other)
+    FarmProductStockBatch.objects.create(
+        farm_product=offer, start_date=today, end_date=today + timedelta(days=3), quantity_units=10
+    )
+
+    original = save(context, quantity=3)
+    service.process_round(round_.pk, now=round_.closes_at)
+    deadline = service.delivery_start(round_) - timedelta(hours=1)
+    service.reopen_selection(
+        selection_id=original.pk, actor=user, deadline=deadline, now=round_.closes_at
+    )
+
+    def choose(first, second, moment):
+        return service.save_selection(
+            round_id=round_.pk,
+            user=user,
+            now=moment,
+            lines=[
+                {"product_id": product.pk, "quantity": first},
+                {"product_id": other.pk, "quantity": second},
+            ],
+        )
+
+    draft = choose(3, 2, round_.closes_at)
+    assert dict(draft.quota_holds.values_list("cycle_quota_id", "units")) == {
+        quota.pk: 4,
+        new_quota.pk: 1,
+    }
+    product.status = "discontinued"
+    product.save(update_fields=["status"])
+    later = now + timedelta(days=1)
+    monkeypatch.setattr(timezone, "now", lambda: later)
+    updated = choose(2, 3, later)
+    assert updated.stock_holds.get(product=product).quantity == 2
+    assert sum(updated.quota_holds.values_list("units", flat=True)) == 5
+    assert updated.quota_holds.filter(cycle_quota=quota).exists()
+    updated = choose(2, 1, later)
+    assert dict(updated.quota_holds.values_list("cycle_quota_id", "units")) == {quota.pk: 3}
+    confirmed = service.confirm_selection(selection_id=updated.pk, user=user, now=later)
+    service.confirm_selection(selection_id=updated.pk, user=user, now=later)
+    quota.refresh_from_db()
+    new_quota.refresh_from_db()
+    assert confirmed.order.lines.count() == 2
+    assert quota.remaining_units + new_quota.remaining_units == 5
+    assert not confirmed.quota_holds.exists()

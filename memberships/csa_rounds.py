@@ -11,7 +11,7 @@ from django.db import transaction
 from django.db.models import Q, Sum
 from django.utils import timezone
 
-from commerce.models import Product, StoreOrder, StoreOrderLine
+from commerce.models import Product, ProductStatus, StoreOrder, StoreOrderLine
 from commerce.public_catalog import _public_product_filter
 from commerce.store_orders import (
     _active_reserved_stock,
@@ -326,12 +326,29 @@ def _credits(selection):
     }
 
 
-def active_stock_holds(*, exclude_selection=None):
+def active_stock_holds(*, exclude_selection=None, now=None):
     rows = CSASelection.objects.exclude(state__in=TERMINAL).filter(round__cancelled_at__isnull=True)
     if exclude_selection:
         rows = rows.exclude(pk=exclude_selection.pk)
     # A late worker must never keep expired reselection drafts in stock availability.
-    return rows.exclude(state="reselecting", reopen_until__lte=timezone.now())
+    return rows.exclude(state="reselecting", reopen_until__lte=now or timezone.now())
+
+
+def selection_held_lines(selection, *, now):
+    """Return only lines backed by an effective stock hold on the same selection."""
+    if selection is None:
+        return {}
+    holds = dict(
+        selection.stock_holds.filter(selection__in=active_stock_holds(now=now)).values_list(
+            "product_id", "quantity"
+        )
+    )
+    return {
+        line.product_id: (line, min(line.quantity, holds[line.product_id]))
+        for line in selection.lines.filter(product_id__in=holds).select_related(
+            "product__csa_quota_group"
+        )
+    }
 
 
 def reserved_stock(product_ids, *, exclude_selection=None):
@@ -502,7 +519,7 @@ def save_selection(*, round_id, user, lines, locale="vi", now=None, expected_rev
     requested = [item["product_id"] for item in lines]
     if len(requested) != len(set(requested)) or len(lines) > 100:
         _fail("csa_selection_invalid")
-    _lock_resources(existing, requested)
+    locked_products = {p.pk: p for p in _lock_resources(existing, requested)}
     # Snapshot shipping once. Later edits/reselections keep this delivery contract
     # even when the member changes or deletes their current profile address.
     address = None
@@ -530,25 +547,74 @@ def save_selection(*, round_id, user, lines, locale="vi", now=None, expected_rev
             csa_quota_cost__gt=0,
         ).prefetch_related("translations")
     }
-    if len(products) != len(requested):
-        _fail("csa_product_unavailable")
-    stock, _batches = active_product_stock(requested, lock=True)
-    held = _active_reserved_stock(requested, exclude_selection=existing)
-    candidates = _quota_candidates(
-        member, existing, {p.csa_quota_group_id for p in products.values()}
-    )
+    previous = selection_held_lines(existing, now=now)
+    stock, _batches = active_product_stock(products, lock=True)
+    held = _active_reserved_stock(products, exclude_selection=existing)
     draft = []
-    allocations = defaultdict(Decimal)
+    protected_points = defaultdict(Decimal)
+    new_points = defaultdict(Decimal)
     for item in lines:
-        product = products[item["product_id"]]
+        product_id = item["product_id"]
         qty = item["quantity"]
         if isinstance(qty, bool) or not isinstance(qty, int) or qty <= 0:
             _fail("csa_selection_invalid")
-        available = stock[product.pk] - held.get(product.pk, 0)
-        if qty > available:
+        product = products.get(product_id)
+        old_line, own = previous.get(product_id, (None, 0))
+        if product is None:
+            product = locked_products.get(product_id)
+            if product is None or product.status == ProductStatus.ACTIVE or qty > own:
+                _fail("csa_product_unavailable")
+        elif qty > stock[product_id] - held.get(product_id, 0):
             _fail("csa_stock_insufficient")
-        needed = qty * product.csa_quota_cost
-        for row in candidates[product.csa_quota_group_id]:
+        if old_line:
+            # A retained quantity keeps the terms already committed, including
+            # when the product comes back on sale or its retail price changes.
+            snapshot = old_line.snapshot
+            group_id = uuid.UUID(snapshot["quota_group_id"])
+            cost = Decimal(snapshot["quota_cost"])
+            if qty > own and (
+                group_id != product.csa_quota_group_id or cost != product.csa_quota_cost
+            ):
+                _fail("csa_product_unavailable")
+        else:
+            group_id = product.csa_quota_group_id
+            cost = product.csa_quota_cost
+            translation = _translation(product, locale)
+            snapshot = {
+                "sku": product.sku,
+                "name": translation.name,
+                "unit_size": str(product.unit_size),
+                "unit_label": product.unit_label_vi if locale == "vi" else product.unit_label_en,
+                "quota_group_id": str(group_id),
+                "quota_cost": str(cost),
+                "unit_price_vnd": product.retail_price_vnd,
+            }
+        protected_points[group_id] += min(qty, own) * cost
+        new_points[group_id] += max(0, qty - own) * cost
+        draft.append((product, qty, snapshot))
+
+    candidates = _quota_candidates(member, existing, set(new_points))
+    own_quota = (
+        dict(existing.quota_holds.values_list("cycle_quota_id", "units")) if existing else {}
+    )
+    allocations = defaultdict(Decimal)
+    for group_id, rows in candidates.items():
+        needed = protected_points.pop(group_id, Decimal(0))
+        # A reduction releases newer quota before it gives up a carried hold.
+        for row in sorted(rows, key=lambda item: item[0].cycle.sequence):
+            quota, remaining = row
+            take = min(needed, remaining, own_quota.get(quota.pk, 0))
+            if take > 0:
+                allocations[quota.pk] += take
+                row[1] -= take
+                needed -= take
+        if needed:
+            _fail("csa_quota_insufficient")
+    if any(protected_points.values()):
+        _fail("csa_quota_insufficient")
+
+    for group_id, needed in new_points.items():
+        for row in candidates[group_id]:
             quota, remaining = row
             take = min(needed, remaining)
             if take > 0:
@@ -557,24 +623,6 @@ def save_selection(*, round_id, user, lines, locale="vi", now=None, expected_rev
                 needed -= take
         if needed:
             _fail("csa_quota_insufficient")
-        translation = _translation(product, locale)
-        draft.append(
-            (
-                product,
-                qty,
-                {
-                    "sku": product.sku,
-                    "name": translation.name,
-                    "unit_size": str(product.unit_size),
-                    "unit_label": product.unit_label_vi
-                    if locale == "vi"
-                    else product.unit_label_en,
-                    "quota_group_id": str(product.csa_quota_group_id),
-                    "quota_cost": str(product.csa_quota_cost),
-                    "unit_price_vnd": product.retail_price_vnd,
-                },
-            )
-        )
     # Inventory/quota locks may have waited beyond the selection deadline.
     _validate_selection_window(round_, member, existing, supplied_now or timezone.now())
     selection = existing or CSASelection.objects.create(

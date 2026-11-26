@@ -5,7 +5,7 @@ from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from commerce.models import Product, ProductTranslation
+from commerce.models import Product, ProductStatus, ProductTranslation
 from content.models import MediaAsset, TrackerFarm
 from content.permissions import IsWebsiteAdmin
 from content.serializers import admin_tracker_farm_payload, media_payload
@@ -91,6 +91,7 @@ def farm_product_payload(row):
         "unit_label_vi": row.product.unit_label_vi,
         "unit_label_en": row.product.unit_label_en,
         "is_active": row.is_active,
+        "product_status": row.product.status,
         "initial_quantity": row.initial_quantity,
         "net_sold_quantity": row.net_sold_quantity,
         "available_quantity": row.available_quantity,
@@ -274,7 +275,9 @@ class AdminFarmAvailableProductListView(APIView):
         get_object_or_404(Farm, pk=farm_id)
         query = FarmProductQuerySerializer(data=request.query_params.dict())
         query.is_valid(raise_exception=True)
-        rows = Product.objects.filter(is_active=True).exclude(farm_offers__farm_id=farm_id)
+        rows = Product.objects.filter(status=ProductStatus.ACTIVE).exclude(
+            farm_offers__farm_id=farm_id
+        )
         search = query.validated_data["search"].strip()
         if search:
             rows = rows.filter(

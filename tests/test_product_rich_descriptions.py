@@ -192,7 +192,7 @@ def test_public_detail_has_rich_text_but_list_does_not(admin_api, product_record
     assert (
         patch_translation(admin_api, product_record, description_document=rich).status_code == 200
     )
-    Product.objects.filter(pk=product_record["id"]).update(is_published=True)
+    Product.objects.filter(pk=product_record["id"]).update(status="active")
     client = APIClient()
     detail = client.get(f"/api/v1/public/store-products/{product_record['slug']}?locale=vi")
     assert detail.status_code == 200, detail.json()
@@ -438,7 +438,7 @@ def test_public_rich_description_uses_same_locale_as_fallback_text(admin_api, pr
         format="json",
     )
     assert response.status_code == 200
-    Product.objects.filter(pk=product_record["id"]).update(is_published=True)
+    Product.objects.filter(pk=product_record["id"]).update(status="active")
     response = APIClient().get(f"/api/v1/public/store-products/{product_record['slug']}?locale=en")
     assert response.status_code == 200
     data = response.json()["data"]
@@ -509,7 +509,7 @@ def test_product_lists_do_not_read_or_return_rich_documents(admin_api, product_r
         patch_translation(admin_api, product_record, description_document=document()).status_code
         == 200
     )
-    Product.objects.filter(pk=product_record["id"]).update(is_published=True)
+    Product.objects.filter(pk=product_record["id"]).update(status="active")
     client = APIClient() if public else admin_api
     url = "/api/v1/public/store-products?locale=vi" if public else "/api/v1/admin/store-products"
     with CaptureQueriesContext(connection) as queries:
@@ -558,7 +558,7 @@ def test_numbered_list_from_installed_tiptap_round_trips(admin_api, product_reco
         next(row for row in detail["translations"] if row["locale"] == "vi")["description_document"]
         == rich
     )
-    Product.objects.filter(pk=product_record["id"]).update(is_published=True)
+    Product.objects.filter(pk=product_record["id"]).update(status="active")
     public = (
         APIClient()
         .get(f"/api/v1/public/store-products/{product_record['slug']}?locale=vi")

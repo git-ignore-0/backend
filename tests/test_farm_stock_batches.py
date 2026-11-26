@@ -42,8 +42,7 @@ def make_product(sku="TOMATO-500G", *, active=True, published=True):
         unit_label_vi="kg",
         unit_label_en="kg",
         retail_price_vnd=25000,
-        is_active=active,
-        is_published=published,
+        status="active" if published else "draft" if active else "discontinued",
     )
     ProductTranslation.objects.create(
         product=product,
@@ -407,3 +406,46 @@ def test_creating_an_additional_batch_locks_product_unit_definition(farm_admin_a
 
     assert response.status_code == 201, response.json()
     lock_product.assert_called_once_with()
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("status", ["draft", "discontinued"])
+def test_non_selling_product_cannot_extend_inventory(farm_admin_api, status):
+    farm = make_farm()
+    product = make_product()
+    Product.objects.filter(pk=product.pk).update(status=status)
+    today = timezone.localdate()
+    products_url = f"/api/v1/admin/farms/{farm.pk}/products"
+    values = batch_payload(start_date=today, end_date=today + timedelta(days=2))
+    assert (
+        farm_admin_api.post(
+            products_url, {"product_id": str(product.pk), **values}, format="json"
+        ).status_code
+        == 409
+    )
+    relation = FarmProduct.objects.create(farm=farm, product=product)
+    batch = FarmProductStockBatch.objects.create(
+        farm_product=relation,
+        start_date=today + timedelta(days=2),
+        end_date=today + timedelta(days=4),
+        quantity_units=10,
+    )
+    batches_url = f"{products_url}/{product.pk}/batches"
+    assert farm_admin_api.post(batches_url, values, format="json").status_code == 409
+    for change in (
+        {"quantity_units": 11},
+        {"start_date": (today + timedelta(days=1)).isoformat()},
+        {"end_date": (today + timedelta(days=5)).isoformat(), "quantity_units": 9},
+    ):
+        rejected = farm_admin_api.patch(
+            f"{batches_url}/{batch.pk}",
+            {"version": batch.version, **change},
+            format="json",
+        )
+        assert rejected.status_code == 409, rejected.json()
+    reduced = farm_admin_api.patch(
+        f"{batches_url}/{batch.pk}",
+        {"version": batch.version, "quantity_units": 9},
+        format="json",
+    )
+    assert reduced.status_code == 200, reduced.json()

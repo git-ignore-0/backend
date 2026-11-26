@@ -42,8 +42,7 @@ def category_with_product(*, slug="vegetables", product_slug="tomato", quota_gro
         retail_price_vnd=40_000,
         csa_quota_cost=1 if quota_group else 0,
         primary_image=image,
-        is_active=True,
-        is_published=True,
+        status="active",
     )
     ProductTranslation.objects.bulk_create(
         [
@@ -135,8 +134,7 @@ def test_category_update_revalidates_all_details_without_loading_every_product_s
                 unit_label_vi="kg",
                 unit_label_en="kg",
                 retail_price_vnd=40_000,
-                is_active=False,
-                is_published=False,
+                status="discontinued",
             )
             for index in range(24)
         ]

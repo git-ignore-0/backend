@@ -53,8 +53,10 @@ def test_rollback_refuses_to_truncate_fractional_points(active_user, store_produ
         with pytest.raises(IrreversibleError, match="fractional CSA"):
             MigrationExecutor(connection).migrate([target])
         if scope == "commerce":
-            store_product.refresh_from_db()
-            assert store_product.csa_quota_cost == Decimal("0.25")
+            # Later commerce migrations have already reversed when the
+            # fractional-points migration refuses to roll back.
+            cost = Product.objects.values_list("csa_quota_cost", flat=True).get(pk=store_product.pk)
+            assert cost == Decimal("0.25")
         else:
             assert MembershipCycleQuota.objects.get(
                 cycle__membership=membership

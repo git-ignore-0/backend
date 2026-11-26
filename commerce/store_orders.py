@@ -7,13 +7,12 @@ from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from django.db import transaction
-from django.db.models import Q, Sum
+from django.db.models import Sum
 from django.db.models.functions import Round
 from django.utils import timezone
 from django.utils.crypto import salted_hmac
 
 from commerce.models import (
-    PUBLIC_STORE_MAX_PRICE_VND,
     CatalogTreeLock,
     Product,
     ShippingAddress,
@@ -28,6 +27,7 @@ from commerce.models import (
     StoreStockMovementKind,
     StoreStockReservation,
 )
+from commerce.public_catalog import _public_product_filter
 from commerce.shipping import (
     active_shipping_area,
     shipping_address_version,
@@ -429,17 +429,7 @@ def calculate_store_quote(*, user, payload, lock=False, check_expected=False, dr
         raise StoreOrderError("store_duplicate_product")
     products = list(
         (Product.objects.select_for_update() if lock else Product.objects)
-        .filter(
-            pk__in=product_ids,
-            is_active=True,
-            is_published=True,
-            retail_price_vnd__lte=PUBLIC_STORE_MAX_PRICE_VND,
-            category__is_active=True,
-        )
-        .filter(
-            Q(category__parent__isnull=True) | Q(category__parent__is_active=True),
-            Q(category__parent__parent__isnull=True) | Q(category__parent__parent__is_active=True),
-        )
+        .filter(_public_product_filter(), pk__in=product_ids)
         .prefetch_related("translations")
         .order_by("pk")
     )

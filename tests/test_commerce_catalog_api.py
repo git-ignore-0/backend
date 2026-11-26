@@ -365,25 +365,31 @@ def test_product_requires_leaf_category_and_image_for_publication(admin_api, tmp
         "/api/v1/admin/store-products", product_payload(root["id"]), format="json"
     )
     assert rejected.status_code == 400
-    published = product_payload(leaf["id"], published=True)
-    assert (
-        admin_api.post("/api/v1/admin/store-products", published, format="json").status_code == 400
-    )
+    published = product_payload(leaf["id"])
+    created = admin_api.post("/api/v1/admin/store-products", published, format="json")
+    assert created.status_code == 201, created.json()
+    product_id = created.json()["data"]["id"]
+    path = f"/api/v1/admin/store-products/{product_id}"
+    transition = {"expected_status": "draft", "target_status": "active"}
+    assert admin_api.post(f"{path}/transition", transition, format="json").status_code == 400
     with override_settings(MEDIA_ROOT=tmp_path):
         upload = admin_api.post(
             "/api/v1/admin/store-products/media", {"image": image_upload()}, format="multipart"
         )
         assert upload.status_code == 201, upload.json()
-        published["primary_image_id"] = upload.json()["data"]["id"]
-        created = admin_api.post("/api/v1/admin/store-products", published, format="json")
-        assert created.status_code == 201, created.json()
-        assert created.json()["data"]["is_published"] is True
-        assert created.json()["data"]["primary_image"]["url"].endswith(".webp")
+        patched = admin_api.patch(
+            path, {"primary_image_id": upload.json()["data"]["id"]}, format="json"
+        )
+        assert patched.status_code == 200, patched.json()
+        active = admin_api.post(f"{path}/transition", transition, format="json")
+        assert active.status_code == 200, active.json()
+        assert active.json()["data"]["is_published"] is True
+        assert active.json()["data"]["primary_image"]["url"].endswith(".webp")
         found = admin_api.get(
             "/api/v1/admin/store-products", {"search": "Rau muống", "is_published": "true"}
         )
         assert found.status_code == 200
-        assert [row["id"] for row in found.json()["data"]] == [created.json()["data"]["id"]]
+        assert [row["id"] for row in found.json()["data"]] == [product_id]
 
 
 @pytest.mark.django_db
@@ -451,18 +457,18 @@ def test_product_patch_and_filters(admin_api):
     ).json()["data"]
     changed = admin_api.patch(
         f"/api/v1/admin/store-products/{created['id']}",
-        {"retail_price_vnd": 39000, "is_active": False},
+        {"retail_price_vnd": 39000},
         format="json",
     )
     assert changed.status_code == 200, changed.json()
     assert changed.json()["data"]["retail_price_vnd"] == "39000"
-    assert changed.json()["data"]["is_active"] is False
+    assert changed.json()["data"]["status"] == "draft"
     matching = admin_api.get(
         "/api/v1/admin/store-products",
-        {"category_id": category["id"], "is_active": "false", "csa_eligible": "false"},
+        {"category_id": category["id"], "status": "draft", "csa_eligible": "false"},
     )
     assert [row["id"] for row in matching.json()["data"]] == [created["id"]]
-    assert admin_api.get("/api/v1/admin/store-products", {"is_active": "true"}).json()["data"] == []
+    assert admin_api.get("/api/v1/admin/store-products", {"status": "active"}).json()["data"] == []
 
 
 @pytest.mark.django_db
@@ -522,9 +528,9 @@ def test_draft_product_can_be_edited_or_moved_after_category_deactivation(admin_
         format="json",
     )
     assert edited_without_category.status_code == 200, edited_without_category.json()
-    publish = admin_api.patch(
-        f"/api/v1/admin/store-products/{product['id']}",
-        {"is_published": True},
+    publish = admin_api.post(
+        f"/api/v1/admin/store-products/{product['id']}/transition",
+        {"expected_status": "draft", "target_status": "active"},
         format="json",
     )
     assert publish.status_code == 400
@@ -595,7 +601,7 @@ def test_deleting_quota_group_used_by_store_product_returns_conflict(admin_api):
 
 
 @pytest.mark.django_db
-def test_published_product_cannot_be_deactivated_without_unpublishing(admin_api, tmp_path):
+def test_legacy_product_payload_cannot_transition_or_create_active(admin_api, tmp_path):
     category = admin_api.post(
         "/api/v1/admin/store-categories", category_payload(), format="json"
     ).json()["data"]
@@ -604,22 +610,16 @@ def test_published_product_cannot_be_deactivated_without_unpublishing(admin_api,
             "/api/v1/admin/store-products/media", {"image": image_upload()}, format="multipart"
         ).json()["data"]
         published = product_payload(category["id"], published=True, image_id=image["id"])
-        created = admin_api.post("/api/v1/admin/store-products", published, format="json").json()[
-            "data"
-        ]
-        result = admin_api.patch(
-            f"/api/v1/admin/store-products/{created['id']}",
-            {"is_active": False},
-            format="json",
-        )
-        assert result.status_code == 400
-        assert Product.objects.get(pk=created["id"]).is_active is True
-        unpublish = admin_api.patch(
-            f"/api/v1/admin/store-products/{created['id']}",
-            {"is_published": False, "is_active": False},
-            format="json",
-        )
-        assert unpublish.status_code == 200
+        rejected = admin_api.post("/api/v1/admin/store-products", published, format="json")
+        assert rejected.status_code == 409
+        assert not Product.objects.exists()
+        published["is_published"] = False
+        created = admin_api.post("/api/v1/admin/store-products", published, format="json")
+        assert created.status_code == 201
+        path = f"/api/v1/admin/store-products/{created.json()['data']['id']}"
+        result = admin_api.patch(path, {"is_active": False}, format="json")
+        assert result.status_code == 409
+        assert admin_api.get(path).json()["data"]["status"] == "draft"
 
 
 @pytest.mark.django_db
@@ -719,10 +719,17 @@ def test_published_store_product_protects_quota_group_deactivation(admin_api, tm
             "/api/v1/admin/store-products/media", {"image": image_upload()}, format="multipart"
         ).json()["data"]
         payload = product_payload(
-            category["id"], group_id=str(group.pk), cost=1, published=True, image_id=image["id"]
+            category["id"], group_id=str(group.pk), cost=1, image_id=image["id"]
         )
         created = admin_api.post("/api/v1/admin/store-products", payload, format="json")
         assert created.status_code == 201, created.json()
+        product_id = created.json()["data"]["id"]
+        active = admin_api.post(
+            f"/api/v1/admin/store-products/{product_id}/transition",
+            {"expected_status": "draft", "target_status": "active"},
+            format="json",
+        )
+        assert active.status_code == 200, active.json()
         blocked = admin_api.patch(
             f"/api/v1/admin/membership-products/{group.pk}",
             {"is_active": False},
@@ -1002,3 +1009,47 @@ def test_package_create_rechecks_group_after_serializer_validation(admin_api, mo
     )
     assert response.status_code == 400, response.json()
     assert not MembershipPackage.objects.filter(name="Gói race").exists()
+
+
+@pytest.mark.django_db
+def test_product_lifecycle_requires_explicit_transition(admin_api, tmp_path):
+    category = admin_api.post("/api/v1/admin/store-categories", category_payload(), format="json")
+    with override_settings(MEDIA_ROOT=tmp_path):
+        image = admin_api.post(
+            "/api/v1/admin/store-products/media", {"image": image_upload()}, format="multipart"
+        )
+    assert image.status_code == 201, image.json()
+    body = product_payload(category.json()["data"]["id"], image_id=image.json()["data"]["id"])
+    body.pop("is_active")
+    body.pop("is_published")
+    created = admin_api.post("/api/v1/admin/store-products", body, format="json")
+    assert created.status_code == 201, created.json()
+    assert created.json()["data"]["status"] == "draft"
+    url = f"/api/v1/admin/store-products/{created.json()['data']['id']}"
+    assert admin_api.patch(url, {"status": "active"}, format="json").status_code == 400
+    assert (
+        admin_api.post(
+            f"{url}/transition",
+            {"expected_status": "draft", "target_status": "discontinued"},
+            format="json",
+        ).status_code
+        == 409
+    )
+    for before, target in [
+        ("draft", "active"),
+        ("active", "discontinued"),
+        ("discontinued", "active"),
+    ]:
+        response = admin_api.post(
+            f"{url}/transition", {"expected_status": before, "target_status": target}, format="json"
+        )
+        assert response.status_code == 200, response.json()
+        assert response.json()["data"]["status"] == target
+    assert (
+        admin_api.patch(url, {"is_active": True, "is_published": False}, format="json").status_code
+        == 409
+    )
+    assert (
+        admin_api.patch(url, {"retail_price_vnd": 39000}, format="json").json()["data"]["status"]
+        == "active"
+    )

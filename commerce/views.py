@@ -1,14 +1,14 @@
-from django.db import transaction
 from django.db.models import CharField, Count, Exists, OuterRef, Prefetch, Q, Subquery
 from django.db.models.functions import Coalesce
 from django.shortcuts import get_object_or_404
 from rest_framework import status, viewsets
+from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from commerce.models import Category, Product, ProductTranslation, ShippingAddress
+from commerce.models import Category, Product, ProductStatus, ProductTranslation, ShippingAddress
 from commerce.public_catalog import (
     public_category_payloads,
     public_product_payload,
@@ -20,6 +20,7 @@ from commerce.serializers import (
     CategoryQuerySerializer,
     CategoryWriteSerializer,
     ProductQuerySerializer,
+    ProductTransitionSerializer,
     ProductWriteSerializer,
     PublicStoreLocaleSerializer,
     PublicStoreProductQuerySerializer,
@@ -33,6 +34,9 @@ from commerce.services import (
     create_product,
     delete_category,
     delete_product,
+    legacy_product_flags,
+    product_capabilities,
+    transition_product,
     update_category,
     update_product,
 )
@@ -408,8 +412,9 @@ def product_payload(item, request, *, include_document=True):
         "csa_quota_cost": item.csa_quota_cost,
         "primary_image_id": str(item.primary_image_id) if item.primary_image_id else None,
         "primary_image": media_payload(item.primary_image, request) if item.primary_image else None,
-        "is_active": item.is_active,
-        "is_published": item.is_published,
+        "status": item.status,
+        **legacy_product_flags(item.status),
+        **({"capabilities": product_capabilities(item)} if include_document else {}),
         "translations": _translations(item, include_document=include_document),
         "created_at": item.created_at.isoformat(),
         "updated_at": item.updated_at.isoformat(),
@@ -494,10 +499,19 @@ class AdminProductViewSet(viewsets.ViewSet):
                 | Q(category__parent_id=category_id)
                 | Q(category__parent__parent_id=category_id)
             )
-        if "is_active" in data:
-            rows = rows.filter(is_active=data["is_active"])
-        if "is_published" in data:
-            rows = rows.filter(is_published=data["is_published"])
+        if "status" in data:
+            rows = rows.filter(status=data["status"])
+        if {"is_active", "is_published"} & data.keys():
+            rows = rows.filter(
+                status__in=[
+                    value
+                    for value in ProductStatus.values
+                    if all(
+                        data.get(key, flag) == flag
+                        for key, flag in legacy_product_flags(value).items()
+                    )
+                ]
+            )
         if "csa_eligible" in data:
             rows = rows.filter(csa_quota_group__isnull=not data["csa_eligible"])
         total = rows.count()
@@ -518,7 +532,10 @@ class AdminProductViewSet(viewsets.ViewSet):
     def create(self, request):
         serializer = ProductWriteSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        product = create_product(actor=request.user, payload=serializer.validated_data)
+        try:
+            product = create_product(actor=request.user, payload=serializer.validated_data)
+        except CatalogConflict as error:
+            return conflict_response(error)
         item = product_queryset().get(pk=product.pk)
         return no_store(
             Response({"data": product_payload(item, request)}, status=status.HTTP_201_CREATED)
@@ -528,21 +545,44 @@ class AdminProductViewSet(viewsets.ViewSet):
         item = get_object_or_404(product_queryset(), pk=pk)
         return no_store(Response({"data": product_payload(item, request)}))
 
-    @transaction.atomic
     def partial_update(self, request, pk=None):
-        product = get_object_or_404(Product.objects.select_for_update(), pk=pk)
+        product = get_object_or_404(Product, pk=pk)
         serializer = ProductWriteSerializer(data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         try:
             update_product(actor=request.user, product=product, payload=serializer.validated_data)
+        except Product.DoesNotExist as error:
+            raise NotFound() from error
         except CatalogConflict as error:
             return conflict_response(error)
-        return no_store(Response({"data": product_payload(product_queryset().get(pk=pk), request)}))
+        return no_store(
+            Response(
+                {"data": product_payload(get_object_or_404(product_queryset(), pk=pk), request)}
+            )
+        )
+
+    @action(detail=True, methods=["post"], url_path="transition")
+    def transition(self, request, pk=None):
+        serializer = ProductTransitionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            transition_product(actor=request.user, product_id=pk, **serializer.validated_data)
+        except Product.DoesNotExist as error:
+            raise NotFound() from error
+        except CatalogConflict as error:
+            return conflict_response(error)
+        return no_store(
+            Response(
+                {"data": product_payload(get_object_or_404(product_queryset(), pk=pk), request)}
+            )
+        )
 
     def destroy(self, request, pk=None):
         product = get_object_or_404(Product, pk=pk)
         try:
             delete_product(actor=request.user, product=product)
+        except Product.DoesNotExist as error:
+            raise NotFound() from error
         except CatalogConflict as error:
             return conflict_response(error)
         return no_store(Response(status=status.HTTP_204_NO_CONTENT))

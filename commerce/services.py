@@ -11,11 +11,13 @@ from commerce.models import (
     Category,
     CategoryTranslation,
     Product,
+    ProductStatus,
     ProductTranslation,
+    StoreOrderLine,
 )
 from commerce.product_descriptions import prepare_product_translations
 from content.models import MediaAsset
-from content.services import delete_orphan_media_asset, request_frontend_revalidation
+from content.services import audit, delete_orphan_media_asset, request_frontend_revalidation
 from memberships.models import Product as MembershipProduct
 from memberships.quota_points import POINT_INPUT_ERROR, is_allowed_point_input
 
@@ -159,7 +161,10 @@ def update_category(*, actor, category, payload):
         raise ValidationError({"translations": "Vietnamese and English names are required."})
     if not active and Category.objects.filter(parent=category, is_active=True).exists():
         raise CatalogConflict("category_has_active_children")
-    if not active and Product.objects.filter(category=category, is_published=True).exists():
+    if (
+        not active
+        and Product.objects.filter(category=category, status=ProductStatus.ACTIVE).exists()
+    ):
         raise CatalogConflict("category_has_published_products")
     if "slug" in data:
         data["slug"] = data["slug"].lower()
@@ -190,13 +195,19 @@ def delete_category(*, actor, category):
     schedule_store_revalidation(categories=True)
 
 
-def _get_category_for_product(pk):
+def _get_category_for_product(pk, *, selling=False):
     try:
         category = Category.objects.select_for_update().get(pk=pk)
     except Category.DoesNotExist as error:
         raise ValidationError({"category_id": "Record does not exist."}) from error
     if not category.is_active or Category.objects.filter(parent=category).exists():
         raise ValidationError({"category_id": "Choose an active leaf category."})
+    if selling:
+        ancestor = category.parent
+        while ancestor:
+            if not ancestor.is_active:
+                raise ValidationError({"category_id": "Choose a category with active ancestors."})
+            ancestor = ancestor.parent
     return category
 
 
@@ -221,7 +232,7 @@ def _get_product_image(pk):
     return image
 
 
-def _validate_product(data, *, instance=None, translations=None):
+def _validate_product(data, *, instance=None, translations=None, selling=False):
     group = data.get("csa_quota_group", instance.csa_quota_group if instance else None)
     cost = data.get("csa_quota_cost", instance.csa_quota_cost if instance else 0)
     try:
@@ -234,11 +245,7 @@ def _validate_product(data, *, instance=None, translations=None):
         raise ValidationError({"csa_quota_cost": "Quota cost must match CSA eligibility."})
     if group is not None and not group.is_active:
         raise ValidationError({"csa_quota_group_id": "Choose an active CSA quota group."})
-    active = data.get("is_active", instance.is_active if instance else True)
-    published = data.get("is_published", instance.is_published if instance else False)
-    if published and not active:
-        raise ValidationError({"is_active": "Published products must be active."})
-    if published:
+    if selling:
         price = data.get("retail_price_vnd", instance.retail_price_vnd if instance else 0)
         if price > PUBLIC_STORE_MAX_PRICE_VND:
             raise ValidationError(
@@ -252,10 +259,28 @@ def _validate_product(data, *, instance=None, translations=None):
             raise ValidationError({"primary_image_id": "An image is required to publish."})
 
 
+def legacy_product_flags(status):
+    return {
+        "is_active": status != ProductStatus.DISCONTINUED,
+        "is_published": status == ProductStatus.ACTIVE,
+    }
+
+
+def _check_product_write_status(data, status):
+    if "status" in data:
+        raise CatalogConflict("product_transition_required")
+    # Old editors echo the flags with unrelated form edits. A stale form
+    # cannot reliably express an intentional transition.
+    for name, expected in legacy_product_flags(status).items():
+        if data.pop(name, expected) != expected:
+            raise CatalogConflict("product_transition_required")
+
+
 @transaction.atomic
 def create_product(*, actor, payload):
     _lock_category_tree()
     data = payload.copy()
+    _check_product_write_status(data, ProductStatus.DRAFT)
     translations = prepare_product_translations(data.pop("translations", []))
     required = {
         "sku",
@@ -289,30 +314,126 @@ def create_product(*, actor, payload):
     return product
 
 
-@transaction.atomic
-def update_product(*, actor, product, payload):
-    data = payload.copy()
-    previous_slug = product.slug
+PRODUCT_IDENTITY_FIELDS = ("sku", "unit_size", "unit_label_vi", "unit_label_en")
+PRODUCT_CSA_FIELDS = ("csa_quota_group_id", "csa_quota_cost")
+
+
+def _product_stock_holds(product):
+    from memberships.csa_rounds import active_stock_holds
+    from memberships.models import CSAStockHold
+
+    return CSAStockHold.objects.filter(product=product, selection__in=active_stock_holds())
+
+
+def _identity_lock_references(product):
     from farms.models import FarmProductStockBatch, LegacyFarmWeeklySupply
 
-    if any(
-        field in data and data[field] != getattr(product, field)
-        for field in ("unit_size", "unit_label_vi", "unit_label_en")
-    ) and (
-        FarmProductStockBatch.objects.filter(farm_product__product=product).exists()
-        or LegacyFarmWeeklySupply.objects.filter(farm_product__product=product).exists()
+    reasons = []
+    for code, model in (
+        ("stock_batch", FarmProductStockBatch),
+        ("legacy_supply", LegacyFarmWeeklySupply),
     ):
+        ref = (
+            model.objects.filter(farm_product__product=product)
+            .order_by("pk")
+            .values("id", "farm_product__farm_id")
+            .first()
+        )
+        if ref:
+            reasons.append(
+                {"code": code, "id": str(ref["id"]), "farm_id": str(ref["farm_product__farm_id"])}
+            )
+    order = (
+        StoreOrderLine.objects.filter(product=product)
+        .order_by("pk")
+        .values("order_id", "order__reference_code")
+        .first()
+    )
+    if order:
+        reasons.append(
+            {
+                "code": "store_order",
+                "id": str(order["order_id"]),
+                "label": order["order__reference_code"],
+            }
+        )
+    return reasons
+
+
+def product_capabilities(product):
+    hold = (
+        _product_stock_holds(product)
+        .order_by("pk")
+        .values("selection__round_id", "selection__round__name")
+        .first()
+    )
+    csa = []
+    if hold:
+        csa.append(
+            {
+                "code": "csa_hold",
+                "id": str(hold["selection__round_id"]),
+                "label": hold["selection__round__name"],
+            }
+        )
+    identity = _identity_lock_references(product)
+    deletion = [*identity, *csa]
+    offer = product.farm_offers.order_by("pk").values("id", "farm_id").first()
+    if offer:
+        deletion.append(
+            {"code": "farm_link", "id": str(offer["id"]), "farm_id": str(offer["farm_id"])}
+        )
+    if not csa:
+        line = (
+            product.csaselectionline_set.order_by("pk")
+            .values_list("selection__round_id", flat=True)
+            .first()
+        )
+        if line:
+            deletion.append({"code": "csa_history", "id": str(line)})
+        elif product.csastockhold_set.exists():
+            deletion.append({"code": "csa_history"})
+    if not deletion and product.store_stock_reservations.exists():
+        deletion.append({"code": "store_reservation"})
+    return {
+        "edit_identity": {"allowed": not (identity or csa), "reasons": [*identity, *csa]},
+        "edit_csa": {"allowed": not csa, "reasons": csa},
+        "delete": {"allowed": not deletion, "reasons": deletion},
+    }
+
+
+@transaction.atomic
+def update_product(*, actor, product, payload):
+    _lock_category_tree()
+    product = Product.objects.select_for_update().get(pk=product.pk)
+    data = payload.copy()
+    _check_product_write_status(data, product.status)
+    previous_slug = product.slug
+    if "sku" in data:
+        data["sku"] = data["sku"].strip().upper()
+    changes_identity = any(
+        field in data and data[field] != getattr(product, field)
+        for field in PRODUCT_IDENTITY_FIELDS
+    )
+    changes_csa = any(
+        field in data and data[field] != getattr(product, field) for field in PRODUCT_CSA_FIELDS
+    )
+    if (changes_identity or changes_csa) and _product_stock_holds(product).exists():
+        raise CatalogConflict("product_csa_hold_in_use")
+    if changes_identity and _identity_lock_references(product):
         raise CatalogConflict("product_unit_in_use")
     translations = prepare_product_translations(data.pop("translations", None), instance=product)
     previous_image = product.primary_image
     requested_category_id = data.pop("category_id", product.category_id)
     keeping_draft_category = (
         str(requested_category_id) == str(product.category_id)
-        and not data.get("is_published", product.is_published)
+        and product.status != ProductStatus.ACTIVE
         and not product.category.is_active
     )
     if not keeping_draft_category:
-        category = _get_category_for_product(requested_category_id)
+        category = _get_category_for_product(
+            requested_category_id, selling=product.status == ProductStatus.ACTIVE
+        )
         if str(category.pk) != str(product.category_id):
             data["category"] = category
     if "csa_quota_group_id" in data:
@@ -322,14 +443,18 @@ def update_product(*, actor, product, payload):
     if "primary_image_id" in data:
         data["primary_image"] = _get_product_image(data.pop("primary_image_id"))
     if "sku" in data:
-        data["sku"] = data["sku"].strip().upper()
         if Product.objects.filter(sku=data["sku"]).exclude(pk=product.pk).exists():
             raise ValidationError({"sku": "This SKU is already in use."})
     if "slug" in data:
         data["slug"] = data["slug"].lower()
         if Product.objects.filter(slug=data["slug"]).exclude(pk=product.pk).exists():
             raise ValidationError({"slug": "This slug is already in use."})
-    _validate_product(data, instance=product, translations=translations)
+    _validate_product(
+        data,
+        instance=product,
+        translations=translations,
+        selling=product.status == ProductStatus.ACTIVE,
+    )
     for field, value in data.items():
         setattr(product, field, value)
     try:
@@ -344,7 +469,43 @@ def update_product(*, actor, product, payload):
 
 
 @transaction.atomic
+def transition_product(*, actor, product_id, expected_status, target_status):
+    _lock_category_tree()
+    product = Product.objects.select_for_update().get(pk=product_id)
+    if product.status != expected_status:
+        raise CatalogConflict("product_status_changed")
+    transitions = {
+        ProductStatus.DRAFT: ProductStatus.ACTIVE,
+        ProductStatus.ACTIVE: ProductStatus.DISCONTINUED,
+        ProductStatus.DISCONTINUED: ProductStatus.ACTIVE,
+    }
+    if transitions.get(product.status) != target_status:
+        raise CatalogConflict("product_transition_invalid")
+    if target_status == ProductStatus.ACTIVE:
+        _get_category_for_product(product.category_id, selling=True)
+        group = _get_quota_group(product.csa_quota_group_id)
+        image = _get_product_image(product.primary_image_id)
+        _validate_product(
+            {"csa_quota_group": group, "primary_image": image}, instance=product, selling=True
+        )
+    product.status = target_status
+    legacy_flags = legacy_product_flags(target_status)
+    for field, value in legacy_flags.items():
+        setattr(product, field, value)
+    product.save(update_fields=["status", *legacy_flags, "updated_at"])
+    audit(
+        actor=actor,
+        action="store_product.transition",
+        entity=product,
+        context={"from": expected_status, "to": target_status},
+    )
+    schedule_store_revalidation(slugs=[product.slug], categories=True)
+    return product
+
+
+@transaction.atomic
 def delete_product(*, actor, product):
+    product = Product.objects.select_for_update().get(pk=product.pk)
     image_id = product.primary_image_id
     slug = product.slug
     try:

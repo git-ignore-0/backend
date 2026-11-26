@@ -20,11 +20,13 @@ from commerce.models import (
     ShippingAddress,
     ShippingArea,
     StoreOrder,
+    StoreOrderLine,
     StoreOrderStatus,
     StorePaymentStatus,
     StoreQuotaReservation,
     StoreStockAllocation,
     StoreStockMovement,
+    StoreStockReservation,
 )
 from content.models import MediaAsset
 from farms.models import Farm, FarmProduct, FarmProductStockBatch
@@ -106,7 +108,7 @@ def store_product():
         unit_label_en="kg",
         retail_price_vnd=45_000,
         primary_image=image,
-        is_active=True,
+        status="active",
         is_published=True,
     )
     ProductTranslation.objects.bulk_create(
@@ -1185,8 +1187,7 @@ def test_multiple_lines_share_quota_in_checkout_position_order(
         retail_price_vnd=45_000,
         csa_quota_cost=2,
         primary_image=store_product.primary_image,
-        is_active=True,
-        is_published=True,
+        status="active",
     )
     ProductTranslation.objects.bulk_create(
         [
@@ -2977,8 +2978,7 @@ def test_admin_detail_allocation_query_count_is_constant(
             unit_label_vi="kg",
             unit_label_en="kg",
             retail_price_vnd=45000,
-            is_active=True,
-            is_published=True,
+            status="active",
         )
         offer = FarmProduct.objects.create(farm=original_batch.farm_product.farm, product=product)
         FarmProductStockBatch.objects.create(
@@ -3235,8 +3235,7 @@ def test_approve_products_sharing_cycle_quota_aggregates_usage(
         retail_price_vnd=45_000,
         csa_quota_cost=second_cost,
         primary_image=store_product.primary_image,
-        is_active=True,
-        is_published=True,
+        status="active",
     )
     ProductTranslation.objects.bulk_create(
         [
@@ -3385,8 +3384,8 @@ def test_buy_again_prepare_is_owner_scoped_and_uses_live_catalog(
     assert row["reason"] == "insufficient_stock"
     assert row["product"]["available_quantity"] == 1
     assert row["quantity"] == 2
-    store_product.is_published = False
-    store_product.save(update_fields=["is_published"])
+    store_product.status = "discontinued"
+    store_product.save(update_fields=["status"])
     row = client.get(url).json()["data"]["lines"][0]
     assert row["reason"] == "unavailable"
     assert row["product"] is None
@@ -3705,3 +3704,231 @@ def test_guest_voucher_is_rejected_without_order(store_product, payment_settings
     assert response.status_code == 400
     assert response.json()["errors"][0]["code"] == "coupon_authentication_required"
     assert not StoreOrder.objects.exists()
+
+
+@pytest.mark.django_db
+def test_selling_unit_can_change_before_first_stock_but_stale_checkout_cannot_submit(
+    store_product, payment_settings, active_user
+):
+    from commerce.services import CatalogConflict, update_product
+    from farms.services import create_stock_batch
+
+    product = store_product
+    offer = product.farm_offers.get()
+    # Fixture creates a normal stocked product. Represent the pre-first-batch state.
+    offer.stock_batches.all().delete()
+    client = APIClient()
+    detail = f"/api/v1/public/store-products/{product.slug}?locale=vi"
+    original = client.get(detail).json()["data"]
+    assert original["unit_size"] == "1.000"
+    assert original["available_quantity"] == 0
+    stale = guest_payload(product, expected_available=0)
+    unavailable = client.post("/api/v1/public/store-checkouts", stale, format="json")
+    assert unavailable.status_code == 409
+    assert unavailable.json()["errors"][0]["code"] == "store_stock_changed"
+
+    update_product(actor=active_user, product=product, payload={"unit_size": Decimal("2.000")})
+    today = timezone.localdate()
+    create_stock_batch(
+        farm_id=offer.farm_id,
+        product_id=product.pk,
+        actor=active_user,
+        data={"start_date": today, "end_date": today + timedelta(days=2), "quantity_units": 10},
+    )
+    rejected = client.post("/api/v1/public/store-checkouts", stale, format="json")
+    assert rejected.status_code == 409
+    assert rejected.json()["errors"][0]["code"] == "store_requote_required"
+    assert not StoreOrder.objects.exists()
+
+    refreshed = client.get(detail).json()["data"]
+    assert refreshed["unit_size"] == "2.000"
+    confirmed = guest_payload(product, expected_available=refreshed["available_quantity"])
+    with pytest.raises(CatalogConflict, match="product_unit_in_use"):
+        update_product(actor=active_user, product=product, payload={"unit_size": Decimal("3.000")})
+    created = client.post("/api/v1/public/store-checkouts", confirmed, format="json")
+    assert created.status_code == 201, created.json()
+    assert StoreOrderLine.objects.get().unit_size_snapshot == Decimal("2.000")
+
+
+@pytest.mark.django_db
+def test_store_quota_reservation_consumes_snapshot_after_product_cost_change(
+    zero_shipping_fee, active_user, access_token, store_product
+):
+    from commerce.services import update_product
+
+    membership = attach_active_membership(active_user, store_product)
+    address = ShippingAddress.objects.get(user=active_user)
+    client = APIClient()
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token.token}")
+    response = client.post(
+        "/api/v1/public/store-checkouts",
+        quota_checkout_payload(store_product, address, quantity=1),
+        format="json",
+    )
+    assert response.status_code == 201, response.json()
+    order = StoreOrder.objects.get(pk=response.json()["data"]["id"])
+    line = order.lines.get()
+    reserved = line.quota_reservations.get()
+    original_cost = line.quota_cost_snapshot
+    update_product(
+        actor=active_user, product=store_product, payload={"csa_quota_cost": Decimal("3")}
+    )
+    approve_review_order(response.json()["data"], active_user)
+    reserved.refresh_from_db()
+    line.refresh_from_db()
+    quota = MembershipCycleQuota.objects.get(cycle__membership=membership)
+    assert reserved.consumed_at is not None
+    assert quota.remaining_units == quota.granted_units - reserved.units
+    assert line.quota_cost_snapshot == original_cost
+    assert reserved.units == original_cost
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.skipif(
+    not connection.features.has_select_for_update, reason="requires database row locking"
+)
+def test_checkout_and_discontinue_serialize_new_orders(
+    store_product, payment_settings, active_user
+):
+    from commerce.services import transition_product
+
+    start = Barrier(2)
+    payload = guest_payload(store_product)
+
+    def checkout():
+        close_old_connections()
+        try:
+            start.wait(timeout=10)
+            return APIClient().post("/api/v1/public/store-checkouts", payload, format="json")
+        finally:
+            close_old_connections()
+
+    def discontinue():
+        close_old_connections()
+        try:
+            start.wait(timeout=10)
+            transition_product(
+                actor=active_user,
+                product_id=store_product.pk,
+                expected_status="active",
+                target_status="discontinued",
+            )
+        finally:
+            close_old_connections()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        checkout_result = pool.submit(checkout)
+        transition_result = pool.submit(discontinue)
+        response = checkout_result.result(timeout=30)
+        transition_result.result(timeout=30)
+    if response.status_code == 201:
+        replay = APIClient().post("/api/v1/public/store-checkouts", payload, format="json")
+        assert replay.json()["data"]["id"] == response.json()["data"]["id"]
+        assert StoreOrder.objects.count() == 1
+        assert StoreStockReservation.objects.count() == 1
+    else:
+        assert response.status_code == 400, response.json()
+        assert response.json()["errors"][0]["code"] == "store_product_changed"
+        assert not StoreOrder.objects.exists()
+        assert not StoreStockReservation.objects.exists()
+
+
+@pytest.mark.django_db
+def test_discontinue_blocks_new_checkout_but_replays_and_approves_existing(
+    store_product, payment_settings, active_user
+):
+    from commerce.services import transition_product
+    from commerce.store_orders import cancel_store_order
+
+    client = APIClient()
+    url = "/api/v1/public/store-checkouts"
+    original = guest_payload(store_product)
+    response = client.post(url, original, format="json")
+    assert response.status_code == 201, response.json()
+    data = response.json()["data"]
+    hold = StoreStockReservation.objects.get()
+    transition_product(
+        actor=active_user,
+        product_id=store_product.pk,
+        expected_status="active",
+        target_status="discontinued",
+    )
+    assert (
+        client.get(f"/api/v1/public/store-products/{store_product.slug}?locale=vi").status_code
+        == 404
+    )
+    hold.refresh_from_db()
+    assert hold.released_at is None
+    new = client.post(url, guest_payload(store_product, expected_available=8), format="json")
+    assert new.status_code == 400, new.json()
+    assert new.json()["errors"][0]["code"] == "store_product_changed"
+    replay = client.post(url, original, format="json")
+    assert replay.json()["data"]["id"] == data["id"]
+    assert StoreOrder.objects.count() == 1
+    assert StoreStockReservation.objects.count() == 1
+
+    approved = approve_review_order(data, active_user)
+    hold.refresh_from_db()
+    assert approved.approved_at is not None
+    assert hold.released_at is not None
+    assert StoreStockMovement.objects.filter(kind="sale").count() == 1
+
+    key = uuid.uuid4()
+    for _ in range(2):
+        cancel_store_order(
+            order_id=approved.pk, actor=active_user, idempotency_key=key, reason="Cancelled"
+        )
+    assert StoreStockMovement.objects.filter(kind="restock").count() == 1
+    assert StoreStockMovement.objects.get(kind="restock").quantity == hold.quantity
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.skipif(
+    not connection.features.has_select_for_update, reason="requires database row locking"
+)
+def test_create_stock_batch_and_discontinue_serialize(store_product, active_user):
+    from commerce.services import transition_product
+    from farms.services import FarmConflict, create_stock_batch
+
+    offer = store_product.farm_offers.get()
+    start = Barrier(2)
+    today = timezone.localdate()
+
+    def add_stock():
+        close_old_connections()
+        try:
+            start.wait(timeout=10)
+            create_stock_batch(
+                farm_id=offer.farm_id,
+                product_id=store_product.pk,
+                actor=active_user,
+                data={"start_date": today, "end_date": today, "quantity_units": 5},
+            )
+            return True
+        except FarmConflict as error:
+            assert error.code == "product_not_selling"
+            return False
+        finally:
+            close_old_connections()
+
+    def discontinue():
+        close_old_connections()
+        try:
+            start.wait(timeout=10)
+            transition_product(
+                actor=active_user,
+                product_id=store_product.pk,
+                expected_status="active",
+                target_status="discontinued",
+            )
+        finally:
+            close_old_connections()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        intake = pool.submit(add_stock)
+        transition = pool.submit(discontinue)
+        created = intake.result(timeout=30)
+        transition.result(timeout=30)
+    store_product.refresh_from_db()
+    assert store_product.status == "discontinued"
+    assert offer.stock_batches.count() == (2 if created else 1)

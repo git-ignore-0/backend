@@ -114,6 +114,12 @@ class CategoryTranslation(models.Model):
         return f"{self.category.slug} ({self.locale})"
 
 
+class ProductStatus(models.TextChoices):
+    DRAFT = "draft", "Draft"
+    ACTIVE = "active", "Active"
+    DISCONTINUED = "discontinued", "Discontinued"
+
+
 class Product(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     category = models.ForeignKey(Category, related_name="products", on_delete=models.PROTECT)
@@ -140,6 +146,8 @@ class Product(models.Model):
     )
     is_active = models.BooleanField(default=True)
     is_published = models.BooleanField(default=False)
+    # Legacy columns mirror status during rollout and rollback.
+    status = models.CharField(max_length=12, choices=ProductStatus, default=ProductStatus.DRAFT)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -162,6 +170,10 @@ class Product(models.Model):
             models.CheckConstraint(
                 condition=Q(is_published=False) | Q(is_active=True),
                 name="commerce_product_published_active",
+            ),
+            models.CheckConstraint(
+                condition=Q(status__in=ProductStatus.values),
+                name="commerce_product_status_valid",
             ),
         ]
 

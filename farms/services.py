@@ -18,7 +18,7 @@ from django.db.models.functions import Coalesce, Greatest
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
-from commerce.models import Product, StoreStockMovement, StoreStockMovementKind
+from commerce.models import Product, ProductStatus, StoreStockMovement, StoreStockMovementKind
 from commerce.services import schedule_store_revalidation
 from content.models import MediaAsset
 from content.services import audit, delete_orphan_media_asset, request_frontend_revalidation
@@ -366,7 +366,7 @@ def add_farm_product(*, farm_id, product_id, start_date, end_date, quantity_unit
     if product is None:
         raise Product.DoesNotExist
     farm = Farm.objects.select_for_update().get(pk=farm_id)
-    if not product.is_active:
+    if product.status != ProductStatus.ACTIVE:
         raise FarmConflict("product_inactive")
     _validate_stock_batch_values(
         start_date=start_date, end_date=end_date, quantity_units=quantity_units
@@ -393,9 +393,13 @@ def add_farm_product(*, farm_id, product_id, start_date, end_date, quantity_unit
 
 @transaction.atomic
 def create_stock_batch(*, farm_id, product_id, actor, data):
-    product = Product.objects.select_for_update().only("slug").filter(pk=product_id).first()
+    product = (
+        Product.objects.select_for_update().only("slug", "status").filter(pk=product_id).first()
+    )
     if product is None:
         raise FarmConflict("farm_product_changed")
+    if product.status != ProductStatus.ACTIVE:
+        raise FarmConflict("product_not_selling")
     relation = (
         FarmProduct.objects.select_for_update()
         .filter(farm_id=farm_id, product_id=product_id)
@@ -421,7 +425,8 @@ def update_stock_batch(*, farm_id, product_id, batch_id, actor, expected_version
     relation = FarmProduct.objects.filter(farm_id=farm_id, product_id=product_id).first()
     if relation is None:
         raise FarmConflict("farm_product_changed")
-    if not Product.objects.select_for_update().filter(pk=product_id).exists():
+    product = Product.objects.select_for_update().filter(pk=product_id).first()
+    if product is None:
         raise FarmConflict("farm_product_changed")
     batch = (
         FarmProductStockBatch.objects.select_for_update()
@@ -444,6 +449,12 @@ def update_stock_batch(*, farm_id, product_id, batch_id, actor, expected_version
     start_date = values.get("start_date", batch.start_date)
     end_date = values.get("end_date", batch.end_date)
     quantity_units = values.get("quantity_units", batch.quantity_units)
+    if product.status != ProductStatus.ACTIVE and (
+        quantity_units > batch.quantity_units
+        or start_date < batch.start_date
+        or end_date > batch.end_date
+    ):
+        raise FarmConflict("product_not_selling")
     _validate_stock_batch_values(
         start_date=start_date,
         end_date=end_date,

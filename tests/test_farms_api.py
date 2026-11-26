@@ -80,6 +80,7 @@ def test_farm_product_and_first_stock_batch_are_scoped_to_farm(farm_admin_api):
     other = Farm.objects.create(**farm_payload(name_en="Other Farm"))
     category = Category.objects.create(slug="greens", is_active=True)
     product = Product.objects.create(
+        status="active",
         category=category,
         sku="GREEN-500G",
         slug="green-500g",
@@ -127,14 +128,14 @@ def test_farm_cannot_link_product_deactivated_after_catalog_selection(farm_admin
         unit_label_vi="gói",
         unit_label_en="pack",
         retail_price_vnd=25000,
-        is_active=True,
+        status="active",
     )
     base = f"/api/v1/admin/farms/{farm.pk}"
     available = farm_admin_api.get(f"{base}/available-products")
     assert any(row["id"] == str(product.pk) for row in available.json()["data"])
 
-    product.is_active = False
-    product.save(update_fields=["is_active"])
+    product.status = "discontinued"
+    product.save(update_fields=["status"])
     response = farm_admin_api.post(
         f"{base}/products",
         {
@@ -157,6 +158,7 @@ def test_farm_product_list_is_paginated_searchable_and_contains_display_summary(
     category = Category.objects.create(slug="farm-product-page", is_active=True)
     for index in range(21):
         product = Product.objects.create(
+            status="active",
             category=category,
             sku=f"FARM-PRODUCT-{index:02d}",
             slug=f"farm-product-{index:02d}",
@@ -191,6 +193,7 @@ def test_available_products_excludes_all_farm_links_across_pages(farm_admin_api)
     category = Category.objects.create(slug="farm-available", is_active=True)
     for index in range(31):
         product = Product.objects.create(
+            status="active",
             category=category,
             sku=f"AVAILABLE-{index:02d}",
             slug=f"available-{index:02d}",
@@ -295,6 +298,7 @@ def test_farm_api_handles_records_removed_after_preflight(farm_admin_api):
     farm = Farm.objects.create(**farm_payload())
     category = Category.objects.create(slug="farm-race", is_active=True)
     product = Product.objects.create(
+        status="active",
         category=category,
         sku="FARM-RACE",
         slug="farm-race",
@@ -336,6 +340,7 @@ def test_batch_write_returns_conflict_if_link_disappears_after_initial_lookup(fa
     farm = Farm.objects.create(**farm_payload())
     category = Category.objects.create(slug="farm-product-race", is_active=True)
     product = Product.objects.create(
+        status="active",
         category=category,
         sku="RACE-500G",
         slug="race-500g",
@@ -422,12 +427,24 @@ def test_product_sale_unit_cannot_change_after_stock_batch_exists(farm_admin_api
         retail_price_vnd=30000,
     )
     row = FarmProduct.objects.create(farm=farm, product=product)
-    FarmProductStockBatch.objects.create(
+    batch = FarmProductStockBatch.objects.create(
         farm_product=row,
         start_date=timezone.localdate(),
         end_date=timezone.localdate(),
         quantity_units=20,
     )
+    detail = farm_admin_api.get(f"/api/v1/admin/store-products/{product.pk}").json()["data"]
+    capabilities = detail["capabilities"]
+    assert capabilities["edit_identity"] == {
+        "allowed": False,
+        "reasons": [{"code": "stock_batch", "id": str(batch.pk), "farm_id": str(farm.pk)}],
+    }
+    assert capabilities["edit_csa"]["allowed"] is True
+    assert capabilities["delete"]["allowed"] is False
+    blocked_sku = farm_admin_api.patch(
+        f"/api/v1/admin/store-products/{product.pk}", {"sku": "NEW-SKU"}, format="json"
+    )
+    assert blocked_sku.status_code == 409
     response = farm_admin_api.patch(
         f"/api/v1/admin/store-products/{product.pk}",
         {"unit_size": "2.000"},
