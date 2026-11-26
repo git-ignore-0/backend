@@ -553,14 +553,27 @@ def test_domain_checks_persisted_actor_and_target(cms, active_user):
 
 @pytest.mark.django_db(transaction=True)
 @pytest.mark.parametrize("shared", ["phone", "email"])
-def test_concurrent_creates_keep_at_most_one_identity(cms, access_token, shared):
+def test_concurrent_creates_keep_at_most_one_identity(cms, access_token, shared, monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
-    from threading import Barrier
+    from threading import Barrier, Event
 
-    from django.db import close_old_connections
+    from django.db import close_old_connections, connection
+
+    from identity import admin_services
 
     token = access_token.token
     barrier = Barrier(2)
+    sqlite = connection.vendor == "sqlite"
+    rolled_back = Event()
+    committed = Event()
+
+    def wait_for_winner(_delay):
+        # The native lock error has already rolled back the losing transaction.
+        rolled_back.set()
+        assert committed.wait(timeout=5)
+
+    if sqlite:
+        monkeypatch.setattr(admin_services, "sleep", wait_for_winner)
 
     def create(index):
         close_old_connections()
@@ -569,15 +582,38 @@ def test_concurrent_creates_keep_at_most_one_identity(cms, access_token, shared)
             client.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
             email = "same@example.com" if shared == "email" else f"same{index}@example.com"
             phone = f"090123456{index}" if shared == "email" else "0901234567"
-            barrier.wait(timeout=5)
-            return client.post(
-                USERS, payload(email=email, login_phone_number=phone), format="json"
-            ).status_code
+
+            def post():
+                return client.post(
+                    USERS, payload(email=email, login_phone_number=phone), format="json"
+                ).status_code
+
+            if not sqlite:
+                barrier.wait(timeout=5)
+                return post()
+
+            def order_inserts(execute, sql, params, many, context):
+                if sql.startswith('INSERT INTO "identity_user"'):
+                    # Both contenders hold a SQLite read lock. Let the second
+                    # request hit the upgrade failure and release its read before
+                    # the first request writes. The retry then sees the winner.
+                    barrier.wait(timeout=5)
+                    if index == 0:
+                        assert rolled_back.wait(timeout=5)
+                return execute(sql, params, many, context)
+
+            with connection.execute_wrapper(order_inserts):
+                status = post()
+            if index == 0:
+                committed.set()
+            return status
         finally:
             close_old_connections()
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         assert sorted(pool.map(create, range(2))) == [201, 400]
+    if sqlite:
+        assert rolled_back.is_set()
     assert User.objects.exclude(pk=access_token.user_id).count() == 1
     assert AuditLog.objects.filter(action="user.created").count() == 1
 

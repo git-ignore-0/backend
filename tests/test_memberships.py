@@ -1178,6 +1178,7 @@ def test_price_option_migration_preserves_historical_membership_price_and_usage(
         "0008_farmbrite_memberships_and_price_options",
     )
     executor = MigrationExecutor(connection)
+    latest = executor.loader.graph.leaf_nodes()
     try:
         executor.migrate([migrate_from])
         old_apps = executor.loader.project_state([migrate_from]).apps
@@ -1329,7 +1330,7 @@ def test_price_option_migration_preserves_historical_membership_price_and_usage(
         assert MigratedUsage.objects.get(pk=usage.pk).note == "Historical delivery"
         assert MigratedAllocation.objects.get(line__order_id=usage.pk).units == 1
     finally:
-        MigrationExecutor(connection).migrate([migrate_to])
+        MigrationExecutor(connection).migrate(latest)
 
 
 @pytest.mark.django_db

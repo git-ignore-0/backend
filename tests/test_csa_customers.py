@@ -946,6 +946,7 @@ def test_customer_migration_backfills_only_membership_users_without_losing_histo
     migrate_to = ("memberships", "0011_csa_customer_finalize")
     members_target = ("members", "0002_member_profile_administrative_codes")
     executor = MigrationExecutor(connection)
+    latest = executor.loader.graph.leaf_nodes()
     try:
         executor.migrate([migrate_from, members_target])
         old = executor.loader.project_state([migrate_from, members_target]).apps
@@ -1074,4 +1075,4 @@ def test_customer_migration_backfills_only_membership_users_without_losing_histo
         assert NewUsage.objects.get(membership_id=first.pk).customer_id == buyer_customer.pk
         assert new.get_model("memberships", "MembershipCycleQuota").objects.count() == 1
     finally:
-        MigrationExecutor(connection).migrate([migrate_to])
+        MigrationExecutor(connection).migrate(latest)
