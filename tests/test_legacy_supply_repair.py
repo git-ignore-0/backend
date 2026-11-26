@@ -6,7 +6,6 @@ import pytest
 from django.db import connection
 from django.db.migrations.executor import MigrationExecutor
 
-from farms.models import Farm, FarmProduct, FarmProductStockBatch, LegacyFarmWeeklySupply
 from tests.test_store_orders import store_product as store_product
 
 
@@ -19,7 +18,12 @@ def test_legacy_archive_repair_preserves_current_stock_and_existing_history(stor
     repair = ("farms", "0004_repair_missing_legacy_supply_table")
     try:
         executor.migrate([parent])
-        offer = FarmProduct.objects.get(product=store_product)
+        historical = executor.loader.project_state([parent]).apps
+        Farm = historical.get_model("farms", "Farm")
+        FarmProduct = historical.get_model("farms", "FarmProduct")
+        FarmProductStockBatch = historical.get_model("farms", "FarmProductStockBatch")
+        LegacyFarmWeeklySupply = historical.get_model("farms", "LegacyFarmWeeklySupply")
+        offer = FarmProduct.objects.get(product_id=store_product.pk)
         legacy = LegacyFarmWeeklySupply.objects.create(
             farm_product=offer,
             week_start=date(2026, 10, 26),

@@ -19,7 +19,6 @@ from commerce.store_orders import (
     _lock_checkout_identity,
     _reference_code,
     _translation,
-    active_product_stock,
     active_product_stock_totals,
 )
 from memberships.models import (
@@ -356,12 +355,10 @@ def selectable_csa_products():
     )
 
 
-def selection_stock_capacity(product_ids, selection, *, lock=False):
-    if lock:
-        stock, _ = active_product_stock(product_ids, lock=True)
-    else:
-        stock = active_product_stock_totals(product_ids)
-    held = _active_reserved_stock(product_ids, exclude_selection=selection)
+def selection_stock_capacity(product_ids, selection, *, now=None):
+    now = now or timezone.now()
+    stock = active_product_stock_totals(product_ids, now=now)
+    held = _active_reserved_stock(product_ids, exclude_selection=selection, now=now)
     return {pk: max(0, stock.get(pk, 0) - held.get(pk, 0)) for pk in product_ids}
 
 
@@ -377,14 +374,18 @@ def selection_quantity_limit(product, capacity, held_line, own_hold):
     return max(own_hold, capacity)
 
 
-def reserved_stock(product_ids, *, exclude_selection=None):
+def effective_stock_hold_rows(*, now, exclude_selection=None):
     from memberships.models import CSAStockHold
 
+    return CSAStockHold.objects.filter(
+        selection__in=active_stock_holds(exclude_selection=exclude_selection, now=now),
+    )
+
+
+def reserved_stock(product_ids, *, exclude_selection=None, now=None):
     return dict(
-        CSAStockHold.objects.filter(
-            selection__in=active_stock_holds(exclude_selection=exclude_selection),
-            product_id__in=product_ids,
-        )
+        effective_stock_hold_rows(now=now or timezone.now(), exclude_selection=exclude_selection)
+        .filter(product_id__in=product_ids)
         .values("product_id")
         .annotate(total=Sum("quantity"))
         .values_list("product_id", "total")
@@ -569,7 +570,7 @@ def save_selection(*, round_id, user, lines, locale="vi", now=None, expected_rev
         for p in selectable_csa_products().filter(pk__in=requested).prefetch_related("translations")
     }
     previous = selection_held_lines(existing, now=now)
-    capacity = selection_stock_capacity(products, existing, lock=True)
+    capacity = selection_stock_capacity(products, existing, now=now)
     draft = []
     protected_points = defaultdict(Decimal)
     new_points = defaultdict(Decimal)
@@ -640,8 +641,17 @@ def save_selection(*, round_id, user, lines, locale="vi", now=None, expected_rev
                 needed -= take
         if needed:
             _fail("csa_quota_insufficient")
-    # Inventory/quota locks may have waited beyond the selection deadline.
-    _validate_selection_window(round_, member, existing, supplied_now or timezone.now())
+    # Inventory/quota locks may have waited past a deadline or a batch date boundary.
+    decision_at = supplied_now or timezone.now()
+    _validate_selection_window(round_, member, existing, decision_at)
+    if timezone.localdate(decision_at) != timezone.localdate(now):
+        capacity = selection_stock_capacity(products, existing, now=decision_at)
+        for product, quantity, _snapshot in draft:
+            old_line, own = previous.get(product.pk, (None, 0))
+            if quantity > selection_quantity_limit(
+                products.get(product.pk), capacity.get(product.pk, 0), old_line, own
+            ):
+                _fail("csa_stock_insufficient")
     selection = existing or CSASelection.objects.create(
         round=round_, membership=member, locale=locale, address_snapshot=address
     )

@@ -261,7 +261,12 @@ def test_public_store_sums_only_current_stock_from_active_farms_and_links():
             location_en="Da Lat",
             is_active=farm_active,
         )
-        relation = FarmProduct.objects.create(farm=farm, product=product, is_active=link_active)
+        relation = FarmProduct.objects.create(
+            farm=farm,
+            product=product,
+            is_active=link_active,
+            removed_at=None if link_active else timezone.now(),
+        )
         FarmProductStockBatch.objects.create(
             farm_product=relation,
             start_date=today + timedelta(days=start_offset),

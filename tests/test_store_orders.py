@@ -1741,7 +1741,7 @@ def test_farm_inventory_excludes_invalid_source(
     if invalid_source == "farm":
         Farm.objects.filter(pk=offer.farm_id).update(is_active=False)
     elif invalid_source == "offer":
-        FarmProduct.objects.filter(pk=offer.pk).update(is_active=False)
+        FarmProduct.objects.filter(pk=offer.pk).update(is_active=False, removed_at=timezone.now())
     else:
         FarmProductStockBatch.objects.filter(pk=batch.pk).update(cancelled_at=timezone.now())
     admin = APIClient()
@@ -3187,7 +3187,9 @@ def test_historical_cancelled_order_restock_projection_matches_server_eligibilit
     elif blocked == "batch_cancelled":
         FarmProductStockBatch.objects.filter(pk=batch.pk).update(cancelled_at=timezone.now())
     elif blocked == "offer_inactive":
-        FarmProduct.objects.filter(pk=batch.farm_product_id).update(is_active=False)
+        FarmProduct.objects.filter(pk=batch.farm_product_id).update(
+            is_active=False, removed_at=timezone.now()
+        )
     elif blocked == "farm_inactive":
         Farm.objects.filter(pk=batch.farm_product.farm_id).update(is_active=False)
     elif blocked == "fully_restocked":
@@ -3736,6 +3738,8 @@ def test_selling_unit_can_change_before_first_stock_but_stale_checkout_cannot_su
     create_stock_batch(
         farm_id=offer.farm_id,
         product_id=product.pk,
+        expected_link_id=offer.pk,
+        expected_version=offer.version,
         actor=active_user,
         data={"start_date": today, "end_date": today + timedelta(days=2), "quantity_units": 10},
     )
@@ -3926,6 +3930,8 @@ def test_create_stock_batch_and_discontinue_serialize(store_product, active_user
             create_stock_batch(
                 farm_id=offer.farm_id,
                 product_id=store_product.pk,
+                expected_link_id=offer.pk,
+                expected_version=offer.version,
                 actor=active_user,
                 data={"start_date": today, "end_date": today, "quantity_units": 5},
             )

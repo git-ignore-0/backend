@@ -1,13 +1,16 @@
 from datetime import timedelta
 from unittest.mock import patch
+from uuid import uuid4
 
 import pytest
 from django.contrib.auth.models import Group
+from django.db import connection
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 from rest_framework.test import APIClient
 
 from commerce.models import Category, Product, ProductTranslation
-from content.models import MediaAsset, TrackerFarm, TrackerFarmPhoto
+from content.models import ContentAuditLog, MediaAsset, TrackerFarm, TrackerFarmPhoto
 from farms.models import (
     Farm,
     FarmPhoto,
@@ -16,6 +19,12 @@ from farms.models import (
     LegacyFarmWeeklySupply,
 )
 from farms.services import FarmConflict
+from tests.test_farm_stock_batches import make_product
+from tests.test_product_lifecycle_locking import checkout_operation as checkout_operation
+from tests.test_store_orders import approve_review_order
+from tests.test_store_orders import payment_settings as payment_settings
+from tests.test_store_orders import store_product as store_product
+from tests.test_store_orders import supported_area as supported_area
 
 
 @pytest.fixture
@@ -327,9 +336,9 @@ def test_farm_api_handles_records_removed_after_preflight(farm_admin_api):
             format="json",
         )
     assert response.status_code == 404
-    with patch("farms.views.update_farm_product", side_effect=FarmConflict("farm_product_changed")):
-        response = farm_admin_api.patch(
-            f"{base}/products/{product.pk}", {"is_active": False}, format="json"
+    with patch("farms.views.remove_farm_product", side_effect=FarmConflict("farm_product_changed")):
+        response = farm_admin_api.post(
+            f"{base}/products/{product.pk}/remove", lifecycle_command(link), format="json"
         )
     assert response.status_code == 409
     assert FarmProduct.objects.filter(pk=link.pk).exists()
@@ -356,11 +365,12 @@ def test_batch_write_returns_conflict_if_link_disappears_after_initial_lookup(fa
         unit_label_en="pack",
         retail_price_vnd=25000,
     )
-    FarmProduct.objects.create(farm=farm, product=product)
+    relation = FarmProduct.objects.create(farm=farm, product=product)
     with patch("farms.views.create_stock_batch", side_effect=FarmConflict("farm_product_changed")):
         response = farm_admin_api.post(
             f"/api/v1/admin/farms/{farm.pk}/products/{product.pk}/batches",
             {
+                **lifecycle_command(relation),
                 "start_date": timezone.localdate().isoformat(),
                 "end_date": timezone.localdate().isoformat(),
                 "quantity_units": 10,
@@ -369,11 +379,6 @@ def test_batch_write_returns_conflict_if_link_disappears_after_initial_lookup(fa
         )
     assert response.status_code == 409
     assert response.json()["errors"][0]["code"] == "farm_product_changed"
-    with patch.object(FarmProduct.objects, "select_for_update") as locked:
-        locked.return_value.filter.return_value.first.return_value = None
-        deleted = farm_admin_api.delete(f"/api/v1/admin/farms/{farm.pk}/products/{product.pk}")
-    assert deleted.status_code == 409
-    assert deleted.json()["errors"][0]["code"] == "farm_product_changed"
 
 
 @pytest.mark.django_db
@@ -384,6 +389,17 @@ def test_farm_api_requires_admin(active_user, access_token):
     client.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token.token}")
     assert client.get("/api/v1/admin/farms").status_code == 403
     assert client.post("/api/v1/admin/farms", farm_payload(), format="json").status_code == 403
+    farm = Farm.objects.create(**farm_payload())
+    source = FarmProduct.objects.create(farm=farm, product=make_product())
+    base = f"/api/v1/admin/farms/{farm.pk}/products/{source.product_id}"
+    assert client.get(base).status_code == 403
+    assert client.get(f"{base}/history").status_code == 403
+    assert (
+        client.post(f"{base}/remove", lifecycle_command(source), format="json").status_code == 403
+    )
+    assert (
+        client.post(f"{base}/re-add", lifecycle_command(source), format="json").status_code == 403
+    )
 
 
 @pytest.mark.django_db
@@ -682,9 +698,7 @@ def test_tracker_count_only_update_does_not_change_shared_farm_version(farm_admi
 
 
 @pytest.mark.django_db
-def test_unreferenced_farm_and_unsupplied_link_can_be_removed_but_history_is_protected(
-    farm_admin_api,
-):
+def test_legacy_link_writes_are_blocked_and_soft_removal_keeps_the_farm_reference(farm_admin_api):
     farm = Farm.objects.create(**farm_payload())
     category = Category.objects.create(slug="root-4", is_active=True)
     product = Product.objects.create(
@@ -700,27 +714,28 @@ def test_unreferenced_farm_and_unsupplied_link_can_be_removed_but_history_is_pro
     farm_url = f"/api/v1/admin/farms/{farm.pk}"
     link_url = f"{farm_url}/products/{product.pk}"
     assert farm_admin_api.delete(farm_url).status_code == 409
-    assert farm_admin_api.delete(link_url).status_code == 204
-    assert not FarmProduct.objects.filter(pk=relation.pk).exists()
-    assert farm_admin_api.delete(farm_url).status_code == 204
-    assert not Farm.objects.filter(pk=farm.pk).exists()
-
-    farm = Farm.objects.create(**farm_payload(name_en="Second Farm"))
-    relation = FarmProduct.objects.create(farm=farm, product=product)
-    FarmProductStockBatch.objects.create(
-        farm_product=relation,
-        start_date=timezone.localdate(),
-        end_date=timezone.localdate(),
-        quantity_units=5,
-    )
+    for response in (
+        farm_admin_api.patch(link_url, {"is_active": False}, format="json"),
+        farm_admin_api.delete(link_url),
+    ):
+        assert response.status_code == 409
+        assert response.json()["errors"][0]["code"] == "farm_product_legacy_write_disabled"
+    relation.refresh_from_db()
+    assert relation.removed_at is None
     assert (
-        farm_admin_api.delete(f"/api/v1/admin/farms/{farm.pk}/products/{product.pk}").status_code
-        == 409
+        farm_admin_api.post(
+            f"{link_url}/remove", lifecycle_command(relation), format="json"
+        ).status_code
+        == 200
     )
+    assert FarmProduct.objects.get(pk=relation.pk).removed_at is not None
+    assert farm_admin_api.delete(farm_url).status_code == 409
+    unreferenced = Farm.objects.create(**farm_payload(name_en="Second Farm"))
+    assert farm_admin_api.delete(f"/api/v1/admin/farms/{unreferenced.pk}").status_code == 204
 
 
 @pytest.mark.django_db
-def test_archived_zero_weekly_history_protects_farm_product_link(farm_admin_api):
+def test_archived_zero_weekly_history_survives_soft_removal(farm_admin_api):
     farm = Farm.objects.create(**farm_payload())
     category = Category.objects.create(slug="legacy-link-category", is_active=True)
     product = Product.objects.create(
@@ -733,7 +748,7 @@ def test_archived_zero_weekly_history_protects_farm_product_link(farm_admin_api)
         retail_price_vnd=10_000,
     )
     relation = FarmProduct.objects.create(farm=farm, product=product)
-    LegacyFarmWeeklySupply.objects.create(
+    archived = LegacyFarmWeeklySupply.objects.create(
         farm_product=relation,
         week_start=timezone.localdate(),
         quantity_units=0,
@@ -743,7 +758,309 @@ def test_archived_zero_weekly_history_protects_farm_product_link(farm_admin_api)
     assert listed.status_code == 200
     assert listed.json()["data"][0]["has_supply_history"] is True
 
-    response = farm_admin_api.delete(f"/api/v1/admin/farms/{farm.pk}/products/{product.pk}")
+    response = farm_admin_api.post(
+        f"/api/v1/admin/farms/{farm.pk}/products/{product.pk}/remove",
+        lifecycle_command(relation),
+        format="json",
+    )
+    assert response.status_code == 200
+    assert response.json()["data"]["has_supply_history"] is True
+    assert LegacyFarmWeeklySupply.objects.filter(pk=archived.pk, farm_product=relation).exists()
 
-    assert response.status_code == 409
-    assert response.json()["errors"][0]["code"] == "farm_product_has_supply"
+
+def lifecycle_command(source, **values):
+    payload = {
+        "expected_link_id": str(source.pk),
+        "expected_version": source.version,
+    }
+    return {**payload, **values}
+
+
+@pytest.mark.django_db
+def test_source_transitions_return_committed_identity_and_fresh_stock(farm_admin_api):
+    farm = Farm.objects.create(**farm_payload())
+    product = make_product()
+    url = f"/api/v1/admin/farms/{farm.pk}/products"
+    detail = f"{url}/{product.pk}"
+    today = timezone.localdate()
+    dates = {"start_date": today.isoformat(), "end_date": (today + timedelta(days=3)).isoformat()}
+
+    added = farm_admin_api.post(
+        url, {"product_id": str(product.pk), **dates, "quantity_units": 10}, format="json"
+    )
+    assert added.status_code == 201
+    source = FarmProduct.objects.get(farm=farm, product=product)
+    first = source.stock_batches.get()
+    assert added.json()["data"]["id"] == str(source.pk)
+    assert added.json()["data"]["first_batch_id"] == str(first.pk)
+    live = farm_admin_api.get(detail).json()["data"]
+    assert live["capabilities"] == {
+        "can_remove": True,
+        "can_readd": False,
+        "can_create_batch": True,
+        "blockers": {"readd": {"code": "farm_product_not_removed"}},
+    }
+
+    removed = farm_admin_api.post(f"{detail}/remove", lifecycle_command(source), format="json")
+    assert removed.status_code == 200
+    data = removed.json()["data"]
+    assert (data["id"], data["supply_status"], data["version"], data["supply_generation"]) == (
+        str(source.pk),
+        "removed",
+        2,
+        1,
+    )
+    assert data["available_quantity"] == 0
+    assert data["removed_at"] is not None
+    assert farm_admin_api.get(f"{detail}/batches?scope=current").json()["data"] == []
+    removed_history = farm_admin_api.get(f"{detail}/batches?scope=history").json()["data"]
+    assert [(row["id"], row["is_historical"]) for row in removed_history] == [(str(first.pk), True)]
+    assert (
+        farm_admin_api.post(
+            f"{detail}/re-add", lifecycle_command(source, **dates, quantity_units=4), format="json"
+        ).json()["errors"][0]["code"]
+        == "farm_product_version_conflict"
+    )
+    source.refresh_from_db()
+    removed_detail = farm_admin_api.get(detail).json()["data"]
+    assert removed_detail["capabilities"]["can_readd"] is True
+    assert removed_detail["capabilities"]["can_create_batch"] is False
+
+    readded = farm_admin_api.post(
+        f"{detail}/re-add", lifecycle_command(source, **dates, quantity_units=4), format="json"
+    )
+    assert readded.status_code == 200
+    data = readded.json()["data"]
+    second = source.stock_batches.exclude(pk=first.pk).get()
+    assert (data["id"], data["first_batch_id"], data["version"], data["supply_generation"]) == (
+        str(source.pk),
+        str(second.pk),
+        3,
+        2,
+    )
+    assert data["removed_at"] is None
+    assert data["available_quantity"] == 4
+
+    history = farm_admin_api.get(f"{detail}/batches?scope=history&status=active").json()["data"]
+    assert [
+        (row["id"], row["available_quantity"], row["remaining_quantity"]) for row in history
+    ] == [(str(first.pk), 0, 10)]
+    assert history[0]["is_historical"] is True
+    assert history[0]["supply_generation"] == 1
+    current = farm_admin_api.get(f"{detail}/batches?scope=current").json()["data"]
+    assert [
+        (row["id"], row["available_quantity"], row["remaining_quantity"]) for row in current
+    ] == [(str(second.pk), 4, 4)]
+    assert current[0]["is_historical"] is False
+    assert current[0]["supply_generation"] == 2
+    stale_batch = farm_admin_api.patch(
+        f"{detail}/batches/{first.pk}",
+        {"version": first.version, "quantity_units": 11},
+        format="json",
+    )
+    assert stale_batch.status_code == 409
+    assert stale_batch.json()["errors"][0]["code"] == "farm_product_generation_changed"
+    assert source.stock_batches.get(pk=first.pk).quantity_units == 10
+
+
+@pytest.mark.django_db
+def test_source_filters_and_picker_distinguish_removed_and_unlinked(farm_admin_api):
+    farm = Farm.objects.create(**farm_payload())
+    supplying = make_product("SUPPLYING")
+    removed = make_product("REMOVED")
+    available = make_product("AVAILABLE")
+    make_product("DRAFT", published=False)
+    FarmProduct.objects.create(farm=farm, product=supplying)
+    FarmProduct.objects.create(
+        farm=farm, product=removed, is_active=False, removed_at=timezone.now()
+    )
+    base = f"/api/v1/admin/farms/{farm.pk}"
+    assert farm_admin_api.get(f"{base}/products?supply_status=invalid").status_code == 400
+    for status, skus in (
+        ("all", ["REMOVED", "SUPPLYING"]),
+        ("removed", ["REMOVED"]),
+        ("supplying", ["SUPPLYING"]),
+    ):
+        response = farm_admin_api.get(f"{base}/products?supply_status={status}")
+        assert response.status_code == 200
+        rows = response.json()["data"]
+        assert [row["sku"] for row in rows] == skus
+        assert all("capabilities" not in row for row in rows)
+
+    picker = farm_admin_api.get(f"{base}/available-products").json()["data"]
+    assert [row["id"] for row in picker] == [str(available.pk)]
+    assert (picker[0]["unit_size"], picker[0]["unit_label_vi"], picker[0]["unit_label_en"]) == (
+        "0.500",
+        "kg",
+        "kg",
+    )
+
+
+@pytest.mark.django_db
+def test_source_writers_reject_unversioned_malformed_and_changed_identity(farm_admin_api):
+    farm = Farm.objects.create(**farm_payload())
+    product = make_product()
+    other = Farm.objects.create(**farm_payload(name_en="Other farm"))
+    source = FarmProduct.objects.create(farm=farm, product=product)
+    other_source = FarmProduct.objects.create(farm=other, product=product)
+    base = f"/api/v1/admin/farms/{farm.pk}/products/{product.pk}"
+    date = timezone.localdate().isoformat()
+    batch = {"start_date": date, "end_date": date, "quantity_units": 5}
+
+    for path, values in (("remove", {}), ("re-add", batch), ("batches", batch)):
+        assert farm_admin_api.post(f"{base}/{path}", values, format="json").status_code == 400
+    for values in (
+        lifecycle_command(source, expected_link_id="not-a-uuid"),
+        lifecycle_command(source, expected_version=0),
+        lifecycle_command(source, supply_generation=2),
+    ):
+        assert farm_admin_api.post(f"{base}/remove", values, format="json").status_code == 400
+
+    mismatch = farm_admin_api.post(f"{base}/remove", lifecycle_command(other_source), format="json")
+    assert mismatch.status_code == 409
+    assert mismatch.json()["errors"][0]["code"] == "farm_product_identity_changed"
+    assert (
+        farm_admin_api.get(f"/api/v1/admin/farms/{farm.pk}/products/{uuid4()}/history").status_code
+        == 404
+    )
+    assert source.stock_batches.count() == 0
+    source.refresh_from_db()
+    assert source.removed_at is None
+
+    created = farm_admin_api.post(
+        f"{base}/batches", lifecycle_command(source, **batch), format="json"
+    )
+    assert created.status_code == 201
+    assert created.json()["data"]["source_version"] == 2
+    stale = farm_admin_api.post(
+        f"{base}/batches", lifecycle_command(source, **batch), format="json"
+    )
+    assert stale.status_code == 409
+    assert stale.json()["errors"][0]["code"] == "farm_product_version_conflict"
+    assert source.stock_batches.count() == 1
+
+
+@pytest.mark.django_db
+def test_lifecycle_history_is_scoped_and_stably_paginated(farm_admin_api, active_user):
+    farm = Farm.objects.create(**farm_payload())
+    product = make_product("FIRST")
+    other = make_product("OTHER")
+    source = FarmProduct.objects.create(farm=farm, product=product)
+    second = FarmProduct.objects.create(farm=farm, product=other)
+    events = ContentAuditLog.objects.bulk_create(
+        [
+            ContentAuditLog(
+                action="farm.product.lifecycle_backfill" if index == 0 else "farm.product.update",
+                actor=active_user if index else None,
+                entity_type="farmproduct",
+                entity_id=str(source.pk),
+                context={
+                    "farm_id": str(farm.pk),
+                    "product_id": str(product.pk),
+                    "provenance": "legacy_disabled_link",
+                    "classified_at": "2026-10-14T01:00:00+00:00",
+                    "supply_generation": 1,
+                }
+                if index == 0
+                else {
+                    "is_active": True,
+                    "stock_batch_id": "invalid-id",
+                    "supply_generation": True,
+                    "email": "private@example.invalid",
+                },
+            )
+            for index in range(21)
+        ]
+    )
+    ContentAuditLog.objects.filter(pk__in=[event.pk for event in events]).update(
+        created_at=timezone.now()
+    )
+    ContentAuditLog.objects.create(
+        action="farm.product.add", entity_type="farmproduct", entity_id=str(second.pk)
+    )
+    ContentAuditLog.objects.create(
+        action="farm.update", entity_type="farm", entity_id=str(source.pk)
+    )
+
+    url = f"/api/v1/admin/farms/{farm.pk}/products/{product.pk}/history"
+    first = farm_admin_api.get(url)
+    assert first.status_code == 200
+    assert first.json()["meta"] == {"page": 1, "page_size": 20, "total": 21}
+    page2 = farm_admin_api.get(f"{url}?page=2").json()["data"]
+    rows = first.json()["data"] + page2
+    assert [row["id"] for row in rows] == sorted(str(event.pk) for event in events)
+    assert {row["action"] for row in rows} == {
+        "farm.product.lifecycle_backfill",
+        "farm.product.update",
+    }
+    migrated = next(row for row in rows if row["action"] == "farm.product.lifecycle_backfill")
+    assert migrated["context"] == {
+        "farm_id": str(farm.pk),
+        "product_id": str(product.pk),
+        "provenance": "legacy_disabled_link",
+        "classified_at": "2026-10-14T01:00:00+00:00",
+        "supply_generation": 1,
+    }
+    assert migrated["actor"] is None
+    legacy = next(row for row in rows if row["action"] == "farm.product.update")
+    assert legacy["context"] == {"is_active": True}
+    assert legacy["actor"] == {"id": str(active_user.pk), "name": active_user.name}
+
+
+@pytest.mark.django_db
+def test_source_removal_returns_the_same_blocker_as_detail(
+    farm_admin_api, store_product, checkout_operation, active_user
+):
+    source = store_product.farm_offers.get()
+    base = f"/api/v1/admin/farms/{source.farm_id}/products/{store_product.pk}"
+    order, _, created = checkout_operation()
+    assert created
+
+    def remove_blocker():
+        response = farm_admin_api.get(base)
+        assert response.status_code == 200
+        capabilities = response.json()["data"]["capabilities"]
+        assert capabilities["can_remove"] is False
+        assert capabilities["can_create_batch"] is True
+        rejected = farm_admin_api.post(f"{base}/remove", lifecycle_command(source), format="json")
+        assert rejected.status_code == 409
+        blocker = rejected.json()["errors"][0]
+        assert blocker == capabilities["blockers"]["remove"]
+        return blocker
+
+    assert remove_blocker() == {
+        "code": "farm_product_supply_shortfall",
+        "context": {"required_units": 2, "remaining_units": 0, "shortfall_units": 2},
+    }
+    approve_review_order({"id": order.pk}, active_user)
+    assert remove_blocker() == {
+        "code": "farm_product_has_open_allocations",
+        "context": {
+            "orders": [{"id": str(order.pk), "reference_code": order.reference_code}],
+            "has_more": False,
+        },
+    }
+    source.refresh_from_db()
+    assert (source.removed_at, source.version) == (None, 1)
+
+
+@pytest.mark.django_db
+def test_supply_list_does_not_evaluate_capability_queries_per_row(farm_admin_api):
+    farm = Farm.objects.create(**farm_payload())
+    other = Farm.objects.create(**farm_payload(name_en="Other farm"))
+    for index in range(20):
+        product = make_product(f"SUPPLY-{index:02d}")
+        FarmProduct.objects.create(farm=farm, product=product)
+        if index == 0:
+            FarmProduct.objects.create(farm=other, product=product)
+
+    def selects(farm_id, expected_rows):
+        with CaptureQueriesContext(connection) as queries:
+            response = farm_admin_api.get(
+                f"/api/v1/admin/farms/{farm_id}/products?supply_status=supplying"
+            )
+        assert response.status_code == 200
+        assert len(response.json()["data"]) == expected_rows
+        return sum(query["sql"].lstrip().upper().startswith("SELECT") for query in queries)
+
+    assert selects(farm.pk, 20) == selects(other.pk, 1)

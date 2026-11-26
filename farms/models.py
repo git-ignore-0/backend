@@ -1,5 +1,6 @@
 import uuid
 
+from django.conf import settings
 from django.db import models
 from django.db.models import Q
 
@@ -61,6 +62,16 @@ class FarmProduct(models.Model):
         "commerce.Product", related_name="farm_offers", on_delete=models.PROTECT
     )
     is_active = models.BooleanField(default=True)
+    removed_at = models.DateTimeField(null=True, blank=True)
+    removed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="removed_farm_products",
+    )
+    version = models.PositiveIntegerField(default=1)
+    supply_generation = models.PositiveIntegerField(default=1)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -68,6 +79,19 @@ class FarmProduct(models.Model):
         ordering = ["product__sku", "id"]
         constraints = [
             models.UniqueConstraint(fields=["farm", "product"], name="farms_product_unique"),
+            models.CheckConstraint(
+                condition=(
+                    Q(is_active=True, removed_at__isnull=True, removed_by__isnull=True)
+                    | Q(is_active=False, removed_at__isnull=False)
+                ),
+                name="farms_product_lifecycle_state",
+            ),
+            models.CheckConstraint(
+                condition=Q(version__gt=0), name="farms_product_version_positive"
+            ),
+            models.CheckConstraint(
+                condition=Q(supply_generation__gt=0), name="farms_product_generation_positive"
+            ),
         ]
 
     def __str__(self):
@@ -106,6 +130,7 @@ class FarmProductStockBatch(models.Model):
     farm_product = models.ForeignKey(
         FarmProduct, related_name="stock_batches", on_delete=models.PROTECT
     )
+    supply_generation = models.PositiveIntegerField(default=1, editable=False)
     start_date = models.DateField()
     end_date = models.DateField()
     quantity_units = models.PositiveIntegerField()
@@ -136,6 +161,9 @@ class FarmProductStockBatch(models.Model):
             ),
             models.CheckConstraint(
                 condition=Q(quantity_units__gt=0), name="farms_batch_quantity_positive"
+            ),
+            models.CheckConstraint(
+                condition=Q(supply_generation__gt=0), name="farms_batch_generation_positive"
             ),
         ]
 

@@ -22,6 +22,18 @@ urlpatterns = [
         views.AdminFarmProductDetailView.as_view(),
     ),
     path(
+        "admin/farms/<uuid:farm_id>/products/<uuid:product_id>/remove",
+        views.AdminFarmProductRemoveView.as_view(),
+    ),
+    path(
+        "admin/farms/<uuid:farm_id>/products/<uuid:product_id>/re-add",
+        views.AdminFarmProductReaddView.as_view(),
+    ),
+    path(
+        "admin/farms/<uuid:farm_id>/products/<uuid:product_id>/history",
+        views.AdminFarmProductHistoryView.as_view(),
+    ),
+    path(
         "admin/farms/<uuid:farm_id>/products/<uuid:product_id>/batches/<uuid:batch_id>",
         views.AdminFarmStockBatchDetailView.as_view(),
     ),

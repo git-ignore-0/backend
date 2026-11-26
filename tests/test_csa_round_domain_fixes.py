@@ -228,7 +228,7 @@ def test_user_scoped_due_processing_does_not_refresh_other_members(context):
 
 
 @pytest.mark.parametrize("reselect", [False, True])
-def test_save_rechecks_deadline_after_inventory_lock(context, monkeypatch, reselect):
+def test_save_rechecks_deadline_after_stock_read(context, monkeypatch, reselect):
     from django.utils import timezone
 
     if reselect:
@@ -238,14 +238,14 @@ def test_save_rechecks_deadline_after_inventory_lock(context, monkeypatch, resel
         monkeypatch.setattr(timezone, "now", lambda: context[3].closes_at)
     else:
         cutoff = context[3].closes_at
-    original = service.active_product_stock
+    original = service.active_product_stock_totals
 
     def delayed_stock(*args, **kwargs):
         result = original(*args, **kwargs)
         monkeypatch.setattr(timezone, "now", lambda: cutoff)
         return result
 
-    monkeypatch.setattr(service, "active_product_stock", delayed_stock)
+    monkeypatch.setattr(service, "active_product_stock_totals", delayed_stock)
     code = "csa_reselection_expired" if reselect else "csa_selection_locked"
     with pytest.raises(service.CSARoundError, match=code):
         save(context, 3)
@@ -261,7 +261,7 @@ def test_save_aggregates_csa_stock_only_once(context):
     assert len(sums) == 1
 
 
-def test_save_rechecks_membership_end_date_after_inventory_lock(context, monkeypatch):
+def test_save_rechecks_membership_end_date_after_stock_read(context, monkeypatch):
     from django.utils import timezone
 
     _, _, member, round_, now = context
@@ -270,14 +270,14 @@ def test_save_rechecks_membership_end_date_after_inventory_lock(context, monkeyp
     round_.closes_at = now + timedelta(days=2)
     round_.delivery_date = timezone.localdate(now) + timedelta(days=3)
     round_.save(update_fields=["closes_at", "delivery_date"])
-    original = service.active_product_stock
+    original = service.active_product_stock_totals
 
     def delayed_stock(*args, **kwargs):
         result = original(*args, **kwargs)
         monkeypatch.setattr(timezone, "now", lambda: now + timedelta(days=1))
         return result
 
-    monkeypatch.setattr(service, "active_product_stock", delayed_stock)
+    monkeypatch.setattr(service, "active_product_stock_totals", delayed_stock)
     with pytest.raises(service.CSARoundError, match="csa_membership_unavailable"):
         save(context)
     assert not CSASelection.objects.filter(round=round_).exists()

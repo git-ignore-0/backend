@@ -4,6 +4,7 @@ from unittest.mock import patch
 import pytest
 from django.contrib.auth.models import Group
 from django.db import transaction
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from commerce.models import Category, CategoryTranslation, Product, ProductTranslation
@@ -11,7 +12,7 @@ from commerce.services import schedule_store_revalidation, update_category, upda
 from content.models import MediaAsset, TrackerFarm
 from content.services import update_tracker_farm
 from farms.models import Farm, FarmProduct
-from farms.services import update_farm, update_farm_product
+from farms.services import readd_farm_product, remove_farm_product, update_farm
 from memberships.models import Product as MembershipProduct
 from memberships.models import ProductTranslation as MembershipProductTranslation
 
@@ -195,7 +196,7 @@ def test_legacy_tracker_update_revalidates_linked_store_products(
 
 
 @pytest.mark.django_db
-def test_farm_presentation_and_offer_status_revalidate_only_linked_product(
+def test_farm_presentation_and_source_lifecycle_revalidate_only_linked_product(
     active_user, django_capture_on_commit_callbacks
 ):
     _category, product = category_with_product()
@@ -206,7 +207,7 @@ def test_farm_presentation_and_offer_status_revalidate_only_linked_product(
         location_en="Da Lat",
         is_active=True,
     )
-    FarmProduct.objects.create(farm=farm, product=product, is_active=True)
+    source = FarmProduct.objects.create(farm=farm, product=product)
 
     with patch("commerce.services.request_frontend_revalidation") as request_revalidation:
         with django_capture_on_commit_callbacks(execute=True):
@@ -223,11 +224,28 @@ def test_farm_presentation_and_offer_status_revalidate_only_linked_product(
 
         request_revalidation.reset_mock()
         with django_capture_on_commit_callbacks(execute=True):
-            update_farm_product(
+            removed = remove_farm_product(
                 farm_id=farm.pk,
                 product_id=product.pk,
-                is_active=False,
+                expected_link_id=source.pk,
+                expected_version=source.version,
                 actor=active_user,
+            )
+        assert request_revalidation.call_args.args[0] == [
+            "store-product:tomato",
+            "store-products",
+        ]
+
+        request_revalidation.reset_mock()
+        with django_capture_on_commit_callbacks(execute=True):
+            today = timezone.localdate()
+            readd_farm_product(
+                farm_id=farm.pk,
+                product_id=product.pk,
+                expected_link_id=removed.pk,
+                expected_version=removed.version,
+                actor=active_user,
+                data={"start_date": today, "end_date": today, "quantity_units": 4},
             )
         assert request_revalidation.call_args.args[0] == [
             "store-product:tomato",

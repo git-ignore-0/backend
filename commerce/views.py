@@ -99,12 +99,12 @@ class PublicStoreProductListView(APIView):
                 | Q(translations__name__icontains=search)
                 | Q(category__translations__name__icontains=search)
                 | Q(
-                    farm_offers__is_active=True,
+                    farm_offers__removed_at__isnull=True,
                     farm_offers__farm__is_active=True,
                     farm_offers__farm__name_vi__icontains=search,
                 )
                 | Q(
-                    farm_offers__is_active=True,
+                    farm_offers__removed_at__isnull=True,
                     farm_offers__farm__is_active=True,
                     farm_offers__farm__name_en__icontains=search,
                 )

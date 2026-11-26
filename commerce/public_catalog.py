@@ -1,4 +1,4 @@
-from django.db.models import IntegerField, OuterRef, Prefetch, Q, Subquery, Sum, Value
+from django.db.models import BigIntegerField, OuterRef, Prefetch, Q, Subquery, Sum, Value
 from django.db.models.functions import Coalesce, Greatest
 from django.utils import timezone
 
@@ -8,12 +8,10 @@ from commerce.models import (
     Product,
     ProductStatus,
     ProductTranslation,
-    StoreStockMovement,
-    StoreStockMovementKind,
-    StoreStockReservation,
 )
 from content.serializers import media_payload
-from farms.models import FarmProduct, FarmProductStockBatch
+from farms.models import FarmProduct
+from farms.stock import product_stock_totals_query
 
 
 def _public_product_filter():
@@ -29,79 +27,41 @@ def _public_product_filter():
 
 
 def public_product_queryset(*, detail=False):
-    current_date = timezone.localdate()
-    current_stock = (
-        FarmProductStockBatch.objects.filter(
-            farm_product__product_id=OuterRef("pk"),
-            farm_product__farm__is_active=True,
-            farm_product__is_active=True,
-            cancelled_at__isnull=True,
-            start_date__lte=current_date,
-            end_date__gte=current_date,
-        )
-        .values("farm_product__product_id")
-        .annotate(total=Sum("quantity_units"))
-        .values("total")[:1]
-    )
-    movement_base = StoreStockMovement.objects.filter(
-        batch__farm_product__product_id=OuterRef("pk"),
-        batch__farm_product__farm__is_active=True,
-        batch__farm_product__is_active=True,
-        batch__cancelled_at__isnull=True,
-        batch__start_date__lte=current_date,
-        batch__end_date__gte=current_date,
-    )
-    sold = (
-        movement_base.filter(kind=StoreStockMovementKind.SALE)
-        .values("batch__farm_product__product_id")
-        .annotate(total=Sum("quantity"))
-        .values("total")[:1]
-    )
-    restocked = (
-        movement_base.filter(kind=StoreStockMovementKind.RESTOCK)
-        .values("batch__farm_product__product_id")
-        .annotate(total=Sum("quantity"))
-        .values("total")[:1]
-    )
-    reserved = (
-        StoreStockReservation.objects.filter(
-            product_id=OuterRef("pk"),
-            released_at__isnull=True,
-            line__order__status__in=["payment_pending", "pending_review", "payment_review"],
-            line__order__expires_at__gt=timezone.now(),
-        )
-        .values("product_id")
-        .annotate(total=Sum("quantity"))
-        .values("total")[:1]
-    )
-    from memberships.csa_rounds import active_stock_holds
-    from memberships.models import CSAStockHold
+    from commerce.store_orders import active_stock_batches, effective_store_stock_reservations
+    from memberships.csa_rounds import effective_stock_hold_rows
 
-    csa_reserved = (
-        CSAStockHold.objects.filter(
-            product_id=OuterRef("pk"),
-            selection__in=active_stock_holds(),
-        )
-        .values("product_id")
-        .annotate(total=Sum("quantity"))
-        .values("total")[:1]
-    )
+    now = timezone.now()
+    current_stock = product_stock_totals_query(
+        active_stock_batches(now=now).filter(farm_product__product_id=OuterRef("pk"))
+    ).values("total")
+    reserved = _demand_for_product(effective_store_stock_reservations(now=now))
+    csa_reserved = _demand_for_product(effective_stock_hold_rows(now=now))
     products = Product.objects.filter(_public_product_filter()).annotate(
         available_quantity=Greatest(
             Value(0),
-            Coalesce(Subquery(current_stock, output_field=IntegerField()), Value(0))
-            - Coalesce(Subquery(sold, output_field=IntegerField()), Value(0))
-            + Coalesce(Subquery(restocked, output_field=IntegerField()), Value(0))
-            - Coalesce(Subquery(reserved, output_field=IntegerField()), Value(0))
-            - Coalesce(Subquery(csa_reserved, output_field=IntegerField()), Value(0)),
+            Coalesce(Subquery(current_stock, output_field=BigIntegerField()), Value(0))
+            - reserved
+            - csa_reserved,
+            output_field=BigIntegerField(),
         )
     )
     return with_public_product_details(products, detail=detail)
 
 
+def _demand_for_product(rows):
+    quantity = (
+        rows.filter(product_id=OuterRef("pk"))
+        .order_by()
+        .values("product_id")
+        .annotate(total=Sum("quantity"))
+        .values("total")
+    )
+    return Coalesce(Subquery(quantity, output_field=BigIntegerField()), Value(0))
+
+
 def with_public_product_details(products, *, detail=False):
     active_suppliers = FarmProduct.objects.filter(
-        is_active=True, farm__is_active=True
+        removed_at__isnull=True, farm__is_active=True
     ).select_related("farm")
     return products.select_related(
         "category",

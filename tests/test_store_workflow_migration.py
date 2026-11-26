@@ -26,6 +26,7 @@ def test_migration_preserves_legacy_states_deadlines_bank_and_exact_create_retry
     old = [
         ("commerce", "0009_storeorder_delivery_date_and_more"),
         ("memberships", "0037_csaround_companion_delivery_cutoff_and_more"),
+        ("farms", "0004_repair_missing_legacy_supply_table"),
     ]
     try:
         executor = MigrationExecutor(connection)
@@ -33,6 +34,11 @@ def test_migration_preserves_legacy_states_deadlines_bank_and_exact_create_retry
         apps = executor.loader.project_state(old).apps
         OldOrder = apps.get_model("commerce", "StoreOrder")
         OldLine = apps.get_model("commerce", "StoreOrderLine")
+        OldReservation = apps.get_model("commerce", "StoreStockReservation")
+        OldAllocation = apps.get_model("commerce", "StoreStockAllocation")
+        OldMovement = apps.get_model("commerce", "StoreStockMovement")
+        OldBatch = apps.get_model("farms", "FarmProductStockBatch")
+        stock_batch = OldBatch.objects.get(farm_product__product_id=store_product.pk)
         now = timezone.now()
         payload = guest_payload(store_product)
         from commerce.serializers import StoreCheckoutSerializer
@@ -86,7 +92,7 @@ def test_migration_preserves_legacy_states_deadlines_bank_and_exact_create_retry
                 transfer_reported_at=now if index == 1 else None,
                 approved_at=now if index == 2 else None,
             )
-            OldLine.objects.create(
+            line = OldLine.objects.create(
                 order=item,
                 product_id=store_product.pk,
                 position=0,
@@ -99,6 +105,22 @@ def test_migration_preserves_legacy_states_deadlines_bank_and_exact_create_retry
                 cash_quantity=2,
                 cash_subtotal_vnd=90000,
             )
+            if deadline is not None:
+                OldReservation.objects.create(
+                    line=line, product_id=store_product.pk, quantity=line.quantity
+                )
+            elif item.approved_at is not None:
+                allocation = OldAllocation.objects.create(
+                    line=line, batch=stock_batch, quantity=line.quantity
+                )
+                OldMovement.objects.create(
+                    allocation=allocation,
+                    batch=stock_batch,
+                    line=line,
+                    kind="sale",
+                    quantity=line.quantity,
+                    idempotency_key=uuid4(),
+                )
             rows.append((item.pk, state, deadline, token))
         MigrationExecutor(connection).migrate(latest)
         from commerce.models import StoreOrder
@@ -111,6 +133,10 @@ def test_migration_preserves_legacy_states_deadlines_bank_and_exact_create_retry
             assert item.bank_name_snapshot == "Old bank"
             if state != "payment_pending":
                 assert item.delivery_date is None
+            if state == "pending_delivery":
+                allocation = item.lines.get().stock_allocations.get()
+                assert allocation.batch_id == stock_batch.pk
+                assert allocation.movements.get(kind="sale").quantity == 2
         response = APIClient().post("/api/v1/public/store-checkouts", payload, format="json")
         assert response.status_code == 200, response.data
         data = response.data["data"]

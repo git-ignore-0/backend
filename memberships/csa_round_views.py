@@ -355,13 +355,20 @@ class MemberProducts(PrivateView):
             }
             for group_id, rows in quota_rows.items()
         ]
-        held_lines = domain.selection_held_lines(existing, now=timezone.now())
+        stock_at = timezone.now()
+        held_lines = domain.selection_held_lines(existing, now=stock_at)
         products = domain.selectable_csa_products().filter(
-            Q(Exists(active_stock_batches().filter(farm_product__product_id=OuterRef("pk"))))
+            Q(
+                Exists(
+                    active_stock_batches(now=stock_at).filter(
+                        farm_product__product_id=OuterRef("pk")
+                    )
+                )
+            )
             | Q(pk__in=held_lines)
         )
         live_products = {product.pk: product for product in with_public_product_details(products)}
-        capacity = domain.selection_stock_capacity(live_products, existing)
+        capacity = domain.selection_stock_capacity(live_products, existing, now=stock_at)
         snapshot_group_ids = {
             uuid.UUID(line.snapshot["quota_group_id"]) for line, _ in held_lines.values()
         }

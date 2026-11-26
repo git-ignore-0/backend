@@ -182,6 +182,8 @@ def test_discontinue_and_inventory_writes_serialize(
             return create_stock_batch(
                 farm_id=offer.farm_id,
                 product_id=store_product.pk,
+                expected_link_id=offer.pk,
+                expected_version=offer.version,
                 actor=active_user,
                 data=new_batch,
             )
@@ -297,6 +299,8 @@ def test_identity_edit_and_first_stock_batch_serialize(store_product, active_use
         return create_stock_batch(
             farm_id=offer.farm_id,
             product_id=store_product.pk,
+            expected_link_id=offer.pk,
+            expected_version=offer.version,
             actor=active_user,
             data={"start_date": today, "end_date": today, "quantity_units": 5},
         )
@@ -406,9 +410,10 @@ def test_delete_and_creating_farm_reference_serialize(store_product, active_user
         assert not FarmProduct.objects.filter(farm_id=farm_id, product_id=product_id).exists()
         assert not FarmProductStockBatch.objects.filter(farm_product__farm_id=farm_id).exists()
     else:
-        added = adding.result()
+        added, batch = adding.result()
         with pytest.raises(CatalogConflict, match="^product_in_use$"):
             deleting.result()
         assert Product.objects.filter(pk=product_id).exists()
         assert FarmProduct.objects.get(farm_id=farm_id, product_id=product_id).pk == added.pk
-        assert added.stock_batches.get().quantity_units == 4
+        assert batch.farm_product_id == added.pk
+        assert batch.quantity_units == 4

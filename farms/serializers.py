@@ -1,4 +1,3 @@
-from django.utils import timezone
 from rest_framework import serializers
 
 from commerce.serializers import StrictSerializer
@@ -54,16 +53,6 @@ class StockBatchWriteSerializer(StrictSerializer):
     end_date = serializers.DateField()
     quantity_units = serializers.IntegerField(min_value=1, max_value=2_147_483_647)
 
-    def validate(self, data):
-        data = super().validate(data)
-        if data["end_date"] < data["start_date"]:
-            raise serializers.ValidationError({"end_date": "End date must not precede start date."})
-        if data["end_date"] < timezone.localdate():
-            raise serializers.ValidationError(
-                {"end_date": "An expired stock batch cannot be created."}
-            )
-        return data
-
 
 class FarmProductWriteSerializer(StockBatchWriteSerializer):
     product_id = serializers.UUIDField()
@@ -74,8 +63,21 @@ class FarmProductQuerySerializer(StrictSerializer):
     page = serializers.IntegerField(min_value=1, max_value=10000, required=False, default=1)
 
 
-class FarmProductUpdateSerializer(StrictSerializer):
-    is_active = serializers.BooleanField()
+class FarmSupplyListQuerySerializer(FarmProductQuerySerializer):
+    supply_status = serializers.ChoiceField(choices=("supplying", "removed", "all"), default="all")
+
+
+class FarmProductRevisionSerializer(StrictSerializer):
+    expected_link_id = serializers.UUIDField()
+    expected_version = serializers.IntegerField(min_value=1)
+
+
+class VersionedStockBatchWriteSerializer(StockBatchWriteSerializer, FarmProductRevisionSerializer):
+    pass
+
+
+class FarmProductHistoryQuerySerializer(StrictSerializer):
+    page = serializers.IntegerField(min_value=1, max_value=10000, default=1)
 
 
 class StockBatchUpdateSerializer(StrictSerializer):
@@ -99,6 +101,7 @@ class StockBatchQuerySerializer(StrictSerializer):
     status = serializers.ChoiceField(
         choices=("upcoming", "active", "expired", "cancelled"), required=False
     )
+    scope = serializers.ChoiceField(choices=("current", "history", "all"), default="all")
     page = serializers.IntegerField(min_value=1, max_value=10000, required=False, default=1)
 
 

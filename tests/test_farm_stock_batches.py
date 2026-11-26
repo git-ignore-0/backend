@@ -98,6 +98,7 @@ def test_farm_payload_counts_only_active_links_by_current_stock(farm_admin_api):
         farm=farm,
         product=make_product("STOPPED"),
         is_active=False,
+        removed_at=timezone.now(),
     )
     FarmProductStockBatch.objects.create(
         farm_product=stopped,
@@ -226,15 +227,20 @@ def test_admin_can_add_overlapping_batches_and_filter_computed_statuses(farm_adm
     for quantity in (10, 10):
         created = farm_admin_api.post(
             base,
-            batch_payload(
-                start_date=today - timedelta(days=1),
-                end_date=today + timedelta(days=6),
-                quantity_units=quantity,
-            ),
+            {
+                "expected_link_id": str(relation.pk),
+                "expected_version": relation.version,
+                **batch_payload(
+                    start_date=today - timedelta(days=1),
+                    end_date=today + timedelta(days=6),
+                    quantity_units=quantity,
+                ),
+            },
             format="json",
         )
         assert created.status_code == 201, created.json()
         assert created.json()["data"]["status"] == "active"
+        relation.refresh_from_db()
     FarmProductStockBatch.objects.create(
         farm_product=relation,
         start_date=today + timedelta(days=7),
@@ -392,7 +398,7 @@ def test_admin_product_search_does_not_multiply_stock_by_translation_count(farm_
 def test_creating_an_additional_batch_locks_product_unit_definition(farm_admin_api):
     farm = make_farm()
     product = make_product()
-    FarmProduct.objects.create(farm=farm, product=product)
+    relation = FarmProduct.objects.create(farm=farm, product=product)
     today = timezone.localdate()
 
     with patch.object(
@@ -402,7 +408,11 @@ def test_creating_an_additional_batch_locks_product_unit_definition(farm_admin_a
     ) as lock_product:
         response = farm_admin_api.post(
             f"/api/v1/admin/farms/{farm.pk}/products/{product.pk}/batches",
-            batch_payload(start_date=today, end_date=today),
+            {
+                "expected_link_id": str(relation.pk),
+                "expected_version": relation.version,
+                **batch_payload(start_date=today, end_date=today),
+            },
             format="json",
         )
 
@@ -435,7 +445,14 @@ def test_non_selling_product_cannot_extend_inventory(farm_admin_api, status):
         quantity_units=10,
     )
     batches_url = f"{products_url}/{product.pk}/batches"
-    assert farm_admin_api.post(batches_url, values, format="json").status_code == 409
+    assert (
+        farm_admin_api.post(
+            batches_url,
+            {"expected_link_id": str(relation.pk), "expected_version": relation.version, **values},
+            format="json",
+        ).status_code
+        == 409
+    )
     for change in (
         {"quantity_units": 11},
         {"start_date": (today + timedelta(days=1)).isoformat()},
