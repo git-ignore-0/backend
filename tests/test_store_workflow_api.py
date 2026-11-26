@@ -9,8 +9,9 @@ from django.contrib.auth.models import Group
 from django.utils import timezone
 from rest_framework.test import APIClient
 
-from commerce.models import StoreOrder
-from tests.test_store_orders import guest_payload
+from commerce.models import StoreOrder, StoreOrderAction
+from commerce.store_orders import StoreOrderError
+from tests.test_store_orders import assert_admin_action_receipt, guest_payload
 from tests.test_store_orders import payment_settings as payment_settings
 from tests.test_store_orders import store_product as store_product
 from tests.test_store_orders import supported_area as supported_area
@@ -411,10 +412,12 @@ def test_v2_payment_cancellation_opens_one_reconciliation_and_close_is_final(
     close_body = {"idempotency_key": closed_key, "reason": "Bank checked: no funds received"}
     close_url = f"/api/v1/admin/store-orders/{checkout['id']}/close-refund-request"
     closed = admin.post(close_url, close_body, format="json")
-    assert closed.status_code == 200, closed.data
+    assert_admin_action_receipt(closed, checkout["id"], "close_refund_request", closed_key)
     assert closed.data["data"]["refund_status"] is None
     assert closed.data["data"]["refund_request_closed_at"] is not None
-    assert admin.post(close_url, close_body, format="json").data["data"]["refund_status"] is None
+    replay = admin.post(close_url, close_body, format="json")
+    assert_admin_action_receipt(replay, checkout["id"], "close_refund_request", closed_key)
+    assert replay.data["data"]["refund_status"] is None
     before = StoreOrderAction.objects.filter(order_id=checkout["id"]).count()
     claim = buyer.post(
         f"{public}/request-refund",
@@ -557,3 +560,94 @@ def test_v2_cancel_replays_an_accepted_old_blank_note_key_without_rewriting_hist
     assert result.status_code == 200
     assert result.data["data"]["reconciliation_note"] == "Existing historical summary"
     assert StoreOrderAction.objects.filter(order=row, action="cancel").count() == 1
+
+
+def test_payment_receipt_confirms_already_received_and_rejects_another_payload(checkout, admin):
+    assert approve(admin, checkout).status_code == 200
+    original = act(admin, checkout, "record-payment", note="Funds verified")
+    assert original.status_code == 200
+    received_at = original.data["data"]["payment_received_at"]
+    key = str(uuid4())
+
+    for response in (
+        act(admin, checkout, "record-payment", note="Second check", idempotency_key=key),
+        act(admin, checkout, "record-payment", note="Second check", idempotency_key=key),
+    ):
+        assert_admin_action_receipt(response, checkout["id"], "record_payment", key)
+        assert response.data["data"]["payment_received_at"] == received_at
+    entry = StoreOrderAction.objects.get(
+        order_id=checkout["id"], action="record_payment", idempotency_key=key
+    )
+    assert entry.context["already_received"] is True
+    assert (
+        StoreOrderAction.objects.filter(order_id=checkout["id"], action="record_payment").count()
+        == 2
+    )
+
+    conflict = act(admin, checkout, "record-payment", note="Different note", idempotency_key=key)
+    assert conflict.status_code == 409
+    assert conflict.data["errors"][0]["code"] == "store_idempotency_conflict"
+    assert "meta" not in conflict.data
+
+
+@pytest.mark.parametrize("mismatch", ["order", "action", "key"])
+def test_admin_mutation_requires_an_exact_persisted_receipt(
+    checkout, admin, store_product, monkeypatch, mismatch
+):
+    order = StoreOrder.objects.get(pk=checkout["id"])
+    key = uuid4()
+    record_order = order
+    if mismatch == "order":
+        other = APIClient().post(
+            "/api/v1/public/store-checkouts",
+            guest_payload(store_product, expected_available=8),
+            format="json",
+        )
+        assert other.status_code == 201
+        record_order = StoreOrder.objects.get(pk=other.data["data"]["id"])
+    record = StoreOrderAction.objects.create(
+        order=record_order,
+        action="record_payment" if mismatch == "action" else "cancel",
+        idempotency_key=uuid4() if mismatch == "key" else key,
+        request_fingerprint="fixture",
+    )
+    # Model an invariant failure after the service returns; the view cannot
+    # trust the request fields or a neighboring action as confirmation.
+    monkeypatch.setattr("commerce.store_views.cancel_store_order", lambda **_kwargs: order)
+    response = act(admin, checkout, "cancel", reason="Harvest shortage", idempotency_key=str(key))
+    assert response.status_code == 500
+    assert "meta" not in response.data
+    assert StoreOrderAction.objects.filter(pk=record.pk).exists()
+    assert not StoreOrderAction.objects.filter(
+        order=order, action="cancel", idempotency_key=key
+    ).exists()
+
+
+def test_rejected_and_rolled_back_actions_do_not_return_a_receipt(checkout, admin, monkeypatch):
+    invalid = act(admin, checkout, "cancel", reason="")
+    assert invalid.status_code == 400
+    assert "meta" not in invalid.data
+
+    def fail_after_action_write(**_kwargs):
+        raise StoreOrderError("store_requote_required")
+
+    monkeypatch.setattr("commerce.store_orders.release_coupon", fail_after_action_write)
+    rolled_back = act(admin, checkout, "cancel", reason="Harvest shortage")
+    assert rolled_back.status_code == 409
+    assert "meta" not in rolled_back.data
+
+    order = StoreOrder.objects.get(pk=checkout["id"])
+    assert order.status == "pending_review"
+    assert order.lines.get().stock_reservations.filter(released_at__isnull=True).exists()
+    assert not StoreOrderAction.objects.filter(order=order).exists()
+
+
+def test_store_receipt_is_not_available_to_an_authenticated_non_admin(checkout, active_user):
+    client = APIClient()
+    client.force_authenticate(
+        active_user, token=SimpleNamespace(scope="profile email content:manage")
+    )
+    denied = act(client, checkout, "cancel", reason="Harvest shortage")
+    assert denied.status_code == 403
+    assert "meta" not in denied.data
+    assert not StoreOrderAction.objects.filter(order_id=checkout["id"]).exists()

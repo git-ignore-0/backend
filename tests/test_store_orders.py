@@ -20,6 +20,7 @@ from commerce.models import (
     ShippingAddress,
     ShippingArea,
     StoreOrder,
+    StoreOrderAction,
     StoreOrderLine,
     StoreOrderStatus,
     StorePaymentStatus,
@@ -49,6 +50,24 @@ from memberships.services import InsufficientQuota, create_usage_order, ensure_d
 
 PROVINCE = "66"
 WARD = "22015"
+
+
+def assert_admin_action_receipt(response, order_id, action, key):
+    assert response.status_code == 200, response.json()
+    assert response["Cache-Control"] == "private, no-store"
+    body = response.json()
+    assert body["data"]["id"] == str(order_id)
+    assert body["meta"]["action_receipt"] == {
+        "order_id": str(order_id),
+        "action": action,
+        "idempotency_key": str(key),
+    }
+    assert (
+        StoreOrderAction.objects.filter(
+            order_id=order_id, action=action, idempotency_key=key
+        ).count()
+        == 1
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -581,7 +600,8 @@ def test_admin_approval_uses_fefo_and_is_replay_safe(
 
     assert approved.status_code == 200, approved.json()
     assert approved.json()["data"]["status"] == "payment_pending"
-    assert replay.status_code == 200
+    for response in (approved, replay):
+        assert_admin_action_receipt(response, created["id"], "approve", payload["idempotency_key"])
     assert StoreOrder.objects.get(pk=created["id"]).payment_status == StorePaymentStatus.UNCONFIRMED
 
 
@@ -775,6 +795,7 @@ def test_legacy_cancelled_paid_late_order_can_be_refunded_idempotently(
     )
     assert cancelled.status_code == 200, cancelled.json()
     assert cancelled.json()["data"]["status"] == "cancelled"
+    assert_admin_action_receipt(cancelled, created["id"], "cancel", cancel_key)
     assert (
         not StoreOrder.objects.get(pk=created["id"])
         .lines.get()
@@ -794,7 +815,8 @@ def test_legacy_cancelled_paid_late_order_can_be_refunded_idempotently(
         format="json",
     )
     assert received.json()["data"]["payment_status"] == "refund_required"
-    assert replay.status_code == 200
+    for response in (received, replay):
+        assert_admin_action_receipt(response, created["id"], "record_payment", payment_key)
 
     refund_key = str(uuid.uuid4())
     refunded = admin.post(
@@ -809,7 +831,26 @@ def test_legacy_cancelled_paid_late_order_can_be_refunded_idempotently(
     )
     assert refunded.status_code == 200, refunded.json()
     assert refunded.json()["data"]["payment_status"] == "refunded"
-    assert refund_replay.status_code == 200
+    for response in (refunded, refund_replay):
+        assert_admin_action_receipt(response, created["id"], "refund", refund_key)
+    later_payment_replay = admin.post(
+        f"/api/v1/admin/store-orders/{created['id']}/record-payment",
+        {"idempotency_key": payment_key, "note": "Tiền đến muộn"},
+        format="json",
+    )
+    assert_admin_action_receipt(later_payment_replay, created["id"], "record_payment", payment_key)
+    assert later_payment_replay.json()["data"]["payment_status"] == "refunded"
+    cancel_replay = admin.post(
+        f"/api/v1/admin/store-orders/{created['id']}/cancel",
+        {
+            "idempotency_key": cancel_key,
+            "reason": "Không thấy tiền",
+            "reconciliation_note": "Kiểm tra 2 lần",
+        },
+        format="json",
+    )
+    assert_admin_action_receipt(cancel_replay, created["id"], "cancel", cancel_key)
+    assert cancel_replay.json()["data"]["payment_status"] == "refunded"
 
 
 @pytest.mark.django_db
@@ -954,11 +995,14 @@ def test_admin_can_mark_approved_order_delivered(
     suggestion = admin.get(f"/api/v1/admin/store-orders/{created['id']}").json()["data"][
         "allocation_suggestion"
     ]
-    admin.post(
+    approve_key = str(uuid.uuid4())
+    approve_body = {"idempotency_key": approve_key, "allocations": suggestion}
+    approved = admin.post(
         f"/api/v1/admin/store-orders/{created['id']}/approve",
-        {"idempotency_key": str(uuid.uuid4()), "allocations": suggestion},
+        approve_body,
         format="json",
     )
+    assert_admin_action_receipt(approved, created["id"], "approve", approve_key)
     payment = admin.post(
         f"/api/v1/admin/store-orders/{created['id']}/record-payment",
         {"idempotency_key": str(uuid.uuid4()), "note": "Bank received"},
@@ -976,8 +1020,18 @@ def test_admin_can_mark_approved_order_delivered(
         {"idempotency_key": key},
         format="json",
     )
-    assert delivered.status_code == replay.status_code == 200
+    for response in (delivered, replay):
+        assert_admin_action_receipt(response, created["id"], "deliver", key)
     assert delivered.json()["data"]["status"] == "delivered"
+    later_approval_replay = admin.post(
+        f"/api/v1/admin/store-orders/{created['id']}/approve",
+        approve_body,
+        format="json",
+    )
+    assert_admin_action_receipt(later_approval_replay, created["id"], "approve", approve_key)
+    assert later_approval_replay.json()["data"]["status"] == "delivered"
+    assert StoreStockAllocation.objects.filter(line__order_id=created["id"]).count() == 1
+    assert StoreStockMovement.objects.filter(line__order_id=created["id"], kind="sale").count() == 1
 
 
 @pytest.mark.django_db
@@ -1010,6 +1064,7 @@ def test_expired_order_cannot_be_approved_and_releases_reservation(
 
     assert response.status_code == 409
     assert response.json()["errors"][0]["code"] == "store_order_expired"
+    assert "meta" not in response.json()
     order = StoreOrder.objects.get(pk=created["id"])
     assert order.status == StoreOrderStatus.CANCELLED
     assert not line.stock_reservations.filter(released_at__isnull=True).exists()
@@ -1054,7 +1109,7 @@ def test_historical_cancelled_order_manual_restock_is_idempotent(
     key = str(uuid.uuid4())
     payload = {
         "idempotency_key": key,
-        "allocations": [{"allocation_id": approved["allocations"][0]["id"], "quantity": 2}],
+        "allocations": [{"allocation_id": approved["allocations"][0]["id"], "quantity": 1}],
     }
     first = admin.post(
         f"/api/v1/admin/store-orders/{created['id']}/restock", payload, format="json"
@@ -1062,8 +1117,22 @@ def test_historical_cancelled_order_manual_restock_is_idempotent(
     replay = admin.post(
         f"/api/v1/admin/store-orders/{created['id']}/restock", payload, format="json"
     )
-    assert first.status_code == replay.status_code == 200
+    for response in (first, replay):
+        assert_admin_action_receipt(response, created["id"], "restock", key)
     assert StoreStockMovement.objects.filter(kind="restock").count() == 1
+    second_key = str(uuid.uuid4())
+    second = admin.post(
+        f"/api/v1/admin/store-orders/{created['id']}/restock",
+        {**payload, "idempotency_key": second_key},
+        format="json",
+    )
+    assert_admin_action_receipt(second, created["id"], "restock", second_key)
+    later_replay = admin.post(
+        f"/api/v1/admin/store-orders/{created['id']}/restock", payload, format="json"
+    )
+    assert_admin_action_receipt(later_replay, created["id"], "restock", key)
+    assert later_replay.json()["data"]["allocations"][0]["restocked_quantity"] == 2
+    assert StoreStockMovement.objects.filter(kind="restock").count() == 2
     assert (
         APIClient()
         .get("/api/v1/public/store-products?locale=vi")

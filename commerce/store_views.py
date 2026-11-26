@@ -16,6 +16,7 @@ from rest_framework.views import APIView
 from commerce.models import (
     StoreGuestLookupSession,
     StoreOrder,
+    StoreOrderAction,
     StoreOrderLine,
     StoreStockAllocation,
 )
@@ -664,6 +665,35 @@ class AdminStoreOrderDetailView(APIView):
         )
 
 
+def _admin_action_response(request, order, *, action, idempotency_key):
+    # The service has applied the operation or validated its replay fingerprint.
+    # Confirm it from the persisted ledger, scoped to this exact action.
+    try:
+        persisted = StoreOrderAction.objects.values("order_id", "action", "idempotency_key").get(
+            order_id=order.pk, action=action, idempotency_key=idempotency_key
+        )
+    except StoreOrderAction.DoesNotExist:
+        return no_store(
+            Response(
+                {"errors": [{"code": "store_action_receipt_unavailable"}]},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        )
+    receipt = {
+        "order_id": str(persisted["order_id"]),
+        "action": persisted["action"],
+        "idempotency_key": str(persisted["idempotency_key"]),
+    }
+    return no_store(
+        Response(
+            {
+                "data": order_payload(order, request=request, admin=True),
+                "meta": {"action_receipt": receipt},
+            }
+        )
+    )
+
+
 class AdminStoreOrderApproveView(APIView):
     permission_classes = [IsWebsiteAdmin]
 
@@ -681,7 +711,12 @@ class AdminStoreOrderApproveView(APIView):
             if isinstance(error, StoreOrder.DoesNotExist):
                 error = StoreOrderError("store_order_not_found")
             return store_error(error)
-        return no_store(Response({"data": order_payload(order, request=request, admin=True)}))
+        return _admin_action_response(
+            request,
+            order,
+            action="approve",
+            idempotency_key=serializer.validated_data["idempotency_key"],
+        )
 
 
 class GuestLookupThrottle(SimpleRateThrottle):
@@ -799,7 +834,12 @@ class AdminStoreOrderCancelView(APIView):
                 if isinstance(error, StoreOrderError)
                 else StoreOrderError("store_order_not_found")
             )
-        return no_store(Response({"data": order_payload(order, request=request, admin=True)}))
+        return _admin_action_response(
+            request,
+            order,
+            action="cancel",
+            idempotency_key=serializer.validated_data["idempotency_key"],
+        )
 
 
 class AdminStoreOrderRecordPaymentView(APIView):
@@ -821,7 +861,12 @@ class AdminStoreOrderRecordPaymentView(APIView):
                 if isinstance(error, StoreOrderError)
                 else StoreOrderError("store_order_not_found")
             )
-        return no_store(Response({"data": order_payload(order, request=request, admin=True)}))
+        return _admin_action_response(
+            request,
+            order,
+            action="record_payment",
+            idempotency_key=serializer.validated_data["idempotency_key"],
+        )
 
 
 class AdminStoreOrderRefundView(APIView):
@@ -842,7 +887,12 @@ class AdminStoreOrderRefundView(APIView):
                 if isinstance(error, StoreOrderError)
                 else StoreOrderError("store_order_not_found")
             )
-        return no_store(Response({"data": order_payload(order, request=request, admin=True)}))
+        return _admin_action_response(
+            request,
+            order,
+            action="refund",
+            idempotency_key=serializer.validated_data["idempotency_key"],
+        )
 
 
 class AdminStoreRefundRequestCloseView(APIView):
@@ -864,7 +914,12 @@ class AdminStoreRefundRequestCloseView(APIView):
                 if isinstance(error, StoreOrderError)
                 else StoreOrderError("store_order_not_found")
             )
-        return no_store(Response({"data": order_payload(order, request=request, admin=True)}))
+        return _admin_action_response(
+            request,
+            order,
+            action="close_refund_request",
+            idempotency_key=serializer.validated_data["idempotency_key"],
+        )
 
 
 class AdminStoreOrderDeliverView(APIView):
@@ -885,7 +940,12 @@ class AdminStoreOrderDeliverView(APIView):
                 if isinstance(error, StoreOrderError)
                 else StoreOrderError("store_order_not_found")
             )
-        return no_store(Response({"data": order_payload(order, request=request, admin=True)}))
+        return _admin_action_response(
+            request,
+            order,
+            action="deliver",
+            idempotency_key=serializer.validated_data["idempotency_key"],
+        )
 
 
 class AdminStoreOrderRestockView(APIView):
@@ -907,4 +967,9 @@ class AdminStoreOrderRestockView(APIView):
                 if isinstance(error, StoreOrderError)
                 else StoreOrderError("store_order_not_found")
             )
-        return no_store(Response({"data": order_payload(order, request=request, admin=True)}))
+        return _admin_action_response(
+            request,
+            order,
+            action="restock",
+            idempotency_key=serializer.validated_data["idempotency_key"],
+        )

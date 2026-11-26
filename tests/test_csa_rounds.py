@@ -6,6 +6,7 @@ from decimal import Decimal
 from threading import Barrier
 
 import pytest
+from django.contrib.auth.models import Group
 from django.db import close_old_connections, connection
 from django.utils import timezone
 from rest_framework.test import APIClient
@@ -16,7 +17,7 @@ from farms.models import FarmProductStockBatch
 from identity.models import AccountStatus, User
 from memberships import csa_rounds as service
 from memberships.models import CSASelection, MembershipCycleQuota
-from tests.test_store_orders import attach_active_membership
+from tests.test_store_orders import assert_admin_action_receipt, attach_active_membership
 from tests.test_store_orders import store_product as store_product
 from tests.test_store_orders import supported_area as supported_area
 from tests.test_store_orders import zero_shipping_fee as zero_shipping_fee
@@ -342,29 +343,28 @@ def test_freeze_preserves_old_round_until_delivery_day_and_blocks_new_round(cont
     assert sync_membership_status(member).status == "ended"
 
 
-def test_order_can_be_allocated_and_delivered_without_double_debit(context):
+def test_order_can_be_allocated_and_delivered_without_double_debit(context, access_token):
     import uuid
 
-    from commerce.store_orders import approve_store_order, deliver_store_order, source_inventory
+    from commerce.store_orders import source_inventory
 
     selected = save(context)
     service.process_round(context[3].pk, now=context[3].closes_at)
     selected.refresh_from_db()
     order = selected.order
-    allocations = source_inventory(order)["suggestion"]
-    approve_store_order(
-        order_id=order.pk,
-        actor=context[0],
-        idempotency_key=uuid.uuid4(),
-        allocations=[
-            {
-                "line_id": uuid.UUID(a["line_id"]),
-                "batch_id": uuid.UUID(a["batch_id"]),
-                "quantity": a["quantity"],
-            }
-            for a in allocations
-        ],
-    )
+    context[0].groups.add(Group.objects.get_or_create(name="website_admin")[0])
+    access_token.scope = "profile email content:manage"
+    access_token.save(update_fields=["scope"])
+    admin = APIClient()
+    admin.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token.token}")
+    path = f"/api/v1/admin/store-orders/{order.pk}"
+    approval = {
+        "idempotency_key": str(uuid.uuid4()),
+        "allocations": source_inventory(order)["suggestion"],
+    }
+    approved = admin.post(f"{path}/approve", approval, format="json")
+    assert_admin_action_receipt(approved, order.pk, "approve", approval["idempotency_key"])
+    assert approved.json()["data"]["csa"]["selection"]["id"] == str(selected.pk)
     assert MembershipCycleQuota.objects.get(cycle__membership=context[2]).remaining_units == 2
     assert not selected.stock_holds.exists()
     with pytest.raises(service.CSARoundError):
@@ -374,7 +374,13 @@ def test_order_can_be_allocated_and_delivered_without_double_debit(context):
             deadline=service.delivery_start(context[3]) - timedelta(hours=1),
             now=context[3].closes_at,
         )
-    deliver_store_order(order_id=order.pk, actor=context[0], idempotency_key=uuid.uuid4())
+    delivery_key = str(uuid.uuid4())
+    delivered = admin.post(f"{path}/deliver", {"idempotency_key": delivery_key}, format="json")
+    assert_admin_action_receipt(delivered, order.pk, "deliver", delivery_key)
+    replay = admin.post(f"{path}/approve", approval, format="json")
+    assert_admin_action_receipt(replay, order.pk, "approve", approval["idempotency_key"])
+    assert replay.json()["data"]["status"] == "delivered"
+    assert MembershipCycleQuota.objects.get(cycle__membership=context[2]).remaining_units == 2
     selected.refresh_from_db()
     assert selected.state == "delivered"
 
