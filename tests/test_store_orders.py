@@ -563,12 +563,8 @@ def test_admin_approval_uses_fefo_and_is_replay_safe(
     first_batch = FarmProductStockBatch.objects.get(farm_product__product=store_product)
     first_batch.quantity_units = 2
     first_batch.save(update_fields=["quantity_units", "updated_at"])
-    second_farm = Farm.objects.create(
-        name_vi="Nông trại B", name_en="Farm B", location_vi="Huế", location_en="Hue"
-    )
-    second_offer = FarmProduct.objects.create(farm=second_farm, product=store_product)
     second_batch = FarmProductStockBatch.objects.create(
-        farm_product=second_offer,
+        farm_product=first_batch.farm_product,
         start_date=timezone.localdate(),
         end_date=timezone.localdate() + timedelta(days=5),
         quantity_units=5,
@@ -1638,7 +1634,7 @@ def test_admin_order_detail_exposes_all_source_candidates_and_restock_balance(
         APIClient()
         .post(
             "/api/v1/public/store-checkouts",
-            guest_payload(store_product, expected_available=14),
+            guest_payload(store_product, expected_available=10),
             format="json",
         )
         .json()["data"]

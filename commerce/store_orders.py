@@ -12,7 +12,14 @@ from django.db.models.functions import Round
 from django.utils import timezone
 from django.utils.crypto import salted_hmac
 
+from commerce.inventory import (
+    WAITING_STATES,
+    active_stock_batches,
+    effective_store_stock_reservations,
+    inventory_capacity,
+)
 from commerce.models import (
+    STORE_CHECKOUT_MAX_QUANTITY,
     CatalogTreeLock,
     Product,
     ShippingAddress,
@@ -43,7 +50,6 @@ from farms.models import Farm, FarmProduct, FarmProductStockBatch
 from farms.stock import (
     batch_net_sold,
     batch_remaining_units,
-    current_stock_batch_q,
     is_current_stock_batch,
     product_stock_totals_query,
     stock_movement_totals,
@@ -87,11 +93,6 @@ from referrals.store_rewards import (
 REVIEW_WINDOW = timedelta(hours=8)
 NEW_PAYMENT_WINDOW = timedelta(hours=12)
 VIETNAM = ZoneInfo("Asia/Ho_Chi_Minh")
-WAITING_STATES = {
-    StoreOrderStatus.PENDING_REVIEW,
-    StoreOrderStatus.PAYMENT_PENDING,
-    StoreOrderStatus.PAYMENT_REVIEW,
-}
 
 
 def delivery_end(order):
@@ -204,26 +205,6 @@ def _net_sold_by_batch(batch_ids):
     return defaultdict(int, rows.values_list("batch_id", "net_sold"))
 
 
-def active_stock_batches(*, now=None):
-    return FarmProductStockBatch.objects.filter(
-        current_stock_batch_q(today=timezone.localdate(now))
-    )
-
-
-def active_product_stock(product_ids, *, now=None):
-    batches = list(
-        active_stock_batches(now=now)
-        .filter(farm_product__product_id__in=product_ids)
-        .select_related("farm_product__farm")
-        .annotate(remaining_units=batch_remaining_units(batch_net_sold()))
-        .order_by("farm_product__product_id", "end_date", "start_date", "id")
-    )
-    totals = defaultdict(int)
-    for batch in batches:
-        totals[batch.farm_product.product_id] += batch.remaining_units
-    return totals, batches
-
-
 def active_product_stock_totals(
     product_ids, *, now=None, exclude_source_id=None, exclude_farm_id=None
 ):
@@ -237,79 +218,56 @@ def active_product_stock_totals(
     return dict(stock.values_list("farm_product__product_id", "total"))
 
 
-def effective_store_stock_reservations(*, now):
-    return StoreStockReservation.objects.filter(
-        released_at__isnull=True,
-        line__order__status__in=WAITING_STATES,
-        line__order__expires_at__gt=now,
-    )
-
-
-def _reservation_totals(rows):
-    return dict(
-        rows.order_by()
-        .values("product_id")
-        .annotate(total=Sum("quantity"))
-        .values_list("product_id", "total")
-    )
-
-
-def _active_reserved_stock(product_ids, *, exclude_order=None, exclude_selection=None, now=None):
-    from memberships.csa_rounds import reserved_stock
-
-    now = now or timezone.now()
-    store = effective_store_stock_reservations(now=now).filter(product_id__in=product_ids)
-    if exclude_order is not None:
-        store = store.exclude(line__order=exclude_order)
-    selection = exclude_selection
-    if selection is None and exclude_order is not None:
-        selection = getattr(exclude_order, "csa_selection", None)
-    totals = _reservation_totals(store)
-    for product_id, quantity in reserved_stock(
-        product_ids, now=now, exclude_selection=selection
-    ).items():
-        totals[product_id] = totals.get(product_id, 0) + quantity
-    return totals
-
-
 def ensure_batch_change_preserves_reservations(
     batch, *, quantity_units=None, start_date=None, end_date=None, cancelling=False, now=None
 ):
+    from copy import copy
+
     # All source writers and demand writers serialize on the Product row.
     now = now or timezone.now()
     today = timezone.localdate(now)
-    product_id = batch.farm_product.product_id
-    reserved = _active_reserved_stock([product_id], now=now).get(product_id, 0)
+    source = batch.farm_product
     net_sold = _net_sold_by_batch([batch.pk]).get(batch.pk, 0)
-    new_quantity = batch.quantity_units if quantity_units is None else quantity_units
-    if new_quantity < net_sold:
+    proposed = copy(batch)
+    proposed.quantity_units = batch.quantity_units if quantity_units is None else quantity_units
+    if proposed.quantity_units < net_sold:
         raise StoreOrderError("stock_sold")
-    if not reserved:
-        return
-    totals = active_product_stock_totals([product_id], now=now)
+    proposed.start_date = start_date if start_date is not None else batch.start_date
+    proposed.end_date = end_date if end_date is not None else batch.end_date
+    if cancelling:
+        proposed.cancelled_at = now
+
     current_remaining = (
         max(0, batch.quantity_units - net_sold) if is_current_stock_batch(batch, today=today) else 0
     )
-    next_eligible = (
-        not cancelling
-        and batch.farm_product.farm.is_active
-        and (start_date or batch.start_date) <= today <= (end_date or batch.end_date)
+    next_remaining = (
+        max(0, proposed.quantity_units - net_sold)
+        if is_current_stock_batch(proposed, today=today)
+        else 0
     )
-    next_remaining = max(0, new_quantity - net_sold) if next_eligible else 0
-    if totals.get(product_id, 0) - current_remaining + next_remaining < reserved:
+    delta = next_remaining - current_remaining
+    if delta >= 0:
+        return
+
+    product_id = source.product_id
+    key = (product_id, source.farm_id)
+    capacity = inventory_capacity([product_id], now=now, stock_adjustments={key: delta})
+    if (
+        capacity.physical.get(key, 0) < capacity.assigned.get(key, 0)
+        or product_id in capacity.legacy_shortfalls
+    ):
         raise StoreOrderError("stock_reserved")
 
 
 def ensure_farm_deactivation_preserves_reservations(farm):
-    ids = list(farm.products.filter(removed_at__isnull=True).values_list("product_id", flat=True))
-    if not ids:
+    sources = dict(farm.products.order_by().values_list("product_id", "removed_at"))
+    if not sources:
         return
     now = timezone.now()
-    reserved = _active_reserved_stock(ids, now=now)
-    if not reserved:
-        return
-    remaining = active_product_stock_totals(reserved, now=now, exclude_farm_id=farm.pk)
-    if any(remaining.get(product_id, 0) < quantity for product_id, quantity in reserved.items()):
+    capacity = inventory_capacity(sources, now=now, exclude_farm_id=farm.pk)
+    if any(sources[product_id] is None for product_id in capacity.legacy_shortfalls) or any(
+        capacity.assigned.get((product_id, farm.pk), 0) for product_id in sources
+    ):
         raise StoreOrderError("stock_reserved")
 
 
@@ -410,38 +368,41 @@ def _lock_checkout_identity(user):
     lock_user_for_shared_read(user.pk)
 
 
-def _check_checkout_stock(requested, products, stock_totals, active_reserved, check_expected):
+def _check_checkout_stock(requested, products, inventory, check_expected):
+    assignments = {}
     for item in requested:
-        available = stock_totals.get(item["product_id"], 0) - active_reserved.get(
-            item["product_id"], 0
-        )
-        product = products[item["product_id"]]
+        quantity = item["quantity"]
+        if type(quantity) is not int or not 1 <= quantity <= STORE_CHECKOUT_MAX_QUANTITY:
+            raise StoreOrderError("store_order_invalid")
+        product_id = item["product_id"]
+        available = inventory.maximum(product_id)
+        product = products[product_id]
         if check_expected and item["expected_unit_price_vnd"] != product.retail_price_vnd:
             raise StoreOrderError(
                 "store_requote_required",
                 context={
                     "reason": "price_changed",
-                    "product_id": str(product.pk),
+                    "product_id": str(product_id),
                     "unit_price_vnd": product.retail_price_vnd,
                 },
             )
-        if check_expected and item["expected_available_quantity"] != max(0, available):
+        if check_expected and item["expected_available_quantity"] != available:
             raise StoreOrderError(
                 "store_requote_required",
                 context={
                     "reason": "stock_changed",
-                    "product_id": str(product.pk),
-                    "available_quantity": max(0, available),
+                    "product_id": str(product_id),
+                    "available_quantity": available,
                 },
             )
-        if item["quantity"] > available:
+        farm_id = inventory.choose_farm(product_id, quantity)
+        if farm_id is None:
             raise StoreOrderError(
                 "store_stock_changed",
-                context={
-                    "product_id": str(item["product_id"]),
-                    "available_quantity": max(0, available),
-                },
+                context={"product_id": str(product_id), "available_quantity": available},
             )
+        assignments[product_id] = farm_id
+    return assignments
 
 
 def calculate_store_quote(*, user, payload, lock=False, check_expected=False, draft_coupon=None):
@@ -514,9 +475,8 @@ def calculate_store_quote(*, user, payload, lock=False, check_expected=False, dr
         )
     # Product mutexes also serialize Farm status, lot writes and stock demand.
     stock_at = timezone.now()
-    stock_totals = active_product_stock_totals(product_ids, now=stock_at)
-    active_reserved = _active_reserved_stock(product_ids, now=stock_at)
-    _check_checkout_stock(requested, by_id, stock_totals, active_reserved, check_expected)
+    inventory = inventory_capacity(product_ids, now=stock_at)
+    _check_checkout_stock(requested, by_id, inventory, check_expected)
 
     group_ids = {
         by_id[item["product_id"]].csa_quota_group_id
@@ -651,9 +611,7 @@ def calculate_store_quote(*, user, payload, lock=False, check_expected=False, dr
         "snapshot": snapshot,
         "discount": discount,
         "voucher_quote": voucher_quote,
-        "stock_at": stock_at,
-        "stock_totals": stock_totals,
-        "active_reserved": active_reserved,
+        "inventory": inventory,
     }
 
 
@@ -679,11 +637,7 @@ def preview_store_voucher(*, user, payload, draft_coupon=None):
                 "quantity": item["quantity"],
                 "use_quota": item["use_quota"],
                 "expected_unit_price_vnd": product.retail_price_vnd,
-                "expected_available_quantity": max(
-                    0,
-                    quote["stock_totals"].get(product.pk, 0)
-                    - quote["active_reserved"].get(product.pk, 0),
-                ),
+                "expected_available_quantity": quote["inventory"].maximum(product.pk),
                 "expected_quota_quantity": quota_quantity,
             }
             for _, item, product, quota_quantity, *_ in quote["line_values"]
@@ -732,17 +686,11 @@ def create_store_checkout(*, user, payload):
     )
     now = timezone.now()
     validate_delivery_date(quote["delivery_date"], now=now)
-    if timezone.localdate(now) != timezone.localdate(quote["stock_at"]):
-        requested = payload["lines"]
-        products = {item[2].pk: item[2] for item in line_values}
-        product_ids = list(products)
-        _check_checkout_stock(
-            requested,
-            products,
-            active_product_stock_totals(product_ids, now=now),
-            _active_reserved_stock(product_ids, now=now),
-            True,
-        )
+    # A batch date or effective hold deadline can change while waiting for payment config.
+    products = {item[2].pk: item[2] for item in line_values}
+    assignments = _check_checkout_stock(
+        payload["lines"], products, inventory_capacity(products, now=now), True
+    )
     # Payment configuration may have blocked after the quote was calculated.
     benefit = companion_benefits(
         user=user, first=quote["delivery_date"], last=quote["delivery_date"], now=now
@@ -818,7 +766,9 @@ def create_store_checkout(*, user, payload):
             cash_quantity=cash_quantity,
             cash_subtotal_vnd=cash_subtotal,
         )
-        StoreStockReservation.objects.create(line=line, product=product, quantity=item["quantity"])
+        StoreStockReservation.objects.create(
+            line=line, product=product, farm_id=assignments[product.pk], quantity=item["quantity"]
+        )
         StoreQuotaReservation.objects.bulk_create(
             [
                 StoreQuotaReservation(line=line, cycle_quota=quota, units=units)
@@ -1207,73 +1157,140 @@ def _batch_available(batch, net_sold):
     return max(0, batch.quantity_units - net_sold.get(batch.pk, 0))
 
 
+def _batch_allocation_plan(line, batch_quantities):
+    needed = line.quantity
+    allocations = []
+    for batch_id, available in batch_quantities:
+        quantity = min(needed, available)
+        if quantity:
+            allocations.append({"line_id": line.pk, "batch_id": batch_id, "quantity": quantity})
+            needed -= quantity
+        if not needed:
+            return allocations
+    return []
+
+
 def allocation_suggestion(order):
     return source_inventory(order)["suggestion"]
 
 
-def source_inventory(order):
+def source_inventory(order, *, lines=None):
     from memberships.csa_rounds import effective_stock_hold_rows
 
     now = timezone.now()
-    lines = list(order.lines.order_by("position", "id"))
+    if lines is None:
+        lines = list(order.lines.order_by("position", "id"))
     product_ids = {line.product_id for line in lines}
-    stock, batches = active_product_stock(product_ids, now=now)
-    reserved = _active_reserved_stock(product_ids, now=now)
-    current_order_reserved = _reservation_totals(
-        effective_store_stock_reservations(now=now).filter(line__order=order)
+    capacity = inventory_capacity(product_ids, now=now, exclude_order=order)
+    batches = (
+        active_stock_batches(now=now)
+        .filter(farm_product__product_id__in=product_ids)
+        .select_related("farm_product__farm")
+        .annotate(remaining_units=batch_remaining_units(batch_net_sold()))
+        .order_by("farm_product__product_id", "end_date", "start_date", "id")
     )
-    csa_demand = effective_stock_hold_rows(now=now).filter(selection__order=order)
-    for product_id, quantity in _reservation_totals(csa_demand).items():
-        current_order_reserved[product_id] = current_order_reserved.get(product_id, 0) + quantity
-    other_demand = {
-        product_id: max(0, quantity - current_order_reserved.get(product_id, 0))
-        for product_id, quantity in reserved.items()
-    }
+    farm_name = "farm__name_vi" if order.locale == "vi" else "farm__name_en"
+    own_stock = effective_store_stock_reservations(now=now).filter(line__order=order)
+    own_csa = effective_stock_hold_rows(now=now).filter(selection__order=order)
+    own_rows = list(own_stock.values_list("product_id", "quantity", "farm_id", farm_name))
+    own_rows.extend(own_csa.values_list("product_id", "quantity", "farm_id", farm_name))
+    current_order_reserved = defaultdict(int)
+    assigned_farms = {}
+    farm_names = defaultdict(dict)
+    for product_id, quantity, farm_id, name in own_rows:
+        current_order_reserved[product_id] += quantity
+        if farm_id is not None:
+            assigned_farms[product_id] = farm_id
+            farm_names[product_id][farm_id] = name
+    active_offers = FarmProduct.objects.filter(
+        product_id__in=product_ids, removed_at__isnull=True, farm__is_active=True
+    )
+    for product_id, farm_id, name in active_offers.values_list("product_id", "farm_id", farm_name):
+        farm_names[product_id][farm_id] = name
+    other_demand = capacity.total_demand
     by_product = defaultdict(list)
     for batch in batches:
-        by_product[batch.farm_product.product_id].append(batch)
+        offer = batch.farm_product
+        farm = offer.farm
+        by_product[offer.product_id].append(batch)
+        farm_names[offer.product_id].setdefault(
+            farm.pk, farm.name_vi if order.locale == "vi" else farm.name_en
+        )
+    csa = getattr(order, "csa_selection", None)
+    can_approve = (
+        order.status == StoreOrderStatus.PENDING_REVIEW
+        and (order.expires_at is None or now < order.expires_at)
+        and (csa is None or csa.state in ("locked", "confirmed"))
+    )
     suggestion = []
     candidates = []
+    source_lines = []
     for line in lines:
-        remaining = max(0, stock.get(line.product_id, 0) - other_demand.get(line.product_id, 0))
-        needed = min(line.quantity, remaining)
+        product_id = line.product_id
+        assigned_farm_id = assigned_farms.get(product_id)
+        farm_quantities = {
+            farm_id: capacity.remaining(product_id, farm_id)
+            for farm_id in sorted(farm_names[product_id], key=str)
+        }
+        suggested_farm_id = (
+            capacity.choose_farm(product_id, line.quantity, preferred_farm_id=assigned_farm_id)
+            if can_approve
+            else None
+        )
+        source_lines.append(
+            {
+                "line_id": str(line.pk),
+                "product_id": str(product_id),
+                "required_quantity": line.quantity,
+                "assigned_farm_id": str(assigned_farm_id) if assigned_farm_id else None,
+                "suggested_farm_id": str(suggested_farm_id) if suggested_farm_id else None,
+                "farms": [
+                    {
+                        "farm_id": str(farm_id),
+                        "farm_name": farm_names[product_id][farm_id],
+                        "available_quantity": quantity,
+                        "eligible": can_approve and quantity >= line.quantity,
+                    }
+                    for farm_id, quantity in farm_quantities.items()
+                ],
+            }
+        )
+        suggested_batches = []
         for batch in by_product[line.product_id]:
-            available = batch.remaining_units
+            farm_id = batch.farm_product.farm_id
+            available = farm_quantities.get(farm_id, 0)
+            if farm_id == suggested_farm_id:
+                suggested_batches.append((batch.pk, batch.remaining_units))
             candidates.append(
                 {
                     "line_id": str(line.pk),
-                    "product_id": str(line.product_id),
-                    "farm_id": str(batch.farm_product.farm_id),
-                    "farm_name": (
-                        batch.farm_product.farm.name_vi
-                        if order.locale == "vi"
-                        else batch.farm_product.farm.name_en
-                    ),
+                    "product_id": str(product_id),
+                    "farm_id": str(farm_id),
+                    "farm_name": farm_names[product_id][farm_id],
                     "batch_id": str(batch.pk),
                     "start_date": batch.start_date.isoformat(),
                     "end_date": batch.end_date.isoformat(),
-                    "available_quantity": available,
+                    "available_quantity": min(available, batch.remaining_units)
+                    if available >= line.quantity
+                    else 0,
                 }
             )
-            take = min(needed, available)
-            if take:
-                suggestion.append(
-                    {"line_id": str(line.pk), "batch_id": str(batch.pk), "quantity": take}
-                )
-                needed -= take
+        suggestion.extend(_batch_allocation_plan(line, suggested_batches))
     return {
         "refresh_required_before_approve": True,
+        "lines": source_lines,
         "product_reservations": [
             {
                 "product_id": str(product_id),
-                "reserved_quantity": reserved.get(product_id, 0),
+                "reserved_quantity": current_order_reserved.get(product_id, 0)
+                + other_demand.get(product_id, 0),
                 "this_order_quantity": current_order_reserved.get(product_id, 0),
                 "other_orders_quantity": other_demand.get(product_id, 0),
             }
-            for product_id in sorted(set(product_ids), key=str)
+            for product_id in sorted(product_ids, key=str)
         ],
         "candidates": candidates,
-        "suggestion": suggestion,
+        "suggestion": _jsonable(suggestion),
     }
 
 
@@ -1331,15 +1348,140 @@ def _consume_reserved_quota(order, actor):
     )
 
 
+def _approval_batch_rows(batches):
+    return batches.order_by().values(
+        "pk", "farm_product_id", "farm_product__farm_id", "farm_product__product_id"
+    )
+
+
+def _legacy_approval_sources(lines, allocations):
+    pairs = [(item["line_id"], item["batch_id"]) for item in allocations]
+    if len(pairs) != len(set(pairs)):
+        raise StoreOrderError("store_allocation_duplicate")
+    batch_rows = {
+        row["pk"]: row
+        for row in _approval_batch_rows(
+            FarmProductStockBatch.objects.filter(
+                pk__in={batch_id for _, batch_id in pairs},
+                farm_product__product_id__in={line.product_id for line in lines.values()},
+            )
+        )
+    }
+    farms_by_line = {}
+    for line_id, batch_id in pairs:
+        line = lines.get(line_id)
+        row = batch_rows.get(batch_id)
+        if line is None or row is None or row["farm_product__product_id"] != line.product_id:
+            raise StoreOrderError("store_allocation_stale")
+        farm_id = row["farm_product__farm_id"]
+        if farms_by_line.setdefault(line_id, farm_id) != farm_id:
+            raise StoreOrderError(
+                "store_allocation_mixed_farm",
+                context={"line_id": str(line_id), "product_id": str(line.product_id)},
+            )
+    if not farms_by_line or farms_by_line.keys() != lines.keys():
+        raise StoreOrderError("store_allocation_incomplete")
+    return farms_by_line, batch_rows.values()
+
+
+def _selected_approval_sources(lines, sources):
+    farms_by_line = {item["line_id"]: item["farm_id"] for item in sources}
+    if len(farms_by_line) != len(sources):
+        raise StoreOrderError("store_allocation_duplicate")
+    if farms_by_line.keys() - lines.keys():
+        raise StoreOrderError("store_allocation_stale")
+    if not farms_by_line or farms_by_line.keys() != lines.keys():
+        raise StoreOrderError("store_allocation_incomplete")
+    selected_pairs = {
+        (lines[line_id].product_id, farm_id) for line_id, farm_id in farms_by_line.items()
+    }
+    potential_offers = FarmProduct.objects.filter(
+        product_id__in={product_id for product_id, _ in selected_pairs},
+        farm_id__in=set(farms_by_line.values()),
+        removed_at__isnull=True,
+    ).values_list("pk", "product_id", "farm_id")
+    offer_ids = [
+        pk
+        for pk, product_id, farm_id in potential_offers
+        if (product_id, farm_id) in selected_pairs
+    ]
+    # Include upcoming rows that may become current while waiting. Eligibility is
+    # decided from the locked rows and the final clock reading.
+    batches = FarmProductStockBatch.objects.filter(
+        farm_product_id__in=offer_ids,
+        cancelled_at__isnull=True,
+        supply_generation=F("farm_product__supply_generation"),
+        end_date__gte=timezone.localdate(),
+    )
+    return farms_by_line, list(_approval_batch_rows(batches))
+
+
+def _approval_farm_error(line, farm_id, available_quantity, *, legacy=False):
+    context = {"product_id": str(line.product_id), "available_quantity": available_quantity}
+    if not legacy:
+        context.update(line_id=str(line.pk), farm_id=str(farm_id))
+    return StoreOrderError("store_allocation_stale", context=context)
+
+
+def _plan_selected_approval(lines, farms_by_line, batches, available_by_batch, capacity):
+    by_farm = defaultdict(list)
+    for batch in sorted(batches.values(), key=lambda row: (row.end_date, row.start_date, row.pk)):
+        if batch.pk in available_by_batch:
+            offer = batch.farm_product
+            by_farm[offer.product_id, offer.farm_id].append(
+                (batch.pk, available_by_batch[batch.pk])
+            )
+    allocations = []
+    for line_id, line in lines.items():
+        farm_id = farms_by_line[line_id]
+        plan = _batch_allocation_plan(line, by_farm[line.product_id, farm_id])
+        if not plan:
+            raise _approval_farm_error(line, farm_id, capacity.remaining(line.product_id, farm_id))
+        allocations.extend(plan)
+    return allocations
+
+
+def _validate_approval_plan(
+    lines, farms_by_line, allocations, available_by_batch, capacity, *, legacy
+):
+    allocated_by_line = defaultdict(int)
+    allocated_by_batch = defaultdict(int)
+    for item in allocations:
+        quantity = item["quantity"]
+        if type(quantity) is not int or quantity <= 0:
+            raise StoreOrderError("store_allocation_incomplete")
+        if item["batch_id"] not in available_by_batch:
+            raise StoreOrderError("store_allocation_stale")
+        allocated_by_line[item["line_id"]] += quantity
+        allocated_by_batch[item["batch_id"]] += quantity
+    if any(allocated_by_line[line.pk] != line.quantity for line in lines.values()):
+        raise StoreOrderError("store_allocation_incomplete")
+    for batch_id, quantity in allocated_by_batch.items():
+        available = available_by_batch[batch_id]
+        if quantity > available:
+            raise StoreOrderError(
+                "store_allocation_stale",
+                context={"batch_id": str(batch_id), "available_quantity": available},
+            )
+    for line_id, line in lines.items():
+        farm_id = farms_by_line[line_id]
+        available = capacity.remaining(line.product_id, farm_id)
+        if line.quantity > available:
+            raise _approval_farm_error(line, farm_id, available, legacy=legacy)
+
+
 @transaction.atomic
-def _approve_store_order_atomic(*, order_id, actor, idempotency_key, allocations):
+def _approve_store_order_atomic(*, order_id, actor, idempotency_key, allocations, sources):
     order = StoreOrder.objects.select_for_update().get(pk=order_id)
-    fingerprint = request_fingerprint({"allocations": allocations})
+    if sources is None:
+        # Old receipts hash the ordered allocation array, including mixed-Farm sales.
+        fingerprint = request_fingerprint({"allocations": allocations})
+    else:
+        fingerprint = request_fingerprint(
+            {"sources": sorted(sources, key=lambda item: str(item["line_id"]))}
+        )
     if _action_replay(order, "approve", idempotency_key, fingerprint):
         return order, False
-    allocation_pairs = [(item["line_id"], item["batch_id"]) for item in allocations]
-    if len(allocation_pairs) != len(set(allocation_pairs)):
-        raise StoreOrderError("store_allocation_duplicate")
     _lock_order_products(order)
     _lock_checkout_identity(actor)
     _lock_order_memberships(order)
@@ -1347,22 +1489,17 @@ def _approve_store_order_atomic(*, order_id, actor, idempotency_key, allocations
         return order, True
     if order.status != StoreOrderStatus.PENDING_REVIEW:
         raise StoreOrderError("store_order_state_conflict")
+    csa = getattr(order, "csa_selection", None)
+    if csa and csa.state not in ("locked", "confirmed"):
+        raise StoreOrderError("store_order_state_conflict")
     lines = {line.pk: line for line in order.lines.select_for_update().all()}
     product_ids = {line.product_id for line in lines.values()}
     # Lock Product -> Membership -> FarmProduct -> Farm -> stock batch -> quota rows.
-    batch_ids = {item["batch_id"] for item in allocations}
-    batch_sources = {
-        row["pk"]: row
-        for row in FarmProductStockBatch.objects.filter(
-            pk__in=batch_ids, farm_product__product_id__in=product_ids
-        ).values("pk", "farm_product_id", "farm_product__farm_id", "farm_product__product_id")
-    }
-    for item in allocations:
-        line = lines.get(item["line_id"])
-        source = batch_sources.get(item["batch_id"])
-        if line is None or source is None or source["farm_product__product_id"] != line.product_id:
-            raise StoreOrderError("store_allocation_stale")
-    batches = _lock_stock_sources(batch_sources.values())
+    if sources is None:
+        farms_by_line, batch_sources = _legacy_approval_sources(lines, allocations)
+    else:
+        farms_by_line, batch_sources = _selected_approval_sources(lines, sources)
+    batches = _lock_stock_sources(batch_sources)
     _lock_order_quotas(order)
     _lock_cancellation_coupon(order)
     # Waiting for a source, quota or coupon lock may have crossed the deadline. This is
@@ -1370,45 +1507,23 @@ def _approve_store_order_atomic(*, order_id, actor, idempotency_key, allocations
     decision_at = timezone.now()
     if _expire_locked_order(order, now=decision_at):
         return order, True
-    if len(batches) != len(batch_ids):
+    if len(batches) != len(batch_sources):
         raise StoreOrderError("store_allocation_stale")
-    net_sold = _net_sold_by_batch(batch_ids)
-    allocated_by_line = defaultdict(int)
-    allocated_by_batch = defaultdict(int)
     today = timezone.localdate(decision_at)
-    for item in allocations:
-        line = lines[item["line_id"]]
-        batch = batches[item["batch_id"]]
-        if not is_current_stock_batch(batch, today=today):
-            raise StoreOrderError("store_allocation_stale")
-        allocated_by_line[line.pk] += item["quantity"]
-        allocated_by_batch[batch.pk] += item["quantity"]
-    if any(allocated_by_line[line.pk] != line.quantity for line in lines.values()):
-        raise StoreOrderError("store_allocation_incomplete")
-    allocated_by_product = defaultdict(int)
-    for batch_id, quantity in allocated_by_batch.items():
-        batch = batches[batch_id]
-        available_quantity = _batch_available(batch, net_sold)
-        if quantity > available_quantity:
-            raise StoreOrderError(
-                "store_allocation_stale",
-                context={"batch_id": str(batch_id), "available_quantity": available_quantity},
-            )
-        allocated_by_product[batch.farm_product.product_id] += quantity
-
-    other_demand = _active_reserved_stock(product_ids, exclude_order=order, now=decision_at)
-    if other_demand:
-        stock = active_product_stock_totals(other_demand, now=decision_at)
-        for product_id, reserved in other_demand.items():
-            available_quantity = stock.get(product_id, 0) - reserved
-            if allocated_by_product[product_id] > available_quantity:
-                raise StoreOrderError(
-                    "store_allocation_stale",
-                    context={
-                        "product_id": str(product_id),
-                        "available_quantity": max(0, available_quantity),
-                    },
-                )
+    net_sold = _net_sold_by_batch(batches)
+    available_by_batch = {
+        batch.pk: _batch_available(batch, net_sold)
+        for batch in batches.values()
+        if is_current_stock_batch(batch, today=today)
+    }
+    capacity = inventory_capacity(product_ids, now=decision_at, exclude_order=order)
+    if sources is not None:
+        allocations = _plan_selected_approval(
+            lines, farms_by_line, batches, available_by_batch, capacity
+        )
+    _validate_approval_plan(
+        lines, farms_by_line, allocations, available_by_batch, capacity, legacy=sources is None
+    )
     for item in allocations:
         allocation = StoreStockAllocation.objects.create(
             line=lines[item["line_id"]], batch=batches[item["batch_id"]], quantity=item["quantity"]
@@ -1422,10 +1537,7 @@ def _approve_store_order_atomic(*, order_id, actor, idempotency_key, allocations
             idempotency_key=idempotency_key,
             actor=actor,
         )
-    csa = getattr(order, "csa_selection", None)
     if csa:
-        if csa.state not in ("locked", "confirmed"):
-            raise StoreOrderError("store_order_state_conflict")
         csa.stock_holds.all().delete()
     _consume_reserved_quota(order, actor)
     _release_reservations(order, "approved")
@@ -1458,23 +1570,22 @@ def _approve_store_order_atomic(*, order_id, actor, idempotency_key, allocations
             "updated_at",
         ]
     )
-    StoreOrderAction.objects.create(
-        order=order,
-        action="approve",
-        idempotency_key=idempotency_key,
-        request_fingerprint=fingerprint,
-        actor=actor,
-        context={"allocations": _jsonable(allocations)},
-    )
+    context = {"allocations": _jsonable(allocations)}
+    if sources is not None:
+        context["sources"] = _jsonable(sources)
+    _record_action(order, "approve", idempotency_key, fingerprint, actor, context=context)
     return order, False
 
 
-def approve_store_order(*, order_id, actor, idempotency_key, allocations):
+def approve_store_order(*, order_id, actor, idempotency_key, allocations=None, sources=None):
+    if (sources is None) == (allocations is None):
+        raise StoreOrderError("store_order_invalid")
     order, expired = _approve_store_order_atomic(
         order_id=order_id,
         actor=actor,
         idempotency_key=idempotency_key,
         allocations=allocations,
+        sources=sources,
     )
     if expired:
         raise StoreOrderError("store_order_expired")

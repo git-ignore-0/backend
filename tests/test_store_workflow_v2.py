@@ -181,7 +181,7 @@ def test_buyer_cancel_releases_product_and_batch_once_without_inventing_receipt(
     assert result.payment_status == "unconfirmed"
     assert result.refund_status == ("pending" if state != "pending_review" else None)
     assert not result.lines.get().stock_reservations.filter(released_at__isnull=True).exists()
-    assert services.active_product_stock([store_product.pk])[0][store_product.pk] == 10
+    assert services.active_product_stock_totals([store_product.pk])[store_product.pk] == 10
     result2 = services.cancel_pending_store_order(
         order_id=order.pk, user=None, guest_token=token, idempotency_key=key, request_refund=refund
     )
@@ -222,7 +222,7 @@ def test_admin_cancel_requires_reason_and_received_money_requires_refund(
     assert result.refund_status == "pending"
     assert result.payment_status == "refund_required"
     assert result.cancelled_by == active_user
-    assert services.active_product_stock([store_product.pk])[0][store_product.pk] == 10
+    assert services.active_product_stock_totals([store_product.pk])[store_product.pk] == 10
     with pytest.raises(services.StoreOrderError, match="store_refund_state_conflict"):
         services.close_store_refund_request(
             order_id=order.pk, actor=active_user, idempotency_key=uuid.uuid4(), reason="No money"
@@ -341,7 +341,7 @@ def test_late_payment_confirmation_cancels_before_recording_and_never_resurrects
     assert result.status == "cancelled"
     assert result.payment_status == "refund_required"
     assert result.refund_status == "pending"
-    assert services.active_product_stock([store_product.pk])[0][store_product.pk] == 10
+    assert services.active_product_stock_totals([store_product.pk])[store_product.pk] == 10
 
 
 def test_cancel_resources_rollback_with_action_failure(
@@ -364,7 +364,7 @@ def test_cancel_resources_rollback_with_action_failure(
         )
     order.refresh_from_db()
     assert order.status == "payment_pending"
-    assert services.active_product_stock([store_product.pk])[0][store_product.pk] == 8
+    assert services.active_product_stock_totals([store_product.pk])[store_product.pk] == 8
     assert not StoreStockMovement.objects.filter(line__order=order, kind="restock").exists()
 
 
@@ -452,7 +452,7 @@ def test_quota_and_voucher_commit_at_goods_then_reverse_once_on_cancel(
     )
     assert MembershipCycleQuota.objects.get().remaining_units == 4
     assert MembershipUsageReversal.objects.count() == 1
-    assert services.active_product_stock([store_product.pk])[0][store_product.pk] == 10
+    assert services.active_product_stock_totals([store_product.pk])[store_product.pk] == 10
     if coupon:
         coupon.refresh_from_db()
         assert coupon.used_count == 0
@@ -902,7 +902,7 @@ def test_new_legacy_retail_cancellation_reverses_allocated_batch_immediately_onc
     approved = approve(order, active_user)
     assert approved.status == "pending_delivery"
     assert approved.payment_status == "received"
-    assert services.active_product_stock([store_product.pk])[0][store_product.pk] == 8
+    assert services.active_product_stock_totals([store_product.pk])[store_product.pk] == 8
     key = uuid.uuid4()
     result = services.cancel_store_order(
         order_id=order.pk,
@@ -912,7 +912,7 @@ def test_new_legacy_retail_cancellation_reverses_allocated_batch_immediately_onc
     )
     assert result.status == "cancelled"
     assert result.payment_status == "refund_required"
-    assert services.active_product_stock([store_product.pk])[0][store_product.pk] == 10
+    assert services.active_product_stock_totals([store_product.pk])[store_product.pk] == 10
     services.cancel_store_order(
         order_id=order.pk,
         actor=active_user,
@@ -954,5 +954,5 @@ def test_historical_cancelled_legacy_retail_is_not_retroactively_restocked(
             idempotency_key=uuid.uuid4(),
             reason="Retry with different key",
         )
-    assert services.active_product_stock([store_product.pk])[0][store_product.pk] == 8
+    assert services.active_product_stock_totals([store_product.pk])[store_product.pk] == 8
     assert not StoreStockMovement.objects.filter(line__order=order, kind="restock").exists()

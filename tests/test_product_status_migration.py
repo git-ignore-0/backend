@@ -203,6 +203,8 @@ def test_status_schema_roundtrip_preserves_order_and_csa_history(
 
     original = history()
     assert all(original.values())
+    store_holds = "commerce.StoreStockReservation"
+    assert all(row["farm_id"] is not None for row in original[store_holds])
     try:
         executor.migrate([("commerce", "0012_product_status_expand")])
         MigrationExecutor(connection).migrate(latest)
@@ -213,6 +215,12 @@ def test_status_schema_roundtrip_preserves_order_and_csa_history(
             True,
             True,
         )
-        assert history() == original
+        # Rolling Commerce back past its assignment migration drops only this
+        # column. Reapplying must preserve the historical hold and ledger rows.
+        expected = {
+            **original,
+            store_holds: [{**row, "farm_id": None} for row in original[store_holds]],
+        }
+        assert history() == expected
     finally:
         MigrationExecutor(connection).migrate(latest)

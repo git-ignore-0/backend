@@ -173,10 +173,10 @@ def test_save_holds_points_and_stock_then_close_creates_order_once(context):
     selected = save(context)
     quota = MembershipCycleQuota.objects.get(cycle__membership=membership)
     assert quota.remaining_units == 4
-    from commerce.store_orders import _active_reserved_stock
+    from commerce.inventory import inventory_capacity
     from memberships.services import quota_availability_rows
 
-    assert _active_reserved_stock([product.pk])[product.pk] == 2
+    assert inventory_capacity([product.pk], now=timezone.now()).total_demand[product.pk] == 2
     assert quota_availability_rows(membership)[0][2] == 2
     service.process_round(round_.pk, now=round_.closes_at)
     service.process_round(round_.pk, now=round_.closes_at)
@@ -249,11 +249,13 @@ def test_api_requires_scopes_and_owns_selection(context, access_token):
 def test_shared_store_and_manual_usage_cannot_spend_csa_holds(context):
     import uuid
 
-    from commerce.public_catalog import public_product_queryset
+    from commerce.public_catalog import public_product_queryset, with_public_product_capacity
     from memberships.services import InsufficientQuota, create_usage_order
 
     selected = save(context)
-    assert public_product_queryset().get(pk=context[1].pk).available_quantity == 8
+    product = public_product_queryset().get(pk=context[1].pk)
+    with_public_product_capacity([product])
+    assert product.available_quantity == 8
     with pytest.raises(InsufficientQuota):
         create_usage_order(
             membership_id=context[2].pk,

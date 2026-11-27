@@ -1,7 +1,7 @@
-from django.db.models import BigIntegerField, OuterRef, Prefetch, Q, Subquery, Sum, Value
-from django.db.models.functions import Coalesce, Greatest
+from django.db.models import Prefetch, Q
 from django.utils import timezone
 
+from commerce.inventory import inventory_capacity
 from commerce.models import (
     PUBLIC_STORE_MAX_PRICE_VND,
     Category,
@@ -11,7 +11,6 @@ from commerce.models import (
 )
 from content.serializers import media_payload
 from farms.models import FarmProduct
-from farms.stock import product_stock_totals_query
 
 
 def _public_product_filter():
@@ -27,36 +26,17 @@ def _public_product_filter():
 
 
 def public_product_queryset(*, detail=False):
-    from commerce.store_orders import active_stock_batches, effective_store_stock_reservations
-    from memberships.csa_rounds import effective_stock_hold_rows
-
-    now = timezone.now()
-    current_stock = product_stock_totals_query(
-        active_stock_batches(now=now).filter(farm_product__product_id=OuterRef("pk"))
-    ).values("total")
-    reserved = _demand_for_product(effective_store_stock_reservations(now=now))
-    csa_reserved = _demand_for_product(effective_stock_hold_rows(now=now))
-    products = Product.objects.filter(_public_product_filter()).annotate(
-        available_quantity=Greatest(
-            Value(0),
-            Coalesce(Subquery(current_stock, output_field=BigIntegerField()), Value(0))
-            - reserved
-            - csa_reserved,
-            output_field=BigIntegerField(),
-        )
+    return with_public_product_details(
+        Product.objects.filter(_public_product_filter()), detail=detail
     )
-    return with_public_product_details(products, detail=detail)
 
 
-def _demand_for_product(rows):
-    quantity = (
-        rows.filter(product_id=OuterRef("pk"))
-        .order_by()
-        .values("product_id")
-        .annotate(total=Sum("quantity"))
-        .values("total")
-    )
-    return Coalesce(Subquery(quantity, output_field=BigIntegerField()), Value(0))
+def with_public_product_capacity(products):
+    items = list(products)
+    inventory = inventory_capacity((product.pk for product in items), now=timezone.now())
+    for product in items:
+        product.available_quantity = inventory.maximum(product.pk)
+    return items
 
 
 def with_public_product_details(products, *, detail=False):

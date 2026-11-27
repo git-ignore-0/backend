@@ -238,14 +238,14 @@ def test_save_rechecks_deadline_after_stock_read(context, monkeypatch, reselect)
         monkeypatch.setattr(timezone, "now", lambda: context[3].closes_at)
     else:
         cutoff = context[3].closes_at
-    original = service.active_product_stock_totals
+    original = service.inventory_capacity
 
     def delayed_stock(*args, **kwargs):
         result = original(*args, **kwargs)
         monkeypatch.setattr(timezone, "now", lambda: cutoff)
         return result
 
-    monkeypatch.setattr(service, "active_product_stock_totals", delayed_stock)
+    monkeypatch.setattr(service, "inventory_capacity", delayed_stock)
     code = "csa_reselection_expired" if reselect else "csa_selection_locked"
     with pytest.raises(service.CSARoundError, match=code):
         save(context, 3)
@@ -270,14 +270,14 @@ def test_save_rechecks_membership_end_date_after_stock_read(context, monkeypatch
     round_.closes_at = now + timedelta(days=2)
     round_.delivery_date = timezone.localdate(now) + timedelta(days=3)
     round_.save(update_fields=["closes_at", "delivery_date"])
-    original = service.active_product_stock_totals
+    original = service.inventory_capacity
 
     def delayed_stock(*args, **kwargs):
         result = original(*args, **kwargs)
         monkeypatch.setattr(timezone, "now", lambda: now + timedelta(days=1))
         return result
 
-    monkeypatch.setattr(service, "active_product_stock_totals", delayed_stock)
+    monkeypatch.setattr(service, "inventory_capacity", delayed_stock)
     with pytest.raises(service.CSARoundError, match="csa_membership_unavailable"):
         save(context)
     assert not CSASelection.objects.filter(round=round_).exists()

@@ -20,7 +20,11 @@ from commerce.models import (
     StoreOrderLine,
     StoreStockAllocation,
 )
-from commerce.public_catalog import public_product_payload, public_product_queryset
+from commerce.public_catalog import (
+    public_product_payload,
+    public_product_queryset,
+    with_public_product_capacity,
+)
 from commerce.serializers import (
     PublicStoreLocaleSerializer,
     StoreActionSerializer,
@@ -86,6 +90,7 @@ def store_error(error):
         "store_allocation_stale",
         "store_allocation_incomplete",
         "store_allocation_duplicate",
+        "store_allocation_mixed_farm",
         "store_payment_state_conflict",
         "store_refund_state_conflict",
         "store_restock_state_conflict",
@@ -267,7 +272,7 @@ def order_payload(order, *, guest_token=None, admin=False, request=None):
                 to_attr="payload_allocations",
             ),
         )
-        inventory = source_inventory(order)
+        inventory = source_inventory(order, lines=lines)
         result["allocation_suggestion"] = inventory.pop("suggestion")
         result["source_inventory"] = inventory
         allocations = []
@@ -578,8 +583,10 @@ class SelfStoreBuyAgainView(APIView):
         lines = list(order.lines.order_by("position", "id"))
         products = {
             product.pk: product
-            for product in public_product_queryset(detail=True).filter(
-                pk__in=[line.product_id for line in lines]
+            for product in with_public_product_capacity(
+                public_product_queryset(detail=True).filter(
+                    pk__in=[line.product_id for line in lines]
+                )
             )
         }
         result = []
@@ -704,8 +711,7 @@ class AdminStoreOrderApproveView(APIView):
             order = approve_store_order(
                 order_id=order_id,
                 actor=request.user,
-                idempotency_key=serializer.validated_data["idempotency_key"],
-                allocations=serializer.validated_data["allocations"],
+                **serializer.validated_data,
             )
         except (StoreOrder.DoesNotExist, StoreOrderError) as error:
             if isinstance(error, StoreOrder.DoesNotExist):

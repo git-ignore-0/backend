@@ -11,16 +11,16 @@ from django.db import transaction
 from django.db.models import Q, Sum
 from django.utils import timezone
 
+from commerce.inventory import inventory_capacity
 from commerce.models import Product, StoreOrder, StoreOrderLine
 from commerce.public_catalog import _public_product_filter
 from commerce.store_orders import (
-    _active_reserved_stock,
     _address_for_checkout,
     _lock_checkout_identity,
     _reference_code,
     _translation,
-    active_product_stock_totals,
 )
+from farms.models import Farm, FarmProduct
 from memberships.models import (
     CSARound,
     CSARoundConfiguration,
@@ -361,15 +361,17 @@ def selection_held_lines(selection, *, now):
     """Return only lines backed by an effective stock hold on the same selection."""
     if selection is None:
         return {}
-    holds = dict(
-        selection.stock_holds.filter(selection__in=active_stock_holds(now=now)).values_list(
-            "product_id", "quantity"
-        )
-    )
-    return {
-        line.product_id: (line, min(line.quantity, holds[line.product_id]))
-        for line in selection.lines.filter(product_id__in=holds)
+    holds = {
+        product_id: (quantity, farm_id)
+        for product_id, quantity, farm_id in selection.stock_holds.filter(
+            selection__in=active_stock_holds(now=now)
+        ).values_list("product_id", "quantity", "farm_id")
     }
+    held_lines = {}
+    for line in selection.lines.filter(product_id__in=holds):
+        quantity, farm_id = holds[line.product_id]
+        held_lines[line.product_id] = (line, min(line.quantity, quantity), farm_id)
+    return held_lines
 
 
 def selectable_csa_products():
@@ -379,10 +381,9 @@ def selectable_csa_products():
 
 
 def selection_stock_capacity(product_ids, selection, *, now=None):
-    now = now or timezone.now()
-    stock = active_product_stock_totals(product_ids, now=now)
-    held = _active_reserved_stock(product_ids, exclude_selection=selection, now=now)
-    return {pk: max(0, stock.get(pk, 0) - held.get(pk, 0)) for pk in product_ids}
+    product_ids = tuple(product_ids)
+    stock = inventory_capacity(product_ids, now=now or timezone.now(), exclude_selection=selection)
+    return {product_id: stock.maximum(product_id) for product_id in product_ids}
 
 
 def selection_quantity_limit(product, capacity, held_line, own_hold):
@@ -395,6 +396,32 @@ def selection_quantity_limit(product, capacity, held_line, own_hold):
     ):
         return own_hold
     return max(own_hold, capacity)
+
+
+def _assign_selection_farms(draft, products, previous, *, selection, now):
+    stock = inventory_capacity(
+        [product.pk for product, _, _ in draft], now=now, exclude_selection=selection
+    )
+    assignments = {}
+    for product, quantity, _ in draft:
+        product_id = product.pk
+        old_line, own, own_farm = previous.get(product_id, (None, 0, None))
+        live_product = products.get(product_id)
+        capacity = stock.maximum(product_id) if live_product is not None else 0
+        limit = selection_quantity_limit(live_product, capacity, old_line, own)
+        if quantity > limit:
+            if live_product is None or limit < capacity:
+                _fail("csa_product_unavailable")
+            _fail("csa_stock_insufficient")
+        farm_id = stock.choose_farm(product_id, quantity, preferred_farm_id=own_farm)
+        if farm_id is None:
+            if quantity > own:
+                _fail("csa_stock_insufficient")
+            # Natural batch expiry can strand a protected hold. Keep its original
+            # assignment (or legacy null) for an unchanged or reduced quantity.
+            farm_id = own_farm
+        assignments[product_id] = farm_id
+    return assignments
 
 
 def effective_stock_hold_rows(*, now, exclude_selection=None):
@@ -593,7 +620,6 @@ def save_selection(*, round_id, user, lines, locale="vi", now=None, expected_rev
         for p in selectable_csa_products().filter(pk__in=requested).prefetch_related("translations")
     }
     previous = selection_held_lines(existing, now=now)
-    capacity = selection_stock_capacity(products, existing, now=now)
     draft = []
     protected_points = defaultdict(Decimal)
     new_points = defaultdict(Decimal)
@@ -603,13 +629,9 @@ def save_selection(*, round_id, user, lines, locale="vi", now=None, expected_rev
         if isinstance(qty, bool) or not isinstance(qty, int) or qty <= 0:
             _fail("csa_selection_invalid")
         product = products.get(product_id)
-        old_line, own = previous.get(product_id, (None, 0))
-        available = capacity.get(product_id, 0)
-        limit = selection_quantity_limit(product, available, old_line, own)
-        if qty > limit:
-            if product is None or limit < available:
-                _fail("csa_product_unavailable")
-            _fail("csa_stock_insufficient")
+        old_line, own, _ = previous.get(product_id, (None, 0, None))
+        if product is None and qty > own:
+            _fail("csa_product_unavailable")
         product = product or locked_products[product_id]
         if old_line:
             # A retained quantity keeps the terms already committed, including
@@ -634,9 +656,30 @@ def save_selection(*, round_id, user, lines, locale="vi", now=None, expected_rev
         new_points[group_id] += max(0, qty - own) * cost
         draft.append((product, qty, snapshot))
 
+    # Prevent the new hold's Farm FK check from waiting after the final clock
+    # sample. Product mutexes already protect assignment candidates and source writes.
+    if draft:
+        farm_ids = set(
+            FarmProduct.objects.filter(
+                product_id__in=requested, removed_at__isnull=True, farm__is_active=True
+            ).values_list("farm_id", flat=True)
+        )
+        farm_ids.update(
+            farm_id
+            for product_id, (_, _, farm_id) in previous.items()
+            if product_id in requested and farm_id is not None
+        )
+        list(Farm.objects.select_for_update().filter(pk__in=farm_ids).order_by("pk"))
     candidates = _quota_candidates(member, existing, set(new_points))
     own_quota = (
         dict(existing.quota_holds.values_list("cycle_quota_id", "units")) if existing else {}
+    )
+    # Read shared inventory after waiting for quota locks, using the same clock
+    # for batch dates, effective Store reservations, and effective CSA holds.
+    decision_at = supplied_now or timezone.now()
+    _validate_selection_window(round_, member, existing, decision_at)
+    assignments = _assign_selection_farms(
+        draft, products, previous, selection=existing, now=decision_at
     )
     allocations = defaultdict(Decimal)
     for group_id, rows in candidates.items():
@@ -664,17 +707,12 @@ def save_selection(*, round_id, user, lines, locale="vi", now=None, expected_rev
                 needed -= take
         if needed:
             _fail("csa_quota_insufficient")
-    # Inventory/quota locks may have waited past a deadline or a batch date boundary.
-    decision_at = supplied_now or timezone.now()
-    _validate_selection_window(round_, member, existing, decision_at)
-    if timezone.localdate(decision_at) != timezone.localdate(now):
-        capacity = selection_stock_capacity(products, existing, now=decision_at)
-        for product, quantity, _snapshot in draft:
-            old_line, own = previous.get(product.pk, (None, 0))
-            if quantity > selection_quantity_limit(
-                products.get(product.pk), capacity.get(product.pk, 0), old_line, own
-            ):
-                _fail("csa_stock_insufficient")
+    write_at = supplied_now or timezone.now()
+    _validate_selection_window(round_, member, existing, write_at)
+    if timezone.localdate(write_at) != timezone.localdate(decision_at):
+        assignments = _assign_selection_farms(
+            draft, products, previous, selection=existing, now=write_at
+        )
     selection = existing or CSASelection.objects.create(
         round=round_, membership=member, locale=locale, address_snapshot=address
     )
@@ -690,7 +728,10 @@ def save_selection(*, round_id, user, lines, locale="vi", now=None, expected_rev
         ]
     )
     CSAStockHold.objects.bulk_create(
-        [CSAStockHold(selection=selection, product=p, quantity=q) for p, q, _ in draft]
+        [
+            CSAStockHold(selection=selection, product=p, quantity=q, farm_id=assignments[p.pk])
+            for p, q, _ in draft
+        ]
     )
     CSAQuotaHold.objects.bulk_create(
         [

@@ -4,6 +4,7 @@ from django.conf import settings
 from django.db import models
 from django.db.models import Q
 
+STORE_CHECKOUT_MAX_QUANTITY = 999
 PUBLIC_STORE_MAX_PRICE_VND = 1_000_000_000
 
 
@@ -467,6 +468,9 @@ class StoreStockReservation(models.Model):
     )
     product = models.ForeignKey(
         Product, related_name="store_stock_reservations", on_delete=models.PROTECT
+    )
+    farm = models.ForeignKey(
+        "farms.Farm", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
     quantity = models.PositiveIntegerField()
     released_at = models.DateTimeField(null=True, blank=True)

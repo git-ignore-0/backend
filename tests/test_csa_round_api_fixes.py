@@ -780,16 +780,11 @@ def test_products_projects_inventory_without_materializing_batches(context, monk
     )
     own = save(context, quantity=3)
     overlapping = publish_overlapping_round(context)
-    service.save_selection(
-        round_id=overlapping.pk,
-        user=user,
-        lines=[{"product_id": product.pk, "quantity": 1}],
-    )
     first = FarmProductStockBatch.objects.get(farm_product__product=product)
     today = timezone.localdate(now)
     for units, active, end in [
         (4, True, today),
-        (6, True, today),
+        (6, True, today + timedelta(days=1)),
         (99, False, today),
         (99, True, today - timedelta(days=1)),
     ]:
@@ -803,6 +798,15 @@ def test_products_projects_inventory_without_materializing_batches(context, monk
         )
         if units == 4:
             second = batch
+        if units == 6:
+            largest_farm = farm
+
+    other_selection = service.save_selection(
+        round_id=overlapping.pk,
+        user=user,
+        lines=[{"product_id": product.pk, "quantity": 1}],
+    )
+    assert other_selection.stock_holds.get().farm_id == second.farm_product.farm_id
 
     for i, expires_at in enumerate((None, now + timedelta(hours=1), now - timedelta(hours=1))):
         quantity = 14 if i == 0 else 2
@@ -830,7 +834,9 @@ def test_products_projects_inventory_without_materializing_batches(context, monk
             cash_subtotal_vnd=quantity,
         )
         if i:
-            StoreStockReservation.objects.create(line=line, product=product, quantity=2)
+            StoreStockReservation.objects.create(
+                line=line, product=product, quantity=2, farm=largest_farm
+            )
             continue
         for batch, sold in [(first, 12), (second, 2)]:
             # An anomalous legacy batch can be oversold. Its deficit must not
@@ -860,10 +866,10 @@ def test_products_projects_inventory_without_materializing_batches(context, monk
     response = client.get(f"{url}/products")
     assert response.status_code == 200, response.json()
     row = response.json()["data"][0]
-    # Per-batch remaining 0 + 3 + 6, less 2 Store and 1 other CSA.
-    assert row["available_quantity"] == 6
+    # Farm capacity is max(0, 3 less 1 other CSA, 6 less 2 active Store).
+    assert row["available_quantity"] == 4
     assert not hydrated
-    for quantity, expected_status in [(7, 409), (6, 200)]:
+    for quantity, expected_status in [(5, 409), (4, 200)]:
         result = client.put(
             f"{url}/selection",
             {
@@ -874,4 +880,5 @@ def test_products_projects_inventory_without_materializing_batches(context, monk
             format="json",
         )
         assert result.status_code == expected_status, result.json()
-    assert own.stock_holds.get().quantity == 6
+    assert own.stock_holds.get().quantity == 4
+    assert own.stock_holds.get().farm_id == largest_farm.pk

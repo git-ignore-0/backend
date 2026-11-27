@@ -308,6 +308,24 @@ def _farm_delete_product_reference(rows, code):
     }
 
 
+def _farm_delete_reservation_reference(farm_id, *, now):
+    from commerce.inventory import effective_store_stock_reservations
+    from memberships.csa_rounds import effective_stock_hold_rows
+
+    order = (
+        effective_store_stock_reservations(now=now)
+        .filter(farm_id=farm_id)
+        .order_by("pk")
+        .values_list("line__order_id", "line__order__reference_code")
+        .first()
+    )
+    if order:
+        return {"code": "store_order", "id": str(order[0]), "label": order[1]}
+    return _farm_delete_product_reference(
+        effective_stock_hold_rows(now=now).filter(farm_id=farm_id), "supplying_product"
+    )
+
+
 def farm_capabilities(farm_id):
     sources = FarmProduct.objects.filter(farm_id=farm_id)
     supplying = _farm_delete_product_reference(
@@ -341,6 +359,10 @@ def farm_capabilities(farm_id):
             reasons.append(
                 {"code": "farm_supply_request", "id": str(request["id"]), "label": request["code"]}
             )
+    if not reasons and (
+        reservation := _farm_delete_reservation_reference(farm_id, now=timezone.now())
+    ):
+        reasons.append(reservation)
     return {"delete": {"allowed": not reasons, "reasons": reasons}}
 
 
@@ -473,8 +495,8 @@ def add_farm_product(*, farm_id, product_id, start_date, end_date, quantity_unit
 
 
 def farm_product_removal_blocker(source, *, now=None):
+    from commerce.inventory import inventory_capacity
     from commerce.models import StoreOrderStatus
-    from commerce.store_orders import _active_reserved_stock, active_product_stock_totals
 
     decision_at = now or timezone.now()
     orders = list(
@@ -494,23 +516,22 @@ def farm_product_removal_blocker(source, *, now=None):
                 "has_more": len(orders) > 3,
             },
         )
-    product_ids = [source.product_id]
-    required = _active_reserved_stock(product_ids, now=decision_at).get(source.product_id, 0)
+    product_id = source.product_id
+    capacity = inventory_capacity([product_id], now=decision_at, exclude_source_id=source.pk)
+    assigned = capacity.assigned.get((product_id, source.farm_id), 0)
+    required, remaining = (
+        (assigned, 0) if assigned else capacity.legacy_shortfalls.get(product_id, (0, 0))
+    )
     if not required:
         return None
-    remaining = active_product_stock_totals(
-        product_ids, now=decision_at, exclude_source_id=source.pk
-    ).get(source.product_id, 0)
-    if remaining < required:
-        return FarmConflict(
-            "farm_product_supply_shortfall",
-            context={
-                "required_units": required,
-                "remaining_units": remaining,
-                "shortfall_units": required - remaining,
-            },
-        )
-    return None
+    return FarmConflict(
+        "farm_product_supply_shortfall",
+        context={
+            "required_units": required,
+            "remaining_units": remaining,
+            "shortfall_units": required - remaining,
+        },
+    )
 
 
 @transaction.atomic

@@ -239,7 +239,7 @@ def test_public_store_list_returns_localized_card_contract():
 
 
 @pytest.mark.django_db
-def test_public_store_sums_only_current_stock_from_active_farms_and_links():
+def test_public_store_reports_highest_farm_capacity_from_current_stock():
     category = make_category("stocked-vegetables")
     product = make_product("stocked-tomato", category)
     today = timezone.localdate()
@@ -291,8 +291,8 @@ def test_public_store_sums_only_current_stock_from_active_farms_and_links():
     assert detail.status_code == 200
     assert listed["Cache-Control"] == "private, no-store"
     assert detail["Cache-Control"] == "private, no-store"
-    assert listed.json()["data"][0]["available_quantity"] == 25
-    assert detail.json()["data"]["available_quantity"] == 25
+    assert listed.json()["data"][0]["available_quantity"] == 15
+    assert detail.json()["data"]["available_quantity"] == 15
 
 
 @pytest.mark.django_db

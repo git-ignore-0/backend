@@ -175,23 +175,25 @@ def order_for(product, *, expected_available=10, quantity=2):
 
 
 @pytest.mark.parametrize("remaining", [5, 3])
-def test_remove_covers_store_and_csa_demand_without_changing_holds(
+def test_remove_covers_legacy_store_and_csa_demand_without_assigning_holds(
     context, payment_settings, remaining
 ):
     actor, product, _, _, _ = context
     source = product.farm_offers.get()
+    selection = save(context)
+    order = order_for(product, expected_available=8)
+    selection.stock_holds.update(farm=None)
+    order.lines.get().stock_reservations.update(farm=None)
     other = FarmProduct.objects.create(
         farm=Farm.objects.create(**farm_payload(name_en="Other farm")), product=product
     )
     other.stock_batches.create(**values(remaining))
-    selection = save(context)
-    order = order_for(product, expected_available=10 + remaining - 2)
     if remaining == 3:
         with pytest.raises(services.FarmConflict, match="farm_product_supply_shortfall") as error:
             services.remove_farm_product(**intent(source, actor))
         assert error.value.context == {
-            "required_units": 4,
-            "remaining_units": 3,
+            "required_units": 2,
+            "remaining_units": 1,
             "shortfall_units": 1,
         }
         assert not ContentAuditLog.objects.filter(action="farm.product.remove").exists()
@@ -199,8 +201,10 @@ def test_remove_covers_store_and_csa_demand_without_changing_holds(
         services.remove_farm_product(**intent(source, actor))
     source.refresh_from_db()
     assert (source.removed_at is not None) == (remaining == 5)
-    assert order.lines.get().stock_reservations.get().released_at is None
-    assert CSAStockHold.objects.get(selection=selection).quantity == 2
+    reservation = order.lines.get().stock_reservations.get()
+    assert (reservation.farm_id, reservation.released_at) == (None, None)
+    hold = CSAStockHold.objects.get(selection=selection)
+    assert (hold.farm_id, hold.quantity) == (None, 2)
 
 
 @pytest.mark.parametrize("terminal", [StoreOrderStatus.DELIVERED, StoreOrderStatus.CANCELLED])
@@ -256,28 +260,29 @@ def test_open_allocation_blocks_even_with_other_farm_and_terminal_keeps_history(
 
 
 def test_only_current_generation_enters_public_farm_store_and_csa_totals(context):
-    from commerce.public_catalog import public_product_queryset
-    from commerce.store_orders import active_product_stock
+    from commerce.public_catalog import public_product_queryset, with_public_product_capacity
+    from commerce.store_orders import active_product_stock_totals
     from memberships.csa_rounds import selection_stock_capacity
 
     actor, product, _, _, _ = context
     source = product.farm_offers.get()
+    removed = services.remove_farm_product(**intent(source, actor))
     alternate = FarmProduct.objects.create(
         farm=Farm.objects.create(**farm_payload(name_en="Alternate stock")), product=product
     )
     alternate.stock_batches.create(**values(5))
     selection = save(context)
 
-    removed = services.remove_farm_product(**intent(source, actor))
     current, first = services.readd_farm_product(**intent(removed, actor), data=values(4))
     assert first.supply_generation == 2
-    assert active_product_stock([product.pk])[0][product.pk] == 9
+    assert active_product_stock_totals([product.pk])[product.pk] == 9
     assert active_product_stock_totals([product.pk]) == {product.pk: 9}
     assert services.farm_product_queryset().get(pk=current.pk).available_quantity == 4
     assert services.farm_queryset().get(pk=source.farm_id).in_stock_product_count == 1
-    assert public_product_queryset().get(pk=product.pk).available_quantity == 7
-    assert selection_stock_capacity([product.pk], selection) == {product.pk: 9}
-    assert selection_stock_capacity([product.pk], None) == {product.pk: 7}
+    [public_product] = with_public_product_capacity(public_product_queryset().filter(pk=product.pk))
+    assert public_product.available_quantity == 4
+    assert selection_stock_capacity([product.pk], selection) == {product.pk: 5}
+    assert selection_stock_capacity([product.pk], None) == {product.pk: 4}
 
 
 def test_remove_checks_shortfall_even_if_target_already_contributes_zero(context):
@@ -293,7 +298,7 @@ def test_remove_checks_shortfall_even_if_target_already_contributes_zero(context
     with pytest.raises(services.FarmConflict, match="farm_product_supply_shortfall") as error:
         services.remove_farm_product(**intent(source, actor))
 
-    assert error.value.context == {"required_units": 2, "remaining_units": 1, "shortfall_units": 1}
+    assert error.value.context == {"required_units": 2, "remaining_units": 0, "shortfall_units": 2}
     assert services.farm_product_queryset().get(pk=source.pk).available_quantity == 0
     assert CSAStockHold.objects.get(selection=selection).quantity == 2
     source.refresh_from_db()
@@ -310,8 +315,11 @@ def test_source_inventory_suggestion_preserves_effective_other_demand(
     store_product.farm_offers.get().stock_batches.update(quantity_units=7)
 
     inventory = source_inventory(first)
-    assert inventory["suggestion"][0]["quantity"] == 2
-    assert inventory["candidates"][0]["available_quantity"] == 7
+    assert inventory["suggestion"] == []
+    assert inventory["lines"][0]["suggested_farm_id"] is None
+    assert inventory["lines"][0]["farms"][0]["available_quantity"] == 2
+    assert inventory["lines"][0]["farms"][0]["eligible"] is False
+    assert inventory["candidates"][0]["available_quantity"] == 0
     assert inventory["product_reservations"] == [
         {
             "product_id": str(store_product.pk),

@@ -3,7 +3,7 @@ from decimal import Decimal
 from django.utils.text import slugify
 from rest_framework import serializers
 
-from commerce.models import ProductStatus
+from commerce.models import STORE_CHECKOUT_MAX_QUANTITY, ProductStatus
 from config.phones import InvalidPhoneNumber, normalize_vietnam_phone
 from members.administrative_units import province_exists, ward_choices
 from memberships.quota_points import POINT_INPUT_ERROR, is_allowed_point_input
@@ -267,7 +267,7 @@ class PublicStoreProductQuerySerializer(PublicStoreLocaleSerializer):
 
 class StoreCheckoutLineSerializer(StrictSerializer):
     product_id = serializers.UUIDField()
-    quantity = serializers.IntegerField(min_value=1, max_value=999)
+    quantity = serializers.IntegerField(min_value=1, max_value=STORE_CHECKOUT_MAX_QUANTITY)
     use_quota = serializers.BooleanField()
     expected_unit_price_vnd = serializers.IntegerField(
         min_value=1, max_value=MAX_POSITIVE_BIG_INTEGER
@@ -284,7 +284,7 @@ class StoreGuestAddressSerializer(ShippingAddressSerializer):
 
 class StoreVoucherLineSerializer(StrictSerializer):
     product_id = serializers.UUIDField()
-    quantity = serializers.IntegerField(min_value=1, max_value=999)
+    quantity = serializers.IntegerField(min_value=1, max_value=STORE_CHECKOUT_MAX_QUANTITY)
     use_quota = serializers.BooleanField()
 
 
@@ -345,15 +345,33 @@ class StoreAllocationSerializer(StrictSerializer):
     quantity = serializers.IntegerField(min_value=1, max_value=999999)
 
 
+class StoreApprovalSourceSerializer(StrictSerializer):
+    line_id = serializers.UUIDField()
+    farm_id = serializers.UUIDField()
+
+
 class StoreApproveSerializer(StrictSerializer):
     idempotency_key = serializers.UUIDField()
-    allocations = StoreAllocationSerializer(many=True, allow_empty=False)
+    allocations = StoreAllocationSerializer(many=True, allow_empty=False, required=False)
+    sources = StoreApprovalSourceSerializer(
+        many=True, allow_empty=False, max_length=100, required=False
+    )
 
     def validate_allocations(self, value):
         pairs = [(item["line_id"], item["batch_id"]) for item in value]
         if len(pairs) != len(set(pairs)):
             raise serializers.ValidationError("Each line and batch pair may appear only once.")
         return value
+
+    def validate_sources(self, value):
+        if len(value) != len({item["line_id"] for item in value}):
+            raise serializers.ValidationError("Each line may appear only once.")
+        return value
+
+    def validate(self, attrs):
+        if ("sources" in attrs) == ("allocations" in attrs):
+            raise serializers.ValidationError("Provide exactly one of sources or allocations.")
+        return attrs
 
 
 class StoreOrderQuerySerializer(StrictSerializer):

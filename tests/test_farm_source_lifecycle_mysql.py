@@ -108,7 +108,7 @@ def test_remove_and_store_checkout_share_product_lock(
 
 
 @pytest.mark.parametrize("remove_first", [True, False], ids=["remove-first", "approve-first"])
-def test_remove_and_approval_never_commit_a_sale_to_removed_source(
+def test_remove_and_approval_protect_assigned_then_allocated_source(
     store_product, active_user, checkout_operation, remove_first
 ):
     order, _, created = checkout_operation()
@@ -136,27 +136,20 @@ def test_remove_and_approval_never_commit_a_sale_to_removed_source(
 
     order.refresh_from_db()
     reservation = line.stock_reservations.get()
-    if remove_first:
-        assert removing.result().pk == source.pk
-        with pytest.raises(StoreOrderError, match="^store_allocation_stale$"):
-            approving.result()
-        assert order.status == StoreOrderStatus.PENDING_REVIEW
-        assert reservation.released_at is None
-        assert not line.stock_allocations.exists()
-        assert not StoreStockMovement.objects.filter(line=line).exists()
-        assert not order.actions.filter(action="approve").exists()
-    else:
-        assert approving.result().pk == order.pk
-        with pytest.raises(lifecycle.FarmConflict, match="^farm_product_has_open_allocations$"):
-            removing.result()
-        assert order.status == StoreOrderStatus.PAYMENT_PENDING
-        assert reservation.released_at is not None
-        allocation = line.stock_allocations.get()
-        assert (allocation.batch_id, allocation.quantity) == (batch.pk, 2)
-        assert list(allocation.movements.values_list("kind", "quantity")) == [("sale", 2)]
-        assert order.actions.filter(action="approve", idempotency_key=approval_key).count() == 1
-    assert_source_state(source, removed=remove_first, version=2 if remove_first else 1)
-    assert source_events(source, "remove") == int(remove_first)
+    expected_error = (
+        "farm_product_supply_shortfall" if remove_first else "farm_product_has_open_allocations"
+    )
+    with pytest.raises(lifecycle.FarmConflict, match=f"^{expected_error}$"):
+        removing.result()
+    assert approving.result().pk == order.pk
+    assert order.status == StoreOrderStatus.PAYMENT_PENDING
+    assert reservation.released_at is not None
+    allocation = line.stock_allocations.get()
+    assert (allocation.batch_id, allocation.quantity) == (batch.pk, 2)
+    assert list(allocation.movements.values_list("kind", "quantity")) == [("sale", 2)]
+    assert order.actions.filter(action="approve", idempotency_key=approval_key).count() == 1
+    assert_source_state(source, removed=False, version=1)
+    assert source_events(source, "remove") == 0
 
 
 @pytest.mark.parametrize("remove_first", [True, False], ids=["remove-first", "hold-first"])

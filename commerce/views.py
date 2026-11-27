@@ -14,6 +14,7 @@ from commerce.public_catalog import (
     public_category_payloads,
     public_product_payload,
     public_product_queryset,
+    with_public_product_capacity,
 )
 from commerce.serializers import (
     AccountShippingAddressSerializer,
@@ -161,7 +162,7 @@ class PublicStoreProductListView(APIView):
         total = rows.count()
         page = data["page"]
         page_size = data["page_size"]
-        items = rows[(page - 1) * page_size : page * page_size]
+        items = with_public_product_capacity(rows[(page - 1) * page_size : page * page_size])
         return no_store(
             Response(
                 {
@@ -181,6 +182,7 @@ class PublicStoreProductDetailView(APIView):
         query = PublicStoreLocaleSerializer(data=request.query_params.dict())
         query.is_valid(raise_exception=True)
         item = get_object_or_404(public_product_queryset(detail=True), slug=slug)
+        with_public_product_capacity([item])
         return no_store(
             Response(
                 {

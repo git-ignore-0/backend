@@ -11,6 +11,7 @@ from rest_framework import serializers
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from commerce.inventory import active_stock_batches
 from commerce.models import Product
 from commerce.public_catalog import (
     _translation,
@@ -18,7 +19,7 @@ from commerce.public_catalog import (
     public_quota_group_payload,
     with_public_product_details,
 )
-from commerce.store_orders import StoreOrderError, active_stock_batches
+from commerce.store_orders import StoreOrderError
 from content.permissions import IsWebsiteAdmin
 from memberships import csa_rounds as domain
 from memberships.csa_admin_payloads import admin_round_payload
@@ -411,7 +412,7 @@ class MemberProducts(PrivateView):
         live_products = {product.pk: product for product in with_public_product_details(products)}
         capacity = domain.selection_stock_capacity(live_products, existing, now=stock_at)
         snapshot_group_ids = {
-            uuid.UUID(line.snapshot["quota_group_id"]) for line, _ in held_lines.values()
+            uuid.UUID(line.snapshot["quota_group_id"]) for line, _, _ in held_lines.values()
         }
         snapshot_groups = QuotaGroup.objects.prefetch_related("translations").in_bulk(
             snapshot_group_ids
@@ -419,7 +420,7 @@ class MemberProducts(PrivateView):
         data = []
         for product_id in dict.fromkeys((*live_products, *held_lines)):
             product = live_products.get(product_id)
-            line, own = held_lines.get(product_id, (None, 0))
+            line, own, _ = held_lines.get(product_id, (None, 0, None))
             limit = domain.selection_quantity_limit(product, capacity.get(product_id, 0), line, own)
             if not limit:
                 continue

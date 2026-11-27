@@ -2261,6 +2261,9 @@ class CSAStockHold(models.Model):
         CSASelection, related_name="stock_holds", on_delete=models.CASCADE
     )
     product = models.ForeignKey("commerce.Product", on_delete=models.PROTECT)
+    farm = models.ForeignKey(
+        "farms.Farm", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
     quantity = models.PositiveIntegerField()
 
     class Meta:
