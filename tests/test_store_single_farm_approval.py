@@ -3,6 +3,8 @@ from datetime import timedelta
 
 import pytest
 from django.contrib.auth.models import Group
+from django.db import connection
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 from rest_framework.test import APIClient
 
@@ -576,3 +578,91 @@ def test_approval_preserves_own_capacity_from_a_verified_plan(
     after = inventory_capacity([product.pk], now=timezone.now())
     assert after.recovery_shortfalls == {}
     assert after.maximum(product.pk) == 0
+
+
+@pytest.mark.parametrize("legacy_shape", [False, True], ids=["sources", "allocations"])
+def test_approval_rechecks_stock_after_consuming_a_partially_deficient_farm(
+    admin, access_token, store_product, payment_settings, monkeypatch, legacy_shape
+):
+    now = timezone.now()
+    monkeypatch.setattr(timezone, "now", lambda: now)
+    product = store_product
+    product.farm_offers.get().stock_batches.all().delete()
+    farm_a = supply(product, "Farm A", 4, farm_id=uuid.UUID(int=1))
+    source = farm_a.products.get()
+    batch_a = source.stock_batches.get()
+    today = timezone.localdate()
+    expiring = source.stock_batches.create(start_date=today, end_date=today, quantity_units=2)
+    first = _checkout(product, quantity=4, expected_available=6)
+    other = _checkout(product, quantity=2, expected_available=2)
+    own = first.lines.get().stock_reservations.get()
+    other_hold = other.lines.get().stock_reservations.get()
+    assert own.farm_id == other_hold.farm_id == farm_a.pk
+    farm_b = supply(product, "Farm B", 2, farm_id=uuid.UUID(int=2))
+    strand_supply(expiring, monkeypatch)
+    expiry = timezone.now() + timedelta(hours=12)
+    StoreOrder.objects.filter(pk__in=[first.pk, other.pk]).update(expires_at=expiry)
+    access_token.expires = expiry
+    access_token.save(update_fields=["expires"])
+
+    before = inventory_capacity([product.pk], now=timezone.now())
+    assert before.physical == {(product.pk, farm_a.pk): 4, (product.pk, farm_b.pk): 2}
+    assert before.assigned == {(product.pk, farm_a.pk): 6}
+    assert before.stranded_hold_counts == {product.pk: 2}
+    assert not before.recovery_shortfalls
+    assert before.maximum(product.pk) == 0
+
+    with CaptureQueriesContext(connection) as queries:
+        inventory_capacity(
+            [product.pk], now=timezone.now(), exclude_order=first, recover_stranded=True
+        )
+    assert len(queries) == 1
+
+    detail = admin.get(_path(first))
+    assert detail.status_code == 200, detail.json()
+    projected = detail.json()["data"]["source_inventory"]["lines"][0]
+    options = {row["farm_id"]: row for row in projected["farms"]}
+    key = uuid.uuid4()
+    payload = {"idempotency_key": str(key)}
+    if legacy_shape:
+        payload["allocations"] = [_allocation(own.line, batch_a, 4)]
+    else:
+        payload["sources"] = [_source(own.line, batch_a)]
+    response = admin.post(f"{_path(first)}/approve", payload, format="json")
+    assert (
+        options[str(farm_a.pk)]["eligible"],
+        projected["suggested_farm_id"],
+        response.status_code,
+    ) == (
+        True,
+        str(farm_a.pk),
+        200,
+    )
+    assert options[str(farm_b.pk)]["eligible"] is False
+    assert_admin_action_receipt(response, first.pk, "approve", key)
+    replay = admin.post(f"{_path(first)}/approve", payload, format="json")
+    assert_admin_action_receipt(replay, first.pk, "approve", key)
+    assert first.actions.filter(action="approve").count() == 1
+    assert list(own.line.stock_allocations.values_list("batch_id", "quantity")) == [(batch_a.pk, 4)]
+    assert list(
+        StoreStockMovement.objects.filter(line=own.line).values_list("kind", "quantity")
+    ) == [("sale", 4)]
+
+    other_hold.refresh_from_db()
+    assert (other_hold.farm_id, other_hold.quantity, other_hold.released_at) == (farm_a.pk, 2, None)
+    after = inventory_capacity([product.pk], now=timezone.now())
+    assert after.total_demand == {product.pk: 2}
+    assert after.stranded_hold_counts == {product.pk: 1}
+    assert not after.recovery_shortfalls
+    assert after.maximum(product.pk) == 0
+    next_key = uuid.uuid4()
+    recovered = admin.post(
+        f"{_path(other)}/approve",
+        {
+            "idempotency_key": str(next_key),
+            "sources": [{"line_id": str(other_hold.line_id), "farm_id": str(farm_b.pk)}],
+        },
+        format="json",
+    )
+    assert_admin_action_receipt(recovered, other.pk, "approve", next_key)
+    assert other_hold.line.stock_allocations.get().batch.farm_product.farm_id == farm_b.pk

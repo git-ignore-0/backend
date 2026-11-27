@@ -266,6 +266,57 @@ def test_csa_can_recover_its_verified_hold_without_increasing_quota(
     assert not inventory_capacity([product.pk], now=timezone.now()).recovery_shortfalls
 
 
+def test_csa_replacement_preserves_protected_quantity_at_a_partially_deficient_farm(
+    context, payment_settings, monkeypatch
+):
+    from commerce.inventory import inventory_capacity
+    from commerce.store_orders import create_store_checkout
+
+    _, product, member, round_, now = context
+    expiring = _initial_batch(product, now, units=2)
+    original = expiring.farm_product.farm
+    _batch(product, now, units=4, farm=original, days=3)
+    round_.closes_at = now + timedelta(days=2)
+    round_.delivery_date = timezone.localdate(now) + timedelta(days=3)
+    round_.save(update_fields=["closes_at", "delivery_date"])
+    quota = MembershipCycleQuota.objects.get(cycle__membership=member)
+    quota.granted_units = quota.remaining_units = 10
+    quota.save(update_fields=["granted_units", "remaining_units"])
+    selection = save(context, quantity=4)
+    order, _, _ = create_store_checkout(
+        user=None, payload=checkout_payload(product, quantity=2, expected_available=2)
+    )
+    supply(product, "Farm B", 2, farm_id=UUID(int=2))
+    strand_supply(expiring, monkeypatch)
+    StoreOrder.objects.filter(pk=order.pk).update(expires_at=timezone.now() + timedelta(hours=12))
+
+    before = inventory_capacity([product.pk], now=timezone.now())
+    assert before.stranded_hold_counts == {product.pk: 2}
+    assert not before.recovery_shortfalls
+    # Keeping an existing hold at its own Farm uses the protected floor.
+    # Replacement capacity itself must leave the other hold at that Farm covered.
+    assert service.selection_stock_capacity([product.pk], selection) == {product.pk: 2}
+    with pytest.raises(service.CSARoundError, match="^csa_stock_insufficient$"):
+        save(context, quantity=5, expected_revision=selection.revision)
+    selection.refresh_from_db()
+    assert selection.revision == 1
+    kept = save(context, quantity=4, expected_revision=selection.revision)
+    reduced = save(context, quantity=3, expected_revision=kept.revision)
+    assert reduced.revision == 3
+    hold = reduced.stock_holds.get()
+    assert (hold.farm_id, hold.quantity) == (original.pk, 3)
+    assert reduced.quota_holds.get().units == 3
+    quota.refresh_from_db()
+    assert quota.remaining_units == 10
+    other_hold = order.lines.get().stock_reservations.get()
+    assert (other_hold.farm_id, other_hold.quantity, other_hold.released_at) == (
+        original.pk,
+        2,
+        None,
+    )
+    assert not inventory_capacity([product.pk], now=timezone.now()).recovery_shortfalls
+
+
 def test_order_creation_and_reselection_preserve_exactly_one_assignment_per_product(
     context, monkeypatch
 ):

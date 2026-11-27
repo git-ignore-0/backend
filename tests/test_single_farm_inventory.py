@@ -1,9 +1,11 @@
+from collections import Counter
 from datetime import timedelta
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from django.utils import timezone
 
+from commerce.inventory import _add_recovery_options, _pack_holds, _partition_assigned
 from commerce.models import CatalogTreeLock, StoreStockReservation
 from commerce.serializers import StoreCheckoutSerializer
 from commerce.store_orders import StoreOrderError, create_store_checkout, preview_store_voucher
@@ -39,6 +41,51 @@ def checkout_payload(product, **kwargs):
     serializer = StoreCheckoutSerializer(data=guest_payload(product, **kwargs))
     serializer.is_valid(raise_exception=True)
     return serializer.validated_data
+
+
+@pytest.mark.parametrize(
+    ("stocks", "own_size", "other_sizes", "legacy_sizes", "approve", "verified", "eligible"),
+    [
+        pytest.param((4, 2), 4, ((2,),), (), True, True, (0,), id="own-larger"),
+        pytest.param((4, 4), 2, ((4,),), (), True, True, (0, 1), id="own-smaller"),
+        pytest.param((4, 2, 2), 4, ((2, 2),), (), True, True, (0,), id="multiple-holds-and-farms"),
+        pytest.param((4, 2, 3), 4, ((2,),), (3,), True, True, (0,), id="legacy-hold"),
+        pytest.param((4, 4, 2), 4, ((2,), (2,)), (), True, True, (0,), id="healthy-other-hold"),
+        pytest.param((5, 4, 4), 4, ((4,),), (5,), True, True, (), id="post-consumption-shortfall"),
+        pytest.param((4, 1), 4, ((2,),), (), True, False, (), id="partial-rejects-origin"),
+        pytest.param((0, 4), 4, ((3,),), (), True, False, (1,), id="partial-keeps-alternate"),
+        pytest.param((4, 2), 4, ((2,),), (), False, True, (), id="csa-replacement"),
+    ],
+)
+def test_contextual_capacity_verifies_proposed_consumption(
+    stocks, own_size, other_sizes, legacy_sizes, approve, verified, eligible
+):
+    farms = [UUID(int=index) for index in range(1, len(stocks) + 1)]
+    original = farms[0]
+    physical = dict(zip(farms, stocks, strict=True))
+    other = {farm: Counter(sizes) for farm, sizes in zip(farms, other_sizes, strict=False) if sizes}
+    own = {original: Counter({own_size: 1})}
+    legacy = Counter(legacy_sizes)
+    all_assigned = other | {original: other.get(original, Counter()) + own[original]}
+    full_free, full_stranded, full_deficient = _partition_assigned(physical, all_assigned)
+    _, full_shortfall = _pack_holds(legacy + full_stranded, full_free)
+    assert (full_shortfall is None) is verified
+    free, stranded, deficient = _partition_assigned(physical, other)
+    plan, _ = _pack_holds(legacy + stranded, free)
+    plan = {farm: units for farm, units in plan.items() if farm not in deficient}
+
+    _add_recovery_options(plan, own, physical, other, legacy, for_approval=approve)
+
+    assert {farm for farm, units in plan.items() if units >= own_size} == {
+        farms[index] for index in eligible
+    }
+    if verified and approve:
+        for index in eligible:
+            target = farms[index]
+            after_stock = physical | {target: physical[target] - own_size}
+            after_free, after_stranded, after_deficient = _partition_assigned(after_stock, other)
+            assert not after_deficient - full_deficient
+            assert _pack_holds(legacy + after_stranded, after_free)[1] is None
 
 
 def test_checkout_reserves_one_farm_and_cannot_use_fragmented_capacity(

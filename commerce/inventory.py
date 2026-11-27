@@ -247,7 +247,7 @@ def inventory_capacity(
         own = own_holds.get(product_id)
         if own:
             _add_recovery_options(
-                plan, own, farm_stock, assigned_holds, legacy, allow_partial=recover_stranded
+                plan, own, farm_stock, assigned_holds, legacy, for_approval=recover_stranded
             )
         free.update({(product_id, farm): units for farm, units in plan.items()})
 
@@ -263,7 +263,7 @@ def inventory_capacity(
     )
 
 
-def _add_recovery_options(plan, own, physical, assigned, legacy, *, allow_partial):
+def _add_recovery_options(plan, own, physical, assigned, legacy, *, for_approval):
     all_assigned = assigned | {
         farm: assigned.get(farm, Counter()) + quantities
         for farm, quantities in own.items()
@@ -273,7 +273,7 @@ def _add_recovery_options(plan, own, physical, assigned, legacy, *, allow_partia
     _, before_shortfall = _pack_holds(
         legacy + before_stranded + own.get(None, Counter()), before_free
     )
-    if before_shortfall and not allow_partial:
+    if before_shortfall and not for_approval:
         return
 
     unreserved, stranded, deficient_farms = _partition_assigned(physical, assigned)
@@ -282,17 +282,27 @@ def _add_recovery_options(plan, own, physical, assigned, legacy, *, allow_partia
         if farm is not None and farm not in before_deficient:
             # Consuming a healthy own hold leaves the same stock for everyone else.
             plan[farm] = max(plan.get(farm, 0), quantity)
+        elif before_shortfall is None and for_approval:
+            for target, units in physical.items():
+                if units < quantity or plan.get(target, 0) >= quantity:
+                    continue
+                # Keep holds that were covered before excluding this order pinned to their Farm.
+                if target not in before_deficient and unreserved[target] < quantity:
+                    continue
+                # Selling can strand a hold that only looked covered after exclusion.
+                # Reclassify the remaining holds using the stock left by this sale.
+                after_stock = physical | {target: units - quantity}
+                after_free, after_stranded, _ = _partition_assigned(after_stock, assigned)
+                _, shortfall = _pack_holds(legacy + after_stranded, after_free)
+                if shortfall is None:
+                    plan[target] = quantity
         elif max(plan.values(), default=0) >= quantity:
             continue
         elif before_shortfall is None:
-            # Test the exact consumption before packing others. Packing first may
-            # use a Farm that the full plan could reserve for this hold instead.
+            # CSA replaces a hold. The new assignment must fit alongside the current holds.
             remaining_demand = legacy + stranded
             for target, units in unreserved.items():
-                if units < quantity:
-                    continue
-                if not allow_partial and target in deficient_farms:
-                    # CSA save needs a Farm that can support the new assignment.
+                if units < quantity or target in deficient_farms:
                     continue
                 _, shortfall = _pack_holds(
                     remaining_demand, unreserved | {target: units - quantity}
