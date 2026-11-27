@@ -6,6 +6,7 @@ from django.contrib.auth.models import Group
 from django.utils import timezone
 from rest_framework.test import APIClient
 
+from commerce.inventory import inventory_capacity
 from commerce.models import (
     StoreOrder,
     StoreOrderAction,
@@ -16,6 +17,7 @@ from commerce.models import (
 )
 from commerce.store_orders import request_fingerprint
 from farms.models import Farm, FarmProduct, FarmProductStockBatch
+from tests.test_single_farm_inventory import strand_supply, supply
 from tests.test_store_orders import assert_admin_action_receipt, guest_payload
 from tests.test_store_orders import payment_settings as payment_settings
 from tests.test_store_orders import store_product as store_product
@@ -478,3 +480,99 @@ def test_partial_recovery_keeps_legacy_stock_when_removing_own_hold_restores_a_f
     _assert_uncommitted(first)
     _assert_uncommitted(other)
     _assert_uncommitted(legacy)
+
+
+@pytest.mark.parametrize(
+    ("assignment", "legacy_shape"),
+    [
+        ("healthy", False),
+        ("stranded", False),
+        ("healthy", True),
+        ("stranded", True),
+        ("unassigned", True),
+    ],
+    ids=["healthy", "stranded", "healthy-with-legacy", "stranded-with-legacy", "unassigned"],
+)
+def test_approval_preserves_own_capacity_from_a_verified_plan(
+    admin, access_token, store_product, payment_settings, monkeypatch, assignment, legacy_shape
+):
+    product = store_product
+    original = product.farm_offers.get().stock_batches.get()
+    stranded = assignment != "healthy"
+    if stranded:
+        first = _checkout(product)
+    else:
+        FarmProductStockBatch.objects.filter(pk=original.pk).update(quantity_units=6)
+    second = _checkout(product, quantity=3, expected_available=6)
+    third = _checkout(product, quantity=3, expected_available=3)
+    farm_a = supply(product, "Farm A", 4, farm_id=uuid.UUID(int=1))
+    batch_a = farm_a.products.get().stock_batches.get()
+    farm_b = supply(product, "Farm B", 6, farm_id=uuid.UUID(int=2))
+    if not stranded:
+        FarmProductStockBatch.objects.filter(pk=original.pk).update(end_date=timezone.localdate())
+        batch_a.end_date = timezone.localdate() + timedelta(days=1)
+        batch_a.save(update_fields=["end_date"])
+        first = _checkout(product, expected_available=6)
+    if legacy_shape:
+        third.lines.get().stock_reservations.update(farm=None)
+    if assignment == "unassigned":
+        first.lines.get().stock_reservations.update(farm=None)
+
+    own = first.lines.get().stock_reservations.get()
+    assert (
+        own.farm_id
+        == {
+            "healthy": farm_a.pk,
+            "stranded": original.farm_product.farm_id,
+            "unassigned": None,
+        }[assignment]
+    )
+    orders = [first, second, third]
+    others = StoreStockReservation.objects.filter(line__order__in=[second, third])
+    other_holds = dict(others.values_list("pk", "farm_id"))
+    strand_supply(original, monkeypatch)
+    StoreOrder.objects.filter(pk__in=[order.pk for order in orders]).update(
+        expires_at=timezone.now() + timedelta(hours=12)
+    )
+    access_token.expires = timezone.now() + timedelta(hours=12)
+    access_token.save(update_fields=["expires"])
+    before = inventory_capacity([product.pk], now=timezone.now())
+    assert before.recovery_shortfalls == {}
+    assert before.maximum(product.pk) == 0
+
+    detail = admin.get(_path(first))
+    assert detail.status_code == 200, detail.json()
+    projection = detail.json()["data"]["source_inventory"]["lines"][0]
+    options = {row["farm_id"]: row for row in projection["farms"]}
+    key = uuid.uuid4()
+    line = own.line
+    payload = {"idempotency_key": str(key)}
+    if legacy_shape:
+        payload["allocations"] = [_allocation(line, batch_a, 4)]
+    else:
+        payload["sources"] = [_source(line, batch_a)]
+    response = admin.post(f"{_path(first)}/approve", payload, format="json")
+    assert (
+        options[str(farm_a.pk)]["eligible"],
+        projection["suggested_farm_id"],
+        response.status_code,
+    ) == (
+        True,
+        str(farm_a.pk),
+        200,
+    )
+    assert options[str(farm_b.pk)]["eligible"] is False
+    assert_admin_action_receipt(response, first.pk, "approve", key)
+    assert_admin_action_receipt(
+        admin.post(f"{_path(first)}/approve", payload, format="json"), first.pk, "approve", key
+    )
+    assert first.actions.filter(action="approve").count() == 1
+    assert list(line.stock_allocations.values_list("batch_id", "quantity")) == [(batch_a.pk, 4)]
+    assert list(StoreStockMovement.objects.filter(line=line).values_list("kind", "quantity")) == [
+        ("sale", 4)
+    ]
+    assert dict(others.filter(released_at__isnull=True).values_list("pk", "farm_id")) == other_holds
+    assert list(others.order_by("pk").values_list("quantity", flat=True)) == [3, 3]
+    after = inventory_capacity([product.pk], now=timezone.now())
+    assert after.recovery_shortfalls == {}
+    assert after.maximum(product.pk) == 0

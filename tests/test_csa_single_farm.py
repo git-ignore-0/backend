@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from threading import Barrier
 from types import SimpleNamespace
+from uuid import UUID, uuid4
 
 import pytest
 from django.db import close_old_connections, connection
@@ -13,10 +14,10 @@ from rest_framework.test import APIClient
 from commerce.models import Product, ProductTranslation, StoreOrder, StoreStockReservation
 from farms.models import Farm, FarmProduct, FarmProductStockBatch
 from memberships import csa_rounds as service
-from memberships.models import CSASelection, MembershipCycleQuota
+from memberships.models import CSASelection, MembershipCycleQuota, MembershipUsageOrder
 from tests.test_csa_rounds import context as context
 from tests.test_csa_rounds import save
-from tests.test_single_farm_inventory import checkout_payload, strand_supply
+from tests.test_single_farm_inventory import checkout_payload, strand_supply, supply
 from tests.test_store_orders import guest_payload
 from tests.test_store_orders import payment_settings as payment_settings
 from tests.test_store_orders import store_product as store_product
@@ -188,6 +189,81 @@ def test_csa_save_uses_only_stock_left_after_stranded_store_hold(
     assert selected.quota_holds.get().units == 1
     hold = order.lines.get().stock_reservations.get()
     assert (hold.farm_id, hold.quantity, hold.released_at) == (first.farm_product.farm_id, 4, None)
+
+
+def test_csa_can_recover_its_verified_hold_without_increasing_quota(
+    context, payment_settings, monkeypatch
+):
+    from commerce.inventory import inventory_capacity
+    from commerce.store_orders import approve_store_order, create_store_checkout
+
+    user, product, member, round_, now = context
+    original = _initial_batch(product, now, units=10)
+    round_.closes_at = now + timedelta(days=2)
+    round_.delivery_date = timezone.localdate(now) + timedelta(days=3)
+    round_.save(update_fields=["closes_at", "delivery_date"])
+    quota = MembershipCycleQuota.objects.get(cycle__membership=member)
+    quota.granted_units = quota.remaining_units = 10
+    quota.save(update_fields=["granted_units", "remaining_units"])
+    selection = save(context, quantity=4)
+    others = [
+        create_store_checkout(
+            user=None, payload=checkout_payload(product, quantity=3, expected_available=expected)
+        )[0]
+        for expected in (6, 3)
+    ]
+    farm_a = supply(product, "Farm A", 4, farm_id=UUID(int=1))
+    supply(product, "Farm B", 6, farm_id=UUID(int=2))
+    strand_supply(original, monkeypatch)
+    StoreOrder.objects.filter(pk__in=[order.pk for order in others]).update(
+        expires_at=round_.closes_at + timedelta(hours=12)
+    )
+
+    assert service.selection_stock_capacity([product.pk], None) == {product.pk: 0}
+    with pytest.raises(service.CSARoundError, match="^csa_stock_insufficient$"):
+        save(context, quantity=5, expected_revision=selection.revision)
+    selection.refresh_from_db()
+    assert selection.revision == 1
+    assert selection.stock_holds.get().farm_id == original.farm_product.farm_id
+    assert selection.quota_holds.get().units == 4
+
+    selection = save(context, quantity=4, expected_revision=selection.revision)
+    assert selection.revision == 2
+    assert selection.stock_holds.get().farm_id == farm_a.pk
+    assert selection.quota_holds.get().units == 4
+    quota.refresh_from_db()
+    assert quota.remaining_units == 10
+
+    monkeypatch.setattr(timezone, "now", lambda: round_.closes_at)
+    service.process_round(round_.pk, now=round_.closes_at)
+    selection.refresh_from_db()
+    order = selection.order
+    assert selection.stock_holds.count() == 1
+    assert not StoreStockReservation.objects.filter(line__order=order).exists()
+    quota.refresh_from_db()
+    assert quota.remaining_units == 6
+    command = {
+        "order_id": order.pk,
+        "actor": user,
+        "idempotency_key": uuid4(),
+        "sources": [{"line_id": order.lines.get().pk, "farm_id": farm_a.pk}],
+    }
+    assert approve_store_order(**command).pk == order.pk
+    assert approve_store_order(**command).pk == order.pk
+    assert order.actions.filter(action="approve").count() == 1
+    assert not selection.stock_holds.exists()
+    assert MembershipUsageOrder.objects.filter(csa_selection=selection).count() == 1
+    assert not MembershipUsageOrder.objects.filter(store_order=order).exists()
+    quota.refresh_from_db()
+    assert quota.remaining_units == 6
+    other_holds = StoreStockReservation.objects.filter(line__order__in=others)
+    assert (
+        other_holds.filter(
+            farm_id=original.farm_product.farm_id, released_at__isnull=True, quantity=3
+        ).count()
+        == 2
+    )
+    assert not inventory_capacity([product.pk], now=timezone.now()).recovery_shortfalls
 
 
 def test_order_creation_and_reselection_preserve_exactly_one_assignment_per_product(

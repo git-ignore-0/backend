@@ -132,7 +132,7 @@ def inventory_capacity(
     earliest_end = {}
     assigned = defaultdict(int)
     assigned_sizes = defaultdict(lambda: defaultdict(Counter))
-    own_assigned = defaultdict(lambda: defaultdict(Counter))
+    own_holds = defaultdict(lambda: defaultdict(Counter))
     legacy_quantities = defaultdict(Counter)
     total_demand = defaultdict(int)
     if product_ids:
@@ -207,8 +207,8 @@ def inventory_capacity(
                 physical[product_id, farm_id] = int(units)
                 earliest_end[product_id, farm_id] = expiry
             elif is_own:
-                if recover_stranded and farm_id is not None:
-                    own_assigned[product_id][farm_id][size] += count
+                if recover_stranded or exclude_selection is not None:
+                    own_holds[product_id][farm_id][size] += count
             else:
                 total_demand[product_id] += int(units)
                 if farm_id is None:
@@ -244,9 +244,11 @@ def inventory_capacity(
 
         # A deficient Farm may contribute to the placement but should not take a new assignment.
         plan = {farm: units for farm, units in plan.items() if farm not in deficient_farms}
-        own = own_assigned.get(product_id)
+        own = own_holds.get(product_id)
         if own:
-            _add_recovery_options(plan, own, farm_stock, assigned_holds, legacy, unreserved)
+            _add_recovery_options(
+                plan, own, farm_stock, assigned_holds, legacy, allow_partial=recover_stranded
+            )
         free.update({(product_id, farm): units for farm, units in plan.items()})
 
     return InventoryCapacity(
@@ -261,21 +263,43 @@ def inventory_capacity(
     )
 
 
-def _add_recovery_options(plan, own, physical, assigned, legacy, unreserved):
+def _add_recovery_options(plan, own, physical, assigned, legacy, *, allow_partial):
     all_assigned = assigned | {
-        farm: assigned.get(farm, Counter()) + quantities for farm, quantities in own.items()
+        farm: assigned.get(farm, Counter()) + quantities
+        for farm, quantities in own.items()
+        if farm is not None
     }
     before_free, before_stranded, before_deficient = _partition_assigned(physical, all_assigned)
-    _, before_shortfall = _pack_holds(legacy + before_stranded, before_free)
-    if not before_shortfall:
+    _, before_shortfall = _pack_holds(
+        legacy + before_stranded + own.get(None, Counter()), before_free
+    )
+    if before_shortfall and not allow_partial:
         return
 
+    unreserved, stranded, deficient_farms = _partition_assigned(physical, assigned)
     for farm, quantities in own.items():
         quantity = sum(size * count for size, count in quantities.items())
-        if farm not in before_deficient:
+        if farm is not None and farm not in before_deficient:
             # Consuming a healthy own hold leaves the same stock for everyone else.
             plan[farm] = max(plan.get(farm, 0), quantity)
-        elif max(plan.values(), default=0) < quantity:
+        elif max(plan.values(), default=0) >= quantity:
+            continue
+        elif before_shortfall is None:
+            # Test the exact consumption before packing others. Packing first may
+            # use a Farm that the full plan could reserve for this hold instead.
+            remaining_demand = legacy + stranded
+            for target, units in unreserved.items():
+                if units < quantity:
+                    continue
+                if not allow_partial and target in deficient_farms:
+                    # CSA save needs a Farm that can support the new assignment.
+                    continue
+                _, shortfall = _pack_holds(
+                    remaining_demand, unreserved | {target: units - quantity}
+                )
+                if shortfall is None:
+                    plan[target] = quantity
+        elif farm is not None:
             # Admin can recover this whole hold in an already unverifiable product.
             # Removing this hold can leave enough stock at its Farm for other assigned holds.
             # Keep those holds and legacy holds protected before offering a recovery source.

@@ -1,4 +1,5 @@
 from datetime import timedelta
+from uuid import uuid4
 
 import pytest
 from django.utils import timezone
@@ -15,10 +16,14 @@ from tests.test_store_orders import store_product as store_product
 from tests.test_store_orders import supported_area as supported_area
 
 
-def supply(product, name, quantity, *, ends_in=4):
+def supply(product, name, quantity, *, ends_in=4, farm_id=None):
     today = timezone.localdate()
     farm = Farm.objects.create(
-        name_vi=name, name_en=name, location_vi="Việt Nam", location_en="Vietnam"
+        pk=farm_id or uuid4(),
+        name_vi=name,
+        name_en=name,
+        location_vi="Việt Nam",
+        location_en="Vietnam",
     )
     offer = FarmProduct.objects.create(farm=farm, product=product)
     FarmProductStockBatch.objects.create(
