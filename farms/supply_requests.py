@@ -1,3 +1,4 @@
+from decimal import Decimal, InvalidOperation
 from uuid import uuid4
 
 from django.db import transaction
@@ -5,7 +6,7 @@ from django.db.models import prefetch_related_objects
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
-from commerce.services import schedule_store_revalidation
+from commerce.services import PRODUCT_IDENTITY_FIELDS, schedule_store_revalidation
 from content.creation_receipts import creation_fingerprint
 from content.services import audit
 from farms.farmer_links import InvalidFarmerToken, farm_for_token
@@ -32,6 +33,25 @@ def supply_product_payload(product):
         "unit_label_vi": product.unit_label_vi,
         "unit_label_en": product.unit_label_en,
     }
+
+
+def product_identity_fingerprint(product):
+    identity = {field: getattr(product, field) for field in PRODUCT_IDENTITY_FIELDS}
+    identity["unit_size"] = format(Decimal(identity["unit_size"]).normalize(), "f")
+    return creation_fingerprint(identity)
+
+
+def _snapshot_matches_identity(snapshot, product):
+    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("unit_size"), str):
+        return False
+    try:
+        unit_size = Decimal(snapshot["unit_size"])
+    except InvalidOperation:
+        return False
+    return unit_size.is_finite() and all(
+        (unit_size if field == "unit_size" else snapshot.get(field)) == getattr(product, field)
+        for field in PRODUCT_IDENTITY_FIELDS
+    )
 
 
 def _locked_items(*, farm, products, sources, items, start_date, end_date):
@@ -67,6 +87,16 @@ def _locked_items(*, farm, products, sources, items, start_date, end_date):
                 data=data,
                 today=today,
             )
+            if "product_snapshot" in item:
+                identity_matches = _snapshot_matches_identity(
+                    item["product_snapshot"], source.product
+                )
+            else:
+                identity_matches = item[
+                    "expected_product_identity"
+                ] == product_identity_fingerprint(source.product)
+            if not identity_matches:
+                raise FarmConflict("product_identity_changed")
             validated.append((source, data))
         except FarmConflict as error:
             raise FarmConflict(error.code, context={**error.context, **context}) from error
@@ -103,6 +133,13 @@ def submit_supply_request(*, farm_id, digest, idempotency_key, start_date, end_d
         if previous.submission_fingerprint != fingerprint:
             raise FarmConflict("idempotency_conflict")
         return previous, False
+    missing_identity = {
+        str(index): {"expected_product_identity": ["This field is required."]}
+        for index, item in enumerate(items)
+        if "expected_product_identity" not in item
+    }
+    if missing_identity:
+        raise ValidationError({"items": missing_identity})
     if not farm.is_active:
         raise FarmConflict("farm_inactive")
     validated = _locked_items(
@@ -169,6 +206,7 @@ def decide_supply_request(*, entry, authorize_write, idempotency_key, outcome, r
                 "expected_link_id": item.source_id,
                 "expected_generation": item.source_generation,
                 "submitted_version": item.source_version,
+                "product_snapshot": item.product_snapshot,
                 "quantity_units": item.quantity_units,
             }
             for item in original

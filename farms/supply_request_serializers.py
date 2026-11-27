@@ -27,10 +27,21 @@ class ISODateField(serializers.DateField):
         return super().to_internal_value(data)
 
 
+class ProductIdentityField(serializers.RegexField):
+    def to_internal_value(self, data):
+        if not isinstance(data, str):
+            self.fail("invalid")
+        return super().to_internal_value(data)
+
+
 class FarmerSupplyItemSerializer(StrictSerializer):
     product_id = JSONUUIDField()
     expected_link_id = JSONUUIDField()
     expected_generation = BulkStockQuantityField(min_value=1, max_value=2_147_483_647)
+    # A missing value is accepted only for a verified replay of a Task 03 payload.
+    expected_product_identity = ProductIdentityField(
+        regex=r"\A[0-9a-f]{64}\Z", trim_whitespace=False, required=False
+    )
     quantity_units = BulkStockQuantityField(min_value=1, max_value=2_147_483_647)
 
 

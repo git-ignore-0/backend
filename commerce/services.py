@@ -366,6 +366,14 @@ def _identity_lock_references(product):
     return reasons
 
 
+def _has_pending_supply_request(product):
+    from farms.models import FarmSupplyRequest, FarmSupplyRequestItem
+
+    return FarmSupplyRequestItem.objects.filter(
+        source__product=product, request__status=FarmSupplyRequest.Status.PENDING
+    ).exists()
+
+
 def _csa_round_reason(rows, code):
     ref = rows.order_by("pk").values("selection__round_id", "selection__round__name").first()
     if ref is None:
@@ -412,7 +420,11 @@ def product_capabilities(product):
                 }
             )
     return {
-        "edit_identity": {"allowed": not (identity or csa), "reasons": [*identity, *csa]},
+        "edit_identity": {
+            "allowed": not (identity or csa or _has_pending_supply_request(product)),
+            # Older Admin clients accept only the existing reason codes.
+            "reasons": [*identity, *csa],
+        },
         "edit_csa": {"allowed": not csa, "reasons": csa},
         "delete": {"allowed": not deletion, "reasons": deletion},
     }
@@ -442,7 +454,9 @@ def update_product(*, actor, product, payload, version=None):
     )
     if (changes_identity or changes_csa) and _product_stock_holds(product).exists():
         raise CatalogConflict("product_csa_hold_in_use")
-    if changes_identity and _identity_lock_references(product):
+    if changes_identity and (
+        _identity_lock_references(product) or _has_pending_supply_request(product)
+    ):
         raise CatalogConflict("product_unit_in_use")
     translations = prepare_product_translations(data.pop("translations", None), instance=product)
     previous_image = product.primary_image

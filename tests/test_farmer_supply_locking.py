@@ -1,10 +1,12 @@
 """Force real row-lock races on the production database family."""
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 from uuid import uuid4
 
 import pytest
 from allauth.account.models import EmailAddress
-from django.db import connection
+from django.db import connection, connections, transaction
 from django.utils import timezone
 from oauth2_provider.models import AccessToken
 from rest_framework.test import APIClient
@@ -17,11 +19,13 @@ from tests.test_farmer_supply_requests import (
     decide,
     farmer_client,
     link_url,
+    make_product_editable,
+    read_supply_payload,
     submit,
     supply_payload,
 )
 from tests.test_farms_api import farm_admin_api as farm_admin_api
-from tests.test_product_lifecycle_locking import run_in_lock_order
+from tests.test_product_lifecycle_locking import LOCK_TIMEOUT, run_in_lock_order
 
 pytestmark = [
     pytest.mark.django_db(transaction=True),
@@ -132,3 +136,102 @@ def test_approve_and_reject_have_one_winner(farm_admin_api, second_admin, source
     assert rejection.result().status_code == (409 if approve_first else 200)
     assert FarmSupplyRequest.objects.get().status == ("approved" if approve_first else "rejected")
     assert FarmProductStockBatch.objects.count() == (len(sources) if approve_first else 0)
+
+
+def change_product_identity(client, source):
+    url = f"/api/v1/admin/store-products/{source.product_id}"
+    return client.patch(url, {"sku": "RACE-NEW-SKU"}, format="json")
+
+
+@pytest.mark.parametrize("submit_first", [True, False], ids=["submit-first", "edit-first"])
+def test_submit_and_product_identity_update_serialize(
+    farm_admin_api, second_admin, sources, submit_first
+):
+    source = sources[0]
+    make_product_editable(source.product)
+    farmer = farmer_client(farm_admin_api.post(link_url(source), {}, format="json"))
+    payload = read_supply_payload(farmer, sources)
+    submission, update = run_in_lock_order(
+        lambda: submit(farmer, payload),
+        lambda: change_product_identity(second_admin, source),
+        left_first=submit_first,
+    )
+    source.product.refresh_from_db()
+    assert not FarmProductStockBatch.objects.exists()
+    if submit_first:
+        assert submission.result().status_code == 201
+        assert update.result().status_code == 409
+        assert update.result().json()["errors"][0]["code"] == "product_unit_in_use"
+        entry = FarmSupplyRequest.objects.get()
+        assert entry.items.get(source=source).product_snapshot["sku"] == source.product.sku
+    else:
+        assert update.result().status_code == 200, update.result().content
+        assert source.product.sku == "RACE-NEW-SKU"
+        assert submission.result().status_code == 409
+        assert submission.result().json() == {
+            "errors": [
+                {
+                    "code": "product_identity_changed",
+                    "context": {"item_index": 0, "product_id": str(source.product_id)},
+                }
+            ]
+        }
+        assert not FarmSupplyRequest.objects.exists()
+
+
+@pytest.mark.parametrize("approve_first", [True, False], ids=["approve-first", "edit-first"])
+def test_approve_and_product_identity_update_keep_identity_locked(
+    farm_admin_api, second_admin, sources, approve_first
+):
+    source = sources[0]
+    farmer = farmer_client(farm_admin_api.post(link_url(source), {}, format="json"))
+    entry_id = submit(farmer, supply_payload(sources)).json()["data"]["id"]
+    approval, update = run_in_lock_order(
+        lambda: decide(farm_admin_api, entry_id),
+        lambda: change_product_identity(second_admin, source),
+        left_first=approve_first,
+    )
+    assert approval.result().status_code == 200
+    assert update.result().status_code == 409
+    assert update.result().json()["errors"][0]["code"] == "product_unit_in_use"
+    entry = FarmSupplyRequest.objects.get(pk=entry_id)
+    assert entry.status == "approved"
+    assert FarmProductStockBatch.objects.count() == len(sources)
+    item = entry.items.select_related("source__product").get(source=source)
+    assert item.product_snapshot["sku"] == item.source.product.sku
+
+
+def test_reject_releases_product_identity_only_after_commit(farm_admin_api, second_admin, sources):
+    source = sources[0]
+    make_product_editable(source.product)
+    farmer = farmer_client(farm_admin_api.post(link_url(source), {}, format="json"))
+    entry_id = submit(farmer, supply_payload(sources)).json()["data"]["id"]
+    decision_written = Event()
+    allow_commit = Event()
+
+    def reject():
+        db = connections["default"]
+        try:
+            with transaction.atomic():
+                response = decide(farm_admin_api, entry_id, "reject", reason="Test")
+                assert response.status_code == 200, response.content
+                decision_written.set()
+                assert allow_commit.wait(LOCK_TIMEOUT)
+        finally:
+            decision_written.set()
+            db.close()
+
+    with ThreadPoolExecutor(max_workers=1) as worker:
+        rejection = worker.submit(reject)
+        try:
+            assert decision_written.wait(LOCK_TIMEOUT)
+            assert FarmSupplyRequest.objects.get(pk=entry_id).status == "pending"
+            response = change_product_identity(second_admin, source)
+            assert response.status_code == 409
+            assert response.json()["errors"][0]["code"] == "product_unit_in_use"
+        finally:
+            allow_commit.set()
+        rejection.result(timeout=LOCK_TIMEOUT)
+    assert FarmSupplyRequest.objects.get(pk=entry_id).status == "rejected"
+    assert change_product_identity(second_admin, source).status_code == 200
+    assert not FarmProductStockBatch.objects.exists()

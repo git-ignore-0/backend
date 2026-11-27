@@ -30,6 +30,7 @@ from farms.supply_request_serializers import (
 )
 from farms.supply_requests import (
     decide_supply_request,
+    product_identity_fingerprint,
     submit_supply_request,
     supply_product_payload,
 )
@@ -80,6 +81,7 @@ def _source_payload(source):
     return {
         **supply_product_payload(source.product),
         "source_id": str(source.pk),
+        "product_identity": product_identity_fingerprint(source.product),
         "supply_generation": source.supply_generation,
     }
 

@@ -1,4 +1,4 @@
-from datetime import timedelta
+from datetime import date, timedelta
 from hashlib import sha256
 from uuid import uuid4
 
@@ -8,14 +8,27 @@ from django.core.cache import cache
 from django.utils import timezone
 from rest_framework.test import APIClient
 
-from content.models import ContentAuditLog
+from commerce.models import StoreOrder, StoreOrderLine
+from content.creation_receipts import creation_fingerprint
+from content.models import ContentAuditLog, MediaAsset
 from farms import supply_requests
-from farms.models import FarmFarmerLink, FarmProduct, FarmProductStockBatch, FarmSupplyRequest
+from farms.models import (
+    FarmFarmerLink,
+    FarmProduct,
+    FarmProductStockBatch,
+    FarmSupplyRequest,
+    FarmSupplyRequestItem,
+    LegacyFarmWeeklySupply,
+)
 from farms.supply_request_views import FarmerSubmitThrottle
+from tests.test_csa_rounds import context as context
+from tests.test_csa_rounds import save as save_selection
 from tests.test_farm_bulk_supply import bulk_payload
 from tests.test_farm_bulk_supply import sources as sources
 from tests.test_farm_stock_batches import make_farm, make_product
 from tests.test_farms_api import farm_admin_api as farm_admin_api
+from tests.test_store_orders import store_product as store_product
+from tests.test_store_orders import supported_area as supported_area
 
 pytestmark = pytest.mark.django_db
 
@@ -37,6 +50,9 @@ def supply_payload(sources, **overrides):
     for source, item in zip(sources, payload["items"], strict=True):
         del item["expected_version"]
         item["expected_generation"] = source.supply_generation
+        item["expected_product_identity"] = supply_requests.product_identity_fingerprint(
+            source.product
+        )
     payload.update(overrides)
     return payload
 
@@ -184,6 +200,7 @@ def test_farmer_products_and_history_expose_only_allowed_fields(farm_admin_api, 
     (item,) = products["data"]
     assert set(item) == {
         "product_id",
+        "product_identity",
         "source_id",
         "supply_generation",
         "sku",
@@ -208,9 +225,11 @@ def test_farmer_products_and_history_expose_only_allowed_fields(farm_admin_api, 
         "rejection_reason",
         "items",
     }
-    assert set(created["items"][0]) == set(item) - {"source_id", "supply_generation"} | {
-        "quantity_units"
-    }
+    assert set(created["items"][0]) == set(item) - {
+        "source_id",
+        "supply_generation",
+        "product_identity",
+    } | {"quantity_units"}
     assert decide(farm_admin_api, created["id"]).status_code == 200
     # A direct Admin batch for this source never appears as Farmer history.
     source_url = f"/api/v1/admin/farms/{farm.pk}/stock-batches/bulk"
@@ -597,3 +616,347 @@ def test_deleting_unused_farm_revokes_its_link(farm_admin_api):
     assert farm_admin_api.delete(url).status_code == 204
     assert not FarmFarmerLink.objects.filter(farm_id=farm.pk).exists()
     assert_error(farmer_client(link).get(f"{FARMER}/farm"), "invalid_farm_token", http_status=403)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("sku", "UPDATED-SKU"),
+        ("unit_size", "1.000"),
+        ("unit_label_vi", "gói"),
+        ("unit_label_en", "pack"),
+    ],
+)
+def test_pending_request_locks_identity_and_reject_releases_it(
+    farm_admin_api, farmer, sources, field, replacement
+):
+    product = sources[0].product
+    make_product_editable(product)
+    url = f"/api/v1/admin/store-products/{product.pk}"
+    before = farm_admin_api.get(url).json()["data"]["capabilities"]
+    assert before["edit_identity"] == {"allowed": True, "reasons": []}
+    pending = submit(farmer, supply_payload(sources)).json()["data"]
+    after = farm_admin_api.get(url).json()["data"]["capabilities"]
+    assert after == {**before, "edit_identity": {"allowed": False, "reasons": []}}
+    assert_error(
+        farm_admin_api.patch(url, {field: replacement}, format="json"), "product_unit_in_use"
+    )
+    assert (
+        farm_admin_api.patch(url, {field: getattr(product, field)}, format="json").status_code
+        == 200
+    )
+    assert decide(farm_admin_api, pending["id"], "reject", reason="Test").status_code == 200
+    assert farm_admin_api.get(url).json()["data"]["capabilities"] == before
+    assert farm_admin_api.patch(url, {field: replacement}, format="json").status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("sku", "UPDATED-SKU"),
+        ("unit_size", "1.000"),
+        ("unit_label_vi", "gói"),
+        ("unit_label_en", "pack"),
+    ],
+)
+def test_submit_rejects_identity_changed_after_product_read(
+    farm_admin_api, farmer, sources, field, replacement
+):
+    payload = read_supply_payload(farmer, sources)
+    product = sources[1].product
+    make_product_editable(product)
+    url = f"/api/v1/admin/store-products/{product.pk}"
+    assert farm_admin_api.patch(url, {field: replacement}, format="json").status_code == 200
+    assert_error(
+        submit(farmer, payload),
+        "product_identity_changed",
+        item_index=1,
+        product_id=str(product.pk),
+    )
+    assert not FarmSupplyRequest.objects.exists()
+    assert not FarmSupplyRequestItem.objects.exists()
+    assert not FarmProductStockBatch.objects.exists()
+    assert not ContentAuditLog.objects.filter(action="farm.supply_request.submit").exists()
+
+
+@pytest.mark.parametrize("field", ["sku", "unit_size", "unit_label_vi", "unit_label_en"])
+def test_approval_rejects_inconsistent_legacy_snapshot(farm_admin_api, farmer, sources, field):
+    pending = submit(farmer, supply_payload(sources)).json()["data"]
+    entry = FarmSupplyRequest.objects.get(pk=pending["id"])
+    item = entry.items.get(position=1)
+    item.product_snapshot[field] = "42"
+    item.save(update_fields=["product_snapshot"])
+    assert_error(
+        decide(farm_admin_api, pending["id"]),
+        "product_identity_changed",
+        item_index=1,
+        product_id=str(sources[1].product_id),
+    )
+    entry.refresh_from_db()
+    item.refresh_from_db()
+    assert entry.status == "pending"
+    assert item.product_snapshot[field] == "42"
+    assert item.quantity_units == pending["items"][1]["quantity_units"]
+    assert item.source_generation == sources[1].supply_generation
+    assert not FarmProductStockBatch.objects.exists()
+
+
+def product_image(name):
+    return MediaAsset.objects.create(
+        file=f"products/{name}", width=100, height=100, original_name=name
+    )
+
+
+def make_product_editable(product):
+    product.primary_image = product_image(f"{product.slug}.jpg")
+    product.save(update_fields=["primary_image"])
+    product.translations.get_or_create(locale="en", defaults={"name": "Tomatoes"})
+
+
+def read_supply_payload(farmer, sources):
+    response = farmer.get(f"{FARMER}/products")
+    assert response.status_code == 200
+    products = {item["product_id"]: item for item in response.json()["data"]}
+    payload = supply_payload(sources)
+    for item in payload["items"]:
+        item["expected_product_identity"] = products[item["product_id"]]["product_identity"]
+    return payload
+
+
+def test_pending_requests_across_farms_keep_shared_product_locked(farm_admin_api, farmer, sources):
+    product = sources[0].product
+    make_product_editable(product)
+    url = f"/api/v1/admin/store-products/{product.pk}"
+    second_source = FarmProduct.objects.create(farm=make_farm("Other farm"), product=product)
+    second_farmer = farmer_client(farm_admin_api.post(link_url(second_source), {}, format="json"))
+    first = submit(farmer, supply_payload(sources)).json()["data"]
+    second = submit(second_farmer, supply_payload([second_source])).json()["data"]
+    assert decide(farm_admin_api, first["id"], "reject", reason="First").status_code == 200
+    assert (
+        farm_admin_api.get(url).json()["data"]["capabilities"]["edit_identity"]["allowed"] is False
+    )
+    assert_error(
+        farm_admin_api.patch(url, {"unit_label_en": "pack"}, format="json"), "product_unit_in_use"
+    )
+    assert decide(farm_admin_api, second["id"], "reject", reason="Second").status_code == 200
+    assert (
+        farm_admin_api.get(url).json()["data"]["capabilities"]["edit_identity"]["allowed"] is True
+    )
+    assert farm_admin_api.patch(url, {"unit_label_en": "pack"}, format="json").status_code == 200
+
+
+@pytest.mark.parametrize("reason_code", ["stock_batch", "legacy_supply", "store_order"])
+def test_reject_preserves_existing_identity_references(
+    farm_admin_api, farmer, sources, reason_code
+):
+    source = sources[0]
+    product = source.product
+    pending = submit(farmer, supply_payload(sources)).json()["data"]
+    today = timezone.localdate()
+    if reason_code == "stock_batch":
+        FarmProductStockBatch.objects.create(
+            farm_product=source, start_date=today, end_date=today, quantity_units=1
+        )
+    elif reason_code == "legacy_supply":
+        LegacyFarmWeeklySupply.objects.create(
+            farm_product=source, week_start=today, quantity_units=0
+        )
+    else:
+        order = StoreOrder.objects.create(
+            reference_code="NFV-TEST-0031",
+            create_idempotency_key=uuid4(),
+            locale="vi",
+            subtotal_vnd=10000,
+            shipping_fee_vnd=0,
+            total_vnd=10000,
+        )
+        StoreOrderLine.objects.create(
+            order=order,
+            product=product,
+            position=1,
+            sku_snapshot=product.sku,
+            name_snapshot="Tomatoes",
+            unit_size_snapshot=product.unit_size,
+            unit_label_snapshot="kg",
+            unit_price_vnd_snapshot=10000,
+            quantity=1,
+            cash_quantity=1,
+            cash_subtotal_vnd=10000,
+        )
+    assert decide(farm_admin_api, pending["id"], "reject", reason="Test").status_code == 200
+    url = f"/api/v1/admin/store-products/{product.pk}"
+    capability = farm_admin_api.get(url).json()["data"]["capabilities"]["edit_identity"]
+    assert capability["allowed"] is False
+    assert [reason["code"] for reason in capability["reasons"]] == [reason_code]
+    assert_error(
+        farm_admin_api.patch(url, {"sku": "NEW-SKU"}, format="json"), "product_unit_in_use"
+    )
+
+
+def test_reject_preserves_existing_csa_hold(farm_admin_api, context, supported_area):
+    _, product, *_ = context
+    save_selection(context)
+    source = product.farm_offers.get()
+    farmer = farmer_client(farm_admin_api.post(link_url(source), {}, format="json"))
+    pending = submit(farmer, supply_payload([source])).json()["data"]
+    assert decide(farm_admin_api, pending["id"], "reject", reason="Test").status_code == 200
+    url = f"/api/v1/admin/store-products/{product.pk}"
+    capability = farm_admin_api.get(url).json()["data"]["capabilities"]["edit_identity"]
+    assert capability["allowed"] is False
+    assert "csa_hold" in {reason["code"] for reason in capability["reasons"]}
+    assert_error(
+        farm_admin_api.patch(url, {"sku": "NEW-SKU"}, format="json"), "product_csa_hold_in_use"
+    )
+
+
+def test_edit_nonidentity_fields_before_submit_and_while_pending(farm_admin_api, farmer, sources):
+    product = sources[0].product
+    make_product_editable(product)
+    url = f"/api/v1/admin/store-products/{product.pk}"
+    payload = read_supply_payload(farmer, sources)
+    for index in (1, 2):
+        image = product_image(f"updated-{index}.jpg")
+        response = farm_admin_api.patch(
+            url,
+            {
+                "translations": [
+                    {"locale": "vi", "name": f"Tên mới {index}", "description": f"Mô tả {index}"},
+                    {
+                        "locale": "en",
+                        "name": f"New name {index}",
+                        "description": f"Details {index}",
+                    },
+                ],
+                "primary_image_id": str(image.pk),
+            },
+            format="json",
+        )
+        assert response.status_code == 200, response.content
+        if index == 1:
+            response = submit(farmer, payload)
+            assert response.status_code == 201, response.content
+            entry = response.json()["data"]
+    assert decide(farm_admin_api, entry["id"]).status_code == 200
+    capability = farm_admin_api.get(url).json()["data"]["capabilities"]["edit_identity"]
+    assert capability["allowed"] is False
+    assert [reason["code"] for reason in capability["reasons"]] == ["stock_batch"]
+    assert_error(
+        farm_admin_api.patch(url, {"sku": "NEW-SKU"}, format="json"), "product_unit_in_use"
+    )
+
+
+def test_equivalent_decimal_and_source_version_increase_preserve_intent(
+    farm_admin_api, farmer, sources
+):
+    source = sources[0]
+    make_product_editable(source.product)
+    payload = read_supply_payload(farmer, sources)
+    url = f"/api/v1/admin/store-products/{source.product_id}"
+    assert farm_admin_api.patch(url, {"unit_size": "0.5"}, format="json").status_code == 200
+    bulk_url = f"/api/v1/admin/farms/{source.farm_id}/stock-batches/bulk"
+    response = farm_admin_api.post(bulk_url, bulk_payload(sources), format="json")
+    assert response.status_code == 201, response.content
+    response = submit(farmer, payload)
+    assert response.status_code == 201, response.content
+    entry = FarmSupplyRequest.objects.get(pk=response.json()["data"]["id"])
+    item = entry.items.get(position=0)
+    item.product_snapshot["unit_size"] = "0.50000"
+    item.save(update_fields=["product_snapshot"])
+    assert decide(farm_admin_api, str(entry.pk)).status_code == 200
+
+
+@pytest.mark.parametrize("value", [None, "missing", "A" * 64, 10**63, "0" * 64 + "\n"])
+def test_new_submit_requires_a_valid_product_identity(farmer, sources, value):
+    payload = supply_payload(sources)
+    if value == "missing":
+        del payload["items"][0]["expected_product_identity"]
+    else:
+        payload["items"][0]["expected_product_identity"] = value
+    response = submit(farmer, payload)
+    assert response.status_code == 400, response.content
+    assert "expected_product_identity" in response.json()["items"]["0"]
+    assert not FarmSupplyRequest.objects.exists()
+
+
+@pytest.mark.parametrize(
+    "snapshot", [None, [], {"unit_size": "not decimal"}, {"unit_size": "NaN"}, {}]
+)
+def test_approval_rejects_missing_or_malformed_identity_snapshot(
+    farm_admin_api, farmer, sources, snapshot
+):
+    response = submit(farmer, supply_payload(sources))
+    assert response.status_code == 201
+    entry = FarmSupplyRequest.objects.get(pk=response.json()["data"]["id"])
+    item = entry.items.get(position=1)
+    if snapshot is not None:
+        item.product_snapshot = snapshot
+    else:
+        del item.product_snapshot["unit_label_en"]
+    item.save(update_fields=["product_snapshot"])
+    assert_error(
+        decide(farm_admin_api, entry.pk),
+        "product_identity_changed",
+        item_index=1,
+        product_id=str(sources[1].product_id),
+    )
+    entry.refresh_from_db()
+    assert entry.status == "pending"
+    assert not FarmProductStockBatch.objects.exists()
+
+
+def test_submission_replays_original_identity_even_after_actual_product_change(
+    farm_admin_api, farmer, sources
+):
+    product = sources[0].product
+    make_product_editable(product)
+    payload = read_supply_payload(farmer, sources)
+    response = submit(farmer, payload)
+    entry_id = response.json()["data"]["id"]
+    assert decide(farm_admin_api, entry_id, "reject", reason="Test").status_code == 200
+    url = f"/api/v1/admin/store-products/{product.pk}"
+    assert farm_admin_api.patch(url, {"unit_size": "1.000"}, format="json").status_code == 200
+    replay = submit(farmer, payload)
+    assert replay.status_code == 200
+    assert replay.json()["data"]["id"] == entry_id
+    fresh = read_supply_payload(farmer, sources)
+    fresh["idempotency_key"] = payload["idempotency_key"]
+    assert_error(submit(farmer, fresh), "idempotency_conflict")
+
+
+def test_legacy_submission_replay_requires_exact_old_intent(farmer, sources):
+    source = sources[0]
+    payload = supply_payload([source])
+    del payload["items"][0]["expected_product_identity"]
+    start = date.fromisoformat(payload["start_date"])
+    end = date.fromisoformat(payload["end_date"])
+    fingerprint = creation_fingerprint(
+        {"start_date": start, "end_date": end, "items": payload["items"]}
+    )
+    entry = FarmSupplyRequest.objects.create(
+        farm=source.farm,
+        code=f"FSR-{uuid4().hex.upper()}",
+        start_date=start,
+        end_date=end,
+        submission_key=payload["idempotency_key"],
+        submission_fingerprint=fingerprint,
+    )
+    FarmSupplyRequestItem.objects.create(
+        request=entry,
+        source=source,
+        position=0,
+        product_snapshot=supply_requests.supply_product_payload(source.product),
+        source_generation=source.supply_generation,
+        source_version=source.version,
+        quantity_units=payload["items"][0]["quantity_units"],
+    )
+    response = submit(farmer, payload)
+    assert response.status_code == 200
+    assert response.json()["meta"]["idempotent_replay"] is True
+    assert response.json()["data"]["id"] == str(entry.pk)
+    payload["items"][0]["quantity_units"] += 1
+    assert_error(submit(farmer, payload), "idempotency_conflict")
+    payload["idempotency_key"] = str(uuid4())
+    assert submit(farmer, payload).status_code == 400
+    entry.refresh_from_db()
+    assert entry.submission_fingerprint == fingerprint
+    assert FarmSupplyRequest.objects.count() == 1
