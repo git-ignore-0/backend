@@ -22,7 +22,7 @@ from commerce.store_orders import (
     cancel_store_order,
     create_store_checkout,
 )
-from content.models import ContentAuditLog, MediaAsset, TrackerFarm
+from content.models import ContentAuditLog, MediaAsset, TrackerFarm, TrackerFarmPhoto
 from content.services import delete_tracker_farm, update_tracker_farm
 from farms.models import Farm, FarmPhoto, FarmProduct, FarmProductStockBatch
 from farms.services import (
@@ -107,6 +107,69 @@ def test_farm_deletion_locks_only_its_stock_sources_in_order(
     assert Product.objects.filter(pk__in=product_ids).count() == 2
     assert FarmProduct.objects.filter(pk=other_source.pk).exists()
     assert FarmProductStockBatch.objects.filter(pk=other_batch.pk).exists()
+
+
+@pytest.mark.django_db
+def test_farm_gallery_update_locks_all_media_in_deletion_order(active_user, monkeypatch):
+    farm = another_farm()
+    farm_photo, tracker_photo, tracker_cover, retained = [
+        MediaAsset.objects.create(
+            pk=uuid.UUID(int=index), file=f"farms/{index}.webp", width=100, height=100
+        )
+        for index in range(1, 5)
+    ]
+    farm.image = retained
+    farm.save(update_fields=["image"])
+    FarmPhoto.objects.create(farm=farm, image=retained, sort_order=0)
+    FarmPhoto.objects.create(farm=farm, image=farm_photo, sort_order=1)
+    profile = create_growth_tracker_profile(farm_id=farm.pk, actor=active_user, data={})
+    profile.image = tracker_cover
+    profile.save(update_fields=["image"])
+    TrackerFarmPhoto.objects.create(farm=profile, image=tracker_photo, sort_order=2)
+    locks = record_resource_locks(monkeypatch)
+
+    update_farm(
+        farm_id=farm.pk,
+        actor=active_user,
+        expected_version=farm.version,
+        data={"photo_ids": [retained.pk]},
+    )
+
+    media_locks = [ids for model, ids, _ in locks if model is MediaAsset]
+    assert media_locks[0] == [farm_photo.pk, tracker_photo.pk, tracker_cover.pk, retained.pk]
+    assert list(farm.photos.values_list("image_id", flat=True)) == [retained.pk]
+    assert list(profile.photos.values_list("image_id", flat=True)) == [retained.pk]
+    assert list(MediaAsset.objects.values_list("pk", flat=True)) == [retained.pk]
+
+
+@pytest.mark.django_db
+def test_growth_tracker_enable_locks_gallery_and_cover_in_deletion_order(active_user, monkeypatch):
+    farm = another_farm()
+    photo = MediaAsset.objects.create(
+        pk=uuid.UUID(int=1), file="farms/photo.webp", width=100, height=100
+    )
+    cover = MediaAsset.objects.create(
+        pk=uuid.UUID(int=2), file="farms/cover.webp", width=100, height=100
+    )
+    farm.image = cover
+    farm.save(update_fields=["image"])
+    FarmPhoto.objects.create(farm=farm, image=cover, sort_order=0)
+    FarmPhoto.objects.create(farm=farm, image=photo, sort_order=1)
+    locks = record_resource_locks(monkeypatch)
+    media_locks_at_insert = []
+    profile_table = connection.ops.quote_name(TrackerFarm._meta.db_table)
+
+    def record_profile_insert(execute, sql, params, many, context):
+        if sql.startswith(f"INSERT INTO {profile_table} "):
+            media_locks_at_insert.extend(ids for model, ids, _ in locks if model is MediaAsset)
+        return execute(sql, params, many, context)
+
+    with connection.execute_wrapper(record_profile_insert):
+        profile = create_growth_tracker_profile(farm_id=farm.pk, actor=active_user, data={})
+
+    assert media_locks_at_insert == [[photo.pk, cover.pk]]
+    assert profile.image_id == cover.pk
+    assert list(profile.photos.values_list("image_id", flat=True)) == [cover.pk, photo.pk]
 
 
 @pytest.mark.django_db(transaction=True)

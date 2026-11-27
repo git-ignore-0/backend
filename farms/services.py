@@ -134,15 +134,20 @@ def stock_batch_queryset():
     )
 
 
-def _replace_photos(farm, ids):
-    locked = list(MediaAsset.objects.select_for_update().filter(pk__in=ids).order_by("pk"))
-    by_id = {asset.pk: asset for asset in locked}
-    missing = [str(asset_id) for asset_id in ids if asset_id not in by_id]
-    if missing:
-        raise ValidationError({"photo_ids": f"Media assets do not exist: {', '.join(missing)}."})
+def _farm_media_for_update(ids):
+    return MediaAsset.objects.select_for_update().filter(pk__in=ids).order_by("pk")
+
+
+def _replace_photos(farm, ids, *, tracker_media_ids=()):
     old_ids = set(farm.photos.values_list("image_id", flat=True))
     if farm.image_id:
         old_ids.add(farm.image_id)
+    # Match deletion's media lock order before changing shared references.
+    media_ids = old_ids.union(ids, tracker_media_ids)
+    by_id = {asset.pk: asset for asset in _farm_media_for_update(media_ids)}
+    missing = [str(asset_id) for asset_id in ids if asset_id not in by_id]
+    if missing:
+        raise ValidationError({"photo_ids": f"Media assets do not exist: {', '.join(missing)}."})
     invalid = [
         str(asset_id)
         for asset_id in ids
@@ -233,8 +238,13 @@ def update_farm(*, farm_id, actor, expected_version, data):
     farm.legacy_tracker_owned = False
     farm.version += 1
     farm.save()
+    old_profile_media_ids = set()
     if photo_ids is not None:
-        _replace_photos(farm, photo_ids)
+        if profile:
+            old_profile_media_ids.update(profile.photos.values_list("image_id", flat=True))
+            if profile.image_id:
+                old_profile_media_ids.add(profile.image_id)
+        _replace_photos(farm, photo_ids, tracker_media_ids=old_profile_media_ids)
     # The legacy tracker admin form still submits shared fields until its UI migration.
     TrackerFarm.objects.filter(farm_id=farm.pk).update(
         name_en=farm.name_en,
@@ -246,9 +256,6 @@ def update_farm(*, farm_id, actor, expected_version, data):
         image_id=farm.image_id,
     )
     if profile:
-        old_profile_media_ids = set(profile.photos.values_list("image_id", flat=True))
-        if profile.image_id:
-            old_profile_media_ids.add(profile.image_id)
         if photo_ids is not None:
             profile.photos.all().delete()
             TrackerFarmPhoto.objects.bulk_create(
@@ -676,6 +683,12 @@ def create_growth_tracker_profile(*, farm_id, actor, data):
     farm = Farm.objects.select_for_update().get(pk=farm_id)
     if TrackerFarm.objects.filter(farm_id=farm.pk).exists():
         raise FarmConflict("growth_tracker_already_enabled")
+    photos = list(farm.photos.order_by("sort_order"))
+    media_ids = {photo.image_id for photo in photos}
+    if farm.image_id:
+        media_ids.add(farm.image_id)
+    # Take the same ordered locks as deletion before the cover FK is written.
+    list(_farm_media_for_update(media_ids).only("pk"))
     values = dict(data)
     max_order = TrackerFarm.objects.aggregate(max_order=Max("sort_order"))["max_order"]
     values.setdefault("sort_order", (max_order if max_order is not None else -1) + 1)
@@ -698,7 +711,7 @@ def create_growth_tracker_profile(*, farm_id, actor, data):
     TrackerFarmPhoto.objects.bulk_create(
         [
             TrackerFarmPhoto(farm=profile, image_id=photo.image_id, sort_order=photo.sort_order)
-            for photo in farm.photos.order_by("sort_order")
+            for photo in photos
         ]
     )
     audit(actor=actor, action="tracker_farm.enable", entity=profile)
