@@ -7,6 +7,7 @@ from django.apps import apps
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.db import connection
+from django.db.migrations.loader import MigrationLoader
 from django.db.migrations.recorder import MigrationRecorder
 from django.utils import timezone
 
@@ -148,7 +149,9 @@ def test_preflight_command_requires_schema_matching_recorded_lifecycle_stage():
     from farms.migrations._lifecycle_preflight import LIFECYCLE_MIGRATIONS
 
     recorder = MigrationRecorder(connection)
-    for app, migration in LIFECYCLE_MIGRATIONS:
+    graph = MigrationLoader(connection).graph
+    # Keep the recorded history dependency-consistent while leaving the schema intact.
+    for app, migration in graph.backwards_plan(LIFECYCLE_MIGRATIONS[0]):
         recorder.record_unapplied(app, migration)
     with pytest.raises(CommandError, match="unrecorded_lifecycle_schema.*farms_farmproduct"):
         call_command("check_farm_product_lifecycle", database=connection.alias)

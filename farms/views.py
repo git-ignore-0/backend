@@ -11,7 +11,18 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from commerce.models import Product, ProductStatus, ProductTranslation
-from content.models import ContentAuditLog, MediaAsset, TrackerFarm
+from config.phones import (
+    InvalidPhoneNumber,
+    format_vietnam_phone,
+    normalize_vietnam_phone,
+    phone_search,
+)
+from content.creation_receipts import (
+    CreationIdempotencyConflict,
+    creation_receipt_meta,
+    find_creation_receipt,
+)
+from content.models import AdminCreationReceipt, ContentAuditLog, MediaAsset, TrackerFarm
 from content.permissions import IsWebsiteAdmin
 from content.serializers import (
     TrackerFarmDeleteSerializer,
@@ -22,6 +33,8 @@ from content.services import delete_orphan_media_asset, tracker_farm_queryset
 from content.views import AdminMediaUploadView, admin_tracker_write_payload
 from farms.models import Farm, FarmProduct, FarmProductStockBatch
 from farms.serializers import (
+    BulkStockBatchRecoverySerializer,
+    BulkStockBatchWriteSerializer,
     FarmProductHistoryQuerySerializer,
     FarmProductQuerySerializer,
     FarmProductRevisionSerializer,
@@ -44,6 +57,7 @@ from farms.services import (
     create_farm,
     create_growth_tracker_profile,
     create_stock_batch,
+    create_stock_batches_bulk,
     delete_farm,
     delete_growth_tracker_profile,
     farm_capabilities,
@@ -85,6 +99,7 @@ def farm_payload(farm, request, *, detail=False):
     photos = [media_payload(photo.image, request) for photo in farm.photos.all()]
     return {
         "id": str(farm.pk),
+        "contact_phone": format_vietnam_phone(farm.contact_phone),
         "name_en": farm.name_en,
         "name_vi": farm.name_vi,
         "location_en": farm.location_en,
@@ -238,13 +253,19 @@ class AdminFarmListView(APIView):
         rows = farm_queryset()
         search = query.validated_data["search"].strip()
         if search:
-            from django.db.models import Q
-
+            phone_match = phone_search(search, "contact_phone")
+            try:
+                canonical_phone = normalize_vietnam_phone(search)
+            except InvalidPhoneNumber:
+                pass
+            else:
+                phone_match |= Q(contact_phone=canonical_phone)
             rows = rows.filter(
                 Q(name_en__icontains=search)
                 | Q(name_vi__icontains=search)
                 | Q(location_en__icontains=search)
                 | Q(location_vi__icontains=search)
+                | phone_match
             )
         if "is_active" in query.validated_data:
             rows = rows.filter(is_active=query.validated_data["is_active"])
@@ -313,6 +334,8 @@ class AdminFarmProductListView(APIView):
         query = FarmSupplyListQuerySerializer(data=request.query_params.dict())
         query.is_valid(raise_exception=True)
         rows = farm_product_queryset().filter(farm_id=farm_id)
+        if product_status := query.validated_data.get("product_status"):
+            rows = rows.filter(product__status=product_status)
         supply_status = query.validated_data["supply_status"]
         if supply_status != "all":
             rows = rows.filter(removed_at__isnull=supply_status == "supplying")
@@ -698,3 +721,50 @@ class AdminFarmMediaDetailView(APIView):
         if not delete_orphan_media_asset(asset_id=media_id, storage_prefix="farms"):
             return conflict("media_in_use_or_invalid")
         return no_store(Response(status=status.HTTP_204_NO_CONTENT))
+
+
+class AdminFarmBulkStockBatchView(APIView):
+    permission_classes = [IsWebsiteAdmin]
+
+    def get(self, request, farm_id):
+        query = BulkStockBatchRecoverySerializer(data=request.query_params.dict())
+        query.is_valid(raise_exception=True)
+        receipt = find_creation_receipt(
+            actor=request.user,
+            action=AdminCreationReceipt.Action.FARM_STOCK_BATCHES,
+            key=query.validated_data["creation_key"],
+        )
+        if receipt is None or receipt.resource_id != farm_id:
+            return no_store(
+                Response({"errors": [{"code": "create_receipt_not_found"}]}, status=404)
+            )
+        return self.receipt_response(receipt, created=False)
+
+    def post(self, request, farm_id):
+        serializer = BulkStockBatchWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            receipt, created = create_stock_batches_bulk(
+                farm_id=farm_id, actor=request.user, **serializer.validated_data
+            )
+        except CreationIdempotencyConflict:
+            return conflict("idempotency_conflict")
+        except FarmConflict as error:
+            return conflict(error.code, error.context)
+        except Farm.DoesNotExist as error:
+            raise Http404 from error
+        return self.receipt_response(receipt, created=created)
+
+    def receipt_response(self, receipt, *, created):
+        return no_store(
+            Response(
+                {
+                    "data": {
+                        "farm_id": str(receipt.resource_id),
+                        "created_count": receipt.created_count,
+                    },
+                    "meta": creation_receipt_meta(receipt, replayed=not created),
+                },
+                status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+            )
+        )

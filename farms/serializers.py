@@ -1,10 +1,24 @@
 from rest_framework import serializers
 
+from commerce.models import ProductStatus
 from commerce.serializers import StrictSerializer
+from config.phones import InvalidPhoneNumber, normalize_vietnam_phone
 from content.models import TRACKER_FARM_MAX_PHOTOS, TRACKER_SIGNUP_COUNT_MAX
 
 
 class FarmWriteSerializer(StrictSerializer):
+    contact_phone = serializers.CharField(
+        max_length=13, required=False, allow_blank=True, default=""
+    )
+
+    def validate_contact_phone(self, value):
+        if not value:
+            return ""
+        try:
+            return normalize_vietnam_phone(value)
+        except InvalidPhoneNumber as error:
+            raise serializers.ValidationError(str(error)) from error
+
     name_en = serializers.CharField(max_length=240)
     name_vi = serializers.CharField(max_length=240)
     location_en = serializers.CharField(max_length=240)
@@ -64,6 +78,7 @@ class FarmProductQuerySerializer(StrictSerializer):
 
 
 class FarmSupplyListQuerySerializer(FarmProductQuerySerializer):
+    product_status = serializers.ChoiceField(choices=ProductStatus.choices, required=False)
     supply_status = serializers.ChoiceField(choices=("supplying", "removed", "all"), default="all")
 
 
@@ -124,3 +139,39 @@ class GrowthTrackerUpdateSerializer(GrowthTrackerWriteSerializer):
         if "version" not in data:
             raise serializers.ValidationError({"version": "This field is required."})
         return data
+
+
+# Match the existing Store multi-line write bound; reject, never split a transaction.
+BULK_STOCK_BATCH_MAX_ITEMS = 50
+
+
+class BulkStockQuantityField(serializers.IntegerField):
+    def to_internal_value(self, data):
+        # DRF's IntegerField also accepts integral decimals such as 1.0.
+        if type(data) is not int:
+            raise serializers.ValidationError("A valid integer is required.", code="invalid")
+        return super().to_internal_value(data)
+
+
+class BulkStockBatchItemSerializer(FarmProductRevisionSerializer):
+    product_id = serializers.UUIDField()
+    quantity_units = BulkStockQuantityField(min_value=1, max_value=2_147_483_647)
+
+
+class BulkStockBatchWriteSerializer(StrictSerializer):
+    idempotency_key = serializers.UUIDField()
+    start_date = serializers.DateField()
+    end_date = serializers.DateField()
+    items = BulkStockBatchItemSerializer(
+        many=True, allow_empty=False, max_length=BULK_STOCK_BATCH_MAX_ITEMS
+    )
+
+    def validate_items(self, value):
+        ids = [item["product_id"] for item in value]
+        if len(ids) != len(set(ids)):
+            raise serializers.ValidationError("Product IDs must be unique.")
+        return value
+
+
+class BulkStockBatchRecoverySerializer(StrictSerializer):
+    creation_key = serializers.UUIDField()

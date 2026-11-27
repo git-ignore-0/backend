@@ -3,6 +3,9 @@ from django.urls import path
 from farms import views
 
 urlpatterns = [
+    path(
+        "admin/farms/<uuid:farm_id>/stock-batches/bulk", views.AdminFarmBulkStockBatchView.as_view()
+    ),
     path("admin/farms", views.AdminFarmListView.as_view()),
     path("admin/farms/media", views.AdminFarmMediaUploadView.as_view()),
     path("admin/farms/media/<uuid:media_id>", views.AdminFarmMediaDetailView.as_view()),

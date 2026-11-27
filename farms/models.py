@@ -9,6 +9,7 @@ class Farm(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name_en = models.CharField(max_length=240)
     name_vi = models.CharField(max_length=240)
+    contact_phone = models.CharField(max_length=13, blank=True, default="")
     location_en = models.CharField(max_length=240)
     location_vi = models.CharField(max_length=240)
     description_en = models.TextField(blank=True, default="")

@@ -16,24 +16,37 @@ def find_creation_receipt(*, actor, action, key):
     return AdminCreationReceipt.objects.filter(actor=actor, action=action, key=key).first()
 
 
-@transaction.atomic
-def create_with_receipt(*, actor, action, key, payload, create):
+def creation_fingerprint(payload):
     material = dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
-    fingerprint = sha256(material.encode()).hexdigest()
+    return sha256(material.encode()).hexdigest()
+
+
+def claim_creation_receipt(*, actor, action, key, fingerprint):
+    """Claim inside the caller's atomic transaction; complete before it commits.
+
+    get_or_create's unique constraint waits for an in-flight identical key. Any
+    failure in the caller must roll back this claim together with its writes.
+    """
     receipt, created = AdminCreationReceipt.objects.get_or_create(
         actor=actor,
         action=action,
         key=key,
         defaults={"request_fingerprint": fingerprint},
     )
-    if not created:
-        if receipt.request_fingerprint != fingerprint:
-            raise CreationIdempotencyConflict
-        return receipt, False
+    if receipt.request_fingerprint != fingerprint:
+        raise CreationIdempotencyConflict
+    return receipt, created
 
-    receipt.resource_id = create().pk
-    receipt.save(update_fields=["resource_id"])
-    return receipt, True
+
+@transaction.atomic
+def create_with_receipt(*, actor, action, key, payload, create):
+    receipt, created = claim_creation_receipt(
+        actor=actor, action=action, key=key, fingerprint=creation_fingerprint(payload)
+    )
+    if created:
+        receipt.resource_id = create().pk
+        receipt.save(update_fields=["resource_id"])
+    return receipt, created
 
 
 def creation_receipt_meta(receipt, *, replayed):
