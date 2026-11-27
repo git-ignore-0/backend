@@ -148,6 +148,7 @@ class Product(models.Model):
     is_published = models.BooleanField(default=False)
     # Legacy columns mirror status during rollout and rollback.
     status = models.CharField(max_length=12, choices=ProductStatus, default=ProductStatus.DRAFT)
+    version = models.PositiveIntegerField(default=1)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

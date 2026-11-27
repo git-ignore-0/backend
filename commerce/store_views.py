@@ -603,7 +603,7 @@ class SelfStoreBuyAgainView(APIView):
                     else None,
                 }
             )
-        return no_store(Response({"data": {"lines": result}}))
+        return no_store(Response({"data": {"order_id": str(order.pk), "lines": result}}))
 
 
 class AdminStoreOrderListView(APIView):

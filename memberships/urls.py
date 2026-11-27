@@ -53,6 +53,7 @@ urlpatterns = [
     path("admin/csa-selections/<uuid:selection_id>/reopen", rounds.AdminReopen.as_view()),
     path("admin/csa-selections/<uuid:selection_id>/events", rounds.AdminSelectionEvents.as_view()),
     path("csa-rounds", rounds.MemberRounds.as_view()),
+    path("csa-rounds/<uuid:round_id>", rounds.MemberRound.as_view()),
     path("csa-rounds/<uuid:round_id>/products", rounds.MemberProducts.as_view()),
     path("csa-rounds/<uuid:round_id>/selection", rounds.MemberSelection.as_view()),
     path("csa-selections/<uuid:selection_id>/confirm", rounds.MemberConfirm.as_view()),

@@ -57,6 +57,7 @@ def test_lists_configurations_and_their_occurrences(context, admin_client, monke
             "name": configuration["name"],
             "type": "weekly",
             "status": "published",
+            "version": configuration["version"] + 1,
             "created_at": configuration["created_at"],
         }
     ]

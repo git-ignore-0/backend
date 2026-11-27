@@ -34,6 +34,7 @@ from content.serializers import (
     TestimonialActionSerializer,
     TestimonialUpdateSerializer,
     TestimonialWriteSerializer,
+    TrackerFarmDeleteSerializer,
     TrackerFarmReorderSerializer,
     TrackerFarmUpdateSerializer,
     TrackerFarmWriteSerializer,
@@ -367,10 +368,22 @@ class AdminTrackerFarmDetailView(APIView):
         return admin_no_store(Response({"data": admin_tracker_write_payload(farm, request)}))
 
     def delete(self, request, farm_id):
+        serializer = TrackerFarmDeleteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
         try:
-            delete_tracker_farm(farm_id=farm_id, actor=request.user)
+            delete_tracker_farm(
+                farm_id=farm_id,
+                actor=request.user,
+                expected_version=serializer.validated_data["version"],
+            )
         except (Farm.DoesNotExist, TrackerFarm.DoesNotExist) as error:
             raise NotFound from error
+        except TrackerFarmVersionConflict:
+            return admin_no_store(
+                Response(
+                    {"errors": [{"code": "version_conflict"}]}, status=status.HTTP_409_CONFLICT
+                )
+            )
         except (ProtectedError, RestrictedError):
             return admin_no_store(
                 Response(

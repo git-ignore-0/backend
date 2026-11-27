@@ -76,6 +76,7 @@ class PointTransaction(models.Model):
     direction = models.CharField(max_length=10, choices=PointDirection.choices)
     amount = models.PositiveIntegerField()
     template = models.CharField(max_length=50, choices=PointTemplate.choices)
+    manual_idempotency_key = models.UUIDField(null=True, unique=True, editable=False)
     message = models.CharField(max_length=240)
     internal_note = models.TextField(blank=True)
     related_referral = models.ForeignKey(
@@ -99,7 +100,12 @@ class PointTransaction(models.Model):
             models.CheckConstraint(
                 condition=Q(amount__gt=0),
                 name="referrals_point_amount_positive",
-            )
+            ),
+            models.CheckConstraint(
+                condition=Q(manual_idempotency_key__isnull=True)
+                | Q(template=PointTemplate.MANUAL_ADJUSTMENT),
+                name="referrals_point_manual_key_template",
+            ),
         ]
         indexes = [models.Index(fields=["user", "-created_at"])]
 

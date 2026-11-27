@@ -13,7 +13,11 @@ from rest_framework.views import APIView
 from commerce.models import Product, ProductStatus, ProductTranslation
 from content.models import ContentAuditLog, MediaAsset, TrackerFarm
 from content.permissions import IsWebsiteAdmin
-from content.serializers import admin_tracker_farm_payload, media_payload
+from content.serializers import (
+    TrackerFarmDeleteSerializer,
+    admin_tracker_farm_payload,
+    media_payload,
+)
 from content.services import delete_orphan_media_asset, tracker_farm_queryset
 from content.views import AdminMediaUploadView, admin_tracker_write_payload
 from farms.models import Farm, FarmProduct, FarmProductStockBatch
@@ -663,8 +667,14 @@ class AdminFarmGrowthTrackerView(APIView):
 
     def delete(self, request, farm_id):
         get_object_or_404(TrackerFarm, farm_id=farm_id)
+        serializer = TrackerFarmDeleteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
         try:
-            delete_growth_tracker_profile(farm_id=farm_id, actor=request.user)
+            delete_growth_tracker_profile(
+                farm_id=farm_id,
+                actor=request.user,
+                expected_version=serializer.validated_data["version"],
+            )
         except FarmConflict as error:
             return conflict(error.code)
         except Farm.DoesNotExist as error:

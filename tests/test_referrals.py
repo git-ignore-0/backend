@@ -537,3 +537,49 @@ def test_referral_and_admin_user_projections_accept_user_without_email(admin_api
         assert row["id"] == str(invitee.pk)
         assert row["email"] is None and row["email_verified"] is False
         assert row["phone"] == row["login_phone_number"] == "+84912345678"
+
+
+@pytest.mark.django_db
+def test_manual_point_adjustment_confirms_key_without_reapplying_and_rechecks_permissions(
+    admin_api, active_user
+):
+    import uuid
+
+    target = create_active_user("adjustment-target@example.com")
+    url = f"/api/v1/admin/users/{target.pk}/points"
+    payload = {
+        "direction": "credit",
+        "amount": 25,
+        "message": "Test adjustment",
+        "idempotency_key": str(uuid.uuid4()),
+    }
+    created = admin_api.post(url, payload, format="json")
+    assert created.status_code == 201
+    txn = created.json()["data"]["transaction"]
+    receipt = {
+        "action": "adjust_points",
+        "user_id": str(target.pk),
+        "transaction_id": txn["id"],
+        "idempotency_key": payload["idempotency_key"],
+    }
+    assert created.json()["meta"] == {"idempotent_replay": False, "action_receipt": receipt}
+    create_point_transaction(
+        user=target, actor=active_user, direction="debit", amount=15, message="Another adjustment"
+    )
+    replay = admin_api.post(url, payload, format="json")
+    assert replay.status_code == 200
+    assert replay.json() == {
+        "data": {"transaction": txn, "balance": 10},
+        "meta": {"idempotent_replay": True, "action_receipt": receipt},
+    }
+    conflict = admin_api.post(url, {**payload, "amount": 26}, format="json")
+    assert conflict.status_code == 409
+    assert conflict.json()["errors"][0]["code"] == "idempotency_conflict"
+    target.groups.add(Group.objects.get(name="website_admin"))
+    protected = admin_api.post(url, payload, format="json")
+    assert protected.status_code == 409
+    assert protected.json()["errors"][0]["code"] == "account_target_protected"
+    active_user.groups.clear()
+    assert admin_api.post(url, payload, format="json").status_code == 403
+    assert PointTransaction.objects.filter(user=target).count() == 2
+    assert point_balance(target) == 10

@@ -429,3 +429,26 @@ class ContentAuditLog(models.Model):
 
     def __str__(self):
         return f"{self.action} · {self.entity_type}:{self.entity_id}"
+
+
+class AdminCreationReceipt(models.Model):
+    class Action(models.TextChoices):
+        PRODUCT = "create_product"
+        CSA_CONFIGURATION = "create_csa_configuration"
+
+    actor = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL)
+    action = models.CharField(max_length=32, choices=Action)
+    key = models.UUIDField(editable=False)
+    request_fingerprint = models.CharField(max_length=64, editable=False)
+    # Retain the original resource identity when the application record is deleted.
+    resource_id = models.UUIDField(null=True, editable=False)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["actor", "action", "key"], name="content_creation_actor_action_key"
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.action}:{self.resource_id}"

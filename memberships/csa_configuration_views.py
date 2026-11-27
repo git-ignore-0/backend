@@ -8,6 +8,13 @@ from django.utils import timezone
 from rest_framework import serializers
 from rest_framework.response import Response
 
+from content.creation_receipts import (
+    CreationIdempotencyConflict,
+    create_with_receipt,
+    creation_receipt_meta,
+    find_creation_receipt,
+)
+from content.models import AdminCreationReceipt
 from content.permissions import IsWebsiteAdmin
 from memberships import csa_rounds as domain
 from memberships.csa_admin_payloads import admin_round_payloads, admin_round_queryset
@@ -76,12 +83,29 @@ class ConfigurationInput(RoundInput):
     )
 
 
+class ConfigurationCreateInput(ConfigurationInput):
+    idempotency_key = serializers.UUIDField(required=False)
+
+
+class ConfigurationUpdateInput(ConfigurationInput):
+    version = serializers.IntegerField(min_value=1, required=False)
+
+
+class ConfigurationVersionInput(StrictSerializer):
+    version = serializers.IntegerField(min_value=1, required=False)
+
+
+class ConfigurationCreationQuery(StrictSerializer):
+    creation_key = serializers.UUIDField()
+
+
 def configuration_payload(configuration, *, detail=False):
     payload = {
         "id": str(configuration.pk),
         "name": configuration.name,
         "type": "weekly" if configuration.recurrence_mode else "standalone",
         "status": configuration.status,
+        "version": configuration.version,
         "created_at": configuration.created_at.isoformat(),
     }
     if detail:
@@ -101,6 +125,16 @@ class AdminRoundConfigurations(PrivateView):
     permission_classes = [IsWebsiteAdmin]
 
     def get(self, request):
+        if "creation_key" in request.query_params:
+            query = configuration_query(request, ConfigurationCreationQuery)
+            receipt = find_creation_receipt(
+                actor=request.user,
+                action=AdminCreationReceipt.Action.CSA_CONFIGURATION,
+                key=query["creation_key"],
+            )
+            if receipt is None:
+                return Response({"errors": [{"code": "create_receipt_not_found"}]}, status=404)
+            return self.creation_response(receipt, created=False)
         query = configuration_query(request, ConfigurationPageQuery)
         rows = CSARoundConfiguration.objects.order_by("-created_at", "-pk")
         if kind := query.get("type"):
@@ -117,10 +151,34 @@ class AdminRoundConfigurations(PrivateView):
 
     def post(self, request):
         configuration_query(request, StrictSerializer)
-        configuration = domain.create_round_configuration(
-            actor=request.user, **validated(ConfigurationInput, request)
+        data = dict(validated(ConfigurationCreateInput, request))
+        key = data.pop("idempotency_key", None)
+        if key is None:
+            configuration = domain.create_round_configuration(actor=request.user, **data)
+            return Response({"data": configuration_payload(configuration, detail=True)}, status=201)
+        # Serializer omission and explicit null select the same standalone schedule.
+        data.setdefault("recurrence_mode", None)
+        try:
+            receipt, created = create_with_receipt(
+                actor=request.user,
+                action=AdminCreationReceipt.Action.CSA_CONFIGURATION,
+                key=key,
+                payload=data,
+                create=lambda: domain.create_round_configuration(actor=request.user, **data),
+            )
+        except CreationIdempotencyConflict as error:
+            raise domain.CSARoundError("idempotency_conflict") from error
+        return self.creation_response(receipt, created=created)
+
+    def creation_response(self, receipt, *, created):
+        row = CSARoundConfiguration.objects.filter(pk=receipt.resource_id).first()
+        return Response(
+            {
+                "data": configuration_payload(row, detail=True) if row else None,
+                "meta": creation_receipt_meta(receipt, replayed=not created),
+            },
+            status=201 if created else 200,
         )
-        return Response({"data": configuration_payload(configuration, detail=True)}, status=201)
 
 
 class AdminRoundConfiguration(PrivateView):
@@ -135,14 +193,15 @@ class AdminRoundConfiguration(PrivateView):
         configuration_query(request, StrictSerializer)
         configuration = domain.update_round_configuration(
             configuration_id=configuration_id,
-            **validated(ConfigurationInput, request, partial=True),
+            **validated(ConfigurationUpdateInput, request, partial=True),
         )
         return Response({"data": configuration_payload(configuration, detail=True)})
 
     def delete(self, request, configuration_id):
         configuration_query(request, StrictSerializer)
-        validated(StrictSerializer, request)
-        domain.delete_round_configuration(configuration_id=configuration_id)
+        domain.delete_round_configuration(
+            configuration_id=configuration_id, **validated(ConfigurationVersionInput, request)
+        )
         return Response(status=204)
 
 
@@ -151,8 +210,9 @@ class AdminPublishRoundConfiguration(PrivateView):
 
     def post(self, request, configuration_id):
         configuration_query(request, StrictSerializer)
-        validated(StrictSerializer, request)
-        configuration = domain.publish_round_configuration(configuration_id=configuration_id)
+        configuration = domain.publish_round_configuration(
+            configuration_id=configuration_id, **validated(ConfigurationVersionInput, request)
+        )
         return Response({"data": configuration_payload(configuration, detail=True)})
 
 
@@ -183,6 +243,7 @@ class AdminStopRoundConfiguration(PrivateView):
 
     def post(self, request, configuration_id):
         configuration_query(request, StrictSerializer)
-        validated(StrictSerializer, request)
-        configuration = domain.stop_round_recurrence(configuration_id=configuration_id)
+        configuration = domain.stop_round_recurrence(
+            configuration_id=configuration_id, **validated(ConfigurationVersionInput, request)
+        )
         return Response({"data": configuration_payload(configuration, detail=True)})

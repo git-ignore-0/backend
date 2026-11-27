@@ -1622,8 +1622,18 @@ def test_revoke_does_not_alter_usage_history(active_user, admin_api):
         {**usage_payload, "idempotency_key": str(uuid.uuid4())},
         format="json",
     )
-    assert replay.status_code == fresh.status_code == 409
-    assert replay.json()["errors"] == fresh.json()["errors"] == [{"code": "invalid_quota_usage"}]
+    assert replay.status_code == 200
+    assert replay.json()["data"]["id"] == str(order.pk)
+    assert replay.json()["meta"]["idempotent_replay"] is True
+    assert fresh.status_code == 409
+    assert fresh.json()["errors"] == [{"code": "invalid_quota_usage"}]
+    mismatched = admin_api.post(
+        "/api/v1/admin/membership-usage",
+        {**usage_payload, "idempotency_key": str(idempotency_key), "note": "Different delivery"},
+        format="json",
+    )
+    assert mismatched.status_code == 409
+    assert mismatched.json()["errors"] == [{"code": "usage_idempotency_conflict"}]
 
     membership.refresh_from_db()
     order.refresh_from_db()

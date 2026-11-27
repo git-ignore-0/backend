@@ -544,11 +544,8 @@ def test_concurrent_contract_creation_maps_duplicate_to_domain_error(package_and
 def test_contract_migration_does_not_backfill_legacy_memberships():
     migrate_from = ("memberships", "0013_csapurchaserequest_guest_token_hash")
     migrate_to = ("memberships", "0014_csacontract")
-    migrate_latest = (
-        "memberships",
-        "0018_remove_csapurchaserequest_memberships_csa_purchase_status_valid_and_more",
-    )
     executor = MigrationExecutor(connection)
+    latest = executor.loader.graph.leaf_nodes()
     try:
         executor.migrate([migrate_from])
         old = executor.loader.project_state([migrate_from]).apps
@@ -593,7 +590,7 @@ def test_contract_migration_does_not_backfill_legacy_memberships():
         assert migrated.get_model("memberships", "Membership").objects.count() == 1
         assert migrated.get_model("memberships", "CSAContract").objects.count() == 0
     finally:
-        MigrationExecutor(connection).migrate([migrate_latest])
+        MigrationExecutor(connection).migrate(latest)
 
 
 @pytest.mark.django_db

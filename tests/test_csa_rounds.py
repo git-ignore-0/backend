@@ -826,3 +826,129 @@ def test_reselection_protects_held_quota_across_cycles_without_duplicating_old_c
     assert confirmed.order.lines.count() == 2
     assert quota.remaining_units + new_quota.remaining_units == 5
     assert not confirmed.quota_holds.exists()
+
+
+def test_member_round_detail_respects_history_visibility_and_returns_only_own_selection(context):
+    from types import SimpleNamespace
+
+    user, _, _, round_, now = context
+    own = save(context)
+    client = APIClient()
+    client.force_authenticate(user, token=SimpleNamespace(scope="profile email"))
+    url = f"/api/v1/csa-rounds/{round_.pk}"
+    response = client.get(url)
+    assert response.status_code == 200
+    assert response["Cache-Control"] == "private, no-store"
+    assert response.json()["data"]["id"] == str(round_.pk)
+    assert response.json()["selection"]["id"] == str(own.pk)
+
+    other = User.objects.create_user(
+        email="unrelated-round-user@example.com", name="Other member", status=AccountStatus.ACTIVE
+    )
+    client.force_authenticate(other, token=SimpleNamespace(scope="profile email"))
+    assert client.get(url).json()["selection"] is None
+    round_.opens_at = now - timedelta(days=4)
+    round_.closes_at = now - timedelta(days=3)
+    round_.delivery_date = now.date() - timedelta(days=2)
+    round_.save(update_fields=["opens_at", "closes_at", "delivery_date"])
+    assert client.get(url).status_code == 404
+    client.force_authenticate(user, token=SimpleNamespace(scope="profile email"))
+    assert client.get(url).json()["selection"]["id"] == str(own.pk)
+    client.force_authenticate(user, token=SimpleNamespace(scope="profile"))
+    assert client.get(url).status_code == 403
+
+
+def test_csa_configuration_create_receipt_and_version_guard_prevent_duplicate_publish(
+    context, access_token
+):
+    import uuid
+
+    from memberships.models import CSARoundConfiguration
+
+    user, _, _, _, now = context
+    admin_group, _ = Group.objects.get_or_create(name="website_admin")
+    user.groups.add(admin_group)
+    access_token.scope = "profile email content:manage"
+    access_token.save(update_fields=["scope"])
+    client = APIClient()
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token.token}")
+    endpoint = "/api/v1/admin/csa-round-configurations"
+    key = str(uuid.uuid4())
+    payload = {
+        "name": "Hardening draft",
+        "opens_at": (now + timedelta(hours=1)).isoformat(),
+        "closes_at": (now + timedelta(hours=2)).isoformat(),
+        "delivery_date": (now.date() + timedelta(days=2)).isoformat(),
+        "recurrence_mode": "draft",
+        "idempotency_key": key,
+    }
+    created = client.post(endpoint, payload, format="json")
+    assert created.status_code == 201, created.json()
+    configuration = created.json()["data"]
+    resource = f"{endpoint}/{configuration['id']}"
+    assert configuration["version"] == 1
+    replay = client.post(endpoint, payload, format="json")
+    assert replay.status_code == 200
+    assert replay.json() == client.get(endpoint, {"creation_key": key}).json()
+    assert replay.json()["meta"]["action_receipt"] == {
+        "action": "create_csa_configuration",
+        "resource_id": configuration["id"],
+        "idempotency_key": key,
+    }
+    conflict = client.post(endpoint, {**payload, "name": "Different intent"}, format="json")
+    assert conflict.status_code == 409
+    assert conflict.json()["errors"][0]["code"] == "idempotency_conflict"
+    edited = client.patch(resource, {"version": 1, "name": "Updated"}, format="json")
+    assert edited.json()["data"]["version"] == 2
+    for stale in (
+        client.patch(resource, {"version": 1, "name": "Stale"}, format="json"),
+        client.delete(resource, {"version": 1}, format="json"),
+        client.post(f"{resource}/publish", {"version": 1}, format="json"),
+    ):
+        assert stale.status_code == 409
+        assert stale.json()["errors"][0]["code"] == "version_conflict"
+    published = client.post(f"{resource}/publish", {"version": 2}, format="json")
+    assert published.json()["data"]["version"] == 3
+    replay = client.post(endpoint, payload, format="json")
+    assert replay.status_code == 200
+    assert replay.json()["data"]["id"] == configuration["id"]
+    assert CSARoundConfiguration.objects.get(pk=configuration["id"]).rounds.count() == 1
+
+
+def test_occurrence_edit_and_companion_settings_cannot_overwrite_a_newer_version(
+    context, access_token
+):
+    user, _, _, round_, now = context
+    user.groups.add(Group.objects.get_or_create(name="website_admin")[0])
+    access_token.scope = "profile email content:manage"
+    access_token.save(update_fields=["scope"])
+    client = APIClient()
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token.token}")
+    url = f"/api/v1/admin/csa-rounds/{round_.pk}"
+    original = client.get(url).json()["data"]
+    assert original.get("version") == 1
+    companion = client.patch(
+        f"{url}/companion-delivery",
+        {
+            "version": 1,
+            "companion_delivery_enabled": True,
+            "companion_delivery_cutoff": (now + timedelta(hours=1)).isoformat(),
+        },
+        format="json",
+    )
+    assert companion.status_code == 200, companion.json()
+    assert companion.json()["data"]["version"] == 2
+    for stale in (
+        client.patch(url, {"version": 1, "name": "Stale edit"}, format="json"),
+        client.post(f"{url}/publish", {"version": 1}, format="json"),
+        client.post(f"{url}/cancel", {"version": 1, "reason": "Stale action"}, format="json"),
+        client.patch(
+            f"{url}/companion-delivery",
+            {"version": 1, "companion_delivery_enabled": False},
+            format="json",
+        ),
+    ):
+        assert stale.status_code == 409
+        assert stale.json()["errors"][0]["code"] == "version_conflict"
+    updated = client.patch(url, {"version": 2, "name": "Fresh edit"}, format="json").json()["data"]
+    assert (updated["version"], updated["name"]) == (3, "Fresh edit")

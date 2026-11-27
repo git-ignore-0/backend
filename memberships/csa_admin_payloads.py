@@ -47,6 +47,7 @@ def admin_round_payloads(rows, *, now=None, participants=False):
         configuration = row.configuration
         payload = {
             **round_payload(row, now=now),
+            "version": row.version,
             "configuration_id": str(configuration.pk),
             "configuration_name": configuration.name,
             "can_edit": can_edit_round(row),

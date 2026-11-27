@@ -145,8 +145,14 @@ def create_round_configuration(
     return configuration
 
 
-def _draft_configuration_for_update(configuration_id):
+def _check_schedule_version(schedule, version):
+    if version is not None and schedule.version != version:
+        _fail("version_conflict")
+
+
+def _draft_configuration_for_update(configuration_id, version):
     configuration = CSARoundConfiguration.objects.select_for_update().get(pk=configuration_id)
+    _check_schedule_version(configuration, version)
     if configuration.status != "draft":
         _fail("csa_configuration_not_draft")
     return configuration
@@ -159,20 +165,21 @@ def _validate_draft_companion_cutoff(configuration):
 
 
 @transaction.atomic
-def update_round_configuration(*, configuration_id, **values):
-    configuration = _draft_configuration_for_update(configuration_id)
+def update_round_configuration(*, configuration_id, version=None, **values):
+    configuration = _draft_configuration_for_update(configuration_id, version)
     for field in ("name", "opens_at", "closes_at", "delivery_date", "recurrence_mode"):
         if field in values:
             setattr(configuration, field, values[field])
     _validate_schedule(configuration)
     _validate_draft_companion_cutoff(configuration)
+    configuration.version += 1
     configuration.save()
     return configuration
 
 
 @transaction.atomic
-def delete_round_configuration(*, configuration_id):
-    _draft_configuration_for_update(configuration_id).delete()
+def delete_round_configuration(*, configuration_id, version=None):
+    _draft_configuration_for_update(configuration_id, version).delete()
 
 
 def can_edit_round(round_):
@@ -186,8 +193,9 @@ def can_edit_round(round_):
 
 
 @transaction.atomic
-def update_round(*, round_id, actor, **values):
+def update_round(*, round_id, actor, version=None, **values):
     row = CSARound.objects.select_for_update().get(pk=round_id)
+    _check_schedule_version(row, version)
     # Once public, dates define entitlement and reservations; create drafts freely.
     if not can_edit_round(row):
         _fail("csa_round_published_immutable")
@@ -199,6 +207,7 @@ def update_round(*, round_id, actor, **values):
         _fail("csa_companion_deadline_invalid")
     if row.published_at and row.closes_at <= timezone.now():
         _fail("csa_round_already_closed")
+    row.version += 1
     row.save()
     return row
 
@@ -216,8 +225,9 @@ def _last_recurrence_week(delivery_date):
 
 
 @transaction.atomic
-def publish_round_configuration(*, configuration_id):
+def publish_round_configuration(*, configuration_id, version=None):
     configuration = CSARoundConfiguration.objects.select_for_update().get(pk=configuration_id)
+    _check_schedule_version(configuration, version)
     if configuration.cancelled_at is not None:
         _fail("csa_configuration_cancelled")
     if configuration.published_at is not None:
@@ -244,6 +254,7 @@ def publish_round_configuration(*, configuration_id):
         published_at=now,
     )
     configuration.published_at = now
+    configuration.version += 1
     configuration.draft_companion_delivery_enabled = False
     configuration.draft_companion_delivery_cutoff = None
     if configuration.recurrence_mode:
@@ -251,6 +262,7 @@ def publish_round_configuration(*, configuration_id):
     configuration.save(
         update_fields=[
             "published_at",
+            "version",
             "next_create_at",
             "draft_companion_delivery_enabled",
             "draft_companion_delivery_cutoff",
@@ -260,8 +272,9 @@ def publish_round_configuration(*, configuration_id):
 
 
 @transaction.atomic
-def publish_round(*, round_id, actor):
+def publish_round(*, round_id, actor, version=None):
     row = CSARound.objects.select_for_update().get(pk=round_id)
+    _check_schedule_version(row, version)
     if row.cancelled_at:
         _fail("csa_round_cancelled")
     if row.published_at:
@@ -271,25 +284,29 @@ def publish_round(*, round_id, actor):
     if row.closes_at <= now:
         _fail("csa_round_already_closed")
     row.published_at = now
-    row.save(update_fields=["published_at", "updated_at"])
+    row.version += 1
+    row.save(update_fields=["published_at", "version", "updated_at"])
     return row
 
 
 @transaction.atomic
-def stop_round_recurrence(*, configuration_id):
+def stop_round_recurrence(*, configuration_id, version=None):
     configuration = CSARoundConfiguration.objects.select_for_update().get(pk=configuration_id)
+    _check_schedule_version(configuration, version)
     if configuration.recurrence_mode is None or configuration.published_at is None:
         _fail("csa_recurrence_not_active")
     if configuration.cancelled_at is None:
         configuration.cancelled_at = timezone.now()
         configuration.next_create_at = None
-        configuration.save(update_fields=["cancelled_at", "next_create_at"])
+        configuration.version += 1
+        configuration.save(update_fields=["cancelled_at", "next_create_at", "version"])
     return configuration
 
 
 @transaction.atomic
-def configure_companion_delivery(*, round_id, actor, **values):
+def configure_companion_delivery(*, round_id, actor, version=None, **values):
     row = CSARound.objects.select_for_update().get(pk=round_id)
+    _check_schedule_version(row, version)
     now = timezone.now()  # Decide after waiting for the round lock.
     if row.cancelled_at:
         _fail("csa_round_cancelled")
@@ -301,8 +318,14 @@ def configure_companion_delivery(*, round_id, actor, **values):
         _fail("csa_companion_deadline_invalid")
     row.companion_delivery_enabled = enabled
     row.companion_delivery_cutoff = cutoff
+    row.version += 1
     row.save(
-        update_fields=["companion_delivery_enabled", "companion_delivery_cutoff", "updated_at"]
+        update_fields=[
+            "companion_delivery_enabled",
+            "companion_delivery_cutoff",
+            "version",
+            "updated_at",
+        ]
     )
     return row
 
@@ -940,8 +963,9 @@ def process_round(round_id, *, now=None, user=None, selection_ids=None):
 
 
 @transaction.atomic
-def cancel_round(*, round_id, actor, reason):
+def cancel_round(*, round_id, actor, reason, version=None):
     round_ = CSARound.objects.select_for_update().get(pk=round_id)
+    _check_schedule_version(round_, version)
     if round_.cancelled_at:
         return round_
     selections = round_.selections.exclude(state__in=TERMINAL)
@@ -971,7 +995,16 @@ def cancel_round(*, round_id, actor, reason):
     round_.cancelled_at = timezone.now()
     round_.cancellation_reason = reason
     round_.cancelled_by = actor
-    round_.save(update_fields=["cancelled_at", "cancellation_reason", "cancelled_by", "updated_at"])
+    round_.version += 1
+    round_.save(
+        update_fields=[
+            "cancelled_at",
+            "cancellation_reason",
+            "cancelled_by",
+            "version",
+            "updated_at",
+        ]
+    )
     return round_
 
 

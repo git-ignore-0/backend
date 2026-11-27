@@ -560,13 +560,15 @@ def delete_temporary_tracker_farm_media(*, media_id, actor):
 
 
 @transaction.atomic
-def delete_tracker_farm(*, farm_id, actor):
+def delete_tracker_farm(*, farm_id, actor, expected_version):
     from farms.models import Farm, FarmPhoto, FarmProduct
 
     canonical_id = TrackerFarm.objects.only("farm_id").get(pk=farm_id).farm_id
     if canonical_id:
         Farm.objects.select_for_update().get(pk=canonical_id)
     farm = TrackerFarm.objects.select_for_update().get(pk=farm_id)
+    if farm.version != expected_version:
+        raise TrackerFarmVersionConflict
     candidate_ids = _tracker_farm_media_ids(farm)
     if canonical_id:
         canonical = Farm.objects.select_for_update().get(pk=canonical_id)

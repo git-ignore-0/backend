@@ -44,6 +44,7 @@ class ReferralCodeSerializer(serializers.Serializer):
 
 
 class PointTransactionWriteSerializer(serializers.Serializer):
+    idempotency_key = serializers.UUIDField(required=False)
     direction = serializers.ChoiceField(choices=PointDirection.choices)
     amount = serializers.IntegerField(min_value=1)
     message = serializers.CharField(max_length=240, trim_whitespace=True)

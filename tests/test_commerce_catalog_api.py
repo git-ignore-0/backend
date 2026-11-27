@@ -1212,3 +1212,73 @@ def test_active_edit_and_transition_rollback_protect_catalog(
     assert product.retail_price_vnd == original.retail_price_vnd
     assert product.primary_image_id == original.primary_image_id
     assert product.translations.count() == 2
+
+
+@pytest.mark.django_db
+def test_product_create_receipt_is_scoped_persistent_and_never_recreates_deleted_product(
+    admin_api, active_user
+):
+    import uuid
+
+    category = Category.objects.create(slug="creation-receipt", is_active=True)
+    endpoint = "/api/v1/admin/store-products"
+    key = str(uuid.uuid4())
+    payload = {**product_payload(str(category.pk)), "idempotency_key": key}
+    assert admin_api.get(endpoint, {"creation_key": key}).status_code == 404
+    created = admin_api.post(endpoint, payload, format="json")
+    assert created.status_code == 201, created.json()
+    product = created.json()["data"]
+    receipt = {
+        "action": "create_product",
+        "resource_id": product["id"],
+        "idempotency_key": key,
+    }
+    assert created.json()["meta"] == {"idempotent_replay": False, "action_receipt": receipt}
+    recovered = admin_api.get(endpoint, {"creation_key": key})
+    assert recovered.json() == {
+        "data": product,
+        "meta": {"idempotent_replay": True, "action_receipt": receipt},
+    }
+    assert "no-store" in recovered["Cache-Control"]
+    replay = admin_api.post(endpoint, payload, format="json")
+    assert replay.status_code == 200
+    assert replay.json() == recovered.json()
+    conflict = admin_api.post(endpoint, {**payload, "unit_label_en": "different"}, format="json")
+    assert conflict.status_code == 409
+    assert conflict.json()["errors"][0]["code"] == "idempotency_conflict"
+    active_user.groups.clear()
+    assert admin_api.get(endpoint, {"creation_key": key}).status_code == 403
+    assert admin_api.post(endpoint, payload, format="json").status_code == 403
+    active_user.groups.add(Group.objects.get(name="website_admin"))
+    assert admin_api.delete(f"{endpoint}/{product['id']}").status_code == 204
+    deleted_replay = admin_api.post(endpoint, payload, format="json")
+    assert deleted_replay.status_code == 200
+    assert deleted_replay.json() == {**recovered.json(), "data": None}
+    assert not Product.objects.filter(sku=payload["sku"].strip().upper()).exists()
+
+
+@pytest.mark.django_db
+def test_product_stale_write_and_delete_do_not_override_updated_snapshot(admin_api):
+    category = Category.objects.create(slug="product-version", is_active=True)
+    endpoint = "/api/v1/admin/store-products"
+    original = admin_api.post(endpoint, product_payload(str(category.pk)), format="json").json()[
+        "data"
+    ]
+    url = f"{endpoint}/{original['id']}"
+    assert original.get("version") == 1
+    updated = admin_api.patch(url, {"version": 1, "retail_price_vnd": 39000}, format="json")
+    assert updated.status_code == 200
+    assert updated.json()["data"]["version"] == 2
+    rejected = (
+        admin_api.patch(url, {"version": 1, "retail_price_vnd": 40000}, format="json"),
+        admin_api.post(
+            f"{url}/transition",
+            {"version": 1, "expected_status": "draft", "target_status": "active"},
+            format="json",
+        ),
+        admin_api.delete(url, {"version": 1}, format="json"),
+    )
+    for response in rejected:
+        assert response.status_code == 409
+        assert response.json()["errors"][0]["code"] == "version_conflict"
+    assert admin_api.get(url).json()["data"]["retail_price_vnd"] == "39000"

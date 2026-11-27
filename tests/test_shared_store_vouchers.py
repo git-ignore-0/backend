@@ -390,7 +390,9 @@ def test_voucher_approval_cancel_refund_and_buy_again_keep_snapshots(context, ac
         f"/api/v1/store-orders/{order.pk}/buy-again", {"locale": "vi"}, format="json"
     )
     assert buy_again.status_code == 200, buy_again.data
-    assert set(buy_again.json()["data"]) == {"lines"}
+    buy_again_data = buy_again.json()["data"]
+    assert set(buy_again_data) == {"lines", "order_id"}
+    assert buy_again_data["order_id"] == str(order.pk)
     snapshot = order.coupon_snapshot
     record_store_payment(order_id=order.pk, actor=active_user, idempotency_key=uuid.uuid4())
     cancel_store_order(

@@ -2101,6 +2101,7 @@ class CSARoundConfiguration(models.Model):
     cancelled_at = models.DateTimeField(null=True, blank=True)
     next_week = models.PositiveIntegerField(default=1)
     next_create_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    version = models.PositiveIntegerField(default=1)
     created_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL)
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -2156,6 +2157,7 @@ class CSARound(models.Model):
         CSARoundConfiguration, related_name="rounds", on_delete=models.PROTECT
     )
     recurrence_week = models.PositiveIntegerField()
+    version = models.PositiveIntegerField(default=1)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

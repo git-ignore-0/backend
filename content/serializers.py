@@ -359,6 +359,10 @@ class TrackerFarmUpdateSerializer(TrackerFarmWriteSerializer):
         return attrs
 
 
+class TrackerFarmDeleteSerializer(TestimonialStrictSerializer):
+    version = serializers.IntegerField(min_value=1)
+
+
 class TrackerFarmReorderItemSerializer(TestimonialStrictSerializer):
     id = serializers.UUIDField()
     sort_order = serializers.IntegerField(min_value=0)

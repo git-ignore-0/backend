@@ -1,9 +1,10 @@
+from django.db import transaction
 from django.db.models import CharField, Count, Exists, OuterRef, Prefetch, Q, Subquery
 from django.db.models.functions import Coalesce
 from django.shortcuts import get_object_or_404
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
-from rest_framework.exceptions import NotFound
+from rest_framework.exceptions import NotFound, ValidationError
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -19,9 +20,12 @@ from commerce.serializers import (
     AdminShippingAddressSerializer,
     CategoryQuerySerializer,
     CategoryWriteSerializer,
+    ProductCreateSerializer,
+    ProductCreationQuerySerializer,
     ProductQuerySerializer,
     ProductTransitionSerializer,
-    ProductWriteSerializer,
+    ProductUpdateSerializer,
+    ProductVersionSerializer,
     PublicStoreLocaleSerializer,
     PublicStoreProductQuerySerializer,
     ShippingLocaleSerializer,
@@ -52,7 +56,13 @@ from commerce.shipping import (
     shipping_address_payload,
     shipping_settings_payload,
 )
-from content.models import MediaAsset
+from content.creation_receipts import (
+    CreationIdempotencyConflict,
+    create_with_receipt,
+    creation_receipt_meta,
+    find_creation_receipt,
+)
+from content.models import AdminCreationReceipt, MediaAsset
 from content.permissions import IsWebsiteAdmin
 from content.serializers import media_payload
 from content.services import delete_orphan_media_asset
@@ -413,6 +423,7 @@ def product_payload(item, request, *, include_document=True):
         "primary_image_id": str(item.primary_image_id) if item.primary_image_id else None,
         "primary_image": media_payload(item.primary_image, request) if item.primary_image else None,
         "status": item.status,
+        "version": item.version,
         **legacy_product_flags(item.status),
         **({"capabilities": product_capabilities(item)} if include_document else {}),
         "translations": _translations(item, include_document=include_document),
@@ -481,6 +492,21 @@ class AdminProductViewSet(viewsets.ViewSet):
     lookup_value_converter = "uuid"
 
     def list(self, request):
+        if "creation_key" in request.query_params:
+            query = ProductCreationQuerySerializer(data=request.query_params)
+            query.is_valid(raise_exception=True)
+            if len(request.query_params.getlist("creation_key")) != 1:
+                raise ValidationError({"creation_key": "Provide this parameter once."})
+            receipt = find_creation_receipt(
+                actor=request.user,
+                action=AdminCreationReceipt.Action.PRODUCT,
+                key=query.validated_data["creation_key"],
+            )
+            if receipt is None:
+                return no_store(
+                    Response({"errors": [{"code": "create_receipt_not_found"}]}, status=404)
+                )
+            return self.creation_response(request, receipt, created=False)
         query = ProductQuerySerializer(data=request.query_params.dict())
         query.is_valid(raise_exception=True)
         data = query.validated_data
@@ -530,27 +556,55 @@ class AdminProductViewSet(viewsets.ViewSet):
         )
 
     def create(self, request):
-        serializer = ProductWriteSerializer(data=request.data)
+        serializer = ProductCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        data = dict(serializer.validated_data)
+        key = data.pop("idempotency_key", None)
         try:
-            product = create_product(actor=request.user, payload=serializer.validated_data)
+            if key is not None:
+                receipt, created = create_with_receipt(
+                    actor=request.user,
+                    action=AdminCreationReceipt.Action.PRODUCT,
+                    key=key,
+                    payload=data,
+                    create=lambda: create_product(actor=request.user, payload=data),
+                )
+                return self.creation_response(request, receipt, created=created)
+            product = create_product(actor=request.user, payload=data)
         except CatalogConflict as error:
             return conflict_response(error)
-        item = product_queryset().get(pk=product.pk)
+        except CreationIdempotencyConflict:
+            return conflict_response(CatalogConflict("idempotency_conflict"))
+        item = get_object_or_404(product_queryset(), pk=product.pk)
         return no_store(
             Response({"data": product_payload(item, request)}, status=status.HTTP_201_CREATED)
+        )
+
+    def creation_response(self, request, receipt, *, created):
+        item = product_queryset().filter(pk=receipt.resource_id).first()
+        return no_store(
+            Response(
+                {
+                    "data": product_payload(item, request) if item else None,
+                    "meta": creation_receipt_meta(receipt, replayed=not created),
+                },
+                status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+            )
         )
 
     def retrieve(self, request, pk=None):
         item = get_object_or_404(product_queryset(), pk=pk)
         return no_store(Response({"data": product_payload(item, request)}))
 
+    @transaction.atomic
     def partial_update(self, request, pk=None):
         product = get_object_or_404(Product, pk=pk)
-        serializer = ProductWriteSerializer(data=request.data, partial=True)
+        serializer = ProductUpdateSerializer(data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         try:
-            update_product(actor=request.user, product=product, payload=serializer.validated_data)
+            data = dict(serializer.validated_data)
+            version = data.pop("version", None)
+            update_product(actor=request.user, product=product, payload=data, version=version)
         except Product.DoesNotExist as error:
             raise NotFound() from error
         except CatalogConflict as error:
@@ -562,6 +616,7 @@ class AdminProductViewSet(viewsets.ViewSet):
         )
 
     @action(detail=True, methods=["post"], url_path="transition")
+    @transaction.atomic
     def transition(self, request, pk=None):
         serializer = ProductTransitionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -579,8 +634,10 @@ class AdminProductViewSet(viewsets.ViewSet):
 
     def destroy(self, request, pk=None):
         product = get_object_or_404(Product, pk=pk)
+        serializer = ProductVersionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
         try:
-            delete_product(actor=request.user, product=product)
+            delete_product(actor=request.user, product=product, **serializer.validated_data)
         except Product.DoesNotExist as error:
             raise NotFound() from error
         except CatalogConflict as error:

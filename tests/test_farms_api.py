@@ -548,7 +548,9 @@ def test_tracker_profile_can_be_enabled_for_existing_farm_and_removed_independen
 
     public = APIClient().get("/api/v1/public/tracker-farms?locale=en")
     assert any(item["id"] == str(farm.pk) for item in public.json()["data"])
-    removed = farm_admin_api.delete(url)
+    removed = farm_admin_api.delete(
+        url, {"version": enabled.json()["data"]["version"]}, format="json"
+    )
     assert removed.status_code == 204
     assert Farm.objects.filter(pk=farm.pk).exists()
     assert not TrackerFarm.objects.filter(farm_id=farm.pk).exists()
@@ -563,7 +565,7 @@ def test_reenabled_tracker_profile_rejects_a_draft_from_its_previous_lifecycle(f
     first = farm_admin_api.post(url, {"signup_count": 12}, format="json")
     assert first.status_code == 201, first.json()
     old_version = first.json()["data"]["version"]
-    assert farm_admin_api.delete(url).status_code == 204
+    assert farm_admin_api.delete(url, {"version": old_version}, format="json").status_code == 204
 
     enabled_again = farm_admin_api.post(url, {"signup_count": 99}, format="json")
     assert enabled_again.status_code == 201, enabled_again.json()
@@ -614,7 +616,7 @@ def test_tracker_write_returns_not_found_when_farm_is_deleted_during_request(
                 url, {"version": profile.version, "signup_count": 3}, format="json"
             )
         else:
-            response = farm_admin_api.delete(url)
+            response = farm_admin_api.delete(url, {"version": profile.version}, format="json")
 
     assert response.status_code == 404
     assert not Farm.objects.filter(pk=farm.pk).exists()
@@ -672,7 +674,9 @@ def test_legacy_tracker_delete_preserves_independently_created_farm(farm_admin_a
     assert enabled.status_code == 201, enabled.json()
     old_version = enabled.json()["data"]["version"]
 
-    removed = farm_admin_api.delete(f"/api/v1/admin/tracker-farms/{farm_id}")
+    removed = farm_admin_api.delete(
+        f"/api/v1/admin/tracker-farms/{farm_id}", {"version": old_version}, format="json"
+    )
     assert removed.status_code == 204, removed.json() if removed.content else None
     assert Farm.objects.filter(pk=farm_id).exists()
     assert not TrackerFarm.objects.filter(farm_id=farm_id).exists()
@@ -709,7 +713,10 @@ def test_new_farm_admin_edit_promotes_legacy_tracker_farm_to_independent(farm_ad
         format="json",
     )
     assert updated.status_code == 200, updated.json()
-    removed = farm_admin_api.delete(f"/api/v1/admin/tracker-farms/{farm_id}")
+    profile = TrackerFarm.objects.get(farm_id=farm_id)
+    removed = farm_admin_api.delete(
+        f"/api/v1/admin/tracker-farms/{farm_id}", {"version": profile.version}, format="json"
+    )
     assert removed.status_code == 204
     assert Farm.objects.filter(pk=farm_id, name_en="Promoted Farm").exists()
 
@@ -1011,7 +1018,12 @@ def test_farm_delete_preserves_allocation_history_across_generations(
     assert allocation.movements.count() == (2 if restocked else 1)
     assert not ContentAuditLog.objects.filter(action="farm.delete", entity_id=str(farm.pk)).exists()
 
-    assert farm_admin_api.delete(f"/api/v1/admin/tracker-farms/{tracker.pk}").status_code == 204
+    removed = farm_admin_api.delete(
+        f"/api/v1/admin/tracker-farms/{tracker.pk}",
+        {"version": tracker.version},
+        format="json",
+    )
+    assert removed.status_code == 204
     assert not TrackerFarm.objects.filter(pk=tracker.pk).exists()
     assert Farm.objects.filter(pk=farm.pk).exists()
     assert StoreStockAllocation.objects.filter(pk=allocation.pk).exists()
@@ -1441,3 +1453,27 @@ def test_supply_list_does_not_evaluate_capability_queries_per_row(farm_admin_api
         return sum(query["sql"].lstrip().upper().startswith("SELECT") for query in queries)
 
     assert selects(farm.pk, 20) == selects(other.pk, 1)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("legacy", [False, True])
+def test_tracker_delete_requires_current_profile_version(farm_admin_api, legacy):
+    farm = Farm.objects.create(**farm_payload())
+    url = f"/api/v1/admin/farms/{farm.pk}/growth-tracker"
+    delete_url = f"/api/v1/admin/tracker-farms/{farm.pk}" if legacy else url
+    original = farm_admin_api.post(url, {"is_visible": True}, format="json").json()["data"]
+    assert farm_admin_api.delete(delete_url, {}, format="json").status_code == 400
+    updated = farm_admin_api.patch(
+        url, {"version": original["version"], "is_visible": False}, format="json"
+    ).json()["data"]
+    stale = farm_admin_api.delete(delete_url, {"version": original["version"]}, format="json")
+    assert stale.status_code == 409
+    assert stale.json()["errors"][0]["code"] == "version_conflict"
+    assert TrackerFarm.objects.get(farm_id=farm.pk).is_visible is False
+    assert (
+        farm_admin_api.delete(
+            delete_url, {"version": updated["version"]}, format="json"
+        ).status_code
+        == 204
+    )
+    assert Farm.objects.filter(pk=farm.pk).exists()

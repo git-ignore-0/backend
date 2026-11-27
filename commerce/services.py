@@ -418,10 +418,16 @@ def product_capabilities(product):
     }
 
 
+def _check_product_version(product, version):
+    if version is not None and product.version != version:
+        raise CatalogConflict("version_conflict")
+
+
 @transaction.atomic
-def update_product(*, actor, product, payload):
+def update_product(*, actor, product, payload, version=None):
     _lock_category_tree()
     product = Product.objects.select_for_update().get(pk=product.pk)
+    _check_product_version(product, version)
     data = payload.copy()
     _check_product_write_status(data, product.status)
     previous_slug = product.slug
@@ -473,6 +479,7 @@ def update_product(*, actor, product, payload):
     )
     for field, value in data.items():
         setattr(product, field, value)
+    product.version += 1
     try:
         product.save()
     except IntegrityError as error:
@@ -485,9 +492,10 @@ def update_product(*, actor, product, payload):
 
 
 @transaction.atomic
-def transition_product(*, actor, product_id, expected_status, target_status):
+def transition_product(*, actor, product_id, expected_status, target_status, version=None):
     _lock_category_tree()
     product = Product.objects.select_for_update().get(pk=product_id)
+    _check_product_version(product, version)
     if product.status != expected_status:
         raise CatalogConflict("product_status_changed")
     transitions = {
@@ -508,7 +516,8 @@ def transition_product(*, actor, product_id, expected_status, target_status):
     legacy_flags = legacy_product_flags(target_status)
     for field, value in legacy_flags.items():
         setattr(product, field, value)
-    product.save(update_fields=["status", *legacy_flags, "updated_at"])
+    product.version += 1
+    product.save(update_fields=["status", *legacy_flags, "version", "updated_at"])
     audit(
         actor=actor,
         action="store_product.transition",
@@ -520,8 +529,9 @@ def transition_product(*, actor, product_id, expected_status, target_status):
 
 
 @transaction.atomic
-def delete_product(*, actor, product):
+def delete_product(*, actor, product, version=None):
     product = Product.objects.select_for_update().get(pk=product.pk)
+    _check_product_version(product, version)
     image_id = product.primary_image_id
     slug = product.slug
     try:

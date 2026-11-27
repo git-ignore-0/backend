@@ -739,13 +739,15 @@ def update_growth_tracker_profile(*, farm_id, actor, expected_version, data):
 
 
 @transaction.atomic
-def delete_growth_tracker_profile(*, farm_id, actor):
+def delete_growth_tracker_profile(*, farm_id, actor, expected_version):
     from content.models import TrackerFarm
 
     farm = Farm.objects.select_for_update().get(pk=farm_id)
     profile = TrackerFarm.objects.select_for_update().filter(farm_id=farm_id).first()
     if profile is None:
         raise FarmConflict("growth_tracker_changed")
+    if profile.version != expected_version:
+        raise FarmConflict("version_conflict")
     farm.tracker_profile_revision = max(farm.tracker_profile_revision, profile.version)
     farm.save(update_fields=["tracker_profile_revision"])
     audit(actor=actor, action="tracker_farm.disable", entity=profile)

@@ -47,6 +47,7 @@ from referrals.serializers import (
     RewardWriteSerializer,
 )
 from referrals.services import (
+    IdempotencyConflict,
     InvalidPointTransaction,
     RedemptionError,
     RedemptionTransitionConflict,
@@ -55,9 +56,9 @@ from referrals.services import (
     RewardNotFound,
     RewardReorderConflict,
     SelfReferral,
+    adjust_points,
     assign_referrer,
     complete_redemption,
-    create_point_transaction,
     create_redemption,
     ensure_referral_account,
     mark_redemption_contacted,
@@ -626,34 +627,47 @@ class AdminPointHistoryView(APIView):
                 )
             )
         try:
-            item, balance = create_point_transaction(
+            item, balance, created = adjust_points(
                 user=user,
                 actor=actor,
                 direction=data["direction"],
                 amount=data["amount"],
                 message=data["message"],
                 related_referral=data.get("related_referral_id"),
+                idempotency_key=data.get("idempotency_key"),
+            )
+        except IdempotencyConflict as error:
+            return no_store(
+                Response({"errors": [{"code": error.code}]}, status=status.HTTP_409_CONFLICT)
             )
         except InvalidPointTransaction as error:
             return no_store(
                 Response(
-                    {"errors": [{"code": "invalid_point_transaction", "detail": str(error)}]},
+                    {"errors": [{"code": error.code, "detail": str(error)}]},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
             )
-        return no_store(
-            Response(
-                {
-                    "data": {
-                        "transaction": {
-                            **transaction_payload(item),
-                            "actor": safe_user(item.actor) if item.actor else None,
-                        },
-                        "balance": balance,
-                    }
+        payload = {
+            "data": {
+                "transaction": {
+                    **transaction_payload(item),
+                    "actor": safe_user(item.actor) if item.actor else None,
                 },
-                status=status.HTTP_201_CREATED,
-            )
+                "balance": balance,
+            }
+        }
+        if item.manual_idempotency_key is not None:
+            payload["meta"] = {
+                "idempotent_replay": not created,
+                "action_receipt": {
+                    "action": "adjust_points",
+                    "user_id": str(item.user_id),
+                    "transaction_id": str(item.pk),
+                    "idempotency_key": str(item.manual_idempotency_key),
+                },
+            }
+        return no_store(
+            Response(payload, status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
         )
 
 

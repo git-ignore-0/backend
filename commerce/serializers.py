@@ -200,9 +200,25 @@ class ProductWriteSerializer(StrictSerializer):
         return validate_unique_locales(value)
 
 
-class ProductTransitionSerializer(StrictSerializer):
+class ProductCreateSerializer(ProductWriteSerializer):
+    idempotency_key = serializers.UUIDField(required=False)
+
+
+class ProductUpdateSerializer(ProductWriteSerializer):
+    version = serializers.IntegerField(min_value=1, required=False)
+
+
+class ProductVersionSerializer(StrictSerializer):
+    version = serializers.IntegerField(min_value=1, required=False)
+
+
+class ProductTransitionSerializer(ProductVersionSerializer):
     target_status = serializers.ChoiceField(choices=ProductStatus.choices)
     expected_status = serializers.ChoiceField(choices=ProductStatus.choices)
+
+
+class ProductCreationQuerySerializer(StrictSerializer):
+    creation_key = serializers.UUIDField()
 
 
 class ProductQuerySerializer(StrictSerializer):

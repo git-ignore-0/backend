@@ -191,7 +191,11 @@ def test_admin_create_update_and_permanent_delete(tracker_admin_api):
     assert updated.json()["data"]["photos"] == []
     assert updated.json()["data"]["version"] == first_data["version"] + 1
 
-    deleted = tracker_admin_api.delete(f"/api/v1/admin/tracker-farms/{first_data['id']}")
+    deleted = tracker_admin_api.delete(
+        f"/api/v1/admin/tracker-farms/{first_data['id']}",
+        {"version": updated.json()["data"]["version"]},
+        format="json",
+    )
     assert deleted.status_code == 204
     assert not TrackerFarm.objects.filter(pk=first_data["id"]).exists()
     assert TrackerFarm.objects.filter(pk=second_data["id"]).exists()
@@ -214,7 +218,11 @@ def test_farm_delete_cleans_exclusive_gallery_assets_and_files(
     assert all(default_storage.exists(file_name) for file_name in file_names)
 
     with django_capture_on_commit_callbacks(execute=True):
-        response = tracker_admin_api.delete(f"/api/v1/admin/tracker-farms/{created['id']}")
+        response = tracker_admin_api.delete(
+            f"/api/v1/admin/tracker-farms/{created['id']}",
+            {"version": created["version"]},
+            format="json",
+        )
 
     assert response.status_code == 204
     assert not TrackerFarm.objects.filter(pk=created["id"]).exists()
@@ -254,7 +262,11 @@ def test_farm_delete_preserves_shared_gallery_asset_until_last_reference_is_remo
     ).json()["data"]
 
     with django_capture_on_commit_callbacks(execute=True):
-        first_delete = tracker_admin_api.delete(f"/api/v1/admin/tracker-farms/{first['id']}")
+        first_delete = tracker_admin_api.delete(
+            f"/api/v1/admin/tracker-farms/{first['id']}",
+            {"version": first["version"]},
+            format="json",
+        )
 
     assert first_delete.status_code == 204
     assert MediaAsset.objects.filter(pk=asset.pk).exists()
@@ -265,7 +277,11 @@ def test_farm_delete_preserves_shared_gallery_asset_until_last_reference_is_remo
     ).exists()
 
     with django_capture_on_commit_callbacks(execute=True):
-        second_delete = tracker_admin_api.delete(f"/api/v1/admin/tracker-farms/{second['id']}")
+        second_delete = tracker_admin_api.delete(
+            f"/api/v1/admin/tracker-farms/{second['id']}",
+            {"version": second["version"]},
+            format="json",
+        )
 
     assert second_delete.status_code == 204
     assert not MediaAsset.objects.filter(pk=asset.pk).exists()
@@ -300,7 +316,11 @@ def test_farm_delete_preserves_assets_referenced_by_testimonials_and_rewards(
     ).json()["data"]
 
     with django_capture_on_commit_callbacks(execute=True):
-        response = tracker_admin_api.delete(f"/api/v1/admin/tracker-farms/{created['id']}")
+        response = tracker_admin_api.delete(
+            f"/api/v1/admin/tracker-farms/{created['id']}",
+            {"version": created["version"]},
+            format="json",
+        )
 
     assert response.status_code == 204
     assert MediaAsset.objects.filter(pk=testimonial_asset.pk).exists()
@@ -1232,8 +1252,14 @@ def test_mutations_revalidate_tracker_farms_after_commit(
                 {"items": [reorder_item(farm, 3, version=updated["version"])]},
                 format="json",
             )
+        farm.refresh_from_db()
         with django_capture_on_commit_callbacks(execute=True):
-            tracker_admin_api.delete(f"/api/v1/admin/tracker-farms/{created['id']}")
+            response = tracker_admin_api.delete(
+                f"/api/v1/admin/tracker-farms/{created['id']}",
+                {"version": farm.version},
+                format="json",
+            )
+        assert response.status_code == 204
 
     assert revalidate.call_count == 4
     revalidate.assert_called_with(["tracker-farms"])

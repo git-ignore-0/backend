@@ -3,6 +3,7 @@
 import uuid
 from decimal import Decimal
 
+from django.db import transaction
 from django.db.models import Exists, OuterRef, Q, Sum
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -56,6 +57,18 @@ class RoundInput(StrictSerializer):
     opens_at = serializers.DateTimeField()
     closes_at = serializers.DateTimeField()
     delivery_date = serializers.DateField()
+
+
+class RoundUpdateInput(RoundInput):
+    version = serializers.IntegerField(min_value=1, required=False)
+
+
+class RoundVersionInput(StrictSerializer):
+    version = serializers.IntegerField(min_value=1, required=False)
+
+
+class CancelRoundInput(ReasonSerializer):
+    version = serializers.IntegerField(min_value=1, required=False)
 
 
 class LineInput(StrictSerializer):
@@ -123,9 +136,12 @@ class AdminRound(PrivateView):
     def get(self, request, round_id):
         return Response({"data": admin_round_payload(round_id)})
 
+    @transaction.atomic
     def patch(self, request, round_id):
         row = domain.update_round(
-            round_id=round_id, actor=request.user, **validated(RoundInput, request, partial=True)
+            round_id=round_id,
+            actor=request.user,
+            **validated(RoundUpdateInput, request, partial=True),
         )
         return Response({"data": admin_round_payload(row.pk)})
 
@@ -137,7 +153,7 @@ class CompanionCutoffField(serializers.DateTimeField):
         return super().enforce_timezone(value)
 
 
-class CompanionDeliveryInput(StrictSerializer):
+class CompanionDeliveryInput(RoundVersionInput):
     companion_delivery_enabled = serializers.BooleanField(required=False)
     companion_delivery_cutoff = CompanionCutoffField(required=False)
 
@@ -148,6 +164,7 @@ class AdminRoundCompanionDelivery(PrivateView):
     @staticmethod
     def payload(row):
         return {
+            "version": row.version,
             "companion_delivery_enabled": row.companion_delivery_enabled,
             "companion_delivery_cutoff": row.companion_delivery_cutoff.isoformat()
             if row.companion_delivery_cutoff
@@ -170,18 +187,21 @@ class AdminRoundCompanionDelivery(PrivateView):
 class AdminRoundPublish(PrivateView):
     permission_classes = [IsWebsiteAdmin]
 
+    @transaction.atomic
     def post(self, request, round_id):
-        validated(StrictSerializer, request)
-        row = domain.publish_round(round_id=round_id, actor=request.user)
+        row = domain.publish_round(
+            round_id=round_id, actor=request.user, **validated(RoundVersionInput, request)
+        )
         return Response({"data": admin_round_payload(row.pk)})
 
 
 class AdminRoundCancel(PrivateView):
     permission_classes = [IsWebsiteAdmin]
 
+    @transaction.atomic
     def post(self, request, round_id):
         row = domain.cancel_round(
-            round_id=round_id, actor=request.user, **validated(ReasonInput, request)
+            round_id=round_id, actor=request.user, **validated(CancelRoundInput, request)
         )
         return Response({"data": admin_round_payload(row.pk)})
 
@@ -259,22 +279,47 @@ class AdminReopen(PrivateView):
         return Response({"data": selection_payload(row, admin=True)})
 
 
+def member_rounds(user):
+    has_selection = Exists(
+        CSASelection.objects.filter(round_id=OuterRef("pk"), membership__customer__user=user)
+    )
+    return CSARound.objects.filter(published_at__isnull=False).filter(
+        Q(delivery_date__gte=timezone.now().astimezone(domain.VIETNAM).date()) | has_selection
+    )
+
+
+def member_selection(user, round_id):
+    return (
+        CSASelection.objects.filter(round_id=round_id, membership__customer__user=user)
+        .prefetch_related("lines")
+        .first()
+    )
+
+
 class MemberRounds(PrivateView):
     permission_classes = [HasMembershipSelfScopes]
 
     def get(self, request):
         query = page_query(request)
         domain.process_due_rounds(user=request.user)
-        rows = (
-            CSARound.objects.filter(published_at__isnull=False)
-            .filter(
-                Q(delivery_date__gte=timezone.now().astimezone(domain.VIETNAM).date())
-                | Q(selections__membership__customer__user=request.user)
-            )
-            .distinct()
-        )
-        rows, meta = paged_rows(rows.order_by("-sequence"), query)
+        rows, meta = paged_rows(member_rounds(request.user).order_by("-sequence"), query)
         return Response({"data": [round_payload(r) for r in rows], "meta": meta})
+
+
+class MemberRound(PrivateView):
+    permission_classes = [HasMembershipSelfScopes]
+
+    def get(self, request, round_id):
+        page_query(request, StrictSerializer)
+        round_ = get_object_or_404(member_rounds(request.user), pk=round_id)
+        domain.process_round(round_id, user=request.user)
+        selection = member_selection(request.user, round_id)
+        return Response(
+            {
+                "data": round_payload(round_),
+                "selection": selection_payload(selection) if selection else None,
+            }
+        )
 
 
 class MemberSelection(PrivateView):
@@ -283,11 +328,7 @@ class MemberSelection(PrivateView):
     def get(self, request, round_id):
         get_object_or_404(CSARound, pk=round_id, published_at__isnull=False)
         domain.process_round(round_id, user=request.user)
-        row = (
-            CSASelection.objects.filter(round_id=round_id, membership__customer__user=request.user)
-            .prefetch_related("lines")
-            .first()
-        )
+        row = member_selection(request.user, round_id)
         return Response({"data": selection_payload(row) if row else None})
 
     def put(self, request, round_id):

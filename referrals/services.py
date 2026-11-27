@@ -32,7 +32,11 @@ class SelfReferral(ValueError):
 
 
 class InvalidPointTransaction(ValueError):
-    pass
+    code = "invalid_point_transaction"
+
+
+class InsufficientAdjustmentPoints(InvalidPointTransaction):
+    code = "insufficient_points"
 
 
 class RedemptionError(ValueError):
@@ -163,6 +167,7 @@ def _create_locked_point_transaction(
     message: str,
     internal_note: str = "",
     related_referral=None,
+    manual_idempotency_key=None,
 ) -> PointTransaction:
     return PointTransaction.objects.create(
         user=user,
@@ -173,10 +178,10 @@ def _create_locked_point_transaction(
         message=message.strip()[:240],
         internal_note=internal_note,
         related_referral=related_referral,
+        manual_idempotency_key=manual_idempotency_key,
     )
 
 
-@transaction.atomic
 def create_point_transaction(
     *,
     user,
@@ -186,6 +191,21 @@ def create_point_transaction(
     message: str,
     related_referral=None,
 ) -> tuple[PointTransaction, int]:
+    item, balance, _ = adjust_points(
+        user=user,
+        actor=actor,
+        direction=direction,
+        amount=amount,
+        message=message,
+        related_referral=related_referral,
+    )
+    return item, balance
+
+
+@transaction.atomic
+def adjust_points(
+    *, user, actor, direction, amount, message, related_referral=None, idempotency_key=None
+):
     try:
         direction = PointDirection(direction)
     except ValueError as error:
@@ -203,20 +223,50 @@ def create_point_transaction(
 
     ReferralAccount.objects.select_for_update().get(user=user)
     balance = point_balance(user)
-    if direction == PointDirection.DEBIT and amount > balance:
-        raise InvalidPointTransaction("Insufficient point balance")
+    if idempotency_key is not None:
+        existing = PointTransaction.objects.filter(manual_idempotency_key=idempotency_key).first()
+        if existing:
+            if (
+                existing.user_id != user.pk
+                or existing.actor_id != (actor.pk if actor else None)
+                or existing.direction != direction
+                or existing.amount != amount
+                or existing.message != message.strip()[:240]
+                or existing.related_referral_id
+                != (related_referral.pk if related_referral else None)
+            ):
+                raise IdempotencyConflict("Idempotency key was used for a different adjustment")
+            return existing, balance, False
 
-    item = _create_locked_point_transaction(
-        user=user,
-        actor=actor,
-        direction=direction,
-        amount=amount,
-        template=PointTemplate.MANUAL_ADJUSTMENT,
-        message=message,
-        related_referral=related_referral,
-    )
+    if direction == PointDirection.DEBIT and amount > balance:
+        raise InsufficientAdjustmentPoints("Insufficient point balance")
+
+    try:
+        with transaction.atomic():
+            item = _create_locked_point_transaction(
+                user=user,
+                actor=actor,
+                direction=direction,
+                amount=amount,
+                template=PointTemplate.MANUAL_ADJUSTMENT,
+                message=message,
+                related_referral=related_referral,
+                manual_idempotency_key=idempotency_key,
+            )
+    except IntegrityError as error:
+        # Different targets have independent ledger locks, so only the global key constraint
+        # can arbitrate a collision between them.
+        if (
+            idempotency_key
+            and PointTransaction.objects.filter(manual_idempotency_key=idempotency_key).exists()
+        ):
+            raise IdempotencyConflict(
+                "Idempotency key was used for a different adjustment"
+            ) from error
+        raise
+
     updated_balance = balance + (amount if direction == PointDirection.CREDIT else -amount)
-    return item, updated_balance
+    return item, updated_balance, True
 
 
 def _reward_snapshot_names(reward: Reward) -> tuple[str, str]:

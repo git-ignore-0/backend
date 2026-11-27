@@ -363,7 +363,7 @@ def test_mysql_farm_deletion_and_patch_serialize(store_product, active_user, del
 @requires_mysql
 @pytest.mark.parametrize("delete_first", [True, False], ids=["delete-first", "tracker-first"])
 @pytest.mark.parametrize(
-    ("service", "creates_profile", "versioned"),
+    ("service", "creates_profile", "takes_data"),
     [
         (create_growth_tracker_profile, True, False),
         (update_growth_tracker_profile, False, True),
@@ -374,15 +374,15 @@ def test_mysql_farm_deletion_and_patch_serialize(store_product, active_user, del
     ids=["create-profile", "update-profile", "delete-profile", "legacy-patch", "legacy-delete"],
 )
 def test_mysql_farm_deletion_and_tracker_writes_serialize(
-    active_user, delete_first, service, creates_profile, versioned
+    active_user, delete_first, service, creates_profile, takes_data
 ):
     farm = another_farm()
     params = {"farm_id": farm.pk, "actor": active_user}
     if not creates_profile:
         profile = create_growth_tracker_profile(**params, data={})
-    if creates_profile or versioned:
+    if creates_profile or takes_data:
         params["data"] = {"signup_count": 7}
-    if versioned:
+    if not creates_profile:
         params["expected_version"] = profile.version
 
     deleting, writing = run_in_lock_order(
@@ -398,7 +398,7 @@ def test_mysql_farm_deletion_and_tracker_writes_serialize(
             writing.result()
     else:
         result = writing.result()
-        if creates_profile or versioned:
+        if creates_profile or takes_data:
             assert result.signup_count == 7
     assert not Farm.objects.filter(pk=farm.pk).exists()
     assert not TrackerFarm.objects.filter(farm_id=farm.pk).exists()

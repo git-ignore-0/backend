@@ -3441,6 +3441,7 @@ def test_buy_again_prepare_is_owner_scoped_and_uses_live_catalog(
     assert order_payload(order, request=request)["can_buy_again"] is True
     count = StoreOrder.objects.count()
     data = client.get(url).json()["data"]
+    assert data["order_id"] == str(order.pk)
     assert data["lines"][0]["quantity"] == 2
     assert data["lines"][0]["product"]["retail_price_vnd"] == 50000
     assert data["lines"][0]["product"]["name"] == "Tomato"

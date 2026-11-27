@@ -1175,12 +1175,6 @@ def create_usage_order(*, membership_id, actor, idempotency_key, lines: list[dic
     membership = (
         Membership.objects.select_for_update().select_related("customer").get(pk=membership_id)
     )
-    today = timezone.localdate()
-    membership = sync_membership_status(membership, as_of=today)
-    if membership.status != MembershipStatus.ACTIVE or not (
-        membership.start_date <= today < membership.end_date
-    ):
-        raise QuotaError("Membership is not active today")
     requested = _normalized_usage_lines(lines)
     existing = (
         MembershipUsageOrder.objects.filter(membership=membership, idempotency_key=idempotency_key)
@@ -1190,6 +1184,8 @@ def create_usage_order(*, membership_id, actor, idempotency_key, lines: list[dic
     if existing:
         if existing.store_order_id is not None:
             raise UsageIdempotencyConflict("Idempotency key belongs to a Store usage order")
+        if existing.csa_selection_id is not None:
+            raise UsageIdempotencyConflict("Idempotency key belongs to a CSA selection usage order")
         validate_usage_integrity(existing)
         existing_lines = sorted(
             (str(line.product_snapshot.product_id), line.units) for line in existing.lines.all()
@@ -1199,6 +1195,12 @@ def create_usage_order(*, membership_id, actor, idempotency_key, lines: list[dic
                 "Idempotency key was used with a different usage payload"
             )
         return existing, False
+    today = timezone.localdate()
+    membership = sync_membership_status(membership, as_of=today)
+    if membership.status != MembershipStatus.ACTIVE or not (
+        membership.start_date <= today < membership.end_date
+    ):
+        raise QuotaError("Membership is not active today")
     ensure_due_cycles(membership, as_of=today)
     membership.refresh_from_db()
     if membership.status != MembershipStatus.ACTIVE or not (
