@@ -38,6 +38,7 @@ from farms.models import (
     FarmPhoto,
     FarmProduct,
     FarmProductStockBatch,
+    FarmSupplyRequest,
     LegacyFarmWeeklySupply,
 )
 from farms.stock import (
@@ -334,6 +335,12 @@ def farm_capabilities(farm_id):
             }
             break
     reasons = [reason for reason in (supplying, order, archived) if reason]
+    if not reasons:
+        request = FarmSupplyRequest.objects.filter(farm_id=farm_id).values("id", "code").first()
+        if request:
+            reasons.append(
+                {"code": "farm_supply_request", "id": str(request["id"]), "label": request["code"]}
+            )
     return {"delete": {"allowed": not reasons, "reasons": reasons}}
 
 
@@ -596,6 +603,22 @@ def create_stock_batch(*, farm_id, product_id, expected_link_id, expected_versio
     return _write_stock_batch_for_source(source=source, actor=actor, data=data)
 
 
+def _lock_stock_products(product_ids):
+    return {
+        product.pk: product
+        for product in Product.objects.select_for_update().filter(pk__in=product_ids).order_by("pk")
+    }
+
+
+def _lock_farm_stock_sources(farm_id, product_ids):
+    return {
+        source.product_id: source
+        for source in FarmProduct.objects.select_for_update()
+        .filter(farm_id=farm_id, product_id__in=product_ids)
+        .order_by("pk")
+    }
+
+
 @transaction.atomic
 def create_stock_batches_bulk(*, farm_id, actor, idempotency_key, start_date, end_date, items):
     """Commit one intent, or replay its immutable receipt before state/date guards.
@@ -620,10 +643,7 @@ def create_stock_batches_bulk(*, farm_id, actor, idempotency_key, start_date, en
         return receipt, False
 
     product_ids = [item["product_id"] for item in items]
-    products = {
-        product.pk: product
-        for product in Product.objects.select_for_update().filter(pk__in=product_ids).order_by("pk")
-    }
+    products = _lock_stock_products(product_ids)
     # Recheck under the unique key after waiting for Products or another receipt.
     # Nothing acquires Products after claiming this bulk action's receipt.
     receipt, created = claim_creation_receipt(
@@ -631,12 +651,7 @@ def create_stock_batches_bulk(*, farm_id, actor, idempotency_key, start_date, en
     )
     if not created:
         return receipt, False
-    sources = {
-        source.product_id: source
-        for source in FarmProduct.objects.select_for_update()
-        .filter(farm_id=farm_id, product_id__in=product_ids)
-        .order_by("pk")
-    }
+    sources = _lock_farm_stock_sources(farm_id, product_ids)
     farm = Farm.objects.select_for_update().get(pk=farm_id)
     today = timezone.localdate()
     validated = []

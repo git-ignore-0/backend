@@ -170,3 +170,110 @@ class FarmProductStockBatch(models.Model):
 
     def __str__(self):
         return f"{self.farm_product_id}:{self.start_date}:{self.end_date}"
+
+
+class FarmFarmerLink(models.Model):
+    farm = models.OneToOneField(Farm, on_delete=models.CASCADE, primary_key=True)
+    token_digest = models.CharField(max_length=64, unique=True, editable=False)
+    encrypted_token = models.BinaryField(editable=False)
+
+    def __str__(self):
+        return str(self.farm_id)
+
+
+class FarmSupplyRequest(models.Model):
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        APPROVED = "approved", "Approved"
+        REJECTED = "rejected", "Rejected"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    farm = models.ForeignKey(Farm, on_delete=models.PROTECT)
+    code = models.CharField(max_length=36, unique=True, editable=False)
+    start_date = models.DateField()
+    end_date = models.DateField()
+    submitted_at = models.DateTimeField(auto_now_add=True)
+    status = models.CharField(max_length=8, choices=Status.choices, default=Status.PENDING)
+    submission_key = models.UUIDField(editable=False)
+    submission_fingerprint = models.CharField(max_length=64, editable=False)
+    processed_at = models.DateTimeField(null=True)
+    processed_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True)
+    decision_key = models.UUIDField(null=True, editable=False)
+    rejection_reason = models.CharField(max_length=500, blank=True, default="")
+
+    class Meta:
+        ordering = ["-submitted_at", "-id"]
+        indexes = [
+            models.Index(
+                fields=["farm", "-submitted_at", "-id"], name="farms_request_farm_new_idx"
+            ),
+            models.Index(
+                fields=["status", "-submitted_at", "-id"], name="farms_request_state_new_idx"
+            ),
+            models.Index(fields=["-submitted_at", "-id"], name="farms_request_new_idx"),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["farm", "submission_key"], name="farms_request_intent_unique"
+            ),
+            models.CheckConstraint(
+                condition=Q(end_date__gte=models.F("start_date")),
+                name="farms_request_dates_ordered",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(
+                        status="pending",
+                        processed_at__isnull=True,
+                        processed_by__isnull=True,
+                        decision_key__isnull=True,
+                        rejection_reason="",
+                    )
+                    | Q(
+                        status="approved",
+                        processed_at__isnull=False,
+                        decision_key__isnull=False,
+                        rejection_reason="",
+                    )
+                    | (
+                        Q(status="rejected", processed_at__isnull=False, decision_key__isnull=False)
+                        & ~Q(rejection_reason="")
+                    )
+                ),
+                name="farms_request_decision_state",
+            ),
+        ]
+
+    def __str__(self):
+        return self.code
+
+
+class FarmSupplyRequestItem(models.Model):
+    request = models.ForeignKey(FarmSupplyRequest, on_delete=models.CASCADE, related_name="items")
+    source = models.ForeignKey(FarmProduct, on_delete=models.PROTECT)
+    position = models.PositiveSmallIntegerField(editable=False)
+    product_snapshot = models.JSONField(editable=False)
+    source_generation = models.PositiveIntegerField(editable=False)
+    source_version = models.PositiveIntegerField(editable=False)
+    quantity_units = models.PositiveIntegerField(editable=False)
+    approved_batch = models.OneToOneField(
+        FarmProductStockBatch, on_delete=models.PROTECT, null=True
+    )
+
+    class Meta:
+        ordering = ["position"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["request", "source"], name="farms_request_source_unique"
+            ),
+            models.UniqueConstraint(
+                fields=["request", "position"], name="farms_request_position_unique"
+            ),
+            models.CheckConstraint(
+                condition=Q(quantity_units__gte=1, quantity_units__lte=2_147_483_647),
+                name="farms_request_item_quantity",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.request_id}:{self.position}"

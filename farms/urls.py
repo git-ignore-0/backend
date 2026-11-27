@@ -1,8 +1,28 @@
 from django.urls import path
 
+from farms import supply_request_views as supply
 from farms import views
 
 urlpatterns = [
+    path("farmer/farm", supply.FarmerFarmView.as_view()),
+    path("farmer/products", supply.FarmerProductListView.as_view()),
+    path("farmer/supply-requests", supply.FarmerSupplyListView.as_view()),
+    path("farmer/supply-requests/<uuid:request_id>", supply.FarmerSupplyDetailView.as_view()),
+    path("admin/farms/<uuid:farm_id>/farmer-link", supply.AdminFarmerLinkView.as_view()),
+    path(
+        "admin/farms/<uuid:farm_id>/farmer-link/rotate",
+        supply.AdminFarmerLinkView.as_view(rotate=True, http_method_names=["post", "options"]),
+    ),
+    path("admin/farm-supply-requests", supply.AdminSupplyListView.as_view()),
+    path("admin/farm-supply-requests/<uuid:request_id>", supply.AdminSupplyDetailView.as_view()),
+    path(
+        "admin/farm-supply-requests/<uuid:request_id>/approve",
+        supply.AdminSupplyDecisionView.as_view(),
+    ),
+    path(
+        "admin/farm-supply-requests/<uuid:request_id>/reject",
+        supply.AdminSupplyDecisionView.as_view(outcome=supply.Status.REJECTED),
+    ),
     path(
         "admin/farms/<uuid:farm_id>/stock-batches/bulk", views.AdminFarmBulkStockBatchView.as_view()
     ),
