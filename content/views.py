@@ -1,6 +1,7 @@
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from django.db.models import Q
+from django.db.models.deletion import ProtectedError, RestrictedError
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import status, viewsets
@@ -73,6 +74,7 @@ from content.services import (
     update_testimonial,
     update_tracker_farm,
 )
+from farms.models import Farm
 
 
 def get_site_settings():
@@ -354,8 +356,17 @@ class AdminTrackerFarmDetailView(APIView):
         return admin_no_store(Response({"data": admin_tracker_farm_payload(farm, request)}))
 
     def delete(self, request, farm_id):
-        get_object_or_404(TrackerFarm, pk=farm_id)
-        delete_tracker_farm(farm_id=farm_id, actor=request.user)
+        try:
+            delete_tracker_farm(farm_id=farm_id, actor=request.user)
+        except (Farm.DoesNotExist, TrackerFarm.DoesNotExist) as error:
+            raise NotFound from error
+        except (ProtectedError, RestrictedError):
+            return admin_no_store(
+                Response(
+                    {"errors": [{"code": "farm_delete_protected"}]},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            )
         return admin_no_store(Response(status=status.HTTP_204_NO_CONTENT))
 
 

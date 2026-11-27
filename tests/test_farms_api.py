@@ -5,11 +5,21 @@ from uuid import uuid4
 import pytest
 from django.contrib.auth.models import Group
 from django.db import connection
+from django.db.models.deletion import ProtectedError
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 from rest_framework.test import APIClient
 
-from commerce.models import Category, Product, ProductTranslation
+from commerce.models import (
+    Category,
+    Product,
+    ProductTranslation,
+    StoreOrder,
+    StoreOrderLine,
+    StoreOrderStatus,
+    StoreStockAllocation,
+    StoreStockMovement,
+)
 from content.models import ContentAuditLog, MediaAsset, TrackerFarm, TrackerFarmPhoto
 from farms.models import (
     Farm,
@@ -65,6 +75,10 @@ def test_admin_can_manage_canonical_farm_without_creating_tracker_profile(farm_a
     listed = farm_admin_api.get("/api/v1/admin/farms?search=Green")
     assert listed.status_code == 200
     assert [row["id"] for row in listed.json()["data"]] == [data["id"]]
+    assert "capabilities" not in listed.json()["data"][0]
+    detail = farm_admin_api.get(f"/api/v1/admin/farms/{data['id']}")
+    assert detail["Cache-Control"] == "private, no-store"
+    assert detail.json()["data"]["capabilities"] == {"delete": {"allowed": True, "reasons": []}}
 
     changed = farm_admin_api.patch(
         f"/api/v1/admin/farms/{data['id']}",
@@ -74,6 +88,7 @@ def test_admin_can_manage_canonical_farm_without_creating_tracker_profile(farm_a
     assert changed.status_code == 200, changed.json()
     assert changed.json()["data"]["name_vi"] == "Trang trại Xanh"
     assert changed.json()["data"]["version"] == data["version"] + 1
+    assert changed.json()["data"]["capabilities"] == detail.json()["data"]["capabilities"]
 
     stale = farm_admin_api.patch(
         f"/api/v1/admin/farms/{data['id']}",
@@ -698,7 +713,7 @@ def test_tracker_count_only_update_does_not_change_shared_farm_version(farm_admi
 
 
 @pytest.mark.django_db
-def test_legacy_link_writes_are_blocked_and_soft_removal_keeps_the_farm_reference(farm_admin_api):
+def test_legacy_link_writes_are_blocked_but_a_removed_unused_source_can_be_deleted(farm_admin_api):
     farm = Farm.objects.create(**farm_payload())
     category = Category.objects.create(slug="root-4", is_active=True)
     product = Product.objects.create(
@@ -729,7 +744,17 @@ def test_legacy_link_writes_are_blocked_and_soft_removal_keeps_the_farm_referenc
         == 200
     )
     assert FarmProduct.objects.get(pk=relation.pk).removed_at is not None
-    assert farm_admin_api.delete(farm_url).status_code == 409
+    batch = FarmProductStockBatch.objects.create(
+        farm_product=relation,
+        start_date=timezone.localdate(),
+        end_date=timezone.localdate(),
+        quantity_units=10,
+    )
+    assert farm_admin_api.get(farm_url).json()["data"]["capabilities"]["delete"]["allowed"]
+    assert farm_admin_api.delete(farm_url).status_code == 204
+    assert not FarmProductStockBatch.objects.filter(pk=batch.pk).exists()
+    assert not FarmProduct.objects.filter(pk=relation.pk).exists()
+    assert Product.objects.filter(pk=product.pk).exists()
     unreferenced = Farm.objects.create(**farm_payload(name_en="Second Farm"))
     assert farm_admin_api.delete(f"/api/v1/admin/farms/{unreferenced.pk}").status_code == 204
 
@@ -766,6 +791,232 @@ def test_archived_zero_weekly_history_survives_soft_removal(farm_admin_api):
     assert response.status_code == 200
     assert response.json()["data"]["has_supply_history"] is True
     assert LegacyFarmWeeklySupply.objects.filter(pk=archived.pk, farm_product=relation).exists()
+    blocked = farm_admin_api.delete(f"/api/v1/admin/farms/{farm.pk}")
+    assert blocked.status_code == 409
+    assert blocked.json()["errors"][0]["context"]["reasons"][0]["code"] == "legacy_supply"
+    assert LegacyFarmWeeklySupply.objects.filter(pk=archived.pk).exists()
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("visible,count", [(True, 0), (True, 7), (False, 7)])
+def test_delete_farm_cascades_tracker_and_cleans_only_orphaned_media(
+    farm_admin_api, django_capture_on_commit_callbacks, visible, count
+):
+    shared = MediaAsset.objects.create(file=f"farms/{uuid4()}.webp", width=100, height=100)
+    private = MediaAsset.objects.create(file=f"farms/{uuid4()}.webp", width=100, height=100)
+    farm = Farm.objects.create(**farm_payload(), image=shared)
+    other = Farm.objects.create(**farm_payload(), image=shared)
+    FarmPhoto.objects.create(farm=farm, image=shared, sort_order=0)
+    tracker = TrackerFarm.objects.create(
+        farm=farm, image=private, is_visible=visible, signup_count=count
+    )
+    TrackerFarmPhoto.objects.create(farm=tracker, image=private, sort_order=0)
+    url = f"/api/v1/admin/farms/{farm.pk}"
+
+    assert farm_admin_api.get(url).json()["data"]["capabilities"]["delete"]["allowed"]
+    with (
+        patch("farms.services.request_frontend_revalidation") as revalidate,
+        django_capture_on_commit_callbacks(execute=True),
+    ):
+        response = farm_admin_api.delete(url)
+        assert response.status_code == 204
+        assert response["Cache-Control"] == "private, no-store"
+        revalidate.assert_not_called()
+
+    revalidate.assert_called_once_with(["tracker-farms"])
+    assert farm_admin_api.get(url).status_code == 404
+    assert not TrackerFarm.objects.filter(pk=tracker.pk).exists()
+    assert not TrackerFarmPhoto.objects.filter(farm=tracker).exists()
+    assert not FarmPhoto.objects.filter(farm=farm).exists()
+    assert not MediaAsset.objects.filter(pk=private.pk).exists()
+    assert Farm.objects.filter(pk=other.pk, image=shared).exists()
+    assert ContentAuditLog.objects.filter(action="farm.delete", entity_id=str(farm.pk)).exists()
+    assert ContentAuditLog.objects.filter(
+        action="tracker_farm.delete", entity_id=str(tracker.pk)
+    ).exists()
+
+
+def allocate_historical_farm_batch(source, status, *, restocked=False):
+    today = timezone.localdate()
+    batch = FarmProductStockBatch.objects.create(
+        farm_product=source,
+        supply_generation=1,
+        start_date=today - timedelta(days=14),
+        end_date=today - timedelta(days=7),
+        quantity_units=10,
+    )
+    order = StoreOrder.objects.create(
+        reference_code="NFV-000123",
+        create_idempotency_key=uuid4(),
+        locale="vi",
+        status=status,
+        subtotal_vnd=10000,
+        shipping_fee_vnd=0,
+        total_vnd=10000,
+    )
+    line = StoreOrderLine.objects.create(
+        order=order,
+        product_id=source.product_id,
+        position=1,
+        sku_snapshot="SKU",
+        name_snapshot="Vegetables",
+        unit_size_snapshot=1,
+        unit_label_snapshot="kg",
+        unit_price_vnd_snapshot=10000,
+        quantity=1,
+        cash_quantity=1,
+        cash_subtotal_vnd=10000,
+    )
+    allocation = StoreStockAllocation.objects.create(line=line, batch=batch, quantity=1)
+    for kind in ["sale", "restock"] if restocked else ["sale"]:
+        StoreStockMovement.objects.create(
+            allocation=allocation,
+            line=line,
+            batch=batch,
+            quantity=1,
+            kind=kind,
+            idempotency_key=uuid4(),
+        )
+    return order, allocation
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "status,restocked",
+    [
+        (StoreOrderStatus.DELIVERED, False),
+        (StoreOrderStatus.CANCELLED, False),
+        (StoreOrderStatus.CANCELLED, True),
+    ],
+)
+def test_farm_delete_preserves_allocation_history_across_generations(
+    farm_admin_api, status, restocked
+):
+    farm = Farm.objects.create(**farm_payload(), legacy_tracker_owned=True)
+    tracker = TrackerFarm.objects.create(farm=farm)
+    product = make_product()
+    source = FarmProduct.objects.create(farm=farm, product=product, supply_generation=2)
+    order, allocation = allocate_historical_farm_batch(source, status, restocked=restocked)
+    url = f"/api/v1/admin/farms/{farm.pk}"
+    capability = farm_admin_api.get(url).json()["data"]["capabilities"]["delete"]
+    assert capability["allowed"] is False
+    assert capability["reasons"] == [
+        {
+            "code": "supplying_product",
+            "id": str(product.pk),
+            "label": product.sku,
+            "name_vi": "Cà chua",
+            "name_en": "Cà chua",
+        },
+        {"code": "store_order", "id": str(order.pk), "label": order.reference_code},
+    ]
+    assert farm_admin_api.delete(url).json()["errors"] == [
+        {"code": "farm_in_use", "context": {"reasons": capability["reasons"]}},
+    ]
+    removed = farm_admin_api.post(
+        f"{url}/products/{product.pk}/remove", lifecycle_command(source), format="json"
+    )
+    assert removed.status_code == 200
+    assert farm_admin_api.get(url).json()["data"]["capabilities"]["delete"] == {
+        "allowed": False,
+        "reasons": capability["reasons"][1:],
+    }
+    assert farm_admin_api.delete(url).status_code == 409
+    assert Farm.objects.filter(pk=farm.pk).exists()
+    assert TrackerFarm.objects.filter(pk=tracker.pk).exists()
+    assert StoreStockAllocation.objects.filter(pk=allocation.pk).exists()
+    assert allocation.movements.count() == (2 if restocked else 1)
+    assert not ContentAuditLog.objects.filter(action="farm.delete", entity_id=str(farm.pk)).exists()
+
+    assert farm_admin_api.delete(f"/api/v1/admin/tracker-farms/{tracker.pk}").status_code == 204
+    assert not TrackerFarm.objects.filter(pk=tracker.pk).exists()
+    assert Farm.objects.filter(pk=farm.pk).exists()
+    assert StoreStockAllocation.objects.filter(pk=allocation.pk).exists()
+
+
+@pytest.mark.django_db
+def test_delete_recognizes_stock_movement_attached_to_a_batch_even_without_its_own_allocation(
+    farm_admin_api,
+):
+    farm = Farm.objects.create(**farm_payload())
+    other = Farm.objects.create(**farm_payload(name_en="Other"))
+    product = make_product()
+    source = FarmProduct.objects.create(
+        farm=farm, product=product, removed_at=timezone.now(), is_active=False
+    )
+    batch = FarmProductStockBatch.objects.create(
+        farm_product=source,
+        start_date=timezone.localdate(),
+        end_date=timezone.localdate(),
+        quantity_units=2,
+    )
+    order, allocation = allocate_historical_farm_batch(
+        FarmProduct.objects.create(farm=other, product=product), StoreOrderStatus.CANCELLED
+    )
+    # Historical ledger inconsistency: the ledger claims this batch, while the
+    # allocation points elsewhere. Protect both batch references.
+    movement = allocation.movements.get()
+    movement.batch = batch
+    movement.save(update_fields=["batch"])
+    url = f"/api/v1/admin/farms/{farm.pk}"
+    response = farm_admin_api.delete(url)
+    assert response.status_code == 409
+    assert response.json()["errors"][0]["context"]["reasons"] == [
+        {"code": "store_order", "id": str(order.pk), "label": order.reference_code},
+    ]
+    assert FarmProductStockBatch.objects.filter(pk=batch.pk).exists()
+    assert StoreStockMovement.objects.filter(pk=movement.pk, batch=batch).exists()
+
+
+@pytest.mark.django_db
+def test_delete_rolls_back_tracker_batches_sources_and_audit_on_unexpected_protection(
+    farm_admin_api,
+):
+    farm = Farm.objects.create(**farm_payload())
+    tracker = TrackerFarm.objects.create(farm=farm)
+    source = FarmProduct.objects.create(
+        farm=farm, product=make_product(), removed_at=timezone.now(), is_active=False
+    )
+    batch = FarmProductStockBatch.objects.create(
+        farm_product=source,
+        start_date=timezone.localdate(),
+        end_date=timezone.localdate(),
+        quantity_units=2,
+    )
+    url = f"/api/v1/admin/farms/{farm.pk}"
+    with patch("farms.models.Farm.delete", side_effect=ProtectedError("dependency", {farm})):
+        response = farm_admin_api.delete(url)
+    assert response.status_code == 409
+    assert response.json()["errors"] == [{"code": "farm_delete_protected"}]
+    assert Farm.objects.filter(pk=farm.pk).exists()
+    assert TrackerFarm.objects.filter(pk=tracker.pk).exists()
+    assert FarmProduct.objects.filter(pk=source.pk).exists()
+    assert FarmProductStockBatch.objects.filter(pk=batch.pk).exists()
+    assert not ContentAuditLog.objects.filter(
+        action__in=["farm.delete", "tracker_farm.delete"],
+        entity_id__in=[str(farm.pk), str(tracker.pk)],
+    ).exists()
+
+
+@pytest.mark.django_db
+def test_farm_delete_capability_bounds_detail_queries_and_references(farm_admin_api):
+    farm = Farm.objects.create(**farm_payload())
+    url = f"/api/v1/admin/farms/{farm.pk}"
+    FarmProduct.objects.create(farm=farm, product=make_product("FIRST"))
+    with CaptureQueriesContext(connection) as first:
+        assert len(farm_admin_api.get(url).json()["data"]["capabilities"]["delete"]["reasons"]) == 1
+    for index in range(12):
+        FarmProduct.objects.create(farm=farm, product=make_product(f"SKU-{index}"))
+    with CaptureQueriesContext(connection) as many:
+        assert len(farm_admin_api.get(url).json()["data"]["capabilities"]["delete"]["reasons"]) == 1
+    assert len(many) == len(first)
+    # Each capability query projects at most one representative reference.
+    for table in (
+        "farms_farmproduct",
+        "commerce_storestockallocation",
+        "commerce_storestockmovement",
+    ):
+        assert any(table in row["sql"] and "LIMIT 1" in row["sql"] for row in many)
 
 
 def lifecycle_command(source, **values):

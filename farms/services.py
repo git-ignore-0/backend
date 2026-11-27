@@ -12,11 +12,18 @@ from django.db.models import (
     Sum,
     Value,
 )
+from django.db.models.deletion import ProtectedError, RestrictedError
 from django.db.models.functions import Coalesce, Greatest
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
-from commerce.models import Product, ProductStatus
+from commerce.models import (
+    Product,
+    ProductStatus,
+    ProductTranslation,
+    StoreStockAllocation,
+    StoreStockMovement,
+)
 from commerce.services import schedule_store_revalidation
 from content.models import MediaAsset
 from content.services import audit, delete_orphan_media_asset, request_frontend_revalidation
@@ -263,23 +270,108 @@ def update_farm(*, farm_id, actor, expected_version, data):
     return farm
 
 
+def _farm_delete_product_reference(rows, code):
+    names = ProductTranslation.objects.filter(product_id=OuterRef("product_id")).order_by()
+    row = (
+        rows.order_by("pk")
+        .values(
+            "product_id",
+            "product__sku",
+            name_vi=Subquery(names.filter(locale="vi").values("name")[:1]),
+            name_en=Subquery(names.filter(locale="en").values("name")[:1]),
+        )
+        .first()
+    )
+    if not row:
+        return None
+    sku = row["product__sku"]
+    return {
+        "code": code,
+        "id": str(row["product_id"]),
+        "label": sku,
+        "name_vi": row["name_vi"] or row["name_en"] or sku,
+        "name_en": row["name_en"] or row["name_vi"] or sku,
+    }
+
+
+def farm_capabilities(farm_id):
+    sources = FarmProduct.objects.filter(farm_id=farm_id)
+    supplying = _farm_delete_product_reference(
+        sources.filter(removed_at__isnull=True), "supplying_product"
+    )
+    archived = _farm_delete_product_reference(
+        sources.filter(
+            Exists(LegacyFarmWeeklySupply.objects.filter(farm_product_id=OuterRef("pk")))
+        ),
+        "legacy_supply",
+    )
+    order = None
+    for model in (StoreStockAllocation, StoreStockMovement):
+        row = (
+            model.objects.filter(batch__farm_product__farm_id=farm_id)
+            .order_by("pk")
+            .values("line__order_id", "line__order__reference_code")
+            .first()
+        )
+        if row:
+            order = {
+                "code": "store_order",
+                "id": str(row["line__order_id"]),
+                "label": row["line__order__reference_code"],
+            }
+            break
+    reasons = [reason for reason in (supplying, order, archived) if reason]
+    return {"delete": {"allowed": not reasons, "reasons": reasons}}
+
+
 @transaction.atomic
 def delete_farm(*, farm_id, actor):
     from content.models import TrackerFarm
 
+    # Match Store and supply mutations. Add can attach a different Product
+    # while we acquire locks, so recheck before touching any dependent rows.
+    sources = FarmProduct.objects.filter(farm_id=farm_id)
+    product_ids = list(sources.order_by().values_list("product_id", flat=True))
+    products = list(
+        Product.objects.select_for_update().filter(pk__in=product_ids).only("slug").order_by("pk")
+    )
+    locked_sources = list(
+        sources.select_for_update().filter(product_id__in=product_ids).order_by("pk")
+    )
     farm = Farm.objects.select_for_update().get(pk=farm_id)
-    if (
-        FarmProduct.objects.filter(farm=farm).exists()
-        or TrackerFarm.objects.filter(farm=farm).exists()
-    ):
-        raise FarmConflict("farm_in_use")
-    asset_ids = set(farm.photos.values_list("image_id", flat=True))
-    if farm.image_id:
-        asset_ids.add(farm.image_id)
-    audit(actor=actor, action="farm.delete", entity=farm)
-    farm.delete()
-    for asset_id in asset_ids:
-        delete_orphan_media_asset(asset_id=asset_id, storage_prefix="farms")
+    if sources.exclude(product_id__in=product_ids).exists():
+        raise FarmConflict("farm_product_changed")
+
+    batches = FarmProductStockBatch.objects.filter(
+        farm_product_id__in=[source.pk for source in locked_sources]
+    )
+    list(batches.select_for_update().only("pk").order_by("pk"))
+    decision = farm_capabilities(farm_id)["delete"]
+    if not decision["allowed"]:
+        raise FarmConflict("farm_in_use", context={"reasons": decision["reasons"]})
+    tracker = TrackerFarm.objects.select_for_update().filter(farm_id=farm_id).first()
+    asset_ids = set()
+    for row in (farm, tracker):
+        if row:
+            asset_ids.update(row.photos.order_by().values_list("image_id", flat=True))
+            if row.image_id:
+                asset_ids.add(row.image_id)
+    try:
+        if tracker:
+            audit(actor=actor, action="tracker_farm.delete", entity=tracker)
+            tracker.delete()
+        batches.delete()
+        sources.delete()
+        audit(actor=actor, action="farm.delete", entity=farm)
+        farm.delete()
+        for asset_id in sorted(asset_ids):
+            delete_orphan_media_asset(asset_id=asset_id, storage_prefix="farms")
+    except (ProtectedError, RestrictedError) as error:
+        raise FarmConflict("farm_delete_protected") from error
+    if tracker:
+        _schedule_tracker_revalidation()
+    if products:
+        schedule_store_revalidation(slugs=[product.slug for product in products])
 
 
 def _validate_stock_batch_values(*, start_date, end_date, quantity_units, today=None):
@@ -360,7 +452,7 @@ def add_farm_product(*, farm_id, product_id, start_date, end_date, quantity_unit
 
 
 def farm_product_removal_blocker(source, *, now=None):
-    from commerce.models import StoreOrderStatus, StoreStockAllocation
+    from commerce.models import StoreOrderStatus
     from commerce.store_orders import _active_reserved_stock, active_product_stock_totals
 
     decision_at = now or timezone.now()

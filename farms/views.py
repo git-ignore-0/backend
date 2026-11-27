@@ -42,6 +42,7 @@ from farms.services import (
     create_stock_batch,
     delete_farm,
     delete_growth_tracker_profile,
+    farm_capabilities,
     farm_product_queryset,
     farm_product_removal_blocker,
     farm_queryset,
@@ -76,7 +77,7 @@ def conflict(code, context=None):
     )
 
 
-def farm_payload(farm, request):
+def farm_payload(farm, request, *, detail=False):
     photos = [media_payload(photo.image, request) for photo in farm.photos.all()]
     return {
         "id": str(farm.pk),
@@ -94,6 +95,7 @@ def farm_payload(farm, request):
         "version": farm.version,
         "created_at": farm.created_at.isoformat(),
         "updated_at": farm.updated_at.isoformat(),
+        **({"capabilities": farm_capabilities(farm.pk)} if detail else {}),
     }
 
 
@@ -270,7 +272,7 @@ class AdminFarmDetailView(APIView):
 
     def get(self, request, farm_id):
         farm = get_object_or_404(farm_queryset(), pk=farm_id)
-        return no_store(Response({"data": farm_payload(farm, request)}))
+        return no_store(Response({"data": farm_payload(farm, request, detail=True)}))
 
     def patch(self, request, farm_id):
         get_object_or_404(Farm, pk=farm_id)
@@ -287,14 +289,13 @@ class AdminFarmDetailView(APIView):
         except Farm.DoesNotExist as error:
             raise Http404 from error
         farm = get_object_or_404(farm_queryset(), pk=farm.pk)
-        return no_store(Response({"data": farm_payload(farm, request)}))
+        return no_store(Response({"data": farm_payload(farm, request, detail=True)}))
 
     def delete(self, request, farm_id):
-        get_object_or_404(Farm, pk=farm_id)
         try:
             delete_farm(farm_id=farm_id, actor=request.user)
         except FarmConflict as error:
-            return conflict(error.code)
+            return conflict(error.code, error.context)
         except Farm.DoesNotExist as error:
             raise Http404 from error
         return no_store(Response(status=status.HTTP_204_NO_CONTENT))
