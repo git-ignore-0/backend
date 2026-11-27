@@ -115,7 +115,7 @@ def test_legacy_holds_are_placed_whole_or_safely_blocked(store_product, payment_
     original.save(update_fields=["quantity_units"])
     capacity = inventory_capacity([product.pk], now=timezone.now())
     assert capacity.maximum(product.pk) == 0
-    assert capacity.legacy_shortfalls[product.pk] == (7, 6)
+    assert capacity.recovery_shortfalls[product.pk] == (7, 6)
     assert capacity.physical[product.pk, other.pk] == 6
     with pytest.raises(CommandError, match="no verified single-Farm plan"):
         call_command("check_farm_fulfillment", stdout=output)
@@ -233,5 +233,124 @@ def test_a_new_assignment_cannot_invalidate_the_verified_legacy_placement(
     assert StoreStockReservation.objects.get(line__order=order).farm_id == lots[2][1]
     capacity = inventory_capacity([product.pk], now=timezone.now())
     assert capacity.maximum(product.pk) == 0
-    assert product.pk not in capacity.legacy_shortfalls
+    assert product.pk not in capacity.recovery_shortfalls
     assert capacity.legacy_hold_counts[product.pk] == 5
+
+
+def strand_supply(batch, monkeypatch):
+    """Advance across the actual batch date boundary without expiring the order."""
+    today = timezone.localdate()
+    batch.start_date = today - timedelta(days=1)
+    batch.end_date = today
+    batch.save(update_fields=["start_date", "end_date"])
+    tomorrow = timezone.now() + timedelta(days=1)
+    monkeypatch.setattr(timezone, "now", lambda: tomorrow)
+
+
+def test_stranded_store_hold_keeps_recovery_stock_from_catalog_quote_and_checkout(
+    store_product, payment_settings, active_user, client, monkeypatch
+):
+    from uuid import uuid4
+
+    from commerce.store_orders import approve_store_order
+
+    original = store_product.farm_offers.get().stock_batches.get()
+    order, _, _ = create_store_checkout(
+        user=None, payload=checkout_payload(store_product, quantity=4)
+    )
+    backup = supply(store_product, "Recovery", 4)
+    hold = order.lines.get().stock_reservations.get()
+    assert hold.farm_id == original.farm_product.farm_id
+    strand_supply(original, monkeypatch)
+    type(order).objects.filter(pk=order.pk).update(expires_at=timezone.now() + timedelta(hours=12))
+
+    payload = checkout_payload(store_product, quantity=4, expected_available=4)
+    with pytest.raises(StoreOrderError, match="^store_requote_required$") as conflict:
+        create_store_checkout(user=None, payload=payload)
+    assert conflict.value.context["available_quantity"] == 0
+    with pytest.raises(StoreOrderError, match="^store_stock_changed$") as quote:
+        preview_store_voucher(user=None, payload=payload)
+    assert quote.value.context["available_quantity"] == 0
+    listing = client.get("/api/v1/public/store-products?locale=vi")
+    detail = client.get(f"/api/v1/public/store-products/{store_product.slug}?locale=vi")
+    assert listing.json()["data"][0]["available_quantity"] == 0
+    assert detail.json()["data"]["available_quantity"] == 0
+
+    hold.refresh_from_db()
+    assert hold.farm_id == original.farm_product.farm_id
+    assert hold.released_at is None
+    assert type(order).objects.count() == 1
+    approve_store_order(
+        order_id=order.pk,
+        actor=active_user,
+        idempotency_key=uuid4(),
+        sources=[{"line_id": hold.line_id, "farm_id": backup.pk}],
+    )
+    assert hold.line.stock_allocations.get().batch.farm_product.farm_id == backup.pk
+
+
+@pytest.mark.parametrize("release", ["expiry", "cancel"])
+def test_recovery_protection_ends_at_reservation_release(
+    store_product, payment_settings, active_user, monkeypatch, release
+):
+    from uuid import uuid4
+
+    from commerce.inventory import inventory_capacity
+    from commerce.store_orders import cancel_store_order
+
+    product = store_product
+    original = product.farm_offers.get().stock_batches.get()
+    order, _, _ = create_store_checkout(user=None, payload=checkout_payload(product, quantity=4))
+    backup = supply(product, "Recovery", 4)
+    strand_supply(original, monkeypatch)
+    type(order).objects.filter(pk=order.pk).update(expires_at=timezone.now() + timedelta(hours=12))
+    assert inventory_capacity([product.pk], now=timezone.now()).maximum(product.pk) == 0
+    if release == "expiry":
+        type(order).objects.filter(pk=order.pk).update(expires_at=timezone.now())
+    else:
+        cancel_store_order(
+            order_id=order.pk, actor=active_user, idempotency_key=uuid4(), reason="Cancelled"
+        )
+    next_order, _, _ = create_store_checkout(
+        user=None, payload=checkout_payload(product, quantity=4, expected_available=4)
+    )
+    assert next_order.lines.get().stock_reservations.get().farm_id == backup.pk
+
+
+def test_legacy_and_stranded_holds_are_counted_whole_in_preflight(store_product, payment_settings):
+    from io import StringIO
+
+    from django.core.management import call_command
+    from django.core.management.base import CommandError
+
+    from commerce.inventory import inventory_capacity
+
+    product = store_product
+    original = product.farm_offers.get().stock_batches.get()
+    first, _, _ = create_store_checkout(user=None, payload=checkout_payload(product, quantity=4))
+    second, _, _ = create_store_checkout(
+        user=None, payload=checkout_payload(product, quantity=3, expected_available=6)
+    )
+    second.lines.get().stock_reservations.update(farm_id=None)
+    original.end_date = timezone.localdate() - timedelta(days=1)
+    original.save(update_fields=["end_date"])
+    replacement = supply(product, "Replacement", 4)
+    another = supply(product, "Another", 2)
+    output = StringIO()
+    with pytest.raises(CommandError, match="no verified single-Farm plan"):
+        call_command("check_farm_fulfillment", stdout=output)
+    assert '"stranded_holds": 1' in output.getvalue()
+    assert '"unassigned_holds": 1' in output.getvalue()
+    assert '"blocked": 1' in output.getvalue()
+    assert inventory_capacity([product.pk], now=timezone.now()).maximum(product.pk) == 0
+
+    another.products.get().stock_batches.update(quantity_units=3)
+    output = StringIO()
+    call_command("check_farm_fulfillment", stdout=output)
+    assert '"stranded_holds": 1' in output.getvalue()
+    assert '"blocked": 0' in output.getvalue()
+    capacity = inventory_capacity([product.pk], now=timezone.now())
+    assert capacity.remaining(product.pk, replacement.pk) == 0
+    assert capacity.remaining(product.pk, another.pk) == 0
+    assert first.lines.get().stock_reservations.get().farm_id == original.farm_product.farm_id
+    assert second.lines.get().stock_reservations.get().farm_id is None

@@ -16,6 +16,7 @@ from memberships import csa_rounds as service
 from memberships.models import CSASelection, MembershipCycleQuota
 from tests.test_csa_rounds import context as context
 from tests.test_csa_rounds import save
+from tests.test_single_farm_inventory import checkout_payload, strand_supply
 from tests.test_store_orders import guest_payload
 from tests.test_store_orders import payment_settings as payment_settings
 from tests.test_store_orders import store_product as store_product
@@ -114,6 +115,79 @@ def test_protected_hold_can_shrink_after_natural_expiry_without_switching(contex
     assert reduced.stock_holds.get().farm_id == first.farm_product.farm_id
     assert reduced.stock_holds.get().quantity == 3
     assert reduced.quota_holds.get().units == 3
+
+
+def test_stranded_csa_hold_protects_recovery_from_store_checkout(
+    context, payment_settings, monkeypatch
+):
+    from commerce.store_orders import StoreOrderError, create_store_checkout
+
+    _, product, member, round_, now = context
+    first = _initial_batch(product, now, units=4)
+    backup = _batch(product, now, units=4)
+    round_.closes_at = now + timedelta(days=2)
+    round_.delivery_date = timezone.localdate(now) + timedelta(days=3)
+    round_.save(update_fields=["closes_at", "delivery_date"])
+    MembershipCycleQuota.objects.filter(cycle__membership=member).update(
+        granted_units=10, remaining_units=10
+    )
+    selection = save(context, quantity=4)
+    assert selection.stock_holds.get().farm_id == first.farm_product.farm_id
+    strand_supply(first, monkeypatch)
+
+    with pytest.raises(StoreOrderError, match="^store_requote_required$") as conflict:
+        create_store_checkout(
+            user=None, payload=checkout_payload(product, quantity=4, expected_available=4)
+        )
+    assert conflict.value.context["available_quantity"] == 0
+    assert not StoreOrder.objects.exists()
+    assert service.selection_stock_capacity([product.pk], None) == {product.pk: 0}
+    assert service.selection_stock_capacity([product.pk], selection) == {product.pk: 4}
+    with pytest.raises(service.CSARoundError, match="^csa_stock_insufficient$"):
+        save(context, quantity=5, expected_revision=selection.revision)
+    selection.refresh_from_db()
+    assert selection.revision == 1
+    assert selection.quota_holds.get().units == 4
+    assert selection.stock_holds.get().farm_id == first.farm_product.farm_id
+
+    recovered = save(context, quantity=4, expected_revision=selection.revision)
+    assert recovered.revision == 2
+    assert recovered.quota_holds.get().units == 4
+    assert recovered.stock_holds.get().farm_id == backup.farm_product.farm_id
+
+
+def test_csa_save_uses_only_stock_left_after_stranded_store_hold(
+    context, payment_settings, monkeypatch
+):
+    from commerce.store_orders import create_store_checkout
+
+    _, product, member, round_, now = context
+    first = _initial_batch(product, now, units=4)
+    order, _, _ = create_store_checkout(
+        user=None, payload=checkout_payload(product, quantity=4, expected_available=4)
+    )
+    backup = _batch(product, now, units=4)
+    round_.closes_at = now + timedelta(days=2)
+    round_.delivery_date = timezone.localdate(now) + timedelta(days=3)
+    round_.save(update_fields=["closes_at", "delivery_date"])
+    strand_supply(first, monkeypatch)
+    StoreOrder.objects.filter(pk=order.pk).update(expires_at=timezone.now() + timedelta(hours=12))
+
+    quota = MembershipCycleQuota.objects.get(cycle__membership=member)
+    before = quota.remaining_units
+    with pytest.raises(service.CSARoundError, match="^csa_stock_insufficient$"):
+        save(context, quantity=1)
+    assert not CSASelection.objects.exists()
+    quota.refresh_from_db()
+    assert quota.remaining_units == before
+
+    backup.quantity_units = 5
+    backup.save(update_fields=["quantity_units"])
+    selected = save(context, quantity=1)
+    assert selected.stock_holds.get().farm_id == backup.farm_product.farm_id
+    assert selected.quota_holds.get().units == 1
+    hold = order.lines.get().stock_reservations.get()
+    assert (hold.farm_id, hold.quantity, hold.released_at) == (first.farm_product.farm_id, 4, None)
 
 
 def test_order_creation_and_reselection_preserve_exactly_one_assignment_per_product(

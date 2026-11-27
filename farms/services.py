@@ -520,7 +520,7 @@ def farm_product_removal_blocker(source, *, now=None):
     capacity = inventory_capacity([product_id], now=decision_at, exclude_source_id=source.pk)
     assigned = capacity.assigned.get((product_id, source.farm_id), 0)
     required, remaining = (
-        (assigned, 0) if assigned else capacity.legacy_shortfalls.get(product_id, (0, 0))
+        (assigned, 0) if assigned else capacity.recovery_shortfalls.get(product_id, (0, 0))
     )
     if not required:
         return None

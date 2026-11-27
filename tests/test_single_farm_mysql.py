@@ -35,6 +35,7 @@ from tests.test_farmer_supply_requests import (
 from tests.test_farms_api import farm_admin_api as farm_admin_api
 from tests.test_product_lifecycle_locking import isolate_side_effects as isolate_side_effects
 from tests.test_product_lifecycle_locking import run_in_lock_order
+from tests.test_single_farm_inventory import strand_supply
 from tests.test_single_farm_lifecycle import add_backup_farm, batch_command
 from tests.test_store_orders import guest_payload
 from tests.test_store_orders import payment_settings as payment_settings
@@ -67,6 +68,101 @@ def approve(order, actor, farm, key=None):
         idempotency_key=key or uuid.uuid4(),
         sources=[{"line_id": order.lines.get().pk, "farm_id": farm.pk}],
     )
+
+
+@pytest.fixture
+def stranded_order(store_product, payment_settings, monkeypatch):
+    original = store_product.farm_offers.get().stock_batches.get()
+    order = checkout(store_product, quantity=4, expected=10)
+    target = add_backup_farm(store_product, 4)
+    strand_supply(original, monkeypatch)
+    StoreOrder.objects.filter(pk=order.pk).update(expires_at=timezone.now() + timedelta(hours=12))
+    return order, target
+
+
+def assert_recovered(order, target):
+    assert order.lines.get().stock_reservations.get().released_at is not None
+    allocation = order.lines.get().stock_allocations.get()
+    assert (allocation.batch.farm_product.farm_id, allocation.quantity) == (target.pk, 4)
+    assert order.actions.filter(action="approve").count() == 1
+
+
+@pytest.mark.parametrize("checkout_first", [True, False], ids=["checkout-first", "approval-first"])
+def test_checkout_cannot_take_stock_used_for_stranded_recovery(
+    store_product, active_user, stranded_order, checkout_first
+):
+    order, target = stranded_order
+    guest, approval = run_in_lock_order(
+        partial(checkout, store_product, quantity=4, expected=4),
+        partial(approve, order, active_user, target),
+        left_first=checkout_first,
+    )
+    with pytest.raises(StoreOrderError, match="^store_requote_required$") as exc:
+        guest.result()
+    assert exc.value.context["available_quantity"] == 0
+    assert approval.result().pk == order.pk
+    assert StoreOrder.objects.count() == 1
+    assert_recovered(order, target)
+
+
+@pytest.mark.parametrize("csa_first", [True, False], ids=["csa-first", "approval-first"])
+def test_csa_save_cannot_take_stock_used_for_stranded_recovery(context, stranded_order, csa_first):
+    actor, _, _, round_, now = context
+    round_.closes_at = now + timedelta(days=2)
+    round_.delivery_date = timezone.localdate(now) + timedelta(days=3)
+    round_.save(update_fields=["closes_at", "delivery_date"])
+    order, target = stranded_order
+
+    selection, approval = run_in_lock_order(
+        partial(save_selection, context, quantity=4),
+        partial(approve, order, actor, target),
+        left_first=csa_first,
+    )
+    with pytest.raises(csa_rounds.CSARoundError, match="^csa_stock_insufficient$"):
+        selection.result()
+    assert approval.result().pk == order.pk
+    assert not CSASelection.objects.exists()
+    assert not CSAStockHold.objects.exists()
+    assert_recovered(order, target)
+
+
+@pytest.mark.parametrize("change_first", [True, False], ids=["change-first", "approval-first"])
+@pytest.mark.parametrize("operation", ["reduce", "deactivate"])
+def test_source_change_serializes_with_stranded_recovery(
+    active_user, stranded_order, change_first, operation
+):
+    order, target = stranded_order
+    source = target.products.get()
+    batch = source.stock_batches.get()
+    if operation == "reduce":
+        change_supply = partial(
+            services.update_stock_batch,
+            **batch_command(source, batch, active_user),
+            data={"quantity_units": 3},
+        )
+    else:
+        change_supply = partial(
+            services.update_farm,
+            farm_id=target.pk,
+            actor=active_user,
+            expected_version=target.version,
+            data={"is_active": False},
+        )
+    changed, approval = run_in_lock_order(
+        change_supply, partial(approve, order, active_user, target), left_first=change_first
+    )
+    assert approval.result().pk == order.pk
+    if change_first:
+        with pytest.raises(services.FarmConflict, match="^stock_reserved$"):
+            changed.result()
+    elif operation == "reduce":
+        with pytest.raises(services.FarmConflict, match="^stock_sold$"):
+            changed.result()
+    else:
+        changed.result()
+        target.refresh_from_db()
+        assert not target.is_active
+    assert_recovered(order, target)
 
 
 @pytest.mark.parametrize("has_backup", [False, True], ids=["one-farm", "two-farms"])

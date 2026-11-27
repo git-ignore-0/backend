@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import date
 from uuid import UUID
 
-from django.db.models import Case, Count, DateField, F, IntegerField, Min, Sum, Value, When
+from django.db.models import Case, Count, DateField, F, IntegerField, Min, Q, Sum, Value, When
 from django.utils import timezone
 
 from commerce.models import StoreOrderStatus, StoreStockReservation
@@ -37,20 +37,16 @@ def effective_store_stock_reservations(*, now):
     )
 
 
-def _effective_inventory_holds(product_ids, *, now, exclude_order=None, exclude_selection=None):
+def _effective_inventory_holds(product_ids, *, now):
     from memberships.csa_rounds import effective_stock_hold_rows
 
-    store = effective_store_stock_reservations(now=now).filter(product_id__in=product_ids)
-    csa = effective_stock_hold_rows(now=now, exclude_selection=exclude_selection).filter(
-        product_id__in=product_ids
+    return (
+        effective_store_stock_reservations(now=now).filter(product_id__in=product_ids),
+        effective_stock_hold_rows(now=now).filter(product_id__in=product_ids),
     )
-    if exclude_order is not None:
-        store = store.exclude(line__order_id=exclude_order.pk)
-        csa = csa.exclude(selection__order_id=exclude_order.pk)
-    return store, csa
 
 
-def _pack_legacy_holds(quantities, free_by_farm):
+def _pack_holds(quantities, free_by_farm):
     """Return a feasible placement or the first whole hold that could not be placed."""
     free = free_by_farm.copy()
     farms = sorted(free)
@@ -65,25 +61,37 @@ def _pack_legacy_holds(quantities, free_by_farm):
                 break
         if count:
             return {}, (quantity, max(0, max(free.values(), default=0)))
-    return {farm: before - free[farm] for farm, before in free_by_farm.items()}, None
+    return free, None
+
+
+def _partition_assigned(physical, assigned):
+    free = physical.copy()
+    stranded = Counter()
+    deficient_farms = set()
+    for farm, quantities in assigned.items():
+        required = sum(quantity * count for quantity, count in quantities.items())
+        if required > physical.get(farm, 0):
+            # At a deficient Farm there is no business priority for individual holds.
+            stranded.update(quantities)
+            deficient_farms.add(farm)
+        else:
+            free[farm] -= required
+    return free, stranded, deficient_farms
 
 
 @dataclass(frozen=True)
 class InventoryCapacity:
     physical: FarmStock
     assigned: FarmStock
-    demand: FarmStock
-    legacy: set[UUID]
-    legacy_shortfalls: dict[UUID, tuple[int, int]]
+    free: FarmStock
+    recovery_shortfalls: dict[UUID, tuple[int, int]]
     legacy_hold_counts: dict[UUID, int]
+    stranded_hold_counts: dict[UUID, int]
     total_demand: dict[UUID, int]
     farms_by_product: dict[UUID, list[UUID]]
 
     def remaining(self, product_id, farm_id):
-        if product_id in self.legacy_shortfalls:
-            return 0
-        pair = (product_id, farm_id)
-        return max(0, self.physical.get(pair, 0) - self.demand.get(pair, 0))
+        return self.free.get((product_id, farm_id), 0)
 
     def maximum(self, product_id):
         return max(
@@ -113,7 +121,7 @@ def inventory_capacity(
     now,
     exclude_order=None,
     exclude_selection=None,
-    exclude_batch_id=None,
+    recover_stranded=False,
     exclude_farm_id=None,
     exclude_source_id=None,
     stock_adjustments=None,
@@ -123,13 +131,12 @@ def inventory_capacity(
     physical = {}
     earliest_end = {}
     assigned = defaultdict(int)
-    legacy = set()
+    assigned_sizes = defaultdict(lambda: defaultdict(Counter))
+    own_assigned = defaultdict(lambda: defaultdict(Counter))
     legacy_quantities = defaultdict(Counter)
     total_demand = defaultdict(int)
     if product_ids:
         batches = active_stock_batches(now=now).filter(farm_product__product_id__in=product_ids)
-        if exclude_batch_id is not None:
-            batches = batches.exclude(pk=exclude_batch_id)
         if exclude_farm_id is not None:
             batches = batches.exclude(farm_product__farm_id=exclude_farm_id)
         if exclude_source_id is not None:
@@ -146,53 +153,69 @@ def inventory_capacity(
             .annotate(
                 first_expiry=Min("end_date"),
                 total=Sum("remaining"),
-                legacy_size=Value(None, output_field=IntegerField()),
+                hold_size=Value(None, output_field=IntegerField()),
+                is_own=Value(0, output_field=IntegerField()),
                 row_count=Value(None, output_field=IntegerField()),
             )
             .values_list(
-                "product_id", "farm_id", "first_expiry", "total", "legacy_size", "row_count"
+                "product_id", "farm_id", "first_expiry", "total", "hold_size", "row_count", "is_own"
             )
         )
-        store, csa = _effective_inventory_holds(
-            product_ids, now=now, exclude_order=exclude_order, exclude_selection=exclude_selection
-        )
+        store, csa = _effective_inventory_holds(product_ids, now=now)
 
-        def grouped(rows):
-            # For assigned holds, group by Farm. For legacy holds retain the size of
-            # each indivisible demand, aggregated by equal quantity.
+        def grouped(rows, owns_hold):
+            # Group equal-sized whole holds in SQL. Keep own demand in the same
+            # snapshot so recovery can distinguish shortage from stock left free.
             return (
                 rows.order_by()
                 .annotate(
-                    legacy_size=Case(
-                        When(farm_id__isnull=True, then=F("quantity")),
-                        output_field=IntegerField(),
-                    )
+                    hold_size=F("quantity"),
+                    is_own=Case(When(owns_hold, then=Value(1)), default=Value(0))
+                    if owns_hold is not None
+                    else Value(0, output_field=IntegerField()),
                 )
-                .values("product_id", "farm_id", "legacy_size")
+                .values("product_id", "farm_id", "hold_size", "is_own")
                 .annotate(
                     first_expiry=Value(None, output_field=DateField()),
                     total=Sum("quantity"),
                     row_count=Count("pk"),
                 )
                 .values_list(
-                    "product_id", "farm_id", "first_expiry", "total", "legacy_size", "row_count"
+                    "product_id",
+                    "farm_id",
+                    "first_expiry",
+                    "total",
+                    "hold_size",
+                    "row_count",
+                    "is_own",
                 )
             )
 
+        owns_store = Q(line__order_id=exclude_order.pk) if exclude_order is not None else None
+        if exclude_selection is not None:
+            owns_csa = Q(selection_id=exclude_selection.pk)
+        elif exclude_order is not None:
+            owns_csa = Q(selection__order_id=exclude_order.pk)
+        else:
+            owns_csa = None
+
         # One statement keeps physical stock and demand on the same read snapshot.
-        for product_id, farm_id, expiry, units, size, count in stock.union(
-            grouped(store), grouped(csa), all=True
+        for product_id, farm_id, expiry, units, size, count, is_own in stock.union(
+            grouped(store, owns_store), grouped(csa, owns_csa), all=True
         ):
             if expiry is not None:
                 physical[product_id, farm_id] = int(units)
                 earliest_end[product_id, farm_id] = expiry
-                continue
-            total_demand[product_id] += int(units)
-            if farm_id is None:
-                legacy.add(product_id)
-                legacy_quantities[product_id][size] += count
+            elif is_own:
+                if recover_stranded and farm_id is not None:
+                    own_assigned[product_id][farm_id][size] += count
             else:
-                assigned[product_id, farm_id] += int(units)
+                total_demand[product_id] += int(units)
+                if farm_id is None:
+                    legacy_quantities[product_id][size] += count
+                else:
+                    assigned[product_id, farm_id] += int(units)
+                    assigned_sizes[product_id][farm_id][size] += count
 
     for pair, delta in (stock_adjustments or {}).items():
         physical[pair] = max(0, physical.get(pair, 0) + delta)
@@ -203,29 +226,60 @@ def inventory_capacity(
     ):
         farms_by_product[product_id].append(farm_id)
 
-    demand = dict(assigned)
+    free = {}
     shortfalls = {}
-    for product_id, quantities in legacy_quantities.items():
-        free_by_farm = {
-            farm: max(0, physical[product_id, farm] - assigned.get((product_id, farm), 0))
-            for farm in farms_by_product.get(product_id, ())
+    stranded_counts = {}
+    for product_id in product_ids:
+        farm_stock = {
+            farm: physical[product_id, farm] for farm in farms_by_product.get(product_id, ())
         }
-        placement, shortfall = _pack_legacy_holds(quantities, free_by_farm)
+        assigned_holds = assigned_sizes.get(product_id, {})
+        legacy = legacy_quantities.get(product_id, Counter())
+        unreserved, stranded, deficient_farms = _partition_assigned(farm_stock, assigned_holds)
+        if stranded:
+            stranded_counts[product_id] = stranded.total()
+        plan, shortfall = _pack_holds(legacy + stranded, unreserved)
         if shortfall:
             shortfalls[product_id] = shortfall
-            continue
-        for farm_id, units in placement.items():
-            if units:
-                pair = (product_id, farm_id)
-                demand[pair] = demand.get(pair, 0) + units
+
+        # A deficient Farm may contribute to the placement but should not take a new assignment.
+        plan = {farm: units for farm, units in plan.items() if farm not in deficient_farms}
+        own = own_assigned.get(product_id)
+        if own:
+            _add_recovery_options(plan, own, farm_stock, assigned_holds, legacy, unreserved)
+        free.update({(product_id, farm): units for farm, units in plan.items()})
 
     return InventoryCapacity(
         physical,
         dict(assigned),
-        demand,
-        legacy,
+        free,
         shortfalls,
         {product_id: quantities.total() for product_id, quantities in legacy_quantities.items()},
+        stranded_counts,
         dict(total_demand),
         dict(farms_by_product),
     )
+
+
+def _add_recovery_options(plan, own, physical, assigned, legacy, unreserved):
+    all_assigned = assigned | {
+        farm: assigned.get(farm, Counter()) + quantities for farm, quantities in own.items()
+    }
+    before_free, before_stranded, before_deficient = _partition_assigned(physical, all_assigned)
+    _, before_shortfall = _pack_holds(legacy + before_stranded, before_free)
+    if not before_shortfall:
+        return
+
+    for farm, quantities in own.items():
+        quantity = sum(size * count for size, count in quantities.items())
+        if farm not in before_deficient:
+            # Consuming a healthy own hold leaves the same stock for everyone else.
+            plan[farm] = max(plan.get(farm, 0), quantity)
+        elif max(plan.values(), default=0) < quantity:
+            # Admin can recover this whole hold in an already unverifiable product.
+            # Removing this hold can leave enough stock at its Farm for other assigned holds.
+            # Keep those holds and legacy holds protected before offering a recovery source.
+            legacy_plan, _ = _pack_holds(legacy, unreserved)
+            for target, units in legacy_plan.items():
+                if units >= quantity:
+                    plan[target] = units

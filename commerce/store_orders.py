@@ -254,7 +254,7 @@ def ensure_batch_change_preserves_reservations(
     capacity = inventory_capacity([product_id], now=now, stock_adjustments={key: delta})
     if (
         capacity.physical.get(key, 0) < capacity.assigned.get(key, 0)
-        or product_id in capacity.legacy_shortfalls
+        or product_id in capacity.recovery_shortfalls
     ):
         raise StoreOrderError("stock_reserved")
 
@@ -265,7 +265,7 @@ def ensure_farm_deactivation_preserves_reservations(farm):
         return
     now = timezone.now()
     capacity = inventory_capacity(sources, now=now, exclude_farm_id=farm.pk)
-    if any(sources[product_id] is None for product_id in capacity.legacy_shortfalls) or any(
+    if any(sources[product_id] is None for product_id in capacity.recovery_shortfalls) or any(
         capacity.assigned.get((product_id, farm.pk), 0) for product_id in sources
     ):
         raise StoreOrderError("stock_reserved")
@@ -1181,7 +1181,7 @@ def source_inventory(order, *, lines=None):
     if lines is None:
         lines = list(order.lines.order_by("position", "id"))
     product_ids = {line.product_id for line in lines}
-    capacity = inventory_capacity(product_ids, now=now, exclude_order=order)
+    capacity = inventory_capacity(product_ids, now=now, exclude_order=order, recover_stranded=True)
     batches = (
         active_stock_batches(now=now)
         .filter(farm_product__product_id__in=product_ids)
@@ -1516,7 +1516,9 @@ def _approve_store_order_atomic(*, order_id, actor, idempotency_key, allocations
         for batch in batches.values()
         if is_current_stock_batch(batch, today=today)
     }
-    capacity = inventory_capacity(product_ids, now=decision_at, exclude_order=order)
+    capacity = inventory_capacity(
+        product_ids, now=decision_at, exclude_order=order, recover_stranded=True
+    )
     if sources is not None:
         allocations = _plan_selected_approval(
             lines, farms_by_line, batches, available_by_batch, capacity

@@ -372,3 +372,109 @@ def test_admin_can_recover_each_live_hold_from_an_expired_farm(
         ("sale", 4),
         ("sale", 4),
     ]
+
+
+@pytest.mark.parametrize("backup_sizes", [(4,), (2, 2)])
+def test_partial_recovery_is_explicit_and_never_combines_farms(
+    admin, store_product, payment_settings, backup_sizes
+):
+    from commerce.inventory import inventory_capacity
+    from tests.test_single_farm_inventory import supply
+
+    original = store_product.farm_offers.get()
+    first = _checkout(store_product, quantity=4)
+    second = _checkout(store_product, quantity=4, expected_available=6)
+    backups = [supply(store_product, f"Backup {i}", size) for i, size in enumerate(backup_sizes)]
+    original.stock_batches.update(end_date=timezone.localdate() - timedelta(days=1))
+    capacity = inventory_capacity([store_product.pk], now=timezone.now())
+    assert capacity.maximum(store_product.pk) == 0
+    assert capacity.stranded_hold_counts[store_product.pk] == 2
+
+    selected = second.lines.get()
+    batch = backups[0].products.get().stock_batches.get()
+    projection = admin.get(_path(second)).json()["data"]["source_inventory"]["lines"][0]
+    response = admin.post(
+        f"{_path(second)}/approve",
+        {"idempotency_key": str(uuid.uuid4()), "sources": [_source(selected, batch)]},
+        format="json",
+    )
+    if backup_sizes == (4,):
+        assert projection["suggested_farm_id"] == str(backups[0].pk)
+        assert response.status_code == 200
+        assert selected.stock_allocations.get().quantity == 4
+    else:
+        assert projection["suggested_farm_id"] is None
+        assert response.status_code == 409
+        _assert_uncommitted(second)
+    _assert_uncommitted(first)
+    hold = first.lines.get().stock_reservations.get()
+    assert hold.farm_id == original.farm_id
+    assert hold.quantity == 4
+
+
+def test_partial_recovery_preserves_healthy_and_legacy_holds(
+    admin, store_product, payment_settings
+):
+    from tests.test_single_farm_inventory import supply
+
+    original = store_product.farm_offers.get()
+    stranded = _checkout(store_product, quantity=4)
+    _checkout(store_product, quantity=4, expected_available=6)
+    backup = supply(store_product, "Backup", 10)
+    healthy = _checkout(store_product, quantity=6, expected_available=10)
+    legacy = _checkout(store_product, quantity=1, expected_available=4)
+    legacy_hold = legacy.lines.get().stock_reservations.get()
+    StoreStockReservation.objects.filter(pk=legacy_hold.pk).update(farm_id=None)
+    original.stock_batches.update(end_date=timezone.localdate() - timedelta(days=1))
+    batch = backup.products.get().stock_batches.get()
+
+    def approve_from_backup(order):
+        return admin.post(
+            f"{_path(order)}/approve",
+            {
+                "idempotency_key": str(uuid.uuid4()),
+                "sources": [_source(order.lines.get(), batch)],
+            },
+            format="json",
+        )
+
+    assert approve_from_backup(stranded).status_code == 409
+    _assert_uncommitted(stranded)
+    assert approve_from_backup(healthy).status_code == 200
+    assert healthy.lines.get().stock_allocations.get().quantity == 6
+    assert approve_from_backup(stranded).status_code == 409
+    _assert_uncommitted(stranded)
+    legacy_hold.refresh_from_db()
+    assert (legacy_hold.farm_id, legacy_hold.quantity, legacy_hold.released_at) == (None, 1, None)
+
+
+def test_partial_recovery_keeps_legacy_stock_when_removing_own_hold_restores_a_farm(
+    admin, store_product, payment_settings
+):
+    from tests.test_single_farm_inventory import supply
+
+    original = store_product.farm_offers.get()
+    original.stock_batches.update(quantity_units=13)
+    first = _checkout(store_product, quantity=4, expected_available=13)
+    other = _checkout(store_product, quantity=4, expected_available=9)
+    legacy = _checkout(store_product, quantity=5, expected_available=5)
+    legacy_hold = legacy.lines.get().stock_reservations.get()
+    StoreStockReservation.objects.filter(pk=legacy_hold.pk).update(farm_id=None)
+    today = timezone.localdate()
+    original.stock_batches.update(end_date=today - timedelta(days=1))
+    original.stock_batches.create(start_date=today, end_date=today, quantity_units=5)
+    backup = supply(store_product, "Backup", 4)
+    batch = backup.products.get().stock_batches.get()
+
+    response = admin.post(
+        f"{_path(first)}/approve",
+        {
+            "idempotency_key": str(uuid.uuid4()),
+            "sources": [_source(first.lines.get(), batch)],
+        },
+        format="json",
+    )
+    assert response.status_code == 409
+    _assert_uncommitted(first)
+    _assert_uncommitted(other)
+    _assert_uncommitted(legacy)

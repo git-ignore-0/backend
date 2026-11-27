@@ -142,3 +142,80 @@ def test_delete_capability_and_mutation_guard_active_reservation_then_keep_histo
     reservation.refresh_from_db()
     assert (reservation.quantity, reservation.farm_id) == (8, None)
     assert not Farm.objects.filter(pk=source.farm_id).exists()
+
+
+@pytest.mark.parametrize("operation", ["reduce", "cancel", "date", "deactivate", "remove"])
+def test_recovery_source_changes_cannot_strand_existing_order(
+    store_product, active_user, payment_settings, monkeypatch, operation
+):
+    from commerce.store_orders import StoreOrderError, ensure_batch_change_preserves_reservations
+    from tests.test_single_farm_inventory import strand_supply
+
+    original = store_product.farm_offers.get().stock_batches.get()
+    order = order_for(store_product, quantity=4)
+    backup = add_backup_farm(store_product, 4)
+    source = backup.products.get()
+    source.stock_batches.update(end_date=timezone.localdate() + timedelta(days=2))
+    batch = source.stock_batches.get()
+    strand_supply(original, monkeypatch)
+    StoreOrder.objects.filter(pk=order.pk).update(expires_at=timezone.now() + timedelta(hours=12))
+    command = batch_command(source, batch, active_user)
+    if operation == "remove":
+        capability = source_capabilities(source, now=timezone.now())
+        assert capability["can_remove"] is False
+        with pytest.raises(
+            services.FarmConflict, match="^farm_product_supply_shortfall$"
+        ) as caught:
+            services.remove_farm_product(**source_command(source, active_user))
+        assert capability["blockers"]["remove"] == {
+            "code": caught.value.code,
+            "context": {"required_units": 4, "remaining_units": 0, "shortfall_units": 4},
+        }
+        assert services.farm_capabilities(backup.pk)["delete"]["allowed"] is False
+        with pytest.raises(services.FarmConflict, match="^farm_in_use$"):
+            services.delete_farm(farm_id=backup.pk, actor=active_user)
+    elif operation == "date":
+        future_start = timezone.localdate() + timedelta(days=1)
+        with pytest.raises(StoreOrderError, match="^stock_reserved$"):
+            ensure_batch_change_preserves_reservations(batch, start_date=future_start)
+        # The batch API already rejects moving the start date of an active lot.
+        with pytest.raises(services.FarmConflict, match="^stock_batch_start_locked$"):
+            services.update_stock_batch(**command, data={"start_date": future_start})
+    else:
+        with pytest.raises(services.FarmConflict, match="^stock_reserved$"):
+            if operation == "deactivate":
+                services.update_farm(
+                    farm_id=backup.pk,
+                    actor=active_user,
+                    expected_version=1,
+                    data={"is_active": False},
+                )
+            elif operation == "cancel":
+                services.cancel_stock_batch(**command)
+            else:
+                services.update_stock_batch(**command, data={"quantity_units": 3})
+    batch.refresh_from_db()
+    assert (batch.quantity_units, batch.cancelled_at, batch.version) == (4, None, 1)
+
+
+def test_increasing_recovery_farm_stock_restores_recovery_and_new_capacity(
+    store_product, active_user, payment_settings, monkeypatch
+):
+    from commerce.inventory import inventory_capacity
+    from tests.test_single_farm_inventory import strand_supply
+
+    original = store_product.farm_offers.get().stock_batches.get()
+    order = order_for(store_product, quantity=4)
+    backup = add_backup_farm(store_product, 3)
+    source = backup.products.get()
+    batch = source.stock_batches.get()
+    strand_supply(original, monkeypatch)
+    StoreOrder.objects.filter(pk=order.pk).update(expires_at=timezone.now() + timedelta(hours=12))
+    before = inventory_capacity([store_product.pk], now=timezone.now())
+    assert store_product.pk in before.recovery_shortfalls
+    services.update_stock_batch(
+        **batch_command(source, batch, active_user), data={"quantity_units": 6}
+    )
+    after = inventory_capacity([store_product.pk], now=timezone.now())
+    assert store_product.pk not in after.recovery_shortfalls
+    assert after.maximum(store_product.pk) == 2
