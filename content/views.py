@@ -306,6 +306,15 @@ class PublicTrackerFarmListView(APIView):
         return response
 
 
+def admin_tracker_write_payload(profile, request):
+    try:
+        return admin_tracker_farm_payload(profile, request)
+    except (Farm.DoesNotExist, MediaAsset.DoesNotExist):
+        # The profile's shared Farm or image may have been removed after commit.
+        current = get_object_or_404(tracker_farm_queryset(), pk=profile.pk)
+        return admin_tracker_farm_payload(current, request)
+
+
 class AdminTrackerFarmListView(APIView):
     permission_classes = [IsWebsiteAdmin]
 
@@ -322,7 +331,7 @@ class AdminTrackerFarmListView(APIView):
             raise ValidationError(error.message_dict) from error
         return admin_no_store(
             Response(
-                {"data": admin_tracker_farm_payload(farm, request)},
+                {"data": admin_tracker_write_payload(farm, request)},
                 status=status.HTTP_201_CREATED,
             )
         )
@@ -344,6 +353,8 @@ class AdminTrackerFarmDetailView(APIView):
                 expected_version=expected_version,
                 data=data,
             )
+        except (Farm.DoesNotExist, TrackerFarm.DoesNotExist) as error:
+            raise NotFound from error
         except TrackerFarmVersionConflict:
             return admin_no_store(
                 Response(
@@ -353,7 +364,7 @@ class AdminTrackerFarmDetailView(APIView):
             )
         except DjangoValidationError as error:
             raise ValidationError(error.message_dict) from error
-        return admin_no_store(Response({"data": admin_tracker_farm_payload(farm, request)}))
+        return admin_no_store(Response({"data": admin_tracker_write_payload(farm, request)}))
 
     def delete(self, request, farm_id):
         try:

@@ -1,7 +1,10 @@
 import uuid
 from datetime import timedelta
+from functools import partial
 
 import pytest
+from django.core.files.base import ContentFile
+from django.core.files.storage import default_storage
 from django.db import connection, transaction
 from django.utils import timezone
 
@@ -19,13 +22,19 @@ from commerce.store_orders import (
     cancel_store_order,
     create_store_checkout,
 )
-from farms.models import Farm, FarmProduct, FarmProductStockBatch
+from content.models import ContentAuditLog, MediaAsset, TrackerFarm
+from content.services import delete_tracker_farm, update_tracker_farm
+from farms.models import Farm, FarmPhoto, FarmProduct, FarmProductStockBatch
 from farms.services import (
     FarmConflict,
     add_farm_product,
+    create_growth_tracker_profile,
     delete_farm,
+    delete_growth_tracker_profile,
     readd_farm_product,
     remove_farm_product,
+    update_farm,
+    update_growth_tracker_profile,
 )
 from tests.test_farm_lifecycle_locking import record_resource_locks, second_product_at_same_farm
 from tests.test_product_lifecycle_locking import isolate_side_effects as isolate_side_effects
@@ -246,3 +255,145 @@ def test_mysql_farm_deletion_and_store_approval_serialize(
         (StoreStockMovementKind.RESTOCK, line.quantity),
         (StoreStockMovementKind.SALE, line.quantity),
     ]
+
+
+@pytest.mark.django_db(transaction=True)
+@requires_mysql
+@pytest.mark.parametrize("delete_first", [True, False], ids=["delete-first", "patch-first"])
+@pytest.mark.parametrize("data", [{"name_en": "Edited Farm"}, {"is_active": False}])
+def test_mysql_farm_deletion_and_patch_serialize(store_product, active_user, delete_first, data):
+    source = remove_supply(store_product.farm_offers.get(), active_user)
+    farm = source.farm
+    # Status PATCH and DELETE meet at Product; information PATCH meets DELETE at Farm.
+    lock_model = Product if "is_active" in data else Farm
+    deleting, patching = run_in_lock_order(
+        partial(delete_farm, farm_id=farm.pk, actor=active_user),
+        partial(
+            update_farm,
+            farm_id=farm.pk,
+            actor=active_user,
+            expected_version=farm.version,
+            data=data,
+        ),
+        left_first=delete_first,
+        lock_model=lock_model,
+    )
+
+    deleting.result()
+    if delete_first:
+        with pytest.raises(Farm.DoesNotExist):
+            patching.result()
+    else:
+        updated = patching.result()
+        assert updated.version == farm.version + 1
+        for field, value in data.items():
+            assert getattr(updated, field) == value
+    assert ContentAuditLog.objects.filter(action="farm.update", entity_id=str(farm.pk)).count() == (
+        0 if delete_first else 1
+    )
+    assert not Farm.objects.filter(pk=farm.pk).exists()
+    assert not FarmProduct.objects.filter(pk=source.pk).exists()
+    assert Product.objects.filter(pk=store_product.pk).exists()
+
+
+@pytest.mark.django_db(transaction=True)
+@requires_mysql
+@pytest.mark.parametrize("delete_first", [True, False], ids=["delete-first", "tracker-first"])
+@pytest.mark.parametrize(
+    ("service", "creates_profile", "versioned"),
+    [
+        (create_growth_tracker_profile, True, False),
+        (update_growth_tracker_profile, False, True),
+        (delete_growth_tracker_profile, False, False),
+        (update_tracker_farm, False, True),
+        (delete_tracker_farm, False, False),
+    ],
+    ids=["create-profile", "update-profile", "delete-profile", "legacy-patch", "legacy-delete"],
+)
+def test_mysql_farm_deletion_and_tracker_writes_serialize(
+    active_user, delete_first, service, creates_profile, versioned
+):
+    farm = another_farm()
+    params = {"farm_id": farm.pk, "actor": active_user}
+    if not creates_profile:
+        profile = create_growth_tracker_profile(**params, data={})
+    if creates_profile or versioned:
+        params["data"] = {"signup_count": 7}
+    if versioned:
+        params["expected_version"] = profile.version
+
+    deleting, writing = run_in_lock_order(
+        partial(delete_farm, farm_id=farm.pk, actor=active_user),
+        partial(service, **params),
+        left_first=delete_first,
+        lock_model=Farm,
+    )
+
+    deleting.result()
+    if delete_first:
+        with pytest.raises(Farm.DoesNotExist):
+            writing.result()
+    else:
+        result = writing.result()
+        if creates_profile or versioned:
+            assert result.signup_count == 7
+    assert not Farm.objects.filter(pk=farm.pk).exists()
+    assert not TrackerFarm.objects.filter(farm_id=farm.pk).exists()
+
+
+@pytest.mark.django_db(transaction=True)
+@requires_mysql
+def test_mysql_concurrent_deletions_of_same_farm_only_commit_once(store_product, active_user):
+    source = remove_supply(store_product.farm_offers.get(), active_user)
+    farm_id = source.farm_id
+    profile = create_growth_tracker_profile(farm_id=farm_id, actor=active_user, data={})
+    delete = partial(delete_farm, farm_id=farm_id, actor=active_user)
+
+    winner, contender = run_in_lock_order(delete, delete, left_first=True)
+
+    winner.result()
+    with pytest.raises(Farm.DoesNotExist):
+        contender.result()
+    assert not Farm.objects.filter(pk=farm_id).exists()
+    assert not TrackerFarm.objects.filter(pk=profile.pk).exists()
+    assert not FarmProduct.objects.filter(pk=source.pk).exists()
+    assert ContentAuditLog.objects.filter(action="farm.delete", entity_id=str(farm_id)).count() == 1
+    assert (
+        ContentAuditLog.objects.filter(
+            action="tracker_farm.delete", entity_id=str(profile.pk)
+        ).count()
+        == 1
+    )
+
+
+@pytest.mark.django_db(transaction=True)
+@requires_mysql
+@pytest.mark.parametrize("retain_reference", [False, True], ids=["orphaned", "still-referenced"])
+def test_mysql_concurrent_farm_deletions_serialize_shared_media_cleanup(
+    active_user, retain_reference
+):
+    first, second = another_farm(), another_farm()
+    original = default_storage.save("farms/shared.webp", ContentFile(b"original"))
+    variant = default_storage.save("farms/shared-small.webp", ContentFile(b"variant"))
+    asset = MediaAsset.objects.create(
+        file=original, variants=[{"file": variant}], width=100, height=100
+    )
+    FarmPhoto.objects.create(farm=first, image=asset, sort_order=0)
+    second.image = asset
+    second.save(update_fields=["image"])
+    if retain_reference:
+        FarmPhoto.objects.create(farm=another_farm(), image=asset, sort_order=0)
+
+    deleting_first, deleting_second = run_in_lock_order(
+        partial(delete_farm, farm_id=first.pk, actor=active_user),
+        partial(delete_farm, farm_id=second.pk, actor=active_user),
+        left_first=True,
+        lock_model=MediaAsset,
+    )
+
+    deleting_first.result()
+    deleting_second.result()
+    assert not Farm.objects.filter(pk__in=[first.pk, second.pk]).exists()
+    assert MediaAsset.objects.filter(pk=asset.pk).exists() is retain_reference
+    assert default_storage.exists(original) is retain_reference
+    assert default_storage.exists(variant) is retain_reference

@@ -14,8 +14,8 @@ from commerce.models import Product, ProductStatus, ProductTranslation
 from content.models import ContentAuditLog, MediaAsset, TrackerFarm
 from content.permissions import IsWebsiteAdmin
 from content.serializers import admin_tracker_farm_payload, media_payload
-from content.services import delete_orphan_media_asset
-from content.views import AdminMediaUploadView
+from content.services import delete_orphan_media_asset, tracker_farm_queryset
+from content.views import AdminMediaUploadView, admin_tracker_write_payload
 from farms.models import Farm, FarmProduct, FarmProductStockBatch
 from farms.serializers import (
     FarmProductHistoryQuerySerializer,
@@ -623,9 +623,7 @@ class AdminFarmGrowthTrackerView(APIView):
     permission_classes = [IsWebsiteAdmin]
 
     def get(self, request, farm_id):
-        profile = get_object_or_404(
-            TrackerFarm.objects.select_related("farm__image"), farm_id=farm_id
-        )
+        profile = get_object_or_404(tracker_farm_queryset(), farm_id=farm_id)
         return no_store(Response({"data": admin_tracker_farm_payload(profile, request)}))
 
     def post(self, request, farm_id):
@@ -642,7 +640,7 @@ class AdminFarmGrowthTrackerView(APIView):
             raise Http404 from error
         return no_store(
             Response(
-                {"data": admin_tracker_farm_payload(profile, request)},
+                {"data": admin_tracker_write_payload(profile, request)},
                 status=status.HTTP_201_CREATED,
             )
         )
@@ -659,7 +657,9 @@ class AdminFarmGrowthTrackerView(APIView):
             )
         except FarmConflict as error:
             return conflict(error.code)
-        return no_store(Response({"data": admin_tracker_farm_payload(profile, request)}))
+        except Farm.DoesNotExist as error:
+            raise Http404 from error
+        return no_store(Response({"data": admin_tracker_write_payload(profile, request)}))
 
     def delete(self, request, farm_id):
         get_object_or_404(TrackerFarm, farm_id=farm_id)
@@ -667,6 +667,8 @@ class AdminFarmGrowthTrackerView(APIView):
             delete_growth_tracker_profile(farm_id=farm_id, actor=request.user)
         except FarmConflict as error:
             return conflict(error.code)
+        except Farm.DoesNotExist as error:
+            raise Http404 from error
         return no_store(Response(status=status.HTTP_204_NO_CONTENT))
 
 

@@ -4,10 +4,13 @@ from uuid import uuid4
 
 import pytest
 from django.contrib.auth.models import Group
+from django.core.files.base import ContentFile
+from django.core.files.storage import default_storage
 from django.db import connection
-from django.db.models.deletion import ProtectedError
+from django.db.models.deletion import ProtectedError, RestrictedError
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
+from django.utils.module_loading import import_string
 from rest_framework.test import APIClient
 
 from commerce.models import (
@@ -28,7 +31,7 @@ from farms.models import (
     FarmProductStockBatch,
     LegacyFarmWeeklySupply,
 )
-from farms.services import FarmConflict
+from farms.services import FarmConflict, delete_farm
 from tests.test_farm_stock_batches import make_product
 from tests.test_product_lifecycle_locking import checkout_operation as checkout_operation
 from tests.test_store_orders import approve_review_order
@@ -571,6 +574,86 @@ def test_reenabled_tracker_profile_rejects_a_draft_from_its_previous_lifecycle(f
 
 
 @pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("route", "method", "service_path", "delete_first"),
+    [
+        ("farms/{id}/growth-tracker", "patch", "farms.views.update_growth_tracker_profile", True),
+        ("farms/{id}/growth-tracker", "patch", "farms.views.update_growth_tracker_profile", False),
+        ("farms/{id}/growth-tracker", "delete", "farms.views.delete_growth_tracker_profile", True),
+        ("tracker-farms/{id}", "patch", "content.views.update_tracker_farm", True),
+        ("tracker-farms/{id}", "patch", "content.views.update_tracker_farm", False),
+    ],
+    ids=[
+        "before-profile-patch",
+        "after-profile-patch",
+        "before-profile-delete",
+        "before-legacy-patch",
+        "after-legacy-patch",
+    ],
+)
+def test_tracker_write_returns_not_found_when_farm_is_deleted_during_request(
+    farm_admin_api, active_user, route, method, service_path, delete_first
+):
+    farm = Farm.objects.create(**farm_payload())
+    profile = TrackerFarm.objects.create(pk=farm.pk, farm=farm)
+    write = import_string(service_path)
+
+    def overlap_farm_deletion(**kwargs):
+        if delete_first:
+            delete_farm(farm_id=farm.pk, actor=active_user)
+            return write(**kwargs)
+        result = write(**kwargs)
+        delete_farm(farm_id=farm.pk, actor=active_user)
+        return result
+
+    url = f"/api/v1/admin/{route.format(id=farm.pk)}"
+    farm_admin_api.raise_request_exception = False
+    with patch(service_path, side_effect=overlap_farm_deletion):
+        if method == "patch":
+            response = farm_admin_api.patch(
+                url, {"version": profile.version, "signup_count": 3}, format="json"
+            )
+        else:
+            response = farm_admin_api.delete(url)
+
+    assert response.status_code == 404
+    assert not Farm.objects.filter(pk=farm.pk).exists()
+    assert not TrackerFarm.objects.filter(pk=profile.pk).exists()
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("legacy", [False, True], ids=["profile-create", "legacy-create"])
+def test_tracker_create_returns_not_found_when_farm_and_image_are_deleted_before_response(
+    farm_admin_api, active_user, legacy
+):
+    asset = MediaAsset.objects.create(file="farms/private.webp", width=100, height=100)
+    if legacy:
+        url = "/api/v1/admin/tracker-farms"
+        data = farm_payload(photo_ids=[str(asset.pk)])
+        service_path = "content.views.create_tracker_farm"
+    else:
+        farm = Farm.objects.create(**farm_payload(), image=asset)
+        url = f"/api/v1/admin/farms/{farm.pk}/growth-tracker"
+        data = {}
+        service_path = "farms.views.create_growth_tracker_profile"
+    create_profile = import_string(service_path)
+
+    def delete_before_response(**kwargs):
+        profile = create_profile(**kwargs)
+        delete_farm(farm_id=profile.farm_id, actor=active_user)
+        return profile
+
+    farm_admin_api.raise_request_exception = False
+    with patch(service_path, side_effect=delete_before_response):
+        response = farm_admin_api.post(url, data, format="json")
+
+    assert response.status_code == 404
+    assert not Farm.objects.exists()
+    assert not TrackerFarm.objects.exists()
+    assert not MediaAsset.objects.filter(pk=asset.pk).exists()
+
+
+@pytest.mark.django_db
 def test_legacy_tracker_delete_preserves_independently_created_farm(farm_admin_api):
     image = MediaAsset.objects.create(
         file="farms/independent.webp",
@@ -996,6 +1079,49 @@ def test_delete_rolls_back_tracker_batches_sources_and_audit_on_unexpected_prote
         action__in=["farm.delete", "tracker_farm.delete"],
         entity_id__in=[str(farm.pk), str(tracker.pk)],
     ).exists()
+
+
+@pytest.mark.django_db
+def test_delete_rolls_back_earlier_asset_cleanup_and_on_commit_work_on_unexpected_restriction(
+    farm_admin_api, django_capture_on_commit_callbacks, settings, tmp_path
+):
+    settings.MEDIA_ROOT = tmp_path
+    assets = [
+        MediaAsset.objects.create(
+            pk=asset_id,
+            file=default_storage.save(f"farms/{asset_id}.webp", ContentFile(b"image")),
+            width=100,
+            height=100,
+        )
+        for asset_id in sorted([uuid4(), uuid4()])
+    ]
+    farm = Farm.objects.create(**farm_payload(), image=assets[0])
+    FarmPhoto.objects.create(farm=farm, image=assets[1], sort_order=0)
+    TrackerFarm.objects.create(farm=farm)
+    delete_asset = MediaAsset.delete
+
+    def restrict_second_asset(asset):
+        if asset.pk == assets[1].pk:
+            assert not MediaAsset.objects.filter(pk=assets[0].pk).exists()
+            assert default_storage.exists(assets[0].file.name)
+            raise RestrictedError("dependency", {asset})
+        return delete_asset(asset)
+
+    with (
+        patch.object(MediaAsset, "delete", new=restrict_second_asset),
+        django_capture_on_commit_callbacks(execute=True) as callbacks,
+    ):
+        response = farm_admin_api.delete(f"/api/v1/admin/farms/{farm.pk}")
+
+    assert response.status_code == 409
+    assert response.json()["errors"] == [{"code": "farm_delete_protected"}]
+    assert not callbacks
+    assert Farm.objects.filter(pk=farm.pk, image=assets[0]).exists()
+    assert FarmPhoto.objects.filter(farm=farm, image=assets[1]).exists()
+    assert TrackerFarm.objects.filter(farm=farm).exists()
+    for asset in assets:
+        assert MediaAsset.objects.filter(pk=asset.pk).exists()
+        assert default_storage.exists(asset.file.name)
 
 
 @pytest.mark.django_db
