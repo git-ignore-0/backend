@@ -141,6 +141,26 @@ class FarmProductReaddSerializer(FarmProductRevisionSerializer):
     idempotency_key = JSONUUIDField()
 
 
+class FarmProductBulkRemoveItemSerializer(FarmProductRevisionSerializer):
+    product_id = JSONUUIDField()
+    expected_link_id = JSONUUIDField()
+    expected_version = JSONIntegerField(min_value=1)
+
+
+class FarmProductBulkRemoveSerializer(StrictSerializer):
+    idempotency_key = JSONUUIDField()
+    items = FarmProductBulkRemoveItemSerializer(
+        many=True, allow_empty=False, max_length=FARM_BULK_MAX_ITEMS
+    )
+
+    def validate_items(self, value):
+        if len({item["product_id"] for item in value}) != len(value):
+            raise serializers.ValidationError("Product IDs must be unique.")
+        if len({item["expected_link_id"] for item in value}) != len(value):
+            raise serializers.ValidationError("Source IDs must be unique.")
+        return value
+
+
 class VersionedStockBatchWriteSerializer(StockBatchWriteSerializer, FarmProductRevisionSerializer):
     pass
 

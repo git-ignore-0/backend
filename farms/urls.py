@@ -38,6 +38,10 @@ urlpatterns = [
     path("admin/farms/<uuid:farm_id>/products", views.AdminFarmProductListView.as_view()),
     path("admin/farms/<uuid:farm_id>/products/bulk", views.AdminFarmBulkProductLinkView.as_view()),
     path(
+        "admin/farms/<uuid:farm_id>/products/bulk-remove",
+        views.AdminFarmBulkProductRemoveView.as_view(),
+    ),
+    path(
         "admin/farms/<uuid:farm_id>/products/<uuid:product_id>/batches",
         views.AdminFarmStockBatchListView.as_view(),
     ),

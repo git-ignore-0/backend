@@ -38,6 +38,7 @@ from farms.models import Farm, FarmProduct, FarmProductStockBatch
 from farms.serializers import (
     BulkStockBatchWriteSerializer,
     FarmCreationRecoverySerializer,
+    FarmProductBulkRemoveSerializer,
     FarmProductHistoryQuerySerializer,
     FarmProductLinkSerializer,
     FarmProductQuerySerializer,
@@ -70,6 +71,7 @@ from farms.services import (
     link_farm_products,
     readd_farm_product,
     remove_farm_product,
+    remove_farm_products_bulk,
     stock_batch_queryset,
     update_farm,
     update_growth_tracker_profile,
@@ -828,3 +830,23 @@ class AdminFarmBulkProductLinkView(AdminFarmBulkCreationView):
 
     def write(self, **command):
         return link_farm_products(authorize_write=self.authorize_write, **command)
+
+
+class AdminFarmBulkProductRemoveView(AdminFarmBulkCreationView):
+    action = AdminCreationReceipt.Action.REMOVE_FARM_PRODUCTS
+    serializer_class = FarmProductBulkRemoveSerializer
+
+    def write(self, **command):
+        return remove_farm_products_bulk(authorize_write=self.authorize_write, **command)
+
+    def receipt_response(self, receipt, *, created):
+        return Response(
+            {
+                "data": {
+                    "farm_id": str(receipt.resource_id),
+                    "removed_count": receipt.created_count,
+                },
+                "meta": creation_receipt_meta(receipt, replayed=not created),
+            },
+            status=status.HTTP_200_OK,
+        )

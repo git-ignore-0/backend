@@ -518,29 +518,50 @@ def farm_product_removal_blocker(source, *, now=None):
     )
 
 
-@transaction.atomic
-def remove_farm_product(*, farm_id, product_id, expected_link_id, expected_version, actor):
-    source = _locked_supply(farm_id, product_id)
+def _validate_source_removal(source, *, expected_link_id, expected_version, decision_at):
     _require_source_revision(source, expected_link_id, expected_version)
     if source.removed_at is not None:
         raise FarmConflict("farm_product_removed")
-    decision_at = timezone.now()
     if blocker := farm_product_removal_blocker(source, now=decision_at):
         raise blocker
+
+
+FARM_PRODUCT_REMOVE_FIELDS = ("removed_at", "removed_by", "is_active", "version", "updated_at")
+
+
+def _mark_source_removed(source, *, actor, decision_at):
     source.removed_at = decision_at
     source.removed_by = actor
     source.is_active = False
     source.version += 1
-    source.save(update_fields=["removed_at", "removed_by", "is_active", "version", "updated_at"])
+    source.updated_at = decision_at
+
+
+def _source_removal_audit_context(source):
+    return {
+        "farm_id": str(source.farm_id),
+        "product_id": str(source.product_id),
+        "supply_generation": source.supply_generation,
+    }
+
+
+@transaction.atomic
+def remove_farm_product(*, farm_id, product_id, expected_link_id, expected_version, actor):
+    source = _locked_supply(farm_id, product_id)
+    decision_at = timezone.now()
+    _validate_source_removal(
+        source,
+        expected_link_id=expected_link_id,
+        expected_version=expected_version,
+        decision_at=decision_at,
+    )
+    _mark_source_removed(source, actor=actor, decision_at=decision_at)
+    source.save(update_fields=FARM_PRODUCT_REMOVE_FIELDS)
     audit(
         actor=actor,
         action="farm.product.remove",
         entity=source,
-        context={
-            "farm_id": str(source.farm_id),
-            "product_id": str(source.product_id),
-            "supply_generation": source.supply_generation,
-        },
+        context=_source_removal_audit_context(source),
     )
     schedule_store_revalidation(slugs=[source.product.slug])
     return source
@@ -677,6 +698,80 @@ def _matching_farm_receipt(actor, action, key, fingerprint):
     if receipt is not None and receipt.request_fingerprint != fingerprint:
         raise CreationIdempotencyConflict
     return receipt
+
+
+@transaction.atomic
+def remove_farm_products_bulk(*, farm_id, actor, idempotency_key, items, authorize_write=None):
+    """Remove a set of distinct Product sources through one immutable intent."""
+    action = AdminCreationReceipt.Action.REMOVE_FARM_PRODUCTS
+    fingerprint = creation_fingerprint(
+        {"farm_id": farm_id, "items": sorted(items, key=lambda item: str(item["product_id"]))}
+    )
+    if receipt := _matching_farm_receipt(actor, action, idempotency_key, fingerprint):
+        return receipt, False
+
+    product_ids = [item["product_id"] for item in items]
+    # Product mutexes precede the receipt's actor FK, FarmProduct locks and Farm lock.
+    products = _lock_stock_products(product_ids)
+    receipt, created = claim_creation_receipt(
+        actor=actor, action=action, key=idempotency_key, fingerprint=fingerprint
+    )
+    if not created:
+        if authorize_write is not None:
+            authorize_write()
+        return receipt, False
+    sources = _lock_farm_stock_sources(farm_id, product_ids)
+    farm = Farm.objects.select_for_update().get(pk=farm_id)
+    if authorize_write is not None:
+        authorize_write()
+
+    decision_at = timezone.now()
+    for index, item in enumerate(items):
+        product_id = item["product_id"]
+        source = sources.get(product_id)
+        context = {"item_index": index, "product_id": str(product_id)}
+        if source is None or product_id not in products:
+            raise FarmConflict("farm_product_changed", context=context)
+        try:
+            # There is at most one selected source per Product. Its capacity guard
+            # reads only that Product, so another selected source cannot affect it.
+            _validate_source_removal(
+                source,
+                expected_link_id=item["expected_link_id"],
+                expected_version=item["expected_version"],
+                decision_at=decision_at,
+            )
+        except FarmConflict as error:
+            raise FarmConflict(
+                error.code,
+                context={
+                    **error.context,
+                    **context,
+                    "source_id": str(source.pk),
+                    "version": source.version,
+                },
+            ) from error
+
+    for source in sources.values():
+        _mark_source_removed(source, actor=actor, decision_at=decision_at)
+    FarmProduct.objects.bulk_update(sources.values(), FARM_PRODUCT_REMOVE_FIELDS)
+    ContentAuditLog.objects.bulk_create(
+        [
+            ContentAuditLog(
+                actor=actor,
+                action="farm.product.remove",
+                entity_type=FarmProduct._meta.model_name,
+                entity_id=str(source.pk),
+                context=_source_removal_audit_context(source),
+            )
+            for source in sources.values()
+        ]
+    )
+    receipt.resource_id = farm.pk
+    receipt.created_count = len(items)
+    receipt.save(update_fields=["resource_id", "created_count"])
+    schedule_store_revalidation(slugs=[product.slug for product in products.values()])
+    return receipt, True
 
 
 def _reject_existing_link(source, *, index):
