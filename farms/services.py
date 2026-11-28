@@ -495,7 +495,7 @@ def add_farm_product(*, farm_id, product_id, start_date, end_date, quantity_unit
 
 
 def farm_product_removal_blocker(source, *, now=None):
-    from commerce.inventory import inventory_capacity
+    from commerce.inventory import inventory_capacity, inventory_wire_quantity
     from commerce.models import StoreOrderStatus
 
     decision_at = now or timezone.now()
@@ -527,9 +527,9 @@ def farm_product_removal_blocker(source, *, now=None):
     return FarmConflict(
         "farm_product_supply_shortfall",
         context={
-            "required_units": required,
-            "remaining_units": remaining,
-            "shortfall_units": required - remaining,
+            "required_units": inventory_wire_quantity(required),
+            "remaining_units": inventory_wire_quantity(remaining),
+            "shortfall_units": inventory_wire_quantity(required - remaining),
         },
     )
 

@@ -19,6 +19,12 @@ WAITING_STATES = {
 }
 
 FarmStock = dict[tuple[UUID, UUID], int]
+MAX_INVENTORY_WIRE_QUANTITY = 9_007_199_254_740_991
+
+
+def inventory_wire_quantity(quantity):
+    """Encode nonnegative inventory totals as exact JSON numbers for JavaScript clients."""
+    return min(quantity, MAX_INVENTORY_WIRE_QUANTITY)
 
 
 def active_stock_batches(*, now=None):
@@ -102,15 +108,16 @@ class InventoryCapacity:
             default=0,
         )
 
-    def choose_farm(self, product_id, quantity, preferred_farm_id=None):
-        if preferred_farm_id and self.remaining(product_id, preferred_farm_id) >= quantity:
+    def choose_farm(self, product_id, quantity, preferred_farm_id=None, *, eligible_farms=None):
+        def fits(farm_id):
+            return (eligible_farms is None or farm_id in eligible_farms) and self.remaining(
+                product_id, farm_id
+            ) >= quantity
+
+        if preferred_farm_id and fits(preferred_farm_id):
             return preferred_farm_id
         return next(
-            (
-                farm
-                for farm in self.farms_by_product.get(product_id, ())
-                if self.remaining(product_id, farm) >= quantity
-            ),
+            (farm for farm in self.farms_by_product.get(product_id, ()) if fits(farm)),
             None,
         )
 

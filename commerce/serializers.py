@@ -3,7 +3,12 @@ from decimal import Decimal
 from django.utils.text import slugify
 from rest_framework import serializers
 
-from commerce.models import STORE_CHECKOUT_MAX_QUANTITY, ProductStatus
+from commerce.inventory import MAX_INVENTORY_WIRE_QUANTITY
+from commerce.models import (
+    STORE_CHECKOUT_MAX_QUANTITY,
+    STORE_LEGACY_ALLOCATION_MAX_QUANTITY,
+    ProductStatus,
+)
 from config.phones import InvalidPhoneNumber, normalize_vietnam_phone
 from members.administrative_units import province_exists, ward_choices
 from memberships.quota_points import POINT_INPUT_ERROR, is_allowed_point_input
@@ -265,6 +270,16 @@ class PublicStoreProductQuerySerializer(PublicStoreLocaleSerializer):
         return attrs
 
 
+class StoreExpectedAvailabilityField(serializers.IntegerField):
+    def to_internal_value(self, data):
+        quantity = super().to_internal_value(data)
+        # Keep historical coercions for old requests. Expanded availability must be a JSON
+        # integer, so a float rounded by the JSON decoder cannot match the current stock.
+        if quantity > MAX_POSITIVE_INTEGER and type(data) is not int:
+            self.fail("invalid")
+        return quantity
+
+
 class StoreCheckoutLineSerializer(StrictSerializer):
     product_id = serializers.UUIDField()
     quantity = serializers.IntegerField(min_value=1, max_value=STORE_CHECKOUT_MAX_QUANTITY)
@@ -272,8 +287,8 @@ class StoreCheckoutLineSerializer(StrictSerializer):
     expected_unit_price_vnd = serializers.IntegerField(
         min_value=1, max_value=MAX_POSITIVE_BIG_INTEGER
     )
-    expected_available_quantity = serializers.IntegerField(
-        min_value=0, max_value=MAX_POSITIVE_INTEGER
+    expected_available_quantity = StoreExpectedAvailabilityField(
+        min_value=0, max_value=MAX_INVENTORY_WIRE_QUANTITY
     )
     expected_quota_quantity = serializers.IntegerField(min_value=0, max_value=999)
 
@@ -342,7 +357,7 @@ class StoreRefundRequestAccessSerializer(StoreOrderAccessSerializer):
 class StoreAllocationSerializer(StrictSerializer):
     line_id = serializers.UUIDField()
     batch_id = serializers.UUIDField()
-    quantity = serializers.IntegerField(min_value=1, max_value=999999)
+    quantity = serializers.IntegerField(min_value=1, max_value=STORE_LEGACY_ALLOCATION_MAX_QUANTITY)
 
 
 class StoreApprovalSourceSerializer(StrictSerializer):

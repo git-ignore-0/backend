@@ -5,6 +5,7 @@ from django.db import models
 from django.db.models import Q
 
 STORE_CHECKOUT_MAX_QUANTITY = 999
+STORE_LEGACY_ALLOCATION_MAX_QUANTITY = 999_999
 PUBLIC_STORE_MAX_PRICE_VND = 1_000_000_000
 
 

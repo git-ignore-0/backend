@@ -10,6 +10,7 @@ from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from commerce.inventory import inventory_wire_quantity
 from commerce.models import Product, ProductStatus, ProductTranslation
 from config.phones import (
     InvalidPhoneNumber,
@@ -136,9 +137,9 @@ def farm_product_payload(row):
         "removed_at": row.removed_at.isoformat() if row.removed_at is not None else None,
         "version": row.version,
         "supply_generation": row.supply_generation,
-        "initial_quantity": row.initial_quantity,
-        "net_sold_quantity": row.net_sold_quantity,
-        "available_quantity": row.available_quantity,
+        "initial_quantity": inventory_wire_quantity(row.initial_quantity),
+        "net_sold_quantity": inventory_wire_quantity(row.net_sold_quantity),
+        "available_quantity": inventory_wire_quantity(row.available_quantity),
         "batch_count": row.batch_count,
         "active_batch_count": row.active_batch_count,
         "has_supply_history": row.batch_count > 0 or row.has_legacy_supply_history,

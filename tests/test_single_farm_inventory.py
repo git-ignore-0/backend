@@ -1,5 +1,6 @@
 from collections import Counter
 from datetime import timedelta
+from itertools import combinations_with_replacement, product
 from uuid import UUID, uuid4
 
 import pytest
@@ -41,6 +42,79 @@ def checkout_payload(product, **kwargs):
     serializer = StoreCheckoutSerializer(data=guest_payload(product, **kwargs))
     serializer.is_valid(raise_exception=True)
     return serializer.validated_data
+
+
+def _whole_placement_exists(capacity, quantities):
+    holds = list(quantities.elements())
+    farms = tuple(capacity)
+    for assignments in product(farms, repeat=len(holds)):
+        used = Counter()
+        for farm, quantity in zip(assignments, holds, strict=True):
+            used[farm] += quantity
+        if all(used[farm] <= capacity[farm] for farm in farms):
+            return True
+    return False
+
+
+def test_whole_hold_packing_is_deterministic_and_only_publishes_verified_free_capacity():
+    farms = (UUID(int=1), UUID(int=2))
+    for sizes in range(4):
+        for holds in combinations_with_replacement(range(1, 5), sizes):
+            demand = Counter(holds)
+            for quantities in product(range(6), repeat=len(farms)):
+                physical = dict(zip(farms, quantities, strict=True))
+                free, unplaced = _pack_holds(demand, physical)
+                reverse = dict(reversed(tuple(physical.items())))
+                assert (free, unplaced) == _pack_holds(Counter(reversed(holds)), reverse)
+                if unplaced:
+                    assert not free
+                    assert unplaced[0] > unplaced[1] >= 0
+                else:
+                    assert all(0 <= free[farm] <= physical[farm] for farm in farms)
+                    spent = {farm: physical[farm] - free[farm] for farm in farms}
+                    assert sum(spent.values()) == sum(holds)
+                    assert _whole_placement_exists(spent, demand)
+
+
+def test_conservative_hold_placement_can_leave_an_existing_feasible_plan_unverified():
+    first, second = UUID(int=1), UUID(int=2)
+    physical = {first: 8, second: 7}
+    holds = Counter((7, 5, 3))
+    assert _whole_placement_exists(physical, holds)
+    assert _pack_holds(holds, physical) == ({}, (3, 2))
+
+
+def test_recovery_options_keep_protected_demand_after_proposed_consumption():
+    origin, backup = UUID(int=1), UUID(int=2)
+    for first, second, quantity, other, legacy_size in product(
+        range(5), range(5), range(1, 5), range(4), range(3)
+    ):
+        physical = {origin: first, backup: second}
+        assigned = {origin: Counter([other])} if other else {}
+        legacy = Counter([legacy_size]) if legacy_size else Counter()
+        own = {origin: Counter([quantity])}
+        before_free, before_stranded, before_deficient = _partition_assigned(
+            physical, {origin: Counter([quantity]) + assigned.get(origin, Counter())}
+        )
+        _, before_shortfall = _pack_holds(legacy + before_stranded, before_free)
+        free, stranded, deficient = _partition_assigned(physical, assigned)
+        plan, _ = _pack_holds(legacy + stranded, free)
+        plan = {farm: units for farm, units in plan.items() if farm not in deficient}
+        _add_recovery_options(plan, own, physical, assigned, legacy, for_approval=True)
+        for target, available in plan.items():
+            assert 0 <= available <= physical[target]
+            if available < quantity:
+                continue
+            after = physical | {target: physical[target] - quantity}
+            after_free, after_stranded, after_deficient = _partition_assigned(after, assigned)
+            assert not after_deficient.difference(before_deficient)
+            if before_shortfall is None:
+                assert _whole_placement_exists(after_free, legacy + after_stranded)
+            elif target == origin and origin not in before_deficient:
+                assert (after_free, after_stranded) == (before_free, before_stranded)
+            else:
+                assert not after_deficient.difference(deficient)
+                assert _whole_placement_exists(after_free, legacy)
 
 
 @pytest.mark.parametrize(
@@ -370,6 +444,7 @@ def test_recovery_protection_ends_at_reservation_release(
 
 
 def test_legacy_and_stranded_holds_are_counted_whole_in_preflight(store_product, payment_settings):
+    import json
     from io import StringIO
 
     from django.core.management import call_command
@@ -394,6 +469,9 @@ def test_legacy_and_stranded_holds_are_counted_whole_in_preflight(store_product,
     assert '"stranded_holds": 1' in output.getvalue()
     assert '"unassigned_holds": 1' in output.getvalue()
     assert '"blocked": 1' in output.getvalue()
+    blocked = json.loads(output.getvalue().splitlines()[0])
+    assert blocked["unplaced_hold"] == [3, 2]
+    assert blocked["remaining_capacity"] == 0
     assert inventory_capacity([product.pk], now=timezone.now()).maximum(product.pk) == 0
 
     another.products.get().stock_batches.update(quantity_units=3)
@@ -401,6 +479,9 @@ def test_legacy_and_stranded_holds_are_counted_whole_in_preflight(store_product,
     call_command("check_farm_fulfillment", stdout=output)
     assert '"stranded_holds": 1' in output.getvalue()
     assert '"blocked": 0' in output.getvalue()
+    verified = json.loads(output.getvalue().splitlines()[0])
+    assert verified["unplaced_hold"] is None
+    assert verified["remaining_capacity"] == 0
     capacity = inventory_capacity([product.pk], now=timezone.now())
     assert capacity.remaining(product.pk, replacement.pk) == 0
     assert capacity.remaining(product.pk, another.pk) == 0

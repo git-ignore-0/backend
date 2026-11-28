@@ -37,6 +37,7 @@ class Command(BaseCommand):
                             "unassigned_holds": capacity.legacy_hold_counts.get(product_id, 0),
                             "stranded_holds": capacity.stranded_hold_counts.get(product_id, 0),
                             "unplaced_hold": capacity.recovery_shortfalls.get(product_id),
+                            "remaining_capacity": capacity.maximum(product_id),
                         }
                     )
                 )

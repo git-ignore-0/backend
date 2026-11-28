@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
+from django.contrib.auth.models import Group
 from django.db import close_old_connections, connection
 from django.utils import timezone
 from rest_framework.test import APIClient
@@ -60,6 +61,68 @@ def test_catalog_and_save_require_one_farm_with_the_entire_quantity(context):
     with pytest.raises(service.CSARoundError, match="^csa_stock_insufficient$"):
         save(context, quantity=4)
     assert not CSASelection.objects.exists()
+
+
+@pytest.mark.parametrize("batch_count", [1, 2])
+def test_csa_large_line_keeps_its_hold_with_complete_legacy_suggestion(context, batch_count):
+    user, product, member, round_, now = context
+    first = _initial_batch(product, now, units=1_500_000_000)
+    farm = first.farm_product.farm
+    second = _batch(product, now, units=1_500_000_000, farm=farm) if batch_count == 2 else None
+    MembershipCycleQuota.objects.filter(cycle__membership=member).update(
+        granted_units=1_000_000, remaining_units=1_000_000
+    )
+    client = APIClient()
+    client.force_authenticate(user, token=SimpleNamespace(scope="profile email"))
+    products = client.get(f"/api/v1/csa-rounds/{round_.pk}/products")
+    assert products.status_code == 200
+    assert products.json()["data"][0]["available_quantity"] == 1_500_000_000 * batch_count
+    response = client.put(
+        f"/api/v1/csa-rounds/{round_.pk}/selection",
+        {"expected_revision": 0, "lines": [{"product_id": str(product.pk), "quantity": 1_000_000}]},
+        format="json",
+    )
+    assert response.status_code == 200, response.json()
+    selection = CSASelection.objects.get(pk=response.json()["data"]["id"])
+    assert selection.stock_holds.get().farm_id == farm.pk
+    assert selection.stock_holds.get().quantity == 1_000_000
+
+    service.process_round(round_.pk, now=round_.closes_at)
+    selection.refresh_from_db()
+    user.groups.add(Group.objects.get_or_create(name="website_admin")[0])
+    client.force_authenticate(user, token=SimpleNamespace(scope="profile email content:manage"))
+    url = f"/api/v1/admin/store-orders/{selection.order_id}"
+    response = client.get(url)
+    assert response.status_code == 200
+    data = response.json()["data"]
+    source = data["source_inventory"]["lines"][0]
+    assert source["suggested_farm_id"] == str(farm.pk)
+    # Each legacy request row has its own ceiling, independently of the line quantity.
+    expected = (
+        [
+            {"line_id": source["line_id"], "batch_id": str(first.pk), "quantity": 999_999},
+            {"line_id": source["line_id"], "batch_id": str(second.pk), "quantity": 1},
+        ]
+        if second is not None
+        else []
+    )
+    assert data["allocation_suggestion"] == expected
+
+    service.reopen_selection(
+        selection_id=selection.pk,
+        actor=user,
+        deadline=service.delivery_start(round_) - timedelta(hours=1),
+        now=round_.closes_at,
+    )
+    response = client.get(url)
+    assert response.status_code == 200
+    data = response.json()["data"]
+    line = data["source_inventory"]["lines"][0]
+    assert line["suggested_farm_id"] is None
+    assert not any(option["eligible"] for option in line["farms"])
+    assert data["allocation_suggestion"] == []
+    candidates = data["source_inventory"]["candidates"]
+    assert [row["available_quantity"] for row in candidates] == [1_500_000_000] * batch_count
 
 
 def test_assignment_prefers_existing_farm_switches_and_survives_quota_failure(context):

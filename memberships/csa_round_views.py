@@ -11,7 +11,7 @@ from rest_framework import serializers
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from commerce.inventory import active_stock_batches
+from commerce.inventory import active_stock_batches, inventory_wire_quantity
 from commerce.models import Product
 from commerce.public_catalog import (
     _translation,
@@ -428,7 +428,11 @@ class MemberProducts(PrivateView):
                 product.available_quantity = limit
                 row = public_product_payload(product, request, locale)
             else:
-                row = {"id": str(product_id), "primary_image": None, "available_quantity": limit}
+                row = {
+                    "id": str(product_id),
+                    "primary_image": None,
+                    "available_quantity": inventory_wire_quantity(limit),
+                }
             if line is not None:
                 snapshot = line.snapshot
                 group = snapshot_groups.get(uuid.UUID(snapshot["quota_group_id"]))

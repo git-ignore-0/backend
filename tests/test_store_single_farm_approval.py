@@ -1,4 +1,6 @@
+import json
 import uuid
+from dataclasses import replace
 from datetime import timedelta
 
 import pytest
@@ -97,6 +99,266 @@ def _assert_uncommitted(order):
     assert StoreStockReservation.objects.filter(
         line__order=order, released_at__isnull=True
     ).exists()
+
+
+def _public_quantity_and_quote(client, product, payload, expected):
+    catalog = "/api/v1/public/store-products"
+    listing = client.get(catalog, {"locale": "vi"})
+    detail = client.get(f"{catalog}/{product.slug}", {"locale": "vi"})
+    assert listing.status_code == detail.status_code == 200
+    assert listing.json()["data"][0]["available_quantity"] == expected
+    assert detail.json()["data"]["available_quantity"] == expected
+    quote = client.post(
+        "/api/v1/public/store-quotes",
+        {
+            "locale": payload["locale"],
+            "delivery_date": payload["delivery_date"],
+            "guest": payload["guest"],
+            "lines": [
+                {key: line[key] for key in ("product_id", "quantity", "use_quota")}
+                for line in payload["lines"]
+            ],
+        },
+        format="json",
+    )
+    if not expected:
+        assert quote.status_code == 409
+        assert quote.json()["errors"][0]["code"] == "store_stock_changed"
+    else:
+        assert quote.status_code == 200, quote.json()
+        assert quote.json()["data"]["lines"] == payload["lines"]
+
+
+@pytest.mark.parametrize("stock", [0, 1, 999, 1000, 2_147_483_647, 2_147_483_648, 3_000_000_000])
+def test_public_availability_matches_checkout_and_replay(
+    admin, store_product, payment_settings, stock
+):
+    batch = FarmProductStockBatch.objects.get(farm_product__product=store_product)
+    if stock == 0:
+        FarmProductStockBatch.objects.filter(pk=batch.pk).update(
+            start_date=timezone.localdate() - timedelta(days=2),
+            end_date=timezone.localdate() - timedelta(days=1),
+        )
+    else:
+        FarmProductStockBatch.objects.filter(pk=batch.pk).update(
+            quantity_units=min(stock, 1_500_000_000)
+        )
+        if stock > 1_500_000_000:
+            batch.farm_product.stock_batches.create(
+                start_date=batch.start_date,
+                end_date=batch.end_date,
+                quantity_units=stock - 1_500_000_000,
+            )
+    if stock == 3_000_000_000:
+        supply(store_product, "Smaller Farm", 1_000_000_000)
+    client = APIClient()
+    payload = guest_payload(store_product, quantity=1, expected_available=stock)
+    _public_quantity_and_quote(client, store_product, payload, stock)
+    url = "/api/v1/public/store-checkouts"
+    response = client.post(url, payload, format="json")
+    if not stock:
+        assert response.status_code == 409
+        assert response.json()["errors"][0]["code"] == "store_stock_changed"
+        return
+    assert response.status_code == 201, response.json()
+    order = StoreOrder.objects.get(pk=response.json()["data"]["id"])
+    hold = StoreStockReservation.objects.get(line__order=order)
+    assert (hold.farm_id, hold.quantity) == (batch.farm_product.farm_id, 1)
+    replay = client.post(url, payload, format="json")
+    assert replay.status_code == 200
+    assert replay.json()["data"]["id"] == str(order.pk)
+    assert StoreStockReservation.objects.filter(line__order=order).count() == 1
+    if stock == 2_147_483_647:
+        for legacy_value in (str(stock), float(stock)):
+            prior_shape = {
+                **payload,
+                "lines": [{**payload["lines"][0], "expected_available_quantity": legacy_value}],
+            }
+            replay = client.post(url, prior_shape, format="json")
+            assert replay.status_code == 200
+            assert replay.json()["data"]["id"] == str(order.pk)
+    if stock == 3_000_000_000:
+        line = order.lines.get()
+        inventory = admin.get(_path(order)).json()["data"]["source_inventory"]["lines"][0]
+        selected = next(farm for farm in inventory["farms"] if farm["farm_id"] == str(hold.farm_id))
+        assert selected["available_quantity"] == stock
+        approved = admin.post(
+            f"{_path(order)}/approve",
+            {"idempotency_key": str(uuid.uuid4()), "sources": [_source(line, batch)]},
+            format="json",
+        )
+        assert approved.status_code == 200, approved.json()
+
+
+@pytest.mark.parametrize("physical", [9_007_199_254_740_991, 9_007_199_254_740_999])
+def test_public_api_saturates_only_the_wire_availability(
+    store_product, payment_settings, monkeypatch, physical
+):
+    batch = FarmProductStockBatch.objects.get(farm_product__product=store_product)
+    key = (store_product.pk, batch.farm_product.farm_id)
+
+    def with_large_stock(*args, **kwargs):
+        capacity = inventory_capacity(*args, **kwargs)
+        return replace(
+            capacity,
+            physical={**capacity.physical, key: physical},
+            free={**capacity.free, key: physical},
+        )
+
+    monkeypatch.setattr("commerce.public_catalog.inventory_capacity", with_large_stock)
+    monkeypatch.setattr("commerce.store_orders.inventory_capacity", with_large_stock)
+    client = APIClient()
+    expected = 9_007_199_254_740_991
+    payload = guest_payload(store_product, quantity=1, expected_available=expected)
+    _public_quantity_and_quote(client, store_product, payload, expected)
+    url = "/api/v1/public/store-checkouts"
+    for invalid in [-1, 0.25, True, "invalid", str(expected), float(expected), expected + 1]:
+        wrong = guest_payload(store_product, quantity=1, expected_available=invalid)
+        assert client.post(url, wrong, format="json").status_code == 400
+    fractional = json.dumps(payload, default=str).replace(str(expected), "9007199254740990.6")
+    assert client.post(url, fractional, content_type="application/json").status_code == 400
+    wrong = guest_payload(store_product, quantity=1000, expected_available=expected)
+    assert client.post(url, wrong, format="json").status_code == 400
+    stale = guest_payload(store_product, quantity=1, expected_available=expected - 1)
+    conflict = client.post(url, stale, format="json")
+    assert conflict.status_code == 409
+    assert conflict.json()["errors"][0]["context"]["available_quantity"] == expected
+    assert client.post(url, payload, format="json").status_code == 201
+    assert FarmProductStockBatch.objects.get(pk=batch.pk).quantity_units == batch.quantity_units
+
+
+def test_public_and_admin_share_six_from_two_batches_at_one_farm(
+    admin, store_product, payment_settings, batches
+):
+    original, early, late = batches
+    FarmProductStockBatch.objects.filter(pk=original.pk).update(quantity_units=4)
+    FarmProductStockBatch.objects.filter(pk__in=(early.pk, late.pk)).update(quantity_units=3)
+    client = APIClient()
+    payload = guest_payload(store_product, quantity=6, expected_available=6)
+    _public_quantity_and_quote(client, store_product, payload, 6)
+    url = "/api/v1/public/store-checkouts"
+    rejected = client.post(
+        url, guest_payload(store_product, quantity=7, expected_available=6), format="json"
+    )
+    assert rejected.status_code == 409
+    assert rejected.json()["errors"][0]["code"] == "store_stock_changed"
+    assert not StoreStockReservation.objects.exists()
+
+    order = _checkout(store_product, quantity=6, expected_available=6)
+    line = order.lines.get()
+    farm_id = str(early.farm_product.farm_id)
+    detail = admin.get(_path(order)).json()["data"]
+    projection = detail["source_inventory"]["lines"][0]
+    assert projection["assigned_farm_id"] == projection["suggested_farm_id"] == farm_id
+    assert [farm["farm_id"] for farm in projection["farms"] if farm["eligible"]] == [farm_id]
+    assert detail["allocation_suggestion"] == [
+        _allocation(line, early, 3),
+        _allocation(line, late, 3),
+    ]
+    result = admin.post(
+        f"{_path(order)}/approve",
+        {"idempotency_key": str(uuid.uuid4()), "sources": [_source(line, early)]},
+        format="json",
+    )
+    assert result.status_code == 200, result.json()
+    assert list(
+        line.stock_allocations.order_by("batch__end_date").values_list("batch_id", "quantity")
+    ) == [(early.pk, 3), (late.pk, 3)]
+
+
+def test_projection_prefers_eligible_assignment_before_inventory_order(
+    admin, store_product, payment_settings, batches
+):
+    original, early, _ = batches
+    FarmProductStockBatch.objects.filter(pk=original.pk).update(end_date=timezone.localdate())
+    order = _checkout(store_product, quantity=4)
+    line = order.lines.get()
+    original_farm = original.farm_product.farm_id
+    backup_farm = early.farm_product.farm_id
+    FarmProductStockBatch.objects.filter(pk=original.pk).update(
+        end_date=timezone.localdate() + timedelta(days=3)
+    )
+    assert (
+        inventory_capacity([store_product.pk], now=timezone.now(), exclude_order=order).choose_farm(
+            store_product.pk, line.quantity
+        )
+        == backup_farm
+    )
+    for assigned, expected in [(original_farm, original_farm), (None, backup_farm)]:
+        StoreStockReservation.objects.filter(line=line).update(farm_id=assigned)
+        response = admin.get(_path(order))
+        assert response.status_code == 200
+        projected = response.json()["data"]["source_inventory"]["lines"][0]
+        assert all(farm["eligible"] for farm in projected["farms"])
+        assert projected["suggested_farm_id"] == str(expected)
+
+
+@pytest.mark.parametrize(
+    ("change", "assigned", "has_backup"),
+    [
+        ("farm", True, True),
+        ("farm", False, True),
+        ("farm", True, False),
+        ("batch", True, True),
+    ],
+)
+def test_source_projection_uses_only_eligible_options_after_stock_reads(
+    admin, store_product, payment_settings, batches, monkeypatch, change, assigned, has_backup
+):
+    original, early, late = batches
+    FarmProductStockBatch.objects.filter(pk=original.pk).update(end_date=timezone.localdate())
+    order = _checkout(store_product, quantity=4)
+    line = order.lines.get()
+    original_farm = original.farm_product.farm_id
+    backup_farm = early.farm_product.farm_id
+    if not assigned:
+        StoreStockReservation.objects.filter(line=line).update(farm=None)
+    if not has_backup:
+        Farm.objects.filter(pk=backup_farm).update(is_active=False)
+
+    read_count = 0
+
+    def read_then_change(*args, **kwargs):
+        nonlocal read_count
+        read_count += 1
+        capacity = inventory_capacity(*args, **kwargs)
+        assert capacity.choose_farm(store_product.pk, line.quantity) == original_farm
+        if change == "farm":
+            Farm.objects.filter(pk=original_farm).update(is_active=False)
+        else:
+            FarmProductStockBatch.objects.filter(pk=original.pk).update(quantity_units=1)
+        return capacity
+
+    monkeypatch.setattr("commerce.store_orders.inventory_capacity", read_then_change)
+    response = admin.get(_path(order))
+    assert response.status_code == 200, response.json()
+    assert read_count == 1
+    data = response.json()["data"]
+    inventory = data["source_inventory"]
+    projected = inventory["lines"][0]
+    assert projected["line_id"] == str(line.pk)
+    assert projected["product_id"] == str(store_product.pk)
+    assert projected["required_quantity"] == 4
+    assert projected["assigned_farm_id"] == (str(original_farm) if assigned else None)
+    farms = {farm["farm_id"]: farm for farm in projected["farms"]}
+    assert len(farms) == len(projected["farms"])
+    if assigned or change == "batch":
+        assert not farms[str(original_farm)]["eligible"]
+        assert farms[str(original_farm)]["available_quantity"] == (1 if change == "batch" else 0)
+    else:
+        assert str(original_farm) not in farms
+    if has_backup:
+        suggested = projected["suggested_farm_id"]
+        assert suggested == str(backup_farm)
+        assert farms[suggested]["eligible"] and farms[suggested]["available_quantity"] >= 4
+        assert data["allocation_suggestion"] == [
+            _allocation(line, early, 2),
+            _allocation(line, late, 2),
+        ]
+    else:
+        assert projected["suggested_farm_id"] is None
+        assert data["allocation_suggestion"] == []
+    assert all(row["farm_id"] in farms for row in inventory["candidates"])
 
 
 def test_approval_switches_farm_and_allocates_current_batches_in_expiry_order(

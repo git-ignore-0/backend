@@ -1,7 +1,7 @@
 from django.db.models import Prefetch, Q
 from django.utils import timezone
 
-from commerce.inventory import inventory_capacity
+from commerce.inventory import inventory_capacity, inventory_wire_quantity
 from commerce.models import (
     PUBLIC_STORE_MAX_PRICE_VND,
     Category,
@@ -188,7 +188,7 @@ def public_product_payload(product, request, locale, *, detail=False):
         "alternate_name": alternate.name if alternate else None,
         "short_description": translation.short_description,
         "retail_price_vnd": product.retail_price_vnd,
-        "available_quantity": product.available_quantity,
+        "available_quantity": inventory_wire_quantity(product.available_quantity),
         "unit_size": str(product.unit_size),
         "unit_label": product.unit_label_vi if locale == "vi" else product.unit_label_en,
         "category": {

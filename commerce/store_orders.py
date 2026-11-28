@@ -17,9 +17,11 @@ from commerce.inventory import (
     active_stock_batches,
     effective_store_stock_reservations,
     inventory_capacity,
+    inventory_wire_quantity,
 )
 from commerce.models import (
     STORE_CHECKOUT_MAX_QUANTITY,
+    STORE_LEGACY_ALLOCATION_MAX_QUANTITY,
     CatalogTreeLock,
     Product,
     ShippingAddress,
@@ -375,7 +377,7 @@ def _check_checkout_stock(requested, products, inventory, check_expected):
         if type(quantity) is not int or not 1 <= quantity <= STORE_CHECKOUT_MAX_QUANTITY:
             raise StoreOrderError("store_order_invalid")
         product_id = item["product_id"]
-        available = inventory.maximum(product_id)
+        available = inventory_wire_quantity(inventory.maximum(product_id))
         product = products[product_id]
         if check_expected and item["expected_unit_price_vnd"] != product.retail_price_vnd:
             raise StoreOrderError(
@@ -637,7 +639,9 @@ def preview_store_voucher(*, user, payload, draft_coupon=None):
                 "quantity": item["quantity"],
                 "use_quota": item["use_quota"],
                 "expected_unit_price_vnd": product.retail_price_vnd,
-                "expected_available_quantity": quote["inventory"].maximum(product.pk),
+                "expected_available_quantity": inventory_wire_quantity(
+                    quote["inventory"].maximum(product.pk)
+                ),
                 "expected_quota_quantity": quota_quantity,
             }
             for _, item, product, quota_quantity, *_ in quote["line_values"]
@@ -1185,7 +1189,7 @@ def source_inventory(order, *, lines=None):
     batches = (
         active_stock_batches(now=now)
         .filter(farm_product__product_id__in=product_ids)
-        .select_related("farm_product__farm")
+        .select_related("farm_product")
         .annotate(remaining_units=batch_remaining_units(batch_net_sold()))
         .order_by("farm_product__product_id", "end_date", "start_date", "id")
     )
@@ -1205,17 +1209,19 @@ def source_inventory(order, *, lines=None):
     active_offers = FarmProduct.objects.filter(
         product_id__in=product_ids, removed_at__isnull=True, farm__is_active=True
     )
+    active_farms = set()
     for product_id, farm_id, name in active_offers.values_list("product_id", "farm_id", farm_name):
+        active_farms.add((product_id, farm_id))
         farm_names[product_id][farm_id] = name
     other_demand = capacity.total_demand
     by_product = defaultdict(list)
+    batch_totals = defaultdict(int)
     for batch in batches:
         offer = batch.farm_product
-        farm = offer.farm
-        by_product[offer.product_id].append(batch)
-        farm_names[offer.product_id].setdefault(
-            farm.pk, farm.name_vi if order.locale == "vi" else farm.name_en
-        )
+        key = (offer.product_id, offer.farm_id)
+        if key in active_farms:
+            by_product[offer.product_id].append(batch)
+            batch_totals[key] += batch.remaining_units
     csa = getattr(order, "csa_selection", None)
     can_approve = (
         order.status == StoreOrderStatus.PENDING_REVIEW
@@ -1223,18 +1229,31 @@ def source_inventory(order, *, lines=None):
         and (csa is None or csa.state in ("locked", "confirmed"))
     )
     suggestion = []
+    complete_suggestion = can_approve
     candidates = []
     source_lines = []
     for line in lines:
         product_id = line.product_id
         assigned_farm_id = assigned_farms.get(product_id)
         farm_quantities = {
-            farm_id: capacity.remaining(product_id, farm_id)
+            # Advisory reads can observe different commits. Publish only capacity
+            # still backed by the offers and batches used for this projection.
+            farm_id: min(capacity.remaining(product_id, farm_id), batch_totals[product_id, farm_id])
             for farm_id in sorted(farm_names[product_id], key=str)
         }
+        eligible_farms = {
+            farm_id
+            for farm_id, quantity in farm_quantities.items()
+            if can_approve and quantity >= line.quantity
+        }
         suggested_farm_id = (
-            capacity.choose_farm(product_id, line.quantity, preferred_farm_id=assigned_farm_id)
-            if can_approve
+            capacity.choose_farm(
+                product_id,
+                line.quantity,
+                preferred_farm_id=assigned_farm_id,
+                eligible_farms=eligible_farms,
+            )
+            if eligible_farms
             else None
         )
         source_lines.append(
@@ -1248,8 +1267,8 @@ def source_inventory(order, *, lines=None):
                     {
                         "farm_id": str(farm_id),
                         "farm_name": farm_names[product_id][farm_id],
-                        "available_quantity": quantity,
-                        "eligible": can_approve and quantity >= line.quantity,
+                        "available_quantity": inventory_wire_quantity(quantity),
+                        "eligible": farm_id in eligible_farms,
                     }
                     for farm_id, quantity in farm_quantities.items()
                 ],
@@ -1260,7 +1279,9 @@ def source_inventory(order, *, lines=None):
             farm_id = batch.farm_product.farm_id
             available = farm_quantities.get(farm_id, 0)
             if farm_id == suggested_farm_id:
-                suggested_batches.append((batch.pk, batch.remaining_units))
+                suggested_batches.append(
+                    (batch.pk, min(batch.remaining_units, STORE_LEGACY_ALLOCATION_MAX_QUANTITY))
+                )
             candidates.append(
                 {
                     "line_id": str(line.pk),
@@ -1270,27 +1291,37 @@ def source_inventory(order, *, lines=None):
                     "batch_id": str(batch.pk),
                     "start_date": batch.start_date.isoformat(),
                     "end_date": batch.end_date.isoformat(),
-                    "available_quantity": min(available, batch.remaining_units)
+                    "available_quantity": inventory_wire_quantity(
+                        min(available, batch.remaining_units)
+                    )
                     if available >= line.quantity
                     else 0,
                 }
             )
-        suggestion.extend(_batch_allocation_plan(line, suggested_batches))
+        if complete_suggestion:
+            plan = _batch_allocation_plan(line, suggested_batches)
+            if plan:
+                suggestion.extend(plan)
+            else:
+                complete_suggestion = False
     return {
         "refresh_required_before_approve": True,
         "lines": source_lines,
         "product_reservations": [
             {
                 "product_id": str(product_id),
-                "reserved_quantity": current_order_reserved.get(product_id, 0)
-                + other_demand.get(product_id, 0),
-                "this_order_quantity": current_order_reserved.get(product_id, 0),
-                "other_orders_quantity": other_demand.get(product_id, 0),
+                "reserved_quantity": inventory_wire_quantity(
+                    current_order_reserved.get(product_id, 0) + other_demand.get(product_id, 0)
+                ),
+                "this_order_quantity": inventory_wire_quantity(
+                    current_order_reserved.get(product_id, 0)
+                ),
+                "other_orders_quantity": inventory_wire_quantity(other_demand.get(product_id, 0)),
             }
             for product_id in sorted(product_ids, key=str)
         ],
         "candidates": candidates,
-        "suggestion": _jsonable(suggestion),
+        "suggestion": _jsonable(suggestion) if complete_suggestion else [],
     }
 
 
@@ -1417,7 +1448,10 @@ def _selected_approval_sources(lines, sources):
 
 
 def _approval_farm_error(line, farm_id, available_quantity, *, legacy=False):
-    context = {"product_id": str(line.product_id), "available_quantity": available_quantity}
+    context = {
+        "product_id": str(line.product_id),
+        "available_quantity": inventory_wire_quantity(available_quantity),
+    }
     if not legacy:
         context.update(line_id=str(line.pk), farm_id=str(farm_id))
     return StoreOrderError("store_allocation_stale", context=context)
