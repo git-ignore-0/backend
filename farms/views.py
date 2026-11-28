@@ -7,6 +7,7 @@ from django.http import Http404
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import status
+from rest_framework.exceptions import NotAuthenticated, ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -18,6 +19,7 @@ from config.phones import (
     normalize_vietnam_phone,
     phone_search,
 )
+from content.authentication import CoreBearerAuthentication
 from content.creation_receipts import (
     CreationIdempotencyConflict,
     creation_receipt_meta,
@@ -34,12 +36,13 @@ from content.services import delete_orphan_media_asset, tracker_farm_queryset
 from content.views import AdminMediaUploadView, admin_tracker_write_payload
 from farms.models import Farm, FarmProduct, FarmProductStockBatch
 from farms.serializers import (
-    BulkStockBatchRecoverySerializer,
     BulkStockBatchWriteSerializer,
+    FarmCreationRecoverySerializer,
     FarmProductHistoryQuerySerializer,
+    FarmProductLinkSerializer,
     FarmProductQuerySerializer,
+    FarmProductReaddSerializer,
     FarmProductRevisionSerializer,
-    FarmProductWriteSerializer,
     FarmQuerySerializer,
     FarmSupplyListQuerySerializer,
     FarmUpdateSerializer,
@@ -53,7 +56,6 @@ from farms.serializers import (
 )
 from farms.services import (
     FarmConflict,
-    add_farm_product,
     cancel_stock_batch,
     create_farm,
     create_growth_tracker_profile,
@@ -65,6 +67,7 @@ from farms.services import (
     farm_product_queryset,
     farm_product_removal_blocker,
     farm_queryset,
+    link_farm_products,
     readd_farm_product,
     remove_farm_product,
     stock_batch_queryset,
@@ -183,11 +186,44 @@ def available_product_payload(product):
     }
 
 
-def source_write_response(source, *, batch=None, status_code=status.HTTP_200_OK):
-    payload = farm_product_payload(farm_product_queryset().get(pk=source.pk))
-    if batch is not None:
-        payload["first_batch_id"] = str(batch.pk)
-    return no_store(Response({"data": payload}, status=status_code))
+def source_write_response(source_id, *, receipt=None, replayed=False):
+    row = farm_product_queryset().filter(pk=source_id).first()
+    response = {"data": farm_product_payload(row) if row is not None else None}
+    if receipt is not None:
+        response["meta"] = creation_receipt_meta(receipt, replayed=replayed)
+    return no_store(Response(response))
+
+
+def farm_creation_receipt(request, action):
+    if len(request.query_params.getlist("creation_key")) > 1:
+        raise ValidationError({"creation_key": "Provide one receipt key."})
+    query = FarmCreationRecoverySerializer(data=request.query_params.dict())
+    query.is_valid(raise_exception=True)
+    return find_creation_receipt(
+        actor=request.user, action=action, key=query.validated_data["creation_key"]
+    )
+
+
+def farm_creation_receipt_not_found():
+    return no_store(Response({"errors": [{"code": "create_receipt_not_found"}]}, status=404))
+
+
+def reauthorize_farm_admin(view):
+    # A write can wait on locks while the token or Admin permission changes.
+    credentials = CoreBearerAuthentication().authenticate(view.request)
+    if credentials is None or credentials[0].pk != view.request.user.pk:
+        raise NotAuthenticated()
+    view.request.user, view.request.auth = credentials
+    view.check_permissions(view.request)
+    return view.request.user
+
+
+class AdminFarmCreationView(APIView):
+    permission_classes = [IsWebsiteAdmin]
+    authorize_write = reauthorize_farm_admin
+
+    def finalize_response(self, request, response, *args, **kwargs):
+        return no_store(super().finalize_response(request, response, *args, **kwargs))
 
 
 def source_capabilities(source, *, now):
@@ -360,26 +396,9 @@ class AdminFarmProductListView(APIView):
             )
         )
 
-    @transaction.atomic
     def post(self, request, farm_id):
         get_object_or_404(Farm, pk=farm_id)
-        serializer = FarmProductWriteSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        data = dict(serializer.validated_data)
-        product_id = data.pop("product_id")
-        get_object_or_404(Product, pk=product_id)
-        try:
-            row, batch = add_farm_product(
-                farm_id=farm_id,
-                product_id=product_id,
-                actor=request.user,
-                **data,
-            )
-        except FarmConflict as error:
-            return conflict(error.code, error.context)
-        except (Farm.DoesNotExist, Product.DoesNotExist) as error:
-            raise Http404 from error
-        return source_write_response(row, batch=batch, status_code=status.HTTP_201_CREATED)
+        return conflict("farm_product_legacy_write_disabled")
 
 
 class AdminFarmAvailableProductListView(APIView):
@@ -453,32 +472,35 @@ class AdminFarmProductRemoveView(APIView):
             )
         except FarmConflict as error:
             return conflict(error.code, error.context)
-        return source_write_response(source)
+        return source_write_response(source.pk)
 
 
-class AdminFarmProductReaddView(APIView):
-    permission_classes = [IsWebsiteAdmin]
+class AdminFarmProductReaddView(AdminFarmCreationView):
+    def get(self, request, farm_id, product_id):
+        receipt = farm_creation_receipt(request, AdminCreationReceipt.Action.FARM_PRODUCT_READD)
+        scope = {"farm_id": str(farm_id), "product_id": str(product_id)}
+        if receipt is None or receipt.resource_scope != scope:
+            return farm_creation_receipt_not_found()
+        return source_write_response(receipt.resource_id, receipt=receipt, replayed=True)
 
-    @transaction.atomic
     def post(self, request, farm_id, product_id):
-        get_object_or_404(FarmProduct.objects.only("pk"), farm_id=farm_id, product_id=product_id)
-        serializer = VersionedStockBatchWriteSerializer(data=request.data)
+        serializer = FarmProductReaddSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        values = dict(serializer.validated_data)
-        expected_link_id = values.pop("expected_link_id")
-        expected_version = values.pop("expected_version")
         try:
-            source, batch = readd_farm_product(
+            receipt, created = readd_farm_product(
                 farm_id=farm_id,
                 product_id=product_id,
-                expected_link_id=expected_link_id,
-                expected_version=expected_version,
                 actor=request.user,
-                data=values,
+                authorize_write=self.authorize_write,
+                **serializer.validated_data,
             )
+        except CreationIdempotencyConflict:
+            return conflict("idempotency_conflict")
         except FarmConflict as error:
             return conflict(error.code, error.context)
-        return source_write_response(source, batch=batch)
+        except (Farm.DoesNotExist, FarmProduct.DoesNotExist) as error:
+            raise Http404 from error
+        return source_write_response(receipt.resource_id, receipt=receipt, replayed=not created)
 
 
 class AdminFarmProductHistoryView(APIView):
@@ -724,33 +746,27 @@ class AdminFarmMediaDetailView(APIView):
         return no_store(Response(status=status.HTTP_204_NO_CONTENT))
 
 
-class AdminFarmBulkStockBatchView(APIView):
-    permission_classes = [IsWebsiteAdmin]
-
+class AdminFarmBulkCreationView(AdminFarmCreationView):
     def get(self, request, farm_id):
-        query = BulkStockBatchRecoverySerializer(data=request.query_params.dict())
-        query.is_valid(raise_exception=True)
-        receipt = find_creation_receipt(
-            actor=request.user,
-            action=AdminCreationReceipt.Action.FARM_STOCK_BATCHES,
-            key=query.validated_data["creation_key"],
-        )
+        receipt = farm_creation_receipt(request, self.action)
         if receipt is None or receipt.resource_id != farm_id:
-            return no_store(
-                Response({"errors": [{"code": "create_receipt_not_found"}]}, status=404)
-            )
+            return farm_creation_receipt_not_found()
         return self.receipt_response(receipt, created=False)
 
     def post(self, request, farm_id):
-        serializer = BulkStockBatchWriteSerializer(data=request.data)
+        serializer = self.serializer_class(data=request.data)
         serializer.is_valid(raise_exception=True)
         try:
-            receipt, created = create_stock_batches_bulk(
+            receipt, created = self.write(
                 farm_id=farm_id, actor=request.user, **serializer.validated_data
             )
         except CreationIdempotencyConflict:
             return conflict("idempotency_conflict")
         except FarmConflict as error:
+            if error.code == "not_found":
+                return no_store(
+                    Response({"errors": [conflict_detail(error.code, error.context)]}, status=404)
+                )
             return conflict(error.code, error.context)
         except Farm.DoesNotExist as error:
             raise Http404 from error
@@ -769,3 +785,17 @@ class AdminFarmBulkStockBatchView(APIView):
                 status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
             )
         )
+
+
+class AdminFarmBulkStockBatchView(AdminFarmBulkCreationView):
+    action = AdminCreationReceipt.Action.FARM_STOCK_BATCHES
+    serializer_class = BulkStockBatchWriteSerializer
+    write = staticmethod(create_stock_batches_bulk)
+
+
+class AdminFarmBulkProductLinkView(AdminFarmBulkCreationView):
+    action = AdminCreationReceipt.Action.FARM_PRODUCT_LINKS
+    serializer_class = FarmProductLinkSerializer
+
+    def write(self, **command):
+        return link_farm_products(authorize_write=self.authorize_write, **command)

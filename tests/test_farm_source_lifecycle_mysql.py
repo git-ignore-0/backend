@@ -248,7 +248,7 @@ def test_concurrent_source_intents_apply_once(store_product, active_user, operat
     def apply_intent():
         if operation == "remove":
             return lifecycle.remove_farm_product(**command)
-        return lifecycle.readd_farm_product(**command, data=batch_data(7))
+        return lifecycle.readd_farm_product(**command, idempotency_key=uuid.uuid4())
 
     winning, stale = run_in_lock_order(apply_intent, apply_intent, left_first=True)
 
@@ -262,12 +262,12 @@ def test_concurrent_source_intents_apply_once(store_product, active_user, operat
         assert source.stock_batches.count() == 1
         assert active_product_stock_totals([store_product.pk]).get(store_product.pk, 0) == 0
     else:
-        readded, batch = result
-        assert readded.pk == source.pk
-        assert batch.pk != original.pk
+        receipt, created = result
+        assert created is True
+        assert receipt.resource_id == source.pk
         assert_source_state(source, removed=False, version=3, generation=2)
-        assert source.stock_batches.count() == 2
-        assert active_product_stock_totals([store_product.pk])[store_product.pk] == 7
+        assert source.stock_batches.get().pk == original.pk
+        assert active_product_stock_totals([store_product.pk]).get(store_product.pk, 0) == 0
     original.refresh_from_db()
     assert (original.quantity_units, original.supply_generation, original.cancelled_at) == (
         10,
@@ -285,7 +285,7 @@ def test_readd_rechecks_product_status_after_waiting_for_lock(
     command = source_command(source, active_user)
 
     readding, discontinuing = run_in_lock_order(
-        lambda: lifecycle.readd_farm_product(**command, data=batch_data(7)),
+        lambda: lifecycle.readd_farm_product(**command, idempotency_key=uuid.uuid4()),
         lambda: discontinue(store_product, active_user),
         left_first=readd_first,
     )
@@ -294,10 +294,10 @@ def test_readd_rechecks_product_status_after_waiting_for_lock(
     store_product.refresh_from_db()
     assert store_product.status == "discontinued"
     if readd_first:
-        readded, batch = readding.result()
-        assert readded.pk == source.pk
-        assert (batch.quantity_units, batch.supply_generation) == (7, 2)
-        assert source.stock_batches.count() == 2
+        receipt, created = readding.result()
+        assert created is True
+        assert receipt.resource_id == source.pk
+        assert source.stock_batches.get().supply_generation == 1
     else:
         with pytest.raises(lifecycle.FarmConflict, match="^product_not_selling$"):
             readding.result()

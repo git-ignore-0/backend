@@ -27,10 +27,11 @@ from content.services import delete_tracker_farm, update_tracker_farm
 from farms.models import Farm, FarmPhoto, FarmProduct, FarmProductStockBatch
 from farms.services import (
     FarmConflict,
-    add_farm_product,
     create_growth_tracker_profile,
+    create_stock_batch,
     delete_farm,
     delete_growth_tracker_profile,
+    link_farm_products,
     readd_farm_product,
     remove_farm_product,
     update_farm,
@@ -72,6 +73,19 @@ def remove_supply(source, actor):
     )
 
 
+def alternate_supply(product, actor, data):
+    source = FarmProduct.objects.create(farm=another_farm(), product=product)
+    batch = create_stock_batch(
+        farm_id=source.farm_id,
+        product_id=source.product_id,
+        expected_link_id=source.pk,
+        expected_version=source.version,
+        actor=actor,
+        data=data,
+    )
+    return source, batch
+
+
 @pytest.mark.django_db
 def test_farm_deletion_locks_only_its_stock_sources_in_order(
     store_product, active_user, stock_data, monkeypatch
@@ -84,10 +98,7 @@ def test_farm_deletion_locks_only_its_stock_sources_in_order(
     remove_supply(second_source, active_user)
     farm_id = first_source.farm_id
     product_ids = sorted([first_source.product_id, second_source.product_id])
-    other_farm = another_farm()
-    other_source, other_batch = add_farm_product(
-        farm_id=other_farm.pk, product_id=store_product.pk, actor=active_user, **stock_data
-    )
+    other_source, other_batch = alternate_supply(store_product, active_user, stock_data)
     recorded = record_resource_locks(monkeypatch)
 
     delete_farm(farm_id=farm_id, actor=active_user)
@@ -177,7 +188,7 @@ def test_growth_tracker_enable_locks_gallery_and_cover_in_deletion_order(active_
 @pytest.mark.parametrize("deletion_first", [True, False], ids=["delete-first", "attach-first"])
 @pytest.mark.parametrize("operation", ["add", "readd"])
 def test_mysql_farm_deletion_and_attachment_serialize(
-    store_product, active_user, stock_data, deletion_first, operation
+    store_product, active_user, deletion_first, operation
 ):
     removed = remove_supply(store_product.farm_offers.get(), active_user)
     farm_id = removed.farm_id
@@ -191,8 +202,11 @@ def test_mysql_farm_deletion_and_attachment_serialize(
         lock_model = Farm
 
         def attach():
-            return add_farm_product(
-                farm_id=farm_id, product_id=new_product.pk, actor=active_user, **stock_data
+            return link_farm_products(
+                farm_id=farm_id,
+                product_ids=[new_product.pk],
+                actor=active_user,
+                idempotency_key=uuid.uuid4(),
             )
 
     else:
@@ -205,7 +219,7 @@ def test_mysql_farm_deletion_and_attachment_serialize(
                 expected_link_id=removed.pk,
                 expected_version=removed.version,
                 actor=active_user,
-                data=stock_data,
+                idempotency_key=uuid.uuid4(),
             )
 
     deleting, attaching = run_in_lock_order(
@@ -222,24 +236,31 @@ def test_mysql_farm_deletion_and_attachment_serialize(
             with pytest.raises(Farm.DoesNotExist):
                 attaching.result()
         else:
-            with pytest.raises(FarmConflict, match="^farm_product_changed$"):
+            with pytest.raises(FarmProduct.DoesNotExist):
                 attaching.result()
         assert not Farm.objects.filter(pk=farm_id).exists()
         assert not FarmProduct.objects.filter(farm_id=farm_id).exists()
         assert not FarmProductStockBatch.objects.filter(farm_product__farm_id=farm_id).exists()
         return
 
-    source, batch = attaching.result()
+    receipt, created = attaching.result()
+    assert created is True
     with pytest.raises(FarmConflict, match="^farm_(in_use|product_changed)$"):
         deleting.result()
     assert Farm.objects.filter(pk=farm_id).exists()
-    source.refresh_from_db()
-    batch.refresh_from_db()
+    source = FarmProduct.objects.get(
+        farm_id=farm_id, product_id=new_product.pk if operation == "add" else store_product.pk
+    )
     assert source.farm_id == farm_id
     assert source.removed_at is None
-    assert batch.farm_product_id == source.pk
-    assert batch.quantity_units == stock_data["quantity_units"]
-    assert batch.supply_generation == (1 if operation == "add" else 2)
+    if operation == "add":
+        assert (receipt.resource_id, receipt.created_count) == (farm_id, 1)
+        assert (source.version, source.supply_generation) == (1, 1)
+        assert not source.stock_batches.exists()
+    else:
+        assert receipt.resource_id == removed.pk == source.pk
+        assert (source.version, source.supply_generation) == (3, 2)
+        assert source.stock_batches.get().supply_generation == 1
 
 
 @pytest.mark.django_db(transaction=True)
@@ -253,12 +274,7 @@ def test_mysql_farm_deletion_and_store_approval_serialize(
     batch_id = source.stock_batches.get().pk
     # Pending Store reservations belong to the Product. Alternate stock lets
     # the Farm retire its last source without stranding the pending order.
-    add_farm_product(
-        farm_id=another_farm().pk,
-        product_id=store_product.pk,
-        actor=active_user,
-        **stock_data,
-    )
+    alternate_supply(store_product, active_user, stock_data)
     payload = StoreCheckoutSerializer(data=guest_payload(store_product, expected_available=14))
     payload.is_valid(raise_exception=True)
     order, _, created = create_store_checkout(user=None, payload=payload.validated_data)

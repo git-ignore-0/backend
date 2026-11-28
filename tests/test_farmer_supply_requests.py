@@ -469,15 +469,12 @@ def test_one_changed_source_blocks_entire_approval(
         response = farm_admin_api.post(f"{source_url}/remove", identity, format="json")
         assert response.status_code == 200, response.content
         if change == "readd":
-            payload = supply_payload(sources)
             response = farm_admin_api.post(
                 f"{source_url}/re-add",
                 {
                     **identity,
                     "expected_version": 3,
-                    "start_date": payload["start_date"],
-                    "end_date": payload["end_date"],
-                    "quantity_units": 3,
+                    "idempotency_key": str(uuid4()),
                 },
                 format="json",
             )

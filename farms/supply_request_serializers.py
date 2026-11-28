@@ -10,14 +10,8 @@ from farms.serializers import (
     BulkStockQuantityField,
     FarmProductHistoryQuerySerializer,
     FarmProductQuerySerializer,
+    JSONUUIDField,
 )
-
-
-class JSONUUIDField(serializers.UUIDField):
-    def to_internal_value(self, data):
-        if not isinstance(data, str):
-            self.fail("invalid", value=data)
-        return super().to_internal_value(data)
 
 
 class ISODateField(serializers.DateField):

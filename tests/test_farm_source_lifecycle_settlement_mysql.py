@@ -18,7 +18,7 @@ from commerce.store_orders import (
     restock_store_order,
 )
 from farms import services as lifecycle
-from farms.models import Farm
+from farms.models import Farm, FarmProduct
 from memberships import csa_rounds
 from memberships.models import CSASelection, MembershipCycleQuota
 from tests.test_csa_rounds import context as context
@@ -174,7 +174,9 @@ def test_source_transition_and_manual_restock_keep_original_batch_scope(
 
     def change_source():
         if transition == "readd":
-            return lifecycle.readd_farm_product(**source_command(source, actor), data=batch_data(7))
+            return lifecycle.readd_farm_product(
+                **source_command(source, actor), idempotency_key=uuid.uuid4()
+            )
         return lifecycle.remove_farm_product(**source_command(source, actor))
 
     changing, restocking = run_in_lock_order(
@@ -189,11 +191,11 @@ def test_source_transition_and_manual_restock_keep_original_batch_scope(
     )
 
     if transition == "readd":
-        readded, batch = changing.result()
-        assert readded.pk == source.pk
-        assert batch.pk != original.pk
-        assert not batch.store_stock_movements.exists()
-        assert active_product_stock_totals([product.pk])[product.pk] == 7
+        receipt, created = changing.result()
+        assert created is True
+        assert receipt.resource_id == source.pk
+        assert source.stock_batches.get().pk == original.pk
+        assert active_product_stock_totals([product.pk]).get(product.pk, 0) == 0
         assert_source_state(source, removed=False, version=3, generation=2)
     else:
         assert changing.result().pk == source.pk
@@ -289,7 +291,7 @@ def test_farm_deactivation_and_source_transition_keep_availability_derived(
     def change_source():
         if transition == "readd":
             return lifecycle.readd_farm_product(
-                **source_command(source, active_user), data=batch_data(7)
+                **source_command(source, active_user), idempotency_key=uuid.uuid4()
             )
         return lifecycle.remove_farm_product(**source_command(source, active_user))
 
@@ -319,9 +321,13 @@ def test_farm_deactivation_and_source_transition_keep_availability_derived(
     assert_source_state(
         source, removed=not readded, version=3 if readded else 2, generation=2 if readded else 1
     )
-    assert active_product_stock_totals([store_product.pk]).get(store_product.pk, 0) == (
-        7 if readded else 0
-    )
+    assert active_product_stock_totals([store_product.pk]).get(store_product.pk, 0) == 0
+    if readded:
+        batch = lifecycle.create_stock_batch(
+            **source_command(source, active_user), data=batch_data(7)
+        )
+        assert batch.supply_generation == 2
+        assert active_product_stock_totals([store_product.pk])[store_product.pk] == 7
 
 
 @pytest.mark.parametrize("add_first", [True, False], ids=["add-first", "farm-first"])
@@ -331,8 +337,11 @@ def test_farm_deactivation_rechecks_sources_attached_while_waiting(
     farm = Farm.objects.create(name_en="Second farm", name_vi="Nông trại thứ hai")
 
     adding, deactivating = run_in_lock_order(
-        lambda: lifecycle.add_farm_product(
-            farm_id=farm.pk, product_id=store_product.pk, actor=active_user, **batch_data(7)
+        lambda: lifecycle.link_farm_products(
+            farm_id=farm.pk,
+            product_ids=[store_product.pk],
+            actor=active_user,
+            idempotency_key=uuid.uuid4(),
         ),
         lambda: lifecycle.update_farm(
             farm_id=farm.pk,
@@ -344,7 +353,9 @@ def test_farm_deactivation_rechecks_sources_attached_while_waiting(
         lock_model=Farm,
     )
 
-    source, batch = adding.result()
+    receipt, created = adding.result()
+    assert created is True
+    assert (receipt.resource_id, receipt.created_count) == (farm.pk, 1)
     if add_first:
         with pytest.raises(lifecycle.FarmConflict, match="^farm_product_changed$"):
             deactivating.result()
@@ -352,9 +363,7 @@ def test_farm_deactivation_rechecks_sources_attached_while_waiting(
         assert deactivating.result().is_active is False
     farm.refresh_from_db()
     assert farm.is_active is add_first
-    assert source.farm_id == farm.pk
+    source = FarmProduct.objects.get(farm=farm, product=store_product)
     assert source.is_active
-    assert (batch.farm_product_id, batch.quantity_units) == (source.pk, 7)
-    assert active_product_stock_totals([store_product.pk])[store_product.pk] == (
-        17 if add_first else 10
-    )
+    assert not source.stock_batches.exists()
+    assert active_product_stock_totals([store_product.pk])[store_product.pk] == 10

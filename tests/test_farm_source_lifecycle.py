@@ -19,9 +19,9 @@ from commerce.store_orders import (
     approve_store_order,
     restock_store_order,
 )
-from content.models import ContentAuditLog
+from content.models import AdminCreationReceipt, ContentAuditLog
 from farms import services
-from farms.models import Farm, FarmProduct, FarmProductStockBatch
+from farms.models import Farm, FarmProduct
 from memberships.csa_rounds import effective_stock_hold_rows
 from memberships.models import CSAStockHold
 from tests.test_csa_rounds import context as context
@@ -52,6 +52,15 @@ def values(quantity, *, days=0):
         "end_date": today + timedelta(days=days + 5),
         "quantity_units": quantity,
     }
+
+
+def readd_source(removed, actor):
+    receipt, created = services.readd_farm_product(
+        **intent(removed, actor), idempotency_key=uuid.uuid4()
+    )
+    assert created is True
+    assert receipt.resource_id == removed.pk
+    return FarmProduct.objects.get(pk=removed.pk)
 
 
 @pytest.mark.parametrize("status", ["draft", "active", "discontinued"])
@@ -91,15 +100,23 @@ def test_readd_preserves_id_and_excludes_all_past_generations(store_product, act
     source.stock_batches.create(**values(50, days=1))
     removed = services.remove_farm_product(**intent(source, active_user))
     with pytest.raises(services.FarmConflict, match="^farm_product_removed$"):
-        services.add_farm_product(
-            farm_id=source.farm_id, product_id=source.product_id, actor=active_user, **values(4)
+        services.link_farm_products(
+            farm_id=source.farm_id,
+            product_ids=[source.product_id],
+            actor=active_user,
+            idempotency_key=uuid.uuid4(),
         )
-    restored, first = services.readd_farm_product(**intent(removed, active_user), data=values(4))
+    restored = readd_source(removed, active_user)
     assert restored.pk == source.pk
     assert restored.removed_at is None and restored.removed_by is None
-    assert (restored.version, first.supply_generation) == (3, 2)
+    assert (restored.version, restored.supply_generation) == (3, 2)
+    assert restored.stock_batches.count() == 2
+    assert active_product_stock_totals([store_product.pk]).get(store_product.pk, 0) == 0
+    first = services.create_stock_batch(**intent(restored, active_user), data=values(4))
+    assert first.supply_generation == 2
     assert active_product_stock_totals([store_product.pk]) == {store_product.pk: 4}
 
+    restored.refresh_from_db()
     batch = services.create_stock_batch(**intent(restored, active_user), data=values(3))
     assert batch.supply_generation == 2
     with pytest.raises(services.FarmConflict, match="farm_product_version_conflict"):
@@ -118,10 +135,12 @@ def test_readd_preserves_id_and_excludes_all_past_generations(store_product, act
 
     restored.refresh_from_db()
     removed_again = services.remove_farm_product(**intent(restored, active_user))
-    current, latest = services.readd_farm_product(
-        **intent(removed_again, active_user), data=values(2)
-    )
+    current = readd_source(removed_again, active_user)
     assert current.pk == source.pk
+    assert current.supply_generation == 3
+    assert source.stock_batches.count() == 4
+    assert active_product_stock_totals([store_product.pk]).get(store_product.pk, 0) == 0
+    latest = services.create_stock_batch(**intent(current, active_user), data=values(2))
     assert latest.supply_generation == 3
     assert source.stock_batches.count() == 5
     assert active_product_stock_totals([store_product.pk]) == {store_product.pk: 2}
@@ -135,31 +154,33 @@ def test_stale_or_wrong_link_intent_and_non_selling_readd_are_rejected(store_pro
         )
     removed = services.remove_farm_product(**intent(source, active_user))
     with pytest.raises(services.FarmConflict, match="farm_product_version_conflict"):
-        services.readd_farm_product(**intent(source, active_user), data=values(2))
+        services.readd_farm_product(**intent(source, active_user), idempotency_key=uuid.uuid4())
     Product.objects.filter(pk=store_product.pk).update(
         status="discontinued", is_active=False, is_published=False
     )
     with pytest.raises(services.FarmConflict, match="product_not_selling"):
-        services.readd_farm_product(**intent(removed, active_user), data=values(2))
+        services.readd_farm_product(**intent(removed, active_user), idempotency_key=uuid.uuid4())
     assert source.stock_batches.count() == 1
 
 
-def test_source_transition_rolls_back_if_new_batch_cannot_be_saved(
+def test_source_transition_rolls_back_if_audit_cannot_be_saved(
     store_product, active_user, monkeypatch
 ):
     source = store_product.farm_offers.get()
     removed = services.remove_farm_product(**intent(source, active_user))
 
     def fail(**kwargs):
-        raise RuntimeError("batch write failed")
+        raise RuntimeError("audit write failed")
 
-    monkeypatch.setattr(FarmProductStockBatch.objects, "create", fail)
-    with pytest.raises(RuntimeError, match="batch write failed"):
-        services.readd_farm_product(**intent(removed, active_user), data=values(2))
+    key = uuid.uuid4()
+    monkeypatch.setattr(services, "audit", fail)
+    with pytest.raises(RuntimeError, match="audit write failed"):
+        services.readd_farm_product(**intent(removed, active_user), idempotency_key=key)
     removed.refresh_from_db()
     assert (removed.is_active, removed.version, removed.supply_generation) == (False, 2, 1)
     assert removed.removed_by_id == active_user.pk
     assert source.stock_batches.count() == 1
+    assert not AdminCreationReceipt.objects.filter(key=key).exists()
     assert not ContentAuditLog.objects.filter(
         action="farm.product.readd", entity_id=source.pk
     ).exists()
@@ -242,7 +263,8 @@ def test_open_allocation_blocks_even_with_other_farm_and_terminal_keeps_history(
     assert order.lines.get().sku_snapshot == store_product.sku
 
     if terminal == StoreOrderStatus.CANCELLED:
-        restored, _ = services.readd_farm_product(**intent(removed, active_user), data=values(4))
+        restored = readd_source(removed, active_user)
+        services.create_stock_batch(**intent(restored, active_user), data=values(4))
         with pytest.raises(StoreOrderError, match="store_restock_invalid") as error:
             restock_store_order(
                 order_id=order.pk,
@@ -274,7 +296,9 @@ def test_only_current_generation_enters_public_farm_store_and_csa_totals(context
     alternate.stock_batches.create(**values(5))
     selection = save(context)
 
-    current, first = services.readd_farm_product(**intent(removed, actor), data=values(4))
+    current = readd_source(removed, actor)
+    assert active_product_stock_totals([product.pk]) == {product.pk: 5}
+    first = services.create_stock_batch(**intent(current, actor), data=values(4))
     assert first.supply_generation == 2
     assert active_product_stock_totals([product.pk])[product.pk] == 9
     assert active_product_stock_totals([product.pk]) == {product.pk: 9}

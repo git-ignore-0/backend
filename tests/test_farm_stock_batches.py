@@ -1,5 +1,6 @@
 from datetime import timedelta
 from unittest.mock import patch
+from uuid import uuid4
 
 import pytest
 from django.contrib.auth.models import Group
@@ -156,15 +157,26 @@ def test_stock_batches_allow_overlaps_and_enforce_valid_quantity_and_dates():
 
 
 @pytest.mark.django_db
-def test_linking_product_creates_first_batch_atomically_and_returns_stock_summary(farm_admin_api):
+def test_first_supply_batch_updates_stock_summary_after_linking(farm_admin_api):
     farm = make_farm()
     product = make_product()
     today = timezone.localdate()
 
+    products_url = f"/api/v1/admin/farms/{farm.pk}/products"
+    linked = farm_admin_api.post(
+        f"{products_url}/bulk",
+        {"product_ids": [str(product.pk)], "idempotency_key": str(uuid4())},
+        format="json",
+    )
+    assert linked.status_code == 201, linked.json()
+    relation = FarmProduct.objects.get(farm=farm, product=product)
+    assert not relation.stock_batches.exists()
+    detail = f"{products_url}/{product.pk}"
     response = farm_admin_api.post(
-        f"/api/v1/admin/farms/{farm.pk}/products",
+        f"{detail}/batches",
         {
-            "product_id": str(product.pk),
+            "expected_link_id": str(relation.pk),
+            "expected_version": relation.version,
             **batch_payload(
                 start_date=today - timedelta(days=4),
                 end_date=today + timedelta(days=2),
@@ -175,12 +187,11 @@ def test_linking_product_creates_first_batch_atomically_and_returns_stock_summar
     )
 
     assert response.status_code == 201, response.json()
-    data = response.json()["data"]
+    data = farm_admin_api.get(detail).json()["data"]
     assert data["available_quantity"] == 10
     assert data["batch_count"] == 1
     assert data["active_batch_count"] == 1
     assert data["next_expiry_date"] == (today + timedelta(days=2)).isoformat()
-    relation = FarmProduct.objects.get(farm=farm, product=product)
     batch = relation.stock_batches.get()
     assert (batch.start_date, batch.end_date, batch.quantity_units) == (
         today - timedelta(days=4),
@@ -190,30 +201,29 @@ def test_linking_product_creates_first_batch_atomically_and_returns_stock_summar
 
 
 @pytest.mark.django_db
-def test_linking_product_rejects_expired_or_nonpositive_first_batch_without_partial_link(
-    farm_admin_api,
-):
+def test_first_supply_batch_rejects_expired_or_nonpositive_values(farm_admin_api):
     farm = make_farm()
+    product = make_product()
+    relation = FarmProduct.objects.create(farm=farm, product=product)
     today = timezone.localdate()
 
-    for index, payload in enumerate(
-        [
-            batch_payload(
-                start_date=today - timedelta(days=10),
-                end_date=today - timedelta(days=1),
-            ),
-            batch_payload(start_date=today, end_date=today, quantity_units=0),
-            batch_payload(start_date=today + timedelta(days=1), end_date=today),
-        ]
+    for payload in (
+        batch_payload(
+            start_date=today - timedelta(days=10),
+            end_date=today - timedelta(days=1),
+        ),
+        batch_payload(start_date=today, end_date=today, quantity_units=0),
+        batch_payload(start_date=today + timedelta(days=1), end_date=today),
     ):
-        product = make_product(f"INVALID-BATCH-{index}")
         response = farm_admin_api.post(
-            f"/api/v1/admin/farms/{farm.pk}/products",
-            {"product_id": str(product.pk), **payload},
+            f"/api/v1/admin/farms/{farm.pk}/products/{product.pk}/batches",
+            {"expected_link_id": str(relation.pk), "expected_version": 1, **payload},
             format="json",
         )
         assert response.status_code == 400, response.json()
-        assert not FarmProduct.objects.filter(farm=farm, product=product).exists()
+        assert not relation.stock_batches.exists()
+        relation.refresh_from_db()
+        assert relation.version == 1
 
 
 @pytest.mark.django_db
@@ -431,12 +441,13 @@ def test_non_selling_product_cannot_extend_inventory(farm_admin_api, status):
     today = timezone.localdate()
     products_url = f"/api/v1/admin/farms/{farm.pk}/products"
     values = batch_payload(start_date=today, end_date=today + timedelta(days=2))
-    assert (
-        farm_admin_api.post(
-            products_url, {"product_id": str(product.pk), **values}, format="json"
-        ).status_code
-        == 409
+    linking = farm_admin_api.post(
+        f"{products_url}/bulk",
+        {"product_ids": [str(product.pk)], "idempotency_key": str(uuid4())},
+        format="json",
     )
+    assert linking.status_code == 409
+    assert linking.json()["errors"][0]["code"] == "product_inactive"
     relation = FarmProduct.objects.create(farm=farm, product=product)
     batch = FarmProductStockBatch.objects.create(
         farm_product=relation,

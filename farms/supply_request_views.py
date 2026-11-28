@@ -1,7 +1,7 @@
 from django.db.models import Exists, OuterRef, Q
 from django.http import Http404
 from django.shortcuts import get_object_or_404
-from rest_framework.exceptions import NotAuthenticated, ValidationError
+from rest_framework.exceptions import ValidationError
 from rest_framework.parsers import JSONParser
 from rest_framework.response import Response
 from rest_framework.settings import api_settings
@@ -10,7 +10,6 @@ from rest_framework.views import APIView
 
 from commerce.models import ProductStatus, ProductTranslation
 from commerce.serializers import StrictSerializer
-from content.authentication import CoreBearerAuthentication
 from content.permissions import IsWebsiteAdmin
 from farms.farmer_links import (
     farm_for_token,
@@ -34,7 +33,7 @@ from farms.supply_requests import (
     submit_supply_request,
     supply_product_payload,
 )
-from farms.views import conflict, no_store
+from farms.views import conflict, no_store, reauthorize_farm_admin
 
 Status = FarmSupplyRequest.Status
 
@@ -217,14 +216,7 @@ class FarmerSupplyDetailView(FarmerView):
 class AdminSupplyView(PrivateJSONView):
     permission_classes = [IsWebsiteAdmin]
 
-    def authorize_write(self):
-        # Recheck with current credentials after waiting for the mutation's locks.
-        credentials = CoreBearerAuthentication().authenticate(self.request)
-        if credentials is None:
-            raise NotAuthenticated()
-        self.request.user, self.request.auth = credentials
-        self.check_permissions(self.request)
-        return self.request.user
+    authorize_write = reauthorize_farm_admin
 
 
 class AdminFarmerLinkView(AdminSupplyView):

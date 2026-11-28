@@ -436,6 +436,8 @@ class AdminCreationReceipt(models.Model):
         PRODUCT = "create_product"
         CSA_CONFIGURATION = "create_csa_configuration"
         FARM_STOCK_BATCHES = "create_farm_stock_batches"
+        FARM_PRODUCT_LINKS = "link_farm_products"
+        FARM_PRODUCT_READD = "readd_farm_product"
 
     actor = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL)
     action = models.CharField(max_length=32, choices=Action)
@@ -443,8 +445,10 @@ class AdminCreationReceipt(models.Model):
     request_fingerprint = models.CharField(max_length=64, editable=False)
     # Retain the original resource identity when the application record is deleted.
     resource_id = models.UUIDField(null=True, editable=False)
-    # Bulk stock creation retains the Farm identity and committed item count.
+    # Farm bulk operations retain the Farm identity and committed item count.
     created_count = models.PositiveIntegerField(null=True, editable=False)
+    # Re-add retains its Farm and Product scope even if the source is later deleted.
+    resource_scope = models.JSONField(null=True, editable=False)
 
     class Meta:
         constraints = [

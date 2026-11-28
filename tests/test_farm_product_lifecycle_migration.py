@@ -1,4 +1,5 @@
 from datetime import date, timedelta
+from uuid import uuid4
 
 import pytest
 from django.db import IntegrityError, connection, transaction
@@ -147,11 +148,10 @@ def test_lifecycle_rollback_blocks_after_source_has_real_transitions(
     }
     removed = services.remove_farm_product(**intent, expected_version=source.version)
     if readded:
-        today = timezone.localdate()
         services.readd_farm_product(
             **intent,
             expected_version=removed.version,
-            data={"start_date": today, "end_date": today, "quantity_units": 7},
+            idempotency_key=uuid4(),
         )
     original_audit = list(ContentAuditLog.objects.order_by("pk").values())
     executor = MigrationExecutor(connection)

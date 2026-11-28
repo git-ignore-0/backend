@@ -1,4 +1,4 @@
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import (
     BigIntegerField,
     Count,
@@ -31,7 +31,7 @@ from content.creation_receipts import (
     creation_fingerprint,
     find_creation_receipt,
 )
-from content.models import AdminCreationReceipt, MediaAsset
+from content.models import AdminCreationReceipt, ContentAuditLog, MediaAsset
 from content.services import audit, delete_orphan_media_asset, request_frontend_revalidation
 from farms.models import (
     Farm,
@@ -429,22 +429,16 @@ def _validate_stock_batch_values(*, start_date, end_date, quantity_units, today=
         raise ValidationError(errors)
 
 
-def _batch_created(*, source, actor, data, action, revalidate=True):
+def _batch_created(*, source, actor, data, revalidate=True):
     batch = FarmProductStockBatch.objects.create(
         farm_product=source, supply_generation=source.supply_generation, **data
     )
-    if action == "farm.stock_batch.create":
-        entity = batch
-        context = {"farm_id": str(source.farm_id), "product_id": str(source.product_id)}
-    else:
-        entity = source
-        context = {
-            "farm_id": str(source.farm_id),
-            "product_id": str(source.product_id),
-            "supply_generation": source.supply_generation,
-            "stock_batch_id": str(batch.pk),
-        }
-    audit(actor=actor, action=action, entity=entity, context=context)
+    audit(
+        actor=actor,
+        action="farm.stock_batch.create",
+        entity=batch,
+        context={"farm_id": str(source.farm_id), "product_id": str(source.product_id)},
+    )
     if revalidate:
         schedule_store_revalidation(slugs=[source.product.slug])
     return batch
@@ -454,9 +448,14 @@ def _locked_supply(farm_id, product_id):
     product = Product.objects.select_for_update().filter(pk=product_id).first()
     if product is None:
         raise FarmConflict("farm_product_changed")
+    return _locked_supply_source(farm_id, product)
+
+
+def _locked_supply_source(farm_id, product):
     source = (
         FarmProduct.objects.select_for_update()
-        .filter(farm_id=farm_id, product_id=product_id)
+        .filter(farm_id=farm_id, product_id=product.pk)
+        .order_by("pk")
         .first()
     )
     if source is None:
@@ -471,27 +470,6 @@ def _require_source_revision(source, expected_link_id, expected_version):
         raise FarmConflict("farm_product_identity_changed")
     if source.version != expected_version:
         raise FarmConflict("farm_product_version_conflict")
-
-
-@transaction.atomic
-def add_farm_product(*, farm_id, product_id, start_date, end_date, quantity_units, actor):
-    product = Product.objects.select_for_update().filter(pk=product_id).first()
-    if product is None:
-        raise Product.DoesNotExist
-    farm = Farm.objects.select_for_update().get(pk=farm_id)
-    if product.status != ProductStatus.ACTIVE:
-        raise FarmConflict("product_inactive")
-    existing = FarmProduct.objects.filter(farm=farm, product=product).first()
-    if existing is not None:
-        raise FarmConflict(
-            "farm_product_removed" if existing.removed_at else "product_already_linked",
-            context={"source_id": str(existing.pk), "version": existing.version},
-        )
-    data = {"start_date": start_date, "end_date": end_date, "quantity_units": quantity_units}
-    _validate_stock_batch_values(**data)
-    source = FarmProduct.objects.create(farm=farm, product=product)
-    batch = _batch_created(source=source, actor=actor, data=data, action="farm.product.add")
-    return source, batch
 
 
 def farm_product_removal_blocker(source, *, now=None):
@@ -563,14 +541,46 @@ def remove_farm_product(*, farm_id, product_id, expected_link_id, expected_versi
 
 
 @transaction.atomic
-def readd_farm_product(*, farm_id, product_id, expected_link_id, expected_version, actor, data):
-    source = _locked_supply(farm_id, product_id)
+def readd_farm_product(
+    *,
+    farm_id,
+    product_id,
+    expected_link_id,
+    expected_version,
+    actor,
+    idempotency_key,
+    authorize_write=None,
+):
+    action = AdminCreationReceipt.Action.FARM_PRODUCT_READD
+    scope = {"farm_id": str(farm_id), "product_id": str(product_id)}
+    fingerprint = creation_fingerprint(
+        {**scope, "expected_link_id": expected_link_id, "expected_version": expected_version}
+    )
+    if receipt := _matching_farm_receipt(actor, action, idempotency_key, fingerprint):
+        return receipt, False
+
+    product = Product.objects.select_for_update().filter(pk=product_id).first()
+    receipt, created = claim_creation_receipt(
+        actor=actor, action=action, key=idempotency_key, fingerprint=fingerprint
+    )
+    if not created:
+        if authorize_write is not None:
+            authorize_write()
+        return receipt, False
+    if product is None:
+        raise FarmProduct.DoesNotExist
+    try:
+        source = _locked_supply_source(farm_id, product)
+    except FarmConflict as error:
+        # Preserve the Admin re-add route's not-found behavior for missing sources.
+        raise FarmProduct.DoesNotExist from error
+    if authorize_write is not None:
+        authorize_write()
     _require_source_revision(source, expected_link_id, expected_version)
     if source.removed_at is None:
         raise FarmConflict("farm_product_not_removed")
     if source.product.status != ProductStatus.ACTIVE:
         raise FarmConflict("product_not_selling")
-    _validate_stock_batch_values(**data)
     source.supply_generation += 1
     source.version += 1
     source.removed_at = None
@@ -586,8 +596,17 @@ def readd_farm_product(*, farm_id, product_id, expected_link_id, expected_versio
             "updated_at",
         ]
     )
-    batch = _batch_created(source=source, actor=actor, data=data, action="farm.product.readd")
-    return source, batch
+    audit(
+        actor=actor,
+        action="farm.product.readd",
+        entity=source,
+        context={**scope, "supply_generation": source.supply_generation},
+    )
+    receipt.resource_id = source.pk
+    receipt.resource_scope = scope
+    receipt.save(update_fields=["resource_id", "resource_scope"])
+    schedule_store_revalidation(slugs=[product.slug])
+    return receipt, True
 
 
 def _validate_stock_batch_creation(*, source, expected_link_id, expected_version, data, today=None):
@@ -607,7 +626,6 @@ def _write_stock_batch_for_source(*, source, actor, data, revalidate=True):
         source=source,
         actor=actor,
         data=data,
-        action="farm.stock_batch.create",
         revalidate=revalidate,
     )
 
@@ -640,6 +658,97 @@ def _lock_farm_stock_sources(farm_id, product_ids):
     }
 
 
+def _matching_farm_receipt(actor, action, key, fingerprint):
+    receipt = find_creation_receipt(actor=actor, action=action, key=key)
+    if receipt is not None and receipt.request_fingerprint != fingerprint:
+        raise CreationIdempotencyConflict
+    return receipt
+
+
+def _reject_existing_link(source, *, index):
+    raise FarmConflict(
+        "farm_product_removed" if source.removed_at else "product_already_linked",
+        context={
+            "item_index": index,
+            "product_id": str(source.product_id),
+            "source_id": str(source.pk),
+            "version": source.version,
+        },
+    )
+
+
+@transaction.atomic
+def link_farm_products(*, farm_id, actor, idempotency_key, product_ids, authorize_write=None):
+    action = AdminCreationReceipt.Action.FARM_PRODUCT_LINKS
+    fingerprint = creation_fingerprint(
+        {"farm_id": farm_id, "product_ids": sorted(product_ids, key=str)}
+    )
+    if receipt := _matching_farm_receipt(actor, action, idempotency_key, fingerprint):
+        return receipt, False
+
+    # Match bulk stock writes: Product -> receipt (shared actor FK) -> source -> Farm.
+    products = _lock_stock_products(product_ids)
+    receipt, created = claim_creation_receipt(
+        actor=actor, action=action, key=idempotency_key, fingerprint=fingerprint
+    )
+    if not created:
+        if authorize_write is not None:
+            authorize_write()
+        return receipt, False
+    existing = _lock_farm_stock_sources(farm_id, product_ids)
+    farm = Farm.objects.select_for_update().get(pk=farm_id)
+    if authorize_write is not None:
+        authorize_write()
+
+    sources = []
+    for index, product_id in enumerate(product_ids):
+        product = products.get(product_id)
+        context = {"item_index": index, "product_id": str(product_id)}
+        if product is None:
+            raise FarmConflict("not_found", context=context)
+        if product.status != ProductStatus.ACTIVE:
+            raise FarmConflict("product_inactive", context=context)
+        if source := existing.get(product_id):
+            _reject_existing_link(source, index=index)
+        sources.append(FarmProduct(farm=farm, product=product))
+
+    try:
+        with transaction.atomic():
+            FarmProduct.objects.bulk_create(sources)
+    except IntegrityError:
+        # A writer bypassing the Product locks still cannot create a duplicate pair.
+        conflicts = {
+            source.product_id: source
+            for source in FarmProduct.objects.filter(farm=farm, product_id__in=product_ids)
+        }
+        for index, product_id in enumerate(product_ids):
+            if source := conflicts.get(product_id):
+                _reject_existing_link(source, index=index)
+        raise
+
+    ContentAuditLog.objects.bulk_create(
+        [
+            ContentAuditLog(
+                actor=actor,
+                action="farm.product.add",
+                entity_type=FarmProduct._meta.model_name,
+                entity_id=str(source.pk),
+                context={
+                    "farm_id": str(farm_id),
+                    "product_id": str(source.product_id),
+                    "supply_generation": source.supply_generation,
+                },
+            )
+            for source in sources
+        ]
+    )
+    receipt.resource_id = farm.pk
+    receipt.created_count = len(sources)
+    receipt.save(update_fields=["resource_id", "created_count"])
+    schedule_store_revalidation(slugs=[product.slug for product in products.values()])
+    return receipt, True
+
+
 @transaction.atomic
 def create_stock_batches_bulk(*, farm_id, actor, idempotency_key, start_date, end_date, items):
     """Commit one intent, or replay its immutable receipt before state/date guards.
@@ -657,10 +766,7 @@ def create_stock_batches_bulk(*, farm_id, actor, idempotency_key, start_date, en
             "items": sorted(items, key=lambda item: str(item["product_id"])),
         }
     )
-    receipt = find_creation_receipt(actor=actor, action=action, key=idempotency_key)
-    if receipt is not None:
-        if receipt.request_fingerprint != fingerprint:
-            raise CreationIdempotencyConflict
+    if receipt := _matching_farm_receipt(actor, action, idempotency_key, fingerprint):
         return receipt, False
 
     product_ids = [item["product_id"] for item in items]

@@ -102,7 +102,7 @@ def test_admin_can_manage_canonical_farm_without_creating_tracker_profile(farm_a
 
 
 @pytest.mark.django_db
-def test_farm_product_and_first_stock_batch_are_scoped_to_farm(farm_admin_api):
+def test_farm_product_link_and_stock_batch_are_scoped_to_farm(farm_admin_api):
     farm = Farm.objects.create(**farm_payload())
     other = Farm.objects.create(**farm_payload(name_en="Other Farm"))
     category = Category.objects.create(slug="greens", is_active=True)
@@ -119,25 +119,34 @@ def test_farm_product_and_first_stock_batch_are_scoped_to_farm(farm_admin_api):
     )
     url = f"/api/v1/admin/farms/{farm.pk}/products"
     today = timezone.localdate()
-    payload = {
-        "product_id": str(product.pk),
-        "start_date": today.isoformat(),
-        "end_date": (today + timedelta(days=6)).isoformat(),
-        "quantity_units": 10,
-    }
-    linked = farm_admin_api.post(url, payload, format="json")
+    payload = {"product_ids": [str(product.pk)], "idempotency_key": str(uuid4())}
+    linked = farm_admin_api.post(f"{url}/bulk", payload, format="json")
     assert linked.status_code == 201, linked.json()
-    assert FarmProduct.objects.filter(farm=farm, product=product).exists()
-    assert farm_admin_api.post(url, payload, format="json").status_code == 409
-    assert FarmProductStockBatch.objects.get(farm_product__farm=farm).quantity_units == 10
+    source = FarmProduct.objects.get(farm=farm, product=product)
+    assert not source.stock_batches.exists()
+    duplicate = farm_admin_api.post(
+        f"{url}/bulk", {**payload, "idempotency_key": str(uuid4())}, format="json"
+    )
+    assert duplicate.status_code == 409
+    assert duplicate.json()["errors"][0]["code"] == "product_already_linked"
+    created = farm_admin_api.post(
+        f"{url}/{product.pk}/batches",
+        lifecycle_command(
+            source,
+            start_date=today.isoformat(),
+            end_date=(today + timedelta(days=6)).isoformat(),
+            quantity_units=10,
+        ),
+        format="json",
+    )
+    assert created.status_code == 201, created.json()
+    assert source.stock_batches.get().quantity_units == 10
     assert (
         farm_admin_api.post(
             f"/api/v1/admin/farms/{other.pk}/products/{product.pk}/batches",
-            {
-                "start_date": today.isoformat(),
-                "end_date": today.isoformat(),
-                "quantity_units": 10,
-            },
+            lifecycle_command(
+                source, start_date=today.isoformat(), end_date=today.isoformat(), quantity_units=10
+            ),
             format="json",
         ).status_code
         == 404
@@ -167,13 +176,8 @@ def test_farm_cannot_link_product_deactivated_after_catalog_selection(farm_admin
         status="discontinued", is_active=False, is_published=False
     )
     response = farm_admin_api.post(
-        f"{base}/products",
-        {
-            "product_id": str(product.pk),
-            "start_date": timezone.localdate().isoformat(),
-            "end_date": timezone.localdate().isoformat(),
-            "quantity_units": 1,
-        },
+        f"{base}/products/bulk",
+        {"product_ids": [str(product.pk)], "idempotency_key": str(uuid4())},
         format="json",
     )
 
@@ -342,15 +346,10 @@ def test_farm_api_handles_records_removed_after_preflight(farm_admin_api):
     )
     link = FarmProduct.objects.create(farm=farm, product=product)
     base = f"/api/v1/admin/farms/{farm.pk}"
-    with patch("farms.views.add_farm_product", side_effect=Product.DoesNotExist):
+    with patch("farms.views.AdminFarmBulkProductLinkView.write", side_effect=Farm.DoesNotExist):
         response = farm_admin_api.post(
-            f"{base}/products",
-            {
-                "product_id": str(product.pk),
-                "start_date": timezone.localdate().isoformat(),
-                "end_date": timezone.localdate().isoformat(),
-                "quantity_units": 1,
-            },
+            f"{base}/products/bulk",
+            {"product_ids": [str(product.pk)], "idempotency_key": str(uuid4())},
             format="json",
         )
     assert response.status_code == 404
@@ -1175,13 +1174,19 @@ def test_source_transitions_return_committed_identity_and_fresh_stock(farm_admin
     dates = {"start_date": today.isoformat(), "end_date": (today + timedelta(days=3)).isoformat()}
 
     added = farm_admin_api.post(
-        url, {"product_id": str(product.pk), **dates, "quantity_units": 10}, format="json"
+        f"{url}/bulk",
+        {"product_ids": [str(product.pk)], "idempotency_key": str(uuid4())},
+        format="json",
     )
     assert added.status_code == 201
     source = FarmProduct.objects.get(farm=farm, product=product)
+    assert not source.stock_batches.exists()
+    supplied = farm_admin_api.post(
+        f"{detail}/batches", lifecycle_command(source, **dates, quantity_units=10), format="json"
+    )
+    assert supplied.status_code == 201, supplied.json()
     first = source.stock_batches.get()
-    assert added.json()["data"]["id"] == str(source.pk)
-    assert added.json()["data"]["first_batch_id"] == str(first.pk)
+    source.refresh_from_db()
     live = farm_admin_api.get(detail).json()["data"]
     assert live["capabilities"] == {
         "can_remove": True,
@@ -1196,7 +1201,7 @@ def test_source_transitions_return_committed_identity_and_fresh_stock(farm_admin
     assert (data["id"], data["supply_status"], data["version"], data["supply_generation"]) == (
         str(source.pk),
         "removed",
-        2,
+        3,
         1,
     )
     assert data["available_quantity"] == 0
@@ -1206,7 +1211,9 @@ def test_source_transitions_return_committed_identity_and_fresh_stock(farm_admin
     assert [(row["id"], row["is_historical"]) for row in removed_history] == [(str(first.pk), True)]
     assert (
         farm_admin_api.post(
-            f"{detail}/re-add", lifecycle_command(source, **dates, quantity_units=4), format="json"
+            f"{detail}/re-add",
+            lifecycle_command(source, idempotency_key=str(uuid4())),
+            format="json",
         ).json()["errors"][0]["code"]
         == "farm_product_version_conflict"
     )
@@ -1216,19 +1223,24 @@ def test_source_transitions_return_committed_identity_and_fresh_stock(farm_admin
     assert removed_detail["capabilities"]["can_create_batch"] is False
 
     readded = farm_admin_api.post(
-        f"{detail}/re-add", lifecycle_command(source, **dates, quantity_units=4), format="json"
+        f"{detail}/re-add",
+        lifecycle_command(source, idempotency_key=str(uuid4())),
+        format="json",
     )
     assert readded.status_code == 200
     data = readded.json()["data"]
-    second = source.stock_batches.exclude(pk=first.pk).get()
-    assert (data["id"], data["first_batch_id"], data["version"], data["supply_generation"]) == (
-        str(source.pk),
-        str(second.pk),
-        3,
-        2,
-    )
+    assert (data["id"], data["version"], data["supply_generation"]) == (str(source.pk), 4, 2)
+    assert "first_batch_id" not in data
     assert data["removed_at"] is None
-    assert data["available_quantity"] == 4
+    assert data["available_quantity"] == 0
+    assert not source.stock_batches.exclude(pk=first.pk).exists()
+    assert farm_admin_api.get(f"{detail}/batches?scope=current").json()["data"] == []
+    source.refresh_from_db()
+    supplied = farm_admin_api.post(
+        f"{detail}/batches", lifecycle_command(source, **dates, quantity_units=4), format="json"
+    )
+    assert supplied.status_code == 201, supplied.json()
+    second = source.stock_batches.exclude(pk=first.pk).get()
 
     history = farm_admin_api.get(f"{detail}/batches?scope=history&status=active").json()["data"]
     assert [

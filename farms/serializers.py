@@ -6,6 +6,13 @@ from config.phones import InvalidPhoneNumber, normalize_vietnam_phone
 from content.models import TRACKER_FARM_MAX_PHOTOS, TRACKER_SIGNUP_COUNT_MAX
 
 
+class JSONUUIDField(serializers.UUIDField):
+    def to_internal_value(self, data):
+        if not isinstance(data, str):
+            self.fail("invalid", value=data)
+        return super().to_internal_value(data)
+
+
 class FarmWriteSerializer(StrictSerializer):
     contact_phone = serializers.CharField(
         max_length=13, required=False, allow_blank=True, default=""
@@ -68,8 +75,14 @@ class StockBatchWriteSerializer(StrictSerializer):
     quantity_units = serializers.IntegerField(min_value=1, max_value=2_147_483_647)
 
 
-class FarmProductWriteSerializer(StockBatchWriteSerializer):
-    product_id = serializers.UUIDField()
+class FarmProductLinkSerializer(StrictSerializer):
+    idempotency_key = JSONUUIDField()
+    product_ids = serializers.ListField(child=JSONUUIDField(), allow_empty=False, max_length=50)
+
+    def validate_product_ids(self, value):
+        if len(value) != len(set(value)):
+            raise serializers.ValidationError("Product IDs must be unique.")
+        return value
 
 
 class FarmProductQuerySerializer(StrictSerializer):
@@ -85,6 +98,11 @@ class FarmSupplyListQuerySerializer(FarmProductQuerySerializer):
 class FarmProductRevisionSerializer(StrictSerializer):
     expected_link_id = serializers.UUIDField()
     expected_version = serializers.IntegerField(min_value=1)
+
+
+class FarmProductReaddSerializer(FarmProductRevisionSerializer):
+    expected_link_id = JSONUUIDField()
+    idempotency_key = JSONUUIDField()
 
 
 class VersionedStockBatchWriteSerializer(StockBatchWriteSerializer, FarmProductRevisionSerializer):
@@ -173,5 +191,5 @@ class BulkStockBatchWriteSerializer(StrictSerializer):
         return value
 
 
-class BulkStockBatchRecoverySerializer(StrictSerializer):
+class FarmCreationRecoverySerializer(StrictSerializer):
     creation_key = serializers.UUIDField()

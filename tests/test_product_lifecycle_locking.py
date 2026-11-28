@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from decimal import Decimal
 from threading import Event
+from uuid import uuid4
 
 import pytest
 from django.db import connection, connections
@@ -20,7 +21,7 @@ from commerce.serializers import StoreCheckoutSerializer
 from commerce.services import CatalogConflict, delete_product, transition_product, update_product
 from commerce.store_orders import StoreOrderError, create_store_checkout
 from farms.models import Farm, FarmProduct, FarmProductStockBatch
-from farms.services import FarmConflict, add_farm_product, create_stock_batch, update_stock_batch
+from farms.services import FarmConflict, create_stock_batch, link_farm_products, update_stock_batch
 from memberships import csa_rounds
 from memberships.models import CSASelection, MembershipCycleQuota
 from tests.test_csa_rounds import context as context
@@ -171,8 +172,11 @@ def test_discontinue_and_inventory_writes_serialize(
         )
 
         def write_stock():
-            return add_farm_product(
-                farm_id=farm.pk, product_id=store_product.pk, actor=active_user, **new_batch
+            return link_farm_products(
+                farm_id=farm.pk,
+                product_ids=[store_product.pk],
+                actor=active_user,
+                idempotency_key=uuid4(),
             )
 
         error_code = "product_inactive"
@@ -218,18 +222,14 @@ def test_discontinue_and_inventory_writes_serialize(
         with pytest.raises(FarmConflict, match=f"^{error_code}$"):
             stock.result()
 
-    expected_batches = 2 if inventory_first and operation != "extend" else 1
+    expected_batches = 2 if inventory_first and operation == "create" else 1
     assert FarmProductStockBatch.objects.filter(farm_product__product=store_product).count() == (
         expected_batches
     )
     if operation == "add":
         if inventory_first:
-            assert (
-                FarmProductStockBatch.objects.get(
-                    farm_product__farm=farm, farm_product__product=store_product
-                ).quantity_units
-                == 6
-            )
+            source = FarmProduct.objects.get(farm=farm, product=store_product)
+            assert not source.stock_batches.exists()
         else:
             assert not FarmProduct.objects.filter(farm=farm, product=store_product).exists()
     elif operation == "create" and inventory_first:
@@ -385,16 +385,13 @@ def test_delete_and_creating_farm_reference_serialize(store_product, active_user
     offer.stock_batches.all().delete()
     offer.delete()
     product_id = store_product.pk
-    today = timezone.localdate()
 
     def add_reference():
-        return add_farm_product(
+        return link_farm_products(
             farm_id=farm_id,
-            product_id=product_id,
-            start_date=today,
-            end_date=today,
-            quantity_units=4,
+            product_ids=[product_id],
             actor=active_user,
+            idempotency_key=uuid4(),
         )
 
     deleting, adding = run_in_lock_order(
@@ -404,16 +401,19 @@ def test_delete_and_creating_farm_reference_serialize(store_product, active_user
     )
     if delete_first:
         deleting.result()
-        with pytest.raises(Product.DoesNotExist):
+        with pytest.raises(FarmConflict, match="^not_found$"):
             adding.result()
         assert not Product.objects.filter(pk=product_id).exists()
         assert not FarmProduct.objects.filter(farm_id=farm_id, product_id=product_id).exists()
         assert not FarmProductStockBatch.objects.filter(farm_product__farm_id=farm_id).exists()
     else:
-        added, batch = adding.result()
+        receipt, created = adding.result()
+        assert created is True
+        assert receipt.resource_id == farm_id
+        assert receipt.created_count == 1
         with pytest.raises(CatalogConflict, match="^product_in_use$"):
             deleting.result()
         assert Product.objects.filter(pk=product_id).exists()
-        assert FarmProduct.objects.get(farm_id=farm_id, product_id=product_id).pk == added.pk
-        assert batch.farm_product_id == added.pk
-        assert batch.quantity_units == 4
+        assert not FarmProduct.objects.get(
+            farm_id=farm_id, product_id=product_id
+        ).stock_batches.exists()

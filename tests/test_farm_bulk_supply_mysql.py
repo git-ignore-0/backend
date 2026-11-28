@@ -97,7 +97,7 @@ def test_bulk_against_supply_and_farm_writers(store_product, active_user, bulk_f
     writers = {
         "single": lambda: services.create_stock_batch(**revision, data=values),
         "remove": lambda: services.remove_farm_product(**revision),
-        "readd": lambda: services.readd_farm_product(**revision, data=values),
+        "readd": lambda: services.readd_farm_product(**revision, idempotency_key=uuid4()),
         "product": lambda: transition_product(
             actor=active_user,
             product_id=source.product_id,
@@ -150,7 +150,9 @@ def test_bulk_against_supply_and_farm_writers(store_product, active_user, bulk_f
             bulk_result.result()
     source.refresh_from_db()
     expected_bulk_success = operation in {"farm", "delete"} or (bulk_first and operation != "readd")
-    assert AdminCreationReceipt.objects.count() == int(expected_bulk_success)
+    assert AdminCreationReceipt.objects.filter(
+        action=AdminCreationReceipt.Action.FARM_STOCK_BATCHES
+    ).count() == int(expected_bulk_success)
 
 
 @pytest.mark.parametrize("bulk_first", [True, False])
@@ -208,18 +210,12 @@ def test_bulk_with_csa_selection(context, bulk_first):
     assert AdminCreationReceipt.objects.count() == 1
 
 
-def test_same_key_disjoint_products_race_at_receipt(active_user):
-    farm = make_farm()
-    sources = [
-        FarmProduct.objects.create(farm=farm, product=make_product(f"DISJOINT-{i}"))
-        for i in range(2)
-    ]
-    key = uuid4()
-    commands = [command([source], active_user, key) for source in sources]
+def run_at_receipt_insert(left, right):
+    """Run two writers with disjoint Products up to their shared receipt key."""
     barrier = Barrier(2)
     table = AdminCreationReceipt._meta.db_table.upper()
 
-    def run(data):
+    def run(operation):
         db = connections["default"]
 
         def coordinate(execute, sql, params, many, context):
@@ -232,12 +228,26 @@ def test_same_key_disjoint_products_race_at_receipt(active_user):
             with db.cursor() as cursor:
                 cursor.execute("SET SESSION innodb_lock_wait_timeout = 15")
             with db.execute_wrapper(coordinate):
-                return services.create_stock_batches_bulk(**data)
+                return operation()
         finally:
             db.close()
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [pool.submit(run, data) for data in commands]
+        return pool.submit(run, left), pool.submit(run, right)
+
+
+def test_same_key_disjoint_products_race_at_receipt(active_user):
+    farm = make_farm()
+    sources = [
+        FarmProduct.objects.create(farm=farm, product=make_product(f"DISJOINT-{i}"))
+        for i in range(2)
+    ]
+    key = uuid4()
+    left, right = [command([source], active_user, key) for source in sources]
+    futures = run_at_receipt_insert(
+        lambda: services.create_stock_batches_bulk(**left),
+        lambda: services.create_stock_batches_bulk(**right),
+    )
     successful = 0
     for future in futures:
         try:

@@ -1,10 +1,10 @@
 from decimal import Decimal
 from unittest.mock import patch
+from uuid import uuid4
 
 import pytest
 from django.contrib.auth.models import Group
 from django.db import transaction
-from django.utils import timezone
 from rest_framework.test import APIClient
 
 from commerce.models import Category, CategoryTranslation, Product, ProductTranslation
@@ -238,14 +238,13 @@ def test_farm_presentation_and_source_lifecycle_revalidate_only_linked_product(
 
         request_revalidation.reset_mock()
         with django_capture_on_commit_callbacks(execute=True):
-            today = timezone.localdate()
             readd_farm_product(
                 farm_id=farm.pk,
                 product_id=product.pk,
                 expected_link_id=removed.pk,
                 expected_version=removed.version,
                 actor=active_user,
-                data={"start_date": today, "end_date": today, "quantity_units": 4},
+                idempotency_key=uuid4(),
             )
         assert request_revalidation.call_args.args[0] == [
             "store-product:tomato",
