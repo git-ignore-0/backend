@@ -18,11 +18,11 @@ from commerce.public_catalog import (
 )
 from commerce.serializers import (
     AccountShippingAddressSerializer,
+    AdminCreationQuerySerializer,
     AdminShippingAddressSerializer,
     CategoryQuerySerializer,
     CategoryWriteSerializer,
     ProductCreateSerializer,
-    ProductCreationQuerySerializer,
     ProductQuerySerializer,
     ProductTransitionSerializer,
     ProductUpdateSerializer,
@@ -495,7 +495,7 @@ class AdminProductViewSet(viewsets.ViewSet):
 
     def list(self, request):
         if "creation_key" in request.query_params:
-            query = ProductCreationQuerySerializer(data=request.query_params)
+            query = AdminCreationQuerySerializer(data=request.query_params)
             query.is_valid(raise_exception=True)
             if len(request.query_params.getlist("creation_key")) != 1:
                 raise ValidationError({"creation_key": "Provide this parameter once."})

@@ -42,6 +42,7 @@ urlpatterns = [
     path("store-orders", store_views.SelfStoreOrderListView.as_view()),
     path("store-orders/<uuid:order_id>", store_views.SelfStoreOrderDetailView.as_view()),
     path("admin/store-orders", store_views.AdminStoreOrderListView.as_view()),
+    path("admin/store-orders/quote", store_views.AdminStoreOrderQuoteView.as_view()),
     path("admin/store-orders/<uuid:order_id>", store_views.AdminStoreOrderDetailView.as_view()),
     path(
         "admin/store-orders/<uuid:order_id>/approve",

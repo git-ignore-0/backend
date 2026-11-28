@@ -8,11 +8,17 @@ from django.db.models import Prefetch, Q, prefetch_related_objects
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import status
+from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.throttling import SimpleRateThrottle
 from rest_framework.views import APIView
 
+from commerce.admin_store_orders import (
+    CREATION_ACTION,
+    create_admin_store_order,
+    quote_admin_store_order,
+)
 from commerce.models import (
     StoreGuestLookupSession,
     StoreOrder,
@@ -26,6 +32,9 @@ from commerce.public_catalog import (
     with_public_product_capacity,
 )
 from commerce.serializers import (
+    AdminCreationQuerySerializer,
+    AdminStoreOrderCreateSerializer,
+    AdminStoreOrderQuoteSerializer,
     PublicStoreLocaleSerializer,
     StoreActionSerializer,
     StoreApproveSerializer,
@@ -64,6 +73,7 @@ from commerce.store_orders import (
 )
 from commerce.store_proxy import trusted_store_client_ip
 from config.phones import InvalidPhoneNumber, normalize_vietnam_phone, phone_search
+from content.creation_receipts import creation_receipt_meta, find_creation_receipt
 from content.permissions import IsWebsiteAdmin
 from memberships.coupons import CouponError
 from memberships.csa_payloads import round_payload, selection_payload
@@ -79,7 +89,11 @@ def no_store(response):
 def store_error(error):
     if error.code == "store_payment_unavailable":
         http_status = status.HTTP_503_SERVICE_UNAVAILABLE
-    elif error.code == "store_order_not_found":
+    elif error.code in {
+        "store_order_not_found",
+        "store_buyer_not_found",
+        "create_receipt_not_found",
+    }:
         http_status = status.HTTP_404_NOT_FOUND
     elif error.code in {
         "store_idempotency_conflict",
@@ -154,7 +168,7 @@ def _can_buy_again(order, viewer):
     )
 
 
-def order_payload(order, *, guest_token=None, admin=False, request=None):
+def order_payload(order, *, guest_token=None, admin=False, admin_list=False, request=None):
     viewer = getattr(request, "user", None)
     lines = getattr(order, "payload_lines", None)
     if lines is None:
@@ -261,7 +275,19 @@ def order_payload(order, *, guest_token=None, admin=False, request=None):
         result["csa"] = {"round": round_payload(csa.round), "selection": selection_payload(csa)}
     if guest_token:
         result["guest_access_token"] = guest_token
+    if (admin or admin_list) and order.admin_creation_receipt_id:
+        actor_id = order.admin_creation_receipt.actor_id
+        result["creation"] = {
+            "origin": "admin_historical" if order.is_historical else "admin",
+            "actor_id": str(actor_id) if actor_id is not None else None,
+        }
     if admin:
+        inventory = source_inventory(order, lines=lines)
+        result["allocation_suggestion"] = inventory.pop("suggestion")
+        result["source_inventory"] = inventory
+        result["allocations"] = []
+        if order.is_historical:
+            return result
         prefetch_related_objects(
             lines,
             Prefetch(
@@ -272,10 +298,7 @@ def order_payload(order, *, guest_token=None, admin=False, request=None):
                 to_attr="payload_allocations",
             ),
         )
-        inventory = source_inventory(order, lines=lines)
-        result["allocation_suggestion"] = inventory.pop("suggestion")
-        result["source_inventory"] = inventory
-        allocations = []
+        allocations = result["allocations"]
         today = timezone.localdate()
         for line in lines:
             for item in line.payload_allocations:
@@ -308,12 +331,14 @@ def order_payload(order, *, guest_token=None, admin=False, request=None):
                         "restock_unavailable_reason": unavailable_reason,
                     }
                 )
-        result["allocations"] = allocations
     return result
 
 
-def order_list_queryset(rows):
-    return rows.select_related("csa_selection__round").prefetch_related(
+def order_list_queryset(rows, *, admin=False):
+    rows = rows.select_related("csa_selection__round")
+    if admin:
+        rows = rows.select_related("admin_creation_receipt")
+    return rows.prefetch_related(
         "csa_selection__lines",
         Prefetch(
             "lines",
@@ -368,9 +393,9 @@ def filter_order_list_payment_status(rows, requested_status, *, now):
     return rows.filter(payment_status=requested_status)
 
 
-def order_list_page(rows, *, page, page_size, now):
+def order_list_page(rows, *, page, page_size, now, admin=False):
     rows = rows.annotate(csa_reselection_overdue=overdue_order_filter(now=now))
-    items = list(order_list_queryset(rows)[(page - 1) * page_size : page * page_size])
+    items = list(order_list_queryset(rows, admin=admin)[(page - 1) * page_size : page * page_size])
     overdue_ids = []
     for order in items:
         if order.csa_reselection_overdue:
@@ -379,7 +404,9 @@ def order_list_page(rows, *, page, page_size, now):
     if overdue_ids:
         refreshed = {
             order.pk: order
-            for order in order_list_queryset(StoreOrder.objects.filter(pk__in=overdue_ids))
+            for order in order_list_queryset(
+                StoreOrder.objects.filter(pk__in=overdue_ids), admin=admin
+            )
         }
         items = [refreshed.get(order.pk, order) for order in items]
     return items
@@ -617,12 +644,16 @@ class AdminStoreOrderListView(APIView):
     permission_classes = [IsWebsiteAdmin]
 
     def get(self, request):
+        if "creation_key" in request.query_params:
+            return self.recover_creation(request)
 
         query = StoreOrderQuerySerializer(data=request.query_params.dict())
         query.is_valid(raise_exception=True)
         now = timezone.now()
         rows = filter_order_list_status(
-            StoreOrder.objects.all(), query.validated_data.get("status"), now=now
+            StoreOrder.objects.all(),
+            query.validated_data.get("status"),
+            now=now,
         )
         if payment_status := query.validated_data.get("payment_status"):
             rows = filter_order_list_payment_status(rows, payment_status, now=now)
@@ -644,32 +675,81 @@ class AdminStoreOrderListView(APIView):
         page = query.validated_data["page"]
         page_size = query.validated_data["page_size"]
         total = rows.count()
-        rows = order_list_page(rows, page=page, page_size=page_size, now=now)
+        rows = order_list_page(rows, page=page, page_size=page_size, now=now, admin=True)
         return no_store(
             Response(
                 {
-                    "data": [order_payload(item, request=request) for item in rows],
+                    "data": [
+                        order_payload(item, admin_list=True, request=request) for item in rows
+                    ],
                     "meta": {"page": page, "page_size": page_size, "total": total},
                 }
             )
         )
+
+    def post(self, request):
+        serializer = AdminStoreOrderCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            receipt, created = create_admin_store_order(
+                actor=request.user, payload=serializer.validated_data
+            )
+        except StoreOrderError as error:
+            return store_error(error)
+        return self.creation_response(request, receipt, created=created)
+
+    def recover_creation(self, request):
+        query = AdminCreationQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+        if len(request.query_params.getlist("creation_key")) != 1:
+            raise ValidationError({"creation_key": "Provide this parameter once."})
+        receipt = find_creation_receipt(
+            actor=request.user, action=CREATION_ACTION, key=query.validated_data["creation_key"]
+        )
+        if receipt is None:
+            return store_error(StoreOrderError("create_receipt_not_found"))
+        return self.creation_response(request, receipt, created=False)
+
+    def creation_response(self, request, receipt, *, created):
+        order = get_object_or_404(
+            StoreOrder.objects.select_related("admin_creation_receipt"),
+            pk=receipt.resource_id,
+            admin_creation_receipt=receipt,
+        )
+        return no_store(
+            Response(
+                {
+                    "data": order_payload(order, admin=True, request=request),
+                    "meta": creation_receipt_meta(receipt, replayed=not created),
+                },
+                status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+            )
+        )
+
+
+class AdminStoreOrderQuoteView(APIView):
+    permission_classes = [IsWebsiteAdmin]
+
+    def post(self, request):
+        serializer = AdminStoreOrderQuoteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            quote = quote_admin_store_order(actor=request.user, payload=serializer.validated_data)
+        except StoreOrderError as error:
+            return store_error(error)
+        return no_store(Response({"data": quote}))
 
 
 class AdminStoreOrderDetailView(APIView):
     permission_classes = [IsWebsiteAdmin]
 
     def get(self, request, order_id):
-        order = get_object_or_404(StoreOrder.objects.prefetch_related("lines"), pk=order_id)
-        expire_order_if_needed(order.pk)
-        return no_store(
-            Response(
-                {
-                    "data": order_payload(
-                        StoreOrder.objects.get(pk=order.pk), admin=True, request=request
-                    )
-                }
-            )
-        )
+        rows = StoreOrder.objects.select_related("admin_creation_receipt")
+        order = get_object_or_404(rows, pk=order_id)
+        if not order.is_historical:
+            expire_order_if_needed(order_id)
+            order = rows.get(pk=order_id)
+        return no_store(Response({"data": order_payload(order, admin=True, request=request)}))
 
 
 def _admin_action_response(request, order, *, action, idempotency_key):

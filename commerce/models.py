@@ -5,8 +5,11 @@ from django.db import models
 from django.db.models import Q
 
 STORE_CHECKOUT_MAX_QUANTITY = 999
+STORE_CHECKOUT_MAX_LINES = 50
 STORE_LEGACY_ALLOCATION_MAX_QUANTITY = 999_999
 PUBLIC_STORE_MAX_PRICE_VND = 1_000_000_000
+# Order clients use safe integer arithmetic even for VND serialized as strings.
+MAX_STORE_ORDER_AMOUNT_VND = 9_007_199_254_740_991
 
 
 class CatalogTreeLock(models.Model):
@@ -253,6 +256,10 @@ class StoreOrder(models.Model):
     )
     create_idempotency_key = models.UUIDField(unique=True, editable=False)
     request_fingerprint = models.CharField(max_length=64, editable=False)
+    admin_creation_receipt = models.OneToOneField(
+        "content.AdminCreationReceipt", null=True, editable=False, on_delete=models.PROTECT
+    )
+    is_historical = models.BooleanField(default=False, editable=False)
     locale = models.CharField(max_length=2, choices=[("vi", "Vietnamese"), ("en", "English")])
     recipient_name_snapshot = models.CharField(max_length=200)
     phone_e164_snapshot = models.CharField(max_length=16)
@@ -368,6 +375,16 @@ class StoreOrder(models.Model):
             models.Index(fields=["reference_code"], name="commerce_order_reference_idx"),
         ]
         constraints = [
+            models.CheckConstraint(
+                condition=Q(is_historical=False)
+                | Q(
+                    admin_creation_receipt__isnull=False,
+                    status=StoreOrderStatus.DELIVERED,
+                    delivery_date__isnull=False,
+                    expires_at__isnull=True,
+                ),
+                name="store_historical_order_terminal",
+            ),
             models.CheckConstraint(
                 condition=Q(status__in=StoreOrderStatus.values),
                 name="commerce_store_order_status_valid",

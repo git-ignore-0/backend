@@ -5,6 +5,8 @@ from rest_framework import serializers
 
 from commerce.inventory import MAX_INVENTORY_WIRE_QUANTITY
 from commerce.models import (
+    MAX_STORE_ORDER_AMOUNT_VND,
+    STORE_CHECKOUT_MAX_LINES,
     STORE_CHECKOUT_MAX_QUANTITY,
     STORE_LEGACY_ALLOCATION_MAX_QUANTITY,
     ProductStatus,
@@ -222,7 +224,7 @@ class ProductTransitionSerializer(ProductVersionSerializer):
     expected_status = serializers.ChoiceField(choices=ProductStatus.choices)
 
 
-class ProductCreationQuerySerializer(StrictSerializer):
+class AdminCreationQuerySerializer(StrictSerializer):
     creation_key = serializers.UUIDField()
 
 
@@ -308,7 +310,9 @@ class StoreQuoteSerializer(StrictSerializer):
     guest = StoreGuestAddressSerializer(required=False)
     coupon_code = serializers.CharField(max_length=64, trim_whitespace=True, required=False)
     locale = serializers.ChoiceField(choices=["vi", "en"], default="vi")
-    lines = StoreVoucherLineSerializer(many=True, allow_empty=False, max_length=50)
+    lines = StoreVoucherLineSerializer(
+        many=True, allow_empty=False, max_length=STORE_CHECKOUT_MAX_LINES
+    )
 
 
 class StoreVoucherPreviewSerializer(StoreQuoteSerializer):
@@ -321,7 +325,9 @@ class StoreCheckoutSerializer(StrictSerializer):
     expected_voucher_quote = serializers.CharField(max_length=64, required=False)
     idempotency_key = serializers.UUIDField()
     locale = serializers.ChoiceField(choices=["vi", "en"], default="vi")
-    lines = StoreCheckoutLineSerializer(many=True, allow_empty=False, max_length=50)
+    lines = StoreCheckoutLineSerializer(
+        many=True, allow_empty=False, max_length=STORE_CHECKOUT_MAX_LINES
+    )
     guest = StoreGuestAddressSerializer(required=False)
     expected_shipping_fee_vnd = serializers.IntegerField(
         min_value=0, max_value=MAX_POSITIVE_BIG_INTEGER
@@ -331,6 +337,63 @@ class StoreCheckoutSerializer(StrictSerializer):
     shipping_address_version = serializers.RegexField(
         r"\A[a-f0-9]{64}\Z", max_length=64, required=False, trim_whitespace=False
     )
+
+
+class StoreOrderQuantityField(serializers.IntegerField):
+    def to_internal_value(self, data):
+        if type(data) is not int:
+            self.fail("invalid")
+        return super().to_internal_value(data)
+
+
+class StoreOrderMoneyField(serializers.IntegerField):
+    def to_internal_value(self, data):
+        if type(data) is not int and not (
+            isinstance(data, str) and data.isascii() and data.isdecimal()
+        ):
+            self.fail("invalid")
+        return super().to_internal_value(data)
+
+
+class AdminStoreOrderLineSerializer(StrictSerializer):
+    product_id = serializers.UUIDField()
+    quantity = StoreOrderQuantityField(min_value=1, max_value=STORE_CHECKOUT_MAX_QUANTITY)
+    unit_price_vnd = StoreOrderMoneyField(
+        min_value=0, max_value=MAX_STORE_ORDER_AMOUNT_VND, required=False
+    )
+
+
+class AdminStoreOrderQuoteSerializer(StrictSerializer):
+    kind = serializers.ChoiceField(choices=["new", "historical"])
+    buyer_user_id = serializers.UUIDField(required=False)
+    guest = StoreGuestAddressSerializer(required=False)
+    delivery_date = serializers.DateField()
+    locale = serializers.ChoiceField(choices=["vi", "en"], default="vi")
+    lines = AdminStoreOrderLineSerializer(
+        many=True, allow_empty=False, max_length=STORE_CHECKOUT_MAX_LINES
+    )
+    shipping_fee_vnd = StoreOrderMoneyField(
+        min_value=0, max_value=MAX_STORE_ORDER_AMOUNT_VND, required=False
+    )
+
+    def validate(self, attrs):
+        if ("buyer_user_id" in attrs) == ("guest" in attrs):
+            raise serializers.ValidationError("Provide exactly one of buyer_user_id or guest.")
+        historical = attrs["kind"] == "historical"
+        if ("shipping_fee_vnd" in attrs) != historical:
+            raise serializers.ValidationError(
+                {"shipping_fee_vnd": "Required for historical orders only."}
+            )
+        if any(("unit_price_vnd" in line) != historical for line in attrs["lines"]):
+            raise serializers.ValidationError(
+                {"lines": "Every line must include unit_price_vnd for historical orders only."}
+            )
+        return attrs
+
+
+class AdminStoreOrderCreateSerializer(AdminStoreOrderQuoteSerializer):
+    idempotency_key = serializers.UUIDField()
+    confirmation = serializers.RegexField(r"\A[a-f0-9]{64}\Z", max_length=64, trim_whitespace=False)
 
 
 class StoreOrderAccessSerializer(StrictSerializer):

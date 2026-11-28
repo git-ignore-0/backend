@@ -61,19 +61,25 @@ class EffectiveShippingArea:
     shipping_fee_vnd: int
 
 
-def active_shipping_area(*, province_code, ward_code):
-    override = ShippingArea.objects.filter(
+def active_shipping_area(*, province_code, ward_code, lock=False):
+    rules = ShippingProvinceRule.objects.filter(province_code=province_code)
+    overrides = ShippingArea.objects.filter(
         province_code=province_code,
         ward_code=ward_code,
-    ).first()
+    )
+    if lock:
+        # Match save_shipping_settings: province rule, then ward override.
+        rule = rules.select_for_update().first()
+        override = overrides.select_for_update().first()
+    else:
+        override = overrides.first()
     if override is not None:
         if not override.is_active:
             return None
         if override.shipping_fee_vnd is not None:
             return override
-    rule = ShippingProvinceRule.objects.filter(
-        province_code=province_code,
-    ).first()
+    if not lock:
+        rule = rules.first()
     if rule is not None and (rule.is_active or override is not None):
         return EffectiveShippingArea(rule.default_shipping_fee_vnd)
     return None

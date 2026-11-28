@@ -439,6 +439,7 @@ class AdminCreationReceipt(models.Model):
         FARM_PRODUCT_LINKS = "link_farm_products"
         FARM_PRODUCT_READD = "readd_farm_product"
         REMOVE_FARM_PRODUCTS = "remove_farm_products"
+        STORE_ORDER = "create_store_order"
 
     actor = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL)
     action = models.CharField(max_length=32, choices=Action)

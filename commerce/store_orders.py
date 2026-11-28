@@ -273,14 +273,16 @@ def ensure_farm_deactivation_preserves_reservations(farm):
         raise StoreOrderError("stock_reserved")
 
 
-def _validate_address(payload):
+def _validate_address(payload, *, require_shipping=True, lock_shipping=False):
     province = payload["province_code"].strip()
     ward = payload["ward_code"].strip()
     if not province_exists(province) or ward not in dict(ward_choices(province, "vi")):
         raise StoreOrderError("store_shipping_address_invalid")
-    area = active_shipping_area(province_code=province, ward_code=ward)
-    if area is None:
-        raise StoreOrderError("store_shipping_area_unsupported")
+    area = None
+    if require_shipping:
+        area = active_shipping_area(province_code=province, ward_code=ward, lock=lock_shipping)
+        if area is None:
+            raise StoreOrderError("store_shipping_area_unsupported")
     try:
         phone = normalize_vietnam_phone(payload["phone_number"])
     except InvalidPhoneNumber as error:
@@ -294,7 +296,8 @@ def _validate_address(payload):
     }, area
 
 
-def _address_for_checkout(user, guest, *, lock=True):
+def _address_for_checkout(user, guest, *, lock=True, admin=False, historical=False):
+    validation = {"require_shipping": not historical, "lock_shipping": lock and admin}
     if user and user.is_authenticated:
         addresses = ShippingAddress.objects
         # The locking callers already hold a shared User lock. Fetch the
@@ -304,8 +307,11 @@ def _address_for_checkout(user, guest, *, lock=True):
             address = addresses.get(user=user)
         except ShippingAddress.DoesNotExist as error:
             raise StoreOrderError("store_shipping_address_required") from error
-        contact = shipping_recipient_details(address)
-        if not all(contact.values()):
+        account = address.user
+        if admin and not account.can_access_core():
+            raise StoreOrderError("store_buyer_ineligible")
+        contact = shipping_recipient_details(address, user=account)
+        if not all(contact.values()) or (admin and not address.address.strip()):
             raise StoreOrderError("store_shipping_address_required")
         address_values, area = _validate_address(
             {
@@ -313,13 +319,23 @@ def _address_for_checkout(user, guest, *, lock=True):
                 "province_code": address.province_code,
                 "ward_code": address.ward_code,
                 "address": address.address,
-            }
+            },
+            **validation,
         )
         return address_values, area, address
     if not guest:
         raise StoreOrderError("store_guest_address_required")
-    address_values, area = _validate_address(guest)
+    address_values, area = _validate_address(guest, **validation)
     return address_values, area, None
+
+
+def _store_address_version(address, snapshot):
+    if address is not None:
+        return shipping_address_version(
+            address,
+            recipient_name=snapshot["recipient_name_snapshot"],
+            phone_number=snapshot["phone_e164_snapshot"],
+        )
 
 
 def _available_quota_rows(membership, group_ids, *, lock=True):
@@ -361,13 +377,16 @@ def _reference_code():
     return f"SO{timezone.localdate():%y%m%d}{secrets.token_hex(4).upper()}"
 
 
-def _lock_checkout_identity(user):
+def _lock_checkout_identity(user, *, actor=None):
     """Serialize with identity updates without blocking actor FK shared locks.
 
     Quota mutations may already hold Membership when writing an actor FK. An
     exclusive User lock here would invert those locks. Store does not update User.
     """
-    lock_user_for_shared_read(user.pk)
+    # Admin creation writes FKs to both accounts. CMS account mutations lock
+    # both identities in UUID order, so take shared locks in that same order.
+    for account_id in sorted({account.pk for account in (user, actor) if account}):
+        lock_user_for_shared_read(account_id)
 
 
 def _check_checkout_stock(requested, products, inventory, check_expected):
@@ -407,7 +426,25 @@ def _check_checkout_stock(requested, products, inventory, check_expected):
     return assignments
 
 
-def calculate_store_quote(*, user, payload, lock=False, check_expected=False, draft_coupon=None):
+def _store_products(requested, *, eligible, lock):
+    product_ids = [item["product_id"] for item in requested]
+    if len(product_ids) != len(set(product_ids)):
+        raise StoreOrderError("store_duplicate_product")
+    products = {
+        item.pk: item
+        for item in (Product.objects.select_for_update() if lock else Product.objects)
+        .filter(eligible, pk__in=product_ids)
+        .prefetch_related("translations")
+        .order_by("pk")
+    }
+    if len(products) != len(product_ids):
+        raise StoreOrderError("store_product_changed")
+    return products
+
+
+def calculate_store_quote(
+    *, user, payload, lock=False, check_expected=False, draft_coupon=None, admin_actor=None
+):
     """Single authoritative cash/quota/shipping calculator; read-only when lock=False."""
     if payload.get("coupon_code") is not None and (user is None or not user.is_authenticated):
         raise CouponError("coupon_authentication_required")
@@ -416,33 +453,18 @@ def calculate_store_quote(*, user, payload, lock=False, check_expected=False, dr
     if lock:
         lock_companion_sources(user=user, delivery_date=delivery_date)
     requested = payload["lines"]
-    product_ids = [item["product_id"] for item in requested]
-    if len(product_ids) != len(set(product_ids)):
-        raise StoreOrderError("store_duplicate_product")
-    products = list(
-        (Product.objects.select_for_update() if lock else Product.objects)
-        .filter(_public_product_filter(), pk__in=product_ids)
-        .prefetch_related("translations")
-        .order_by("pk")
-    )
-    by_id = {item.pk: item for item in products}
-    if len(products) != len(product_ids):
-        raise StoreOrderError("store_product_changed")
-    if lock and user and user.is_authenticated:
-        # Match Product -> identity -> address/quota, but keep actor FK writes
-        # compatible while cancellation/approval already holds Membership.
+    products = _store_products(requested, eligible=_public_product_filter(), lock=lock)
+    # Match Product -> identity -> address/quota. Shared identity locks allow
+    # actor FK writes while cancellation/approval already holds Membership.
+    if lock and admin_actor is not None:
+        _lock_checkout_identity(user, actor=admin_actor)
+    elif lock and user and user.is_authenticated:
         _lock_checkout_identity(user)
-    address, area, saved_address = _address_for_checkout(user, payload.get("guest"), lock=lock)
-    address_updated_at = saved_address.updated_at if saved_address else None
-    address_version = (
-        shipping_address_version(
-            saved_address,
-            recipient_name=address["recipient_name_snapshot"],
-            phone_number=address["phone_e164_snapshot"],
-        )
-        if saved_address
-        else None
+    address, area, saved_address = _address_for_checkout(
+        user, payload.get("guest"), lock=lock, admin=admin_actor is not None
     )
+    address_updated_at = saved_address.updated_at if saved_address else None
+    address_version = _store_address_version(saved_address, address)
     if check_expected:
         expected_version = payload.get("shipping_address_version")
         if saved_address is None and expected_version is not None:
@@ -466,9 +488,7 @@ def calculate_store_quote(*, user, payload, lock=False, check_expected=False, dr
 
     if lock:
         offers = list(
-            FarmProduct.objects.select_for_update()
-            .filter(product_id__in=product_ids)
-            .order_by("pk")
+            FarmProduct.objects.select_for_update().filter(product_id__in=products).order_by("pk")
         )
         list(
             Farm.objects.select_for_update()
@@ -477,13 +497,13 @@ def calculate_store_quote(*, user, payload, lock=False, check_expected=False, dr
         )
     # Product mutexes also serialize Farm status, lot writes and stock demand.
     stock_at = timezone.now()
-    inventory = inventory_capacity(product_ids, now=stock_at)
-    _check_checkout_stock(requested, by_id, inventory, check_expected)
+    inventory = inventory_capacity(products, now=stock_at)
+    _check_checkout_stock(requested, products, inventory, check_expected)
 
     group_ids = {
-        by_id[item["product_id"]].csa_quota_group_id
+        products[item["product_id"]].csa_quota_group_id
         for item in requested
-        if item["use_quota"] and by_id[item["product_id"]].csa_quota_group_id
+        if item["use_quota"] and products[item["product_id"]].csa_quota_group_id
     }
     if lock and membership and group_ids:
         ensure_due_cycles(membership)
@@ -495,7 +515,7 @@ def calculate_store_quote(*, user, payload, lock=False, check_expected=False, dr
     line_values = []
     subtotal = 0
     for position, item in enumerate(requested):
-        product = by_id[item["product_id"]]
+        product = products[item["product_id"]]
         quota_quantity = 0
         reservations = []
         if item["use_quota"]:
@@ -661,7 +681,7 @@ def create_store_checkout(*, user, payload):
         existing = StoreOrder.objects.select_for_update().filter(create_idempotency_key=key).first()
     if existing:
         requester_user_id = user.pk if user and user.is_authenticated else None
-        if existing.buyer_user_id != requester_user_id:
+        if existing.admin_creation_receipt_id or existing.buyer_user_id != requester_user_id:
             raise StoreOrderError("store_idempotency_conflict")
         if existing.request_fingerprint != fingerprint:
             raise StoreOrderError("store_idempotency_conflict")
@@ -673,7 +693,31 @@ def create_store_checkout(*, user, payload):
         )
         return StoreOrder.objects.get(pk=existing.pk), guest_token, False
 
-    quote = calculate_store_quote(user=user, payload=payload, lock=True, check_expected=True)
+    return _create_store_checkout(user=user, payload=payload, key=key, fingerprint=fingerprint)
+
+
+def _store_line_snapshots(product, locale):
+    translation = _translation(product, locale)
+    return {
+        "sku_snapshot": product.sku,
+        "name_snapshot": translation.name if translation else product.sku,
+        "unit_size_snapshot": product.unit_size,
+        "unit_label_snapshot": product.unit_label_vi if locale == "vi" else product.unit_label_en,
+    }
+
+
+def _create_store_checkout(
+    *, user, payload, key, fingerprint, admin_actor=None, confirm_admin_quote=None
+):
+    # Both creation entry points hold the catalog mutex inside their transaction.
+    check_expected = admin_actor is None
+    quote = calculate_store_quote(
+        user=user,
+        payload=payload,
+        lock=True,
+        check_expected=check_expected,
+        admin_actor=admin_actor,
+    )
     address = quote["address"]
     subtotal, shipping_fee, total = quote["subtotal"], quote["shipping_fee"], quote["total"]
     line_values = quote["line_values"]
@@ -686,15 +730,16 @@ def create_store_checkout(*, user, payload):
             raise StoreOrderError("store_payment_unavailable")
     order_id = uuid.uuid4()
     guest_token = (
-        _guest_access_token(order_id, key) if not user or not user.is_authenticated else None
+        _guest_access_token(order_id, key)
+        if admin_actor is None and (not user or not user.is_authenticated)
+        else None
     )
     now = timezone.now()
     validate_delivery_date(quote["delivery_date"], now=now)
     # A batch date or effective hold deadline can change while waiting for payment config.
     products = {item[2].pk: item[2] for item in line_values}
-    assignments = _check_checkout_stock(
-        payload["lines"], products, inventory_capacity(products, now=now), True
-    )
+    inventory = inventory_capacity(products, now=now)
+    assignments = _check_checkout_stock(payload["lines"], products, inventory, check_expected)
     # Payment configuration may have blocked after the quote was calculated.
     benefit = companion_benefits(
         user=user, first=quote["delivery_date"], last=quote["delivery_date"], now=now
@@ -711,6 +756,11 @@ def create_store_checkout(*, user, payload):
         )
     if benefit:
         benefit["decided_at"] = now.isoformat()
+    receipt = None
+    if confirm_admin_quote:
+        receipt, created = confirm_admin_quote({**quote, "inventory": inventory})
+        if not created:
+            return StoreOrder.objects.get(pk=receipt.resource_id), None, False
     order = StoreOrder.objects.create(
         id=order_id,
         reference_code=_reference_code(),
@@ -718,6 +768,7 @@ def create_store_checkout(*, user, payload):
         referral_rewards_eligible=store_referral_rewards_active(),
         create_idempotency_key=key,
         request_fingerprint=fingerprint,
+        admin_creation_receipt=receipt,
         locale=payload["locale"],
         **address,
         workflow_version=2,
@@ -750,20 +801,14 @@ def create_store_checkout(*, user, payload):
         cash_subtotal,
         reservations,
     ) in line_values:
-        translation = _translation(product, payload["locale"])
         line = StoreOrderLine.objects.create(
             order=order,
             product=product,
             position=position,
-            sku_snapshot=product.sku,
-            name_snapshot=translation.name if translation else product.sku,
-            unit_size_snapshot=product.unit_size,
-            unit_label_snapshot=product.unit_label_vi
-            if payload["locale"] == "vi"
-            else product.unit_label_en,
+            **_store_line_snapshots(product, payload["locale"]),
             unit_price_vnd_snapshot=product.retail_price_vnd,
             quantity=item["quantity"],
-            quota_group=product.csa_quota_group,
+            quota_group_id=product.csa_quota_group_id,
             quota_cost_snapshot=product.csa_quota_cost,
             quota_quantity=quota_quantity,
             quota_units=quota_quantity * product.csa_quota_cost,
@@ -1184,6 +1229,24 @@ def source_inventory(order, *, lines=None):
     now = timezone.now()
     if lines is None:
         lines = list(order.lines.order_by("position", "id"))
+    if order.is_historical:
+        return {
+            "refresh_required_before_approve": False,
+            "lines": [
+                {
+                    "line_id": str(line.pk),
+                    "product_id": str(line.product_id),
+                    "required_quantity": line.quantity,
+                    "assigned_farm_id": None,
+                    "suggested_farm_id": None,
+                    "farms": [],
+                }
+                for line in lines
+            ],
+            "product_reservations": [],
+            "candidates": [],
+            "suggestion": [],
+        }
     product_ids = {line.product_id for line in lines}
     capacity = inventory_capacity(product_ids, now=now, exclude_order=order, recover_stranded=True)
     batches = (
