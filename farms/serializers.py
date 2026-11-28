@@ -13,6 +13,14 @@ class JSONUUIDField(serializers.UUIDField):
         return super().to_internal_value(data)
 
 
+class JSONIntegerField(serializers.IntegerField):
+    def to_internal_value(self, data):
+        # DRF also accepts strings and integral decimals such as 1.0.
+        if type(data) is not int:
+            self.fail("invalid")
+        return super().to_internal_value(data)
+
+
 class FarmWriteSerializer(StrictSerializer):
     contact_phone = serializers.CharField(
         max_length=13, required=False, allow_blank=True, default=""
@@ -75,14 +83,42 @@ class StockBatchWriteSerializer(StrictSerializer):
     quantity_units = serializers.IntegerField(min_value=1, max_value=2_147_483_647)
 
 
+# Match the existing Store multi-line write bound; reject, never split a transaction.
+FARM_BULK_MAX_ITEMS = 50
+
+
+class FarmRemovedSourceRevisionSerializer(StrictSerializer):
+    id = JSONUUIDField()
+    version = JSONIntegerField(min_value=1)
+
+
+class FarmProductLinkItemSerializer(StrictSerializer):
+    product_id = JSONUUIDField()
+    expected_source = FarmRemovedSourceRevisionSerializer(allow_null=True)
+
+
 class FarmProductLinkSerializer(StrictSerializer):
     idempotency_key = JSONUUIDField()
-    product_ids = serializers.ListField(child=JSONUUIDField(), allow_empty=False, max_length=50)
+    product_ids = serializers.ListField(
+        child=JSONUUIDField(), required=False, allow_empty=False, max_length=FARM_BULK_MAX_ITEMS
+    )
+    items = FarmProductLinkItemSerializer(
+        many=True, required=False, allow_empty=False, max_length=FARM_BULK_MAX_ITEMS
+    )
 
     def validate_product_ids(self, value):
         if len(value) != len(set(value)):
             raise serializers.ValidationError("Product IDs must be unique.")
         return value
+
+    def validate_items(self, value):
+        self.validate_product_ids([item["product_id"] for item in value])
+        return value
+
+    def validate(self, data):
+        if ("items" in data) == ("product_ids" in data):
+            raise serializers.ValidationError("Submit exactly one of items or product_ids.")
+        return data
 
 
 class FarmProductQuerySerializer(StrictSerializer):
@@ -159,21 +195,9 @@ class GrowthTrackerUpdateSerializer(GrowthTrackerWriteSerializer):
         return data
 
 
-# Match the existing Store multi-line write bound; reject, never split a transaction.
-BULK_STOCK_BATCH_MAX_ITEMS = 50
-
-
-class BulkStockQuantityField(serializers.IntegerField):
-    def to_internal_value(self, data):
-        # DRF's IntegerField also accepts integral decimals such as 1.0.
-        if type(data) is not int:
-            raise serializers.ValidationError("A valid integer is required.", code="invalid")
-        return super().to_internal_value(data)
-
-
 class BulkStockBatchItemSerializer(FarmProductRevisionSerializer):
     product_id = serializers.UUIDField()
-    quantity_units = BulkStockQuantityField(min_value=1, max_value=2_147_483_647)
+    quantity_units = JSONIntegerField(min_value=1, max_value=2_147_483_647)
 
 
 class BulkStockBatchWriteSerializer(StrictSerializer):
@@ -181,7 +205,7 @@ class BulkStockBatchWriteSerializer(StrictSerializer):
     start_date = serializers.DateField()
     end_date = serializers.DateField()
     items = BulkStockBatchItemSerializer(
-        many=True, allow_empty=False, max_length=BULK_STOCK_BATCH_MAX_ITEMS
+        many=True, allow_empty=False, max_length=FARM_BULK_MAX_ITEMS
     )
 
     def validate_items(self, value):

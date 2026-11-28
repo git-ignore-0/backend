@@ -81,7 +81,10 @@ def test_admin_can_manage_canonical_farm_without_creating_tracker_profile(farm_a
     assert "capabilities" not in listed.json()["data"][0]
     detail = farm_admin_api.get(f"/api/v1/admin/farms/{data['id']}")
     assert detail["Cache-Control"] == "private, no-store"
-    assert detail.json()["data"]["capabilities"] == {"delete": {"allowed": True, "reasons": []}}
+    assert detail.json()["data"]["capabilities"] == {
+        "delete": {"allowed": True, "reasons": []},
+        "can_add_supply": False,
+    }
 
     changed = farm_admin_api.patch(
         f"/api/v1/admin/farms/{data['id']}",
@@ -1272,7 +1275,7 @@ def test_source_filters_and_picker_distinguish_removed_and_unlinked(farm_admin_a
     available = make_product("AVAILABLE")
     make_product("DRAFT", published=False)
     FarmProduct.objects.create(farm=farm, product=supplying)
-    FarmProduct.objects.create(
+    source = FarmProduct.objects.create(
         farm=farm, product=removed, is_active=False, removed_at=timezone.now()
     )
     base = f"/api/v1/admin/farms/{farm.pk}"
@@ -1289,7 +1292,12 @@ def test_source_filters_and_picker_distinguish_removed_and_unlinked(farm_admin_a
         assert all("capabilities" not in row for row in rows)
 
     picker = farm_admin_api.get(f"{base}/available-products").json()["data"]
-    assert [row["id"] for row in picker] == [str(available.pk)]
+    assert [row["id"] for row in picker] == [str(available.pk), str(removed.pk)]
+    assert (picker[0]["link_state"], picker[0]["removed_source"]) == ("unlinked", None)
+    assert (picker[1]["link_state"], picker[1]["removed_source"]) == (
+        "removed",
+        {"id": str(source.pk), "version": 1, "supply_generation": 1},
+    )
     assert (picker[0]["unit_size"], picker[0]["unit_label_vi"], picker[0]["unit_label_en"]) == (
         "0.500",
         "kg",

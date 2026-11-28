@@ -2,7 +2,7 @@ from datetime import datetime
 from uuid import UUID
 
 from django.db import transaction
-from django.db.models import Exists, OuterRef, Q
+from django.db.models import Exists, OuterRef, Q, Subquery
 from django.http import Http404
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -78,6 +78,7 @@ from farms.services import (
 from farms.stock import (
     is_current_stock_batch,
     is_historical_stock_batch,
+    stock_batch_source_blocker,
     stock_batch_status,
     stock_batch_status_q,
 )
@@ -101,6 +102,16 @@ def conflict(code, context=None):
 
 def farm_payload(farm, request, *, detail=False):
     photos = [media_payload(photo.image, request) for photo in farm.photos.all()]
+    capabilities = (
+        {
+            "capabilities": {
+                **farm_capabilities(farm.pk),
+                "can_add_supply": farm.can_add_supply,
+            }
+        }
+        if detail
+        else {}
+    )
     return {
         "id": str(farm.pk),
         "contact_phone": format_vietnam_phone(farm.contact_phone),
@@ -118,7 +129,7 @@ def farm_payload(farm, request, *, detail=False):
         "version": farm.version,
         "created_at": farm.created_at.isoformat(),
         "updated_at": farm.updated_at.isoformat(),
-        **({"capabilities": farm_capabilities(farm.pk)} if detail else {}),
+        **capabilities,
     }
 
 
@@ -175,6 +186,15 @@ def stock_batch_payload(batch, *, today=None):
 
 def available_product_payload(product):
     names = {item.locale: item.name for item in product.translations.all()}
+    removed_source = (
+        {
+            "id": str(product.removed_source_id),
+            "version": product.removed_source_version,
+            "supply_generation": product.removed_source_generation,
+        }
+        if product.removed_source_id is not None
+        else None
+    )
     return {
         "id": str(product.pk),
         "sku": product.sku,
@@ -183,6 +203,8 @@ def available_product_payload(product):
         "unit_size": str(product.unit_size),
         "unit_label_vi": product.unit_label_vi,
         "unit_label_en": product.unit_label_en,
+        "link_state": "removed" if removed_source else "unlinked",
+        "removed_source": removed_source,
     }
 
 
@@ -228,18 +250,16 @@ class AdminFarmCreationView(APIView):
 
 def source_capabilities(source, *, now):
     blockers = {}
-    selling = source.product.status == ProductStatus.ACTIVE
+    if batch_blocker := stock_batch_source_blocker(source):
+        blockers["create_batch"] = conflict_detail(batch_blocker)
     if source.removed_at is not None:
         blockers["remove"] = conflict_detail("farm_product_removed")
-        blockers["create_batch"] = conflict_detail("farm_product_removed")
-        if not selling:
+        if source.product.status != ProductStatus.ACTIVE:
             blockers["readd"] = conflict_detail("product_not_selling")
     else:
         if blocker := farm_product_removal_blocker(source, now=now):
             blockers["remove"] = conflict_detail(blocker.code, blocker.context)
         blockers["readd"] = conflict_detail("farm_product_not_removed")
-        if not selling:
-            blockers["create_batch"] = conflict_detail("product_not_selling")
     return {
         "can_remove": "remove" not in blockers,
         "can_readd": "readd" not in blockers,
@@ -333,7 +353,7 @@ class AdminFarmDetailView(APIView):
     permission_classes = [IsWebsiteAdmin]
 
     def get(self, request, farm_id):
-        farm = get_object_or_404(farm_queryset(), pk=farm_id)
+        farm = get_object_or_404(farm_queryset(include_supply_capability=True), pk=farm_id)
         return no_store(Response({"data": farm_payload(farm, request, detail=True)}))
 
     def patch(self, request, farm_id):
@@ -350,7 +370,7 @@ class AdminFarmDetailView(APIView):
             return conflict(error.code)
         except Farm.DoesNotExist as error:
             raise Http404 from error
-        farm = get_object_or_404(farm_queryset(), pk=farm.pk)
+        farm = get_object_or_404(farm_queryset(include_supply_capability=True), pk=farm.pk)
         return no_store(Response({"data": farm_payload(farm, request, detail=True)}))
 
     def delete(self, request, farm_id):
@@ -408,20 +428,29 @@ class AdminFarmAvailableProductListView(APIView):
         get_object_or_404(Farm, pk=farm_id)
         query = FarmProductQuerySerializer(data=request.query_params.dict())
         query.is_valid(raise_exception=True)
-        rows = Product.objects.filter(status=ProductStatus.ACTIVE).exclude(
-            farm_offers__farm_id=farm_id
+        sources = FarmProduct.objects.filter(farm_id=farm_id, product_id=OuterRef("pk"))
+        rows = Product.objects.filter(status=ProductStatus.ACTIVE).filter(
+            ~Exists(sources.filter(removed_at__isnull=True))
         )
         search = query.validated_data["search"].strip()
         if search:
-            rows = rows.filter(
-                Q(sku__icontains=search) | Q(translations__name__icontains=search)
-            ).distinct()
+            matching_translation = ProductTranslation.objects.filter(
+                product_id=OuterRef("pk"), name__icontains=search
+            )
+            rows = rows.filter(Q(sku__icontains=search) | Exists(matching_translation))
         page = query.validated_data["page"]
         page_size = 30
         total = rows.count()
-        rows = rows.prefetch_related("translations").order_by("sku", "id")[
-            (page - 1) * page_size : page * page_size
-        ]
+        removed = sources.filter(removed_at__isnull=False).order_by()
+        rows = (
+            rows.annotate(
+                removed_source_id=Subquery(removed.values("pk")[:1]),
+                removed_source_version=Subquery(removed.values("version")[:1]),
+                removed_source_generation=Subquery(removed.values("supply_generation")[:1]),
+            )
+            .prefetch_related("translations")
+            .order_by("sku", "id")[(page - 1) * page_size : page * page_size]
+        )
         return no_store(
             Response(
                 {

@@ -38,20 +38,38 @@ pytestmark = [
 ]
 
 
-def link_operation(farm, actor, product_ids, *, key=None):
+def link_operation(farm, actor, product_ids, *, key=None, removed=None):
+    if removed is None:
+        payload = {"product_ids": product_ids}
+    else:
+        payload = {
+            "items": [
+                {
+                    "product_id": product_id,
+                    "expected_source": (
+                        {"id": removed.pk, "version": removed.version}
+                        if removed.product_id == product_id
+                        else None
+                    ),
+                }
+                for product_id in product_ids
+            ]
+        }
     return partial(
         services.link_farm_products,
         farm_id=farm.pk,
         actor=actor,
         idempotency_key=key or uuid4(),
-        product_ids=product_ids,
+        **payload,
     )
 
 
-def assert_links(farm, product_ids):
+def assert_links(farm, product_ids, *, restored=None):
     sources = FarmProduct.objects.filter(farm=farm)
+    restored_id = restored.product_id if restored is not None else None
     assert set(sources.values_list("product_id", "version", "supply_generation")) == {
-        (product_id, 1, 1) for product_id in product_ids
+        (product_id, 3, 2) if product_id == restored_id else (product_id, 1, 1)
+        for product_id in product_ids
     }
     assert sources.count() == len(product_ids)
     assert not FarmProductStockBatch.objects.filter(farm_product__farm=farm).exists()
@@ -59,23 +77,38 @@ def assert_links(farm, product_ids):
         action="farm.product.add", context__farm_id=str(farm.pk)
     )
     assert sorted(link_events.values_list("entity_id", flat=True)) == sorted(
-        str(source_id) for source_id in sources.values_list("pk", flat=True)
+        str(source_id)
+        for source_id in sources.exclude(product_id=restored_id).values_list("pk", flat=True)
     )
+    if restored is not None:
+        assert_source_state(restored, removed=False, version=3, generation=2)
+        assert source_events(restored, "readd") == 1
+
+
+def removed_source(farm, product_id, actor):
+    source = FarmProduct.objects.create(farm=farm, product_id=product_id)
+    return services.remove_farm_product(**source_command(source, actor))
 
 
 @pytest.mark.parametrize("left_first", [True, False], ids=["left-first", "right-first"])
+@pytest.mark.parametrize("revision_aware", [False, True], ids=["legacy", "mixed"])
 @pytest.mark.parametrize("race", ["replay", "overlap", "same-product"])
-def test_concurrent_link_intents_commit_only_one_complete_set(active_user, left_first, race):
+def test_concurrent_link_intents_commit_only_one_complete_set(
+    active_user, left_first, revision_aware, race
+):
     farm = make_farm()
     shared, first, second = [make_product(f"LINK-{i}").pk for i in range(3)]
     key = uuid4()
+    removed = removed_source(farm, shared, active_user) if revision_aware else None
     if race == "same-product":
         left_ids = right_ids = [shared]
     else:
         left_ids = [first, shared]
         right_ids = [shared, first] if race == "replay" else [second, shared]
-    left = link_operation(farm, active_user, left_ids, key=key)
-    right = link_operation(farm, active_user, right_ids, key=key if race == "replay" else uuid4())
+    left = link_operation(farm, active_user, left_ids, key=key, removed=removed)
+    right = link_operation(
+        farm, active_user, right_ids, key=key if race == "replay" else uuid4(), removed=removed
+    )
 
     results = run_in_lock_order(left, right, left_first=left_first)
 
@@ -89,10 +122,11 @@ def test_concurrent_link_intents_commit_only_one_complete_set(active_user, left_
         assert created is False
         assert replay.pk == receipt.pk
     else:
-        with pytest.raises(services.FarmConflict, match="^product_already_linked$") as error:
+        code = "farm_product_version_conflict" if revision_aware else "product_already_linked"
+        with pytest.raises(services.FarmConflict, match=f"^{code}$") as error:
             losing.result()
         assert error.value.context["product_id"] == str(shared)
-    assert_links(farm, winner_ids)
+    assert_links(farm, winner_ids, restored=removed)
     assert AdminCreationReceipt.objects.get().pk == receipt.pk
 
 
@@ -118,10 +152,14 @@ def test_same_key_disjoint_links_compete_at_receipt_insert(active_user):
 
 
 @pytest.mark.parametrize("link_first", [True, False], ids=["link-first", "farm-first"])
+@pytest.mark.parametrize("revision_aware", [False, True], ids=["legacy", "mixed"])
 @pytest.mark.parametrize("operation", ["delete", "deactivate"])
-def test_bulk_linking_serializes_with_farm_writers(active_user, link_first, operation):
+def test_bulk_linking_serializes_with_farm_writers(
+    active_user, link_first, revision_aware, operation
+):
     farm = make_farm()
     product_ids = [make_product(f"FARM-LINK-{i}").pk for i in range(2)]
+    removed = removed_source(farm, product_ids[1], active_user) if revision_aware else None
     if operation == "delete":
         farm_write = partial(services.delete_farm, farm_id=farm.pk, actor=active_user)
     else:
@@ -134,10 +172,10 @@ def test_bulk_linking_serializes_with_farm_writers(active_user, link_first, oper
         )
 
     linking, writing = run_in_lock_order(
-        link_operation(farm, active_user, product_ids),
+        link_operation(farm, active_user, product_ids, removed=removed),
         farm_write,
         left_first=link_first,
-        lock_model=Farm,
+        lock_model=Product if revision_aware else Farm,
     )
 
     if link_first:
@@ -158,19 +196,23 @@ def test_bulk_linking_serializes_with_farm_writers(active_user, link_first, oper
     farm.refresh_from_db()
     assert farm.is_active is link_first
     assert farm.version == (1 if link_first else 2)
-    assert_links(farm, product_ids)
+    assert_links(farm, product_ids, restored=removed)
     assert AdminCreationReceipt.objects.get().created_count == 2
 
 
 @pytest.mark.parametrize("link_first", [True, False], ids=["link-first", "status-first"])
-def test_bulk_linking_rechecks_product_status_and_rolls_back(active_user, link_first):
+@pytest.mark.parametrize("revision_aware", [False, True], ids=["legacy", "mixed"])
+def test_bulk_linking_rechecks_product_status_and_rolls_back(
+    active_user, link_first, revision_aware
+):
     farm = make_farm()
     eligible = make_product("ELIGIBLE")
     changed = make_product("DISCONTINUING")
     product_ids = [eligible.pk, changed.pk]
+    removed = removed_source(farm, changed.pk, active_user) if revision_aware else None
 
     linking, discontinuing = run_in_lock_order(
-        link_operation(farm, active_user, product_ids),
+        link_operation(farm, active_user, product_ids, removed=removed),
         partial(discontinue, changed, active_user),
         left_first=link_first,
         lock_model=Product,
@@ -181,13 +223,18 @@ def test_bulk_linking_rechecks_product_status_and_rolls_back(active_user, link_f
     assert changed.status == "discontinued"
     if link_first:
         assert linking.result()[1] is True
-        assert_links(farm, product_ids)
+        assert_links(farm, product_ids, restored=removed)
         assert AdminCreationReceipt.objects.get().created_count == 2
     else:
         with pytest.raises(services.FarmConflict, match="^product_inactive$") as error:
             linking.result()
-        assert error.value.context == {"item_index": 1, "product_id": str(changed.pk)}
-        assert_links(farm, [])
+        context = {"item_index": 1, "product_id": str(changed.pk)}
+        if removed is not None:
+            assert_source_state(removed, removed=True, version=2)
+            assert source_events(removed, "readd") == 0
+            context.update(source_id=str(removed.pk), version=2)
+        assert error.value.context == context
+        assert not FarmProduct.objects.filter(farm=farm, product=eligible).exists()
         assert not AdminCreationReceipt.objects.exists()
 
 
@@ -263,8 +310,11 @@ def test_concurrent_readd_with_the_same_key_replays_once(active_user):
 
 
 @pytest.mark.parametrize("readd_first", [True, False], ids=["readd-first", "other-first"])
+@pytest.mark.parametrize("revision_aware", [False, True], ids=["single", "mixed"])
 @pytest.mark.parametrize("operation", ["remove", "farmer-approval", "bulk-supply"])
-def test_readd_serializes_with_stale_source_operations(active_user, readd_first, operation):
+def test_readd_serializes_with_stale_source_operations(
+    active_user, readd_first, revision_aware, operation
+):
     source = FarmProduct.objects.create(farm=make_farm(), product=make_product())
     if operation == "farmer-approval":
         entry = submit_for_empty_source(source, active_user)
@@ -283,15 +333,25 @@ def test_readd_serializes_with_stale_source_operations(active_user, readd_first,
     else:
         other = partial(services.create_stock_batches_bulk, **supply_command([source], active_user))
 
+    restoring_operation = partial(services.readd_farm_product, **revision, idempotency_key=uuid4())
+    if revision_aware:
+        new = make_product("NEW")
+        restoring_operation = link_operation(
+            source.farm, active_user, [new.pk, source.product_id], removed=source
+        )
     restoring, competing = run_in_lock_order(
-        partial(services.readd_farm_product, **revision, idempotency_key=uuid4()),
+        restoring_operation,
         other,
         left_first=readd_first,
     )
 
     receipt, created = restoring.result()
     assert created is True
-    assert receipt.resource_id == source.pk
+    if revision_aware:
+        assert (receipt.resource_id, receipt.created_count) == (source.farm_id, 2)
+        assert_links(source.farm, [new.pk, source.product_id], restored=source)
+    else:
+        assert receipt.resource_id == source.pk
     if readd_first:
         code = (
             "farm_product_generation_changed"
@@ -312,6 +372,26 @@ def test_readd_serializes_with_stale_source_operations(active_user, readd_first,
         assert entry.status == FarmSupplyRequest.Status.PENDING
         assert entry.items.get().approved_batch_id is None
         assert not ContentAuditLog.objects.filter(action="farm.supply_request.approved").exists()
+
+
+@pytest.mark.parametrize("mixed_first", [True, False], ids=["mixed-first", "single-first"])
+def test_mixed_and_single_readd_do_not_both_change_the_same_generation(active_user, mixed_first):
+    farm = make_farm()
+    new, product = make_product("NEW"), make_product("RESTORE")
+    source = removed_source(farm, product.pk, active_user)
+    mixed = link_operation(farm, active_user, [new.pk, product.pk], removed=source)
+    single = partial(
+        services.readd_farm_product, **source_command(source, active_user), idempotency_key=uuid4()
+    )
+    results = run_in_lock_order(mixed, single, left_first=mixed_first)
+
+    winning, losing = results if mixed_first else reversed(results)
+    receipt, created = winning.result()
+    assert created
+    with pytest.raises(services.FarmConflict, match="^farm_product_version_conflict$"):
+        losing.result()
+    assert_links(farm, [new.pk, product.pk] if mixed_first else [product.pk], restored=source)
+    assert AdminCreationReceipt.objects.get().pk == receipt.pk
 
 
 @pytest.mark.parametrize("link_first", [True, False], ids=["link-first", "checkout-first"])

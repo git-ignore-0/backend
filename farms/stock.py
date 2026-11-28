@@ -2,7 +2,19 @@ from django.db.models import BigIntegerField, Case, F, OuterRef, Q, Subquery, Su
 from django.db.models.functions import Cast, Coalesce, Greatest
 from django.utils import timezone
 
-from commerce.models import StoreStockMovement, StoreStockMovementKind
+from commerce.models import ProductStatus, StoreStockMovement, StoreStockMovementKind
+
+
+def stock_batch_source_q():
+    return Q(removed_at__isnull=True, product__status=ProductStatus.ACTIVE)
+
+
+def stock_batch_source_blocker(source):
+    if source.removed_at is not None:
+        return "farm_product_removed"
+    if source.product.status != ProductStatus.ACTIVE:
+        return "product_not_selling"
+    return None
 
 
 def stock_batch_status(batch, *, today=None):

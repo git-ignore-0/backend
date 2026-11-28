@@ -45,6 +45,8 @@ from farms.stock import (
     batch_net_sold,
     batch_remaining_units,
     current_stock_batch_q,
+    stock_batch_source_blocker,
+    stock_batch_source_q,
     stock_batch_status,
 )
 
@@ -67,9 +69,10 @@ def _current_source_batches(today):
     )
 
 
-def farm_queryset():
+def farm_queryset(*, include_supply_capability=False):
     today = timezone.localdate()
-    supplying = FarmProduct.objects.filter(farm_id=OuterRef("pk"), removed_at__isnull=True)
+    sources = FarmProduct.objects.filter(farm_id=OuterRef("pk"))
+    supplying = sources.filter(removed_at__isnull=True)
     batches_with_stock = (
         _current_source_batches(today)
         .alias(remaining=batch_remaining_units(batch_net_sold()))
@@ -85,7 +88,7 @@ def farm_queryset():
         .annotate(total=Count("pk"))
         .values("total")
     )
-    return (
+    rows = (
         Farm.objects.select_related("image")
         .prefetch_related(
             Prefetch(
@@ -105,6 +108,9 @@ def farm_queryset():
             out_of_stock_product_count=F("_active_product_count") - F("in_stock_product_count"),
         )
     )
+    if include_supply_capability:
+        rows = rows.annotate(can_add_supply=Exists(sources.filter(stock_batch_source_q())))
+    return rows
 
 
 def farm_product_queryset(*, today=None):
@@ -540,6 +546,33 @@ def remove_farm_product(*, farm_id, product_id, expected_link_id, expected_versi
     return source
 
 
+FARM_PRODUCT_READD_FIELDS = (
+    "supply_generation",
+    "version",
+    "removed_at",
+    "removed_by",
+    "is_active",
+    "updated_at",
+)
+
+
+def _validate_farm_product_readd(source, expected_link_id, expected_version):
+    _require_source_revision(source, expected_link_id, expected_version)
+    if source.removed_at is None:
+        raise FarmConflict("farm_product_not_removed")
+    if source.product.status != ProductStatus.ACTIVE:
+        raise FarmConflict("product_not_selling")
+
+
+def _restore_removed_farm_product(source, *, now):
+    source.supply_generation += 1
+    source.version += 1
+    source.removed_at = None
+    source.removed_by = None
+    source.is_active = True
+    source.updated_at = now
+
+
 @transaction.atomic
 def readd_farm_product(
     *,
@@ -576,26 +609,9 @@ def readd_farm_product(
         raise FarmProduct.DoesNotExist from error
     if authorize_write is not None:
         authorize_write()
-    _require_source_revision(source, expected_link_id, expected_version)
-    if source.removed_at is None:
-        raise FarmConflict("farm_product_not_removed")
-    if source.product.status != ProductStatus.ACTIVE:
-        raise FarmConflict("product_not_selling")
-    source.supply_generation += 1
-    source.version += 1
-    source.removed_at = None
-    source.removed_by = None
-    source.is_active = True
-    source.save(
-        update_fields=[
-            "supply_generation",
-            "version",
-            "removed_at",
-            "removed_by",
-            "is_active",
-            "updated_at",
-        ]
-    )
+    _validate_farm_product_readd(source, expected_link_id, expected_version)
+    _restore_removed_farm_product(source, now=timezone.now())
+    source.save(update_fields=FARM_PRODUCT_READD_FIELDS)
     audit(
         actor=actor,
         action="farm.product.readd",
@@ -612,10 +628,8 @@ def readd_farm_product(
 def _validate_stock_batch_creation(*, source, expected_link_id, expected_version, data, today=None):
     """Check the current source after Product, FarmProduct and Farm are locked."""
     _require_source_revision(source, expected_link_id, expected_version)
-    if source.removed_at is not None:
-        raise FarmConflict("farm_product_removed")
-    if source.product.status != ProductStatus.ACTIVE:
-        raise FarmConflict("product_not_selling")
+    if blocker := stock_batch_source_blocker(source):
+        raise FarmConflict(blocker)
     _validate_stock_batch_values(**data, today=today)
 
 
@@ -678,11 +692,18 @@ def _reject_existing_link(source, *, index):
 
 
 @transaction.atomic
-def link_farm_products(*, farm_id, actor, idempotency_key, product_ids, authorize_write=None):
+def link_farm_products(
+    *, farm_id, actor, idempotency_key, product_ids=None, items=None, authorize_write=None
+):
     action = AdminCreationReceipt.Action.FARM_PRODUCT_LINKS
-    fingerprint = creation_fingerprint(
-        {"farm_id": farm_id, "product_ids": sorted(product_ids, key=str)}
-    )
+    if items is None:
+        # Keep the historical fingerprint and new-link-only expectations.
+        intent = {"product_ids": sorted(product_ids, key=str)}
+        items = [{"product_id": product_id, "expected_source": None} for product_id in product_ids]
+    else:
+        intent = {"items": sorted(items, key=lambda item: str(item["product_id"]))}
+        product_ids = [item["product_id"] for item in items]
+    fingerprint = creation_fingerprint({"farm_id": farm_id, **intent})
     if receipt := _matching_farm_receipt(actor, action, idempotency_key, fingerprint):
         return receipt, False
 
@@ -700,37 +721,62 @@ def link_farm_products(*, farm_id, actor, idempotency_key, product_ids, authoriz
     if authorize_write is not None:
         authorize_write()
 
-    sources = []
-    for index, product_id in enumerate(product_ids):
+    new_sources = []
+    restored_sources = []
+    for index, item in enumerate(items):
+        product_id = item["product_id"]
+        expected_source = item["expected_source"]
         product = products.get(product_id)
         context = {"item_index": index, "product_id": str(product_id)}
         if product is None:
             raise FarmConflict("not_found", context=context)
-        if product.status != ProductStatus.ACTIVE:
-            raise FarmConflict("product_inactive", context=context)
-        if source := existing.get(product_id):
-            _reject_existing_link(source, index=index)
-        sources.append(FarmProduct(farm=farm, product=product))
-
-    try:
-        with transaction.atomic():
-            FarmProduct.objects.bulk_create(sources)
-    except IntegrityError:
-        # A writer bypassing the Product locks still cannot create a duplicate pair.
-        conflicts = {
-            source.product_id: source
-            for source in FarmProduct.objects.filter(farm=farm, product_id__in=product_ids)
-        }
-        for index, product_id in enumerate(product_ids):
-            if source := conflicts.get(product_id):
+        source = existing.get(product_id)
+        if expected_source is None:
+            if product.status != ProductStatus.ACTIVE:
+                raise FarmConflict("product_inactive", context=context)
+            if source is not None:
                 _reject_existing_link(source, index=index)
-        raise
+            new_sources.append(FarmProduct(farm=farm, product=product))
+            continue
+        if source is None:
+            raise FarmConflict("farm_product_changed", context=context)
+        source.product = product
+        try:
+            _validate_farm_product_readd(source, expected_source["id"], expected_source["version"])
+        except FarmConflict as error:
+            code = "product_inactive" if error.code == "product_not_selling" else error.code
+            raise FarmConflict(
+                code, context={**context, "source_id": str(source.pk), "version": source.version}
+            ) from error
+        restored_sources.append(source)
+
+    if new_sources:
+        try:
+            with transaction.atomic():
+                FarmProduct.objects.bulk_create(new_sources)
+        except IntegrityError:
+            # A writer bypassing the Product locks still cannot create a duplicate pair.
+            conflicts = {
+                source.product_id: source
+                for source in FarmProduct.objects.filter(
+                    farm=farm, product_id__in=[source.product_id for source in new_sources]
+                )
+            }
+            for index, product_id in enumerate(product_ids):
+                if source := conflicts.get(product_id):
+                    _reject_existing_link(source, index=index)
+            raise
+    if restored_sources:
+        now = timezone.now()
+        for source in restored_sources:
+            _restore_removed_farm_product(source, now=now)
+        FarmProduct.objects.bulk_update(restored_sources, FARM_PRODUCT_READD_FIELDS)
 
     ContentAuditLog.objects.bulk_create(
         [
             ContentAuditLog(
                 actor=actor,
-                action="farm.product.add",
+                action=action,
                 entity_type=FarmProduct._meta.model_name,
                 entity_id=str(source.pk),
                 context={
@@ -739,11 +785,15 @@ def link_farm_products(*, farm_id, actor, idempotency_key, product_ids, authoriz
                     "supply_generation": source.supply_generation,
                 },
             )
+            for action, sources in (
+                ("farm.product.add", new_sources),
+                ("farm.product.readd", restored_sources),
+            )
             for source in sources
         ]
     )
     receipt.resource_id = farm.pk
-    receipt.created_count = len(sources)
+    receipt.created_count = len(items)
     receipt.save(update_fields=["resource_id", "created_count"])
     schedule_store_revalidation(slugs=[product.slug for product in products.values()])
     return receipt, True

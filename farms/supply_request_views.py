@@ -8,7 +8,7 @@ from rest_framework.settings import api_settings
 from rest_framework.throttling import SimpleRateThrottle
 from rest_framework.views import APIView
 
-from commerce.models import ProductStatus, ProductTranslation
+from commerce.models import ProductTranslation
 from commerce.serializers import StrictSerializer
 from content.permissions import IsWebsiteAdmin
 from farms.farmer_links import (
@@ -19,6 +19,7 @@ from farms.farmer_links import (
 )
 from farms.models import Farm, FarmFarmerLink, FarmProduct, FarmSupplyRequest
 from farms.services import FarmConflict
+from farms.stock import stock_batch_source_q
 from farms.supply_request_serializers import (
     FarmerHistoryQuerySerializer,
     FarmerProductListQuerySerializer,
@@ -174,9 +175,7 @@ class FarmerProductListView(FarmerView):
     def get(self, request):
         query = _query(request, FarmerProductListQuerySerializer)
         rows = (
-            FarmProduct.objects.filter(
-                farm=self.farm, removed_at__isnull=True, product__status=ProductStatus.ACTIVE
-            )
+            FarmProduct.objects.filter(stock_batch_source_q(), farm=self.farm)
             .select_related("product")
             .prefetch_related("product__translations")
         )

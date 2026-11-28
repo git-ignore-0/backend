@@ -5,11 +5,11 @@ from rest_framework import serializers
 from commerce.serializers import StrictSerializer
 from farms.models import FarmSupplyRequest
 from farms.serializers import (
-    BULK_STOCK_BATCH_MAX_ITEMS,
+    FARM_BULK_MAX_ITEMS,
     BulkStockBatchWriteSerializer,
-    BulkStockQuantityField,
     FarmProductHistoryQuerySerializer,
     FarmProductQuerySerializer,
+    JSONIntegerField,
     JSONUUIDField,
 )
 
@@ -31,21 +31,19 @@ class ProductIdentityField(serializers.RegexField):
 class FarmerSupplyItemSerializer(StrictSerializer):
     product_id = JSONUUIDField()
     expected_link_id = JSONUUIDField()
-    expected_generation = BulkStockQuantityField(min_value=1, max_value=2_147_483_647)
+    expected_generation = JSONIntegerField(min_value=1, max_value=2_147_483_647)
     # A missing value is accepted only for a verified replay of a Task 03 payload.
     expected_product_identity = ProductIdentityField(
         regex=r"\A[0-9a-f]{64}\Z", trim_whitespace=False, required=False
     )
-    quantity_units = BulkStockQuantityField(min_value=1, max_value=2_147_483_647)
+    quantity_units = JSONIntegerField(min_value=1, max_value=2_147_483_647)
 
 
 class FarmerSupplyWriteSerializer(BulkStockBatchWriteSerializer):
     idempotency_key = JSONUUIDField()
     start_date = ISODateField()
     end_date = ISODateField()
-    items = FarmerSupplyItemSerializer(
-        many=True, allow_empty=False, max_length=BULK_STOCK_BATCH_MAX_ITEMS
-    )
+    items = FarmerSupplyItemSerializer(many=True, allow_empty=False, max_length=FARM_BULK_MAX_ITEMS)
 
 
 class QueryPageField(serializers.IntegerField):
