@@ -1,5 +1,5 @@
 import uuid
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from django.utils import timezone
@@ -22,6 +22,7 @@ from commerce.store_orders import (
 from content.models import ContentAuditLog
 from farms import services
 from farms.models import Farm, FarmProduct, FarmProductStockBatch
+from memberships.csa_rounds import effective_stock_hold_rows
 from memberships.models import CSAStockHold
 from tests.test_csa_rounds import context as context
 from tests.test_csa_rounds import save
@@ -285,15 +286,45 @@ def test_only_current_generation_enters_public_farm_store_and_csa_totals(context
     assert selection_stock_capacity([product.pk], None) == {product.pk: 4}
 
 
-def test_remove_checks_shortfall_even_if_target_already_contributes_zero(context):
-    actor, product, _, _, _ = context
+@pytest.fixture
+def removal_context_at(request, monkeypatch):
+    monkeypatch.setattr(timezone, "now", lambda: request.param)
+    return request.getfixturevalue("context")
+
+
+@pytest.mark.parametrize(
+    "removal_context_at",
+    [
+        pytest.param(datetime(2026, 11, 27, 17, 1, tzinfo=UTC), id="after-vietnam-midnight"),
+        pytest.param(datetime(2026, 11, 27, 23, 59, tzinfo=UTC), id="before-utc-midnight"),
+        pytest.param(datetime(2026, 11, 28, 0, 1, tzinfo=UTC), id="after-utc-midnight"),
+        pytest.param(datetime(2026, 11, 28, 5, 0, tzinfo=UTC), id="vietnam-daytime"),
+    ],
+    indirect=True,
+)
+def test_remove_checks_shortfall_even_if_target_already_contributes_zero(removal_context_at):
+    actor, product, _, _, decision_at = removal_context_at
+    decision_date = timezone.localdate(decision_at)
+    expired_on = decision_date - timedelta(days=1)
     source = product.farm_offers.get()
+    batch = source.stock_batches.get()
+    # Use the CSA clock for both a sellable batch at selection and a valid expired range.
+    batch.start_date = expired_on
+    batch.end_date = decision_date
+    batch.save(update_fields=["start_date", "end_date"])
     other = FarmProduct.objects.create(
         farm=Farm.objects.create(**farm_payload(name_en="Other farm")), product=product
     )
     other.stock_batches.create(**values(1))
-    selection = save(context)
-    source.stock_batches.update(end_date=timezone.localdate() - timedelta(days=1))
+    selection = save(removal_context_at)
+    batch.end_date = expired_on
+    batch.save(update_fields=["end_date"])
+    assert batch.start_date <= batch.end_date < decision_date
+    assert (
+        effective_stock_hold_rows(now=decision_at)
+        .filter(selection=selection, farm_id=source.farm_id, quantity=2)
+        .exists()
+    )
 
     with pytest.raises(services.FarmConflict, match="farm_product_supply_shortfall") as error:
         services.remove_farm_product(**intent(source, actor))
